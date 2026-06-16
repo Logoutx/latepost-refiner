@@ -1,0 +1,21 @@
+# 构建产物
+*.zip
+
+# 系统
+.DS_Store
+
+# Python（universal/ 待建）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Node
+node_modules/
+
+# 跑测时的输出/临时目录
+/output/
+/tmp/
+*.local.md
