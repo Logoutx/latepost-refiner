@@ -1,25 +1,25 @@
-# Transcriber-Universal — 构建任务书
+# Transcriber-Universal — Build Task Book
 
-## 一句话目标
+## One-line goal
 
-把本仓库的访谈精校流水线做成一个**独立的、直接调 Anthropic API 的 Node CLI**——有 API key 就能在任意机器跑，不依赖 Claude Code 的 Workflow 工具，也不依赖 claude.ai 上传 skill。
+Turn this repo's interview-transcript refinement pipeline into a **standalone Node CLI that calls the Anthropic API directly** — anyone with an API key can run it on any machine, with no dependency on Claude Code's Workflow tooling and no need to upload a skill to claude.ai.
 
-## 关键前提：逻辑已经共享，你只写「引擎 + CLI」
+## Key premise: the logic is already shared — you only write the "engine + CLI"
 
-流水线、prompts、schemas、编辑规范、全部纯逻辑都在 [`../core/`](../core/)，**两个 edition 共用**。Universal 版**不重写任何业务逻辑**——只 `import { runPipeline } from '../core/pipeline.js'`，再补一层运行时引擎和命令行外壳。
+The pipeline, prompts, schemas, editorial rules, and all pure business logic live in [`../core/`](../core/) and are **shared by both editions**. The Universal edition **does not rewrite any business logic** — it simply does `import { runPipeline } from '../core/pipeline.js'` and adds a runtime engine layer plus a command-line shell.
 
-`runPipeline(A, engine)` 只依赖 engine 的 5 个原语。Claude Code 版用 Workflow 全局充当；你这版用 Anthropic SDK 兑现同样 5 个：
+`runPipeline(A, engine)` depends only on 5 primitives that the engine must provide. The Claude Code edition satisfies them via the Workflow global; this edition satisfies the same 5 using the Anthropic SDK:
 
 ```js
 import { runPipeline } from '../core/pipeline.js'
 import { makeApiEngine } from '../engines/api.js'
 const engine = makeApiEngine({ apiKey: process.env.ANTHROPIC_API_KEY, models, concurrency })
-const result = await runPipeline(A, engine)   // A 由 argv 解析，与 Claude Code 版同形
+const result = await runPipeline(A, engine)   // A is parsed from argv, same shape as the Claude Code edition
 ```
 
-## 要建的只有三块
+## Only three things to build
 
-### 1. `../engines/api.js` —— 兑现 engine 接口（核心工作量）
+### 1. `../engines/api.js` — implement the engine interface (core work)
 
 ```
 agent(prompt, { label, model, schema, phase }) -> Promise<obj | string | null>
@@ -29,50 +29,50 @@ phase(title) -> void
 log(msg) -> void
 ```
 
-- **`agent`**：`anthropic.messages.create` 跑一个 **tool-use 循环**。关键技巧——把 `Read / Write / WebSearch` 实现成**客户端工具**（模型 call → 你本地执行 fs 读写 / 联网 → 把结果回灌进对话），于是 `core/` 里现成的「用 Read 分页读…」「Write 到…」「WebSearch 核实…」的 prompt **一字不改就能用**。这是省掉重写的命门。
-  - 有 `schema` 时：把 schema 作为一个 `StructuredOutput` 工具的 `input_schema`，用 `tool_choice` 逼模型最后调用它；返回解析后的对象。**沿用 core 的教训：schema 不设 required**（缺字段由 core 的 JS 兜底；别让校验失败触发死循环）。无 `schema` 返回最终文本。
-  - 模型名走 `models`（与 core 默认分层一致：scout=haiku，verify/dedup=sonnet，refine/logic/summary/timeline=opus，结尾核对=haiku）。
-- **`parallel` / `pipeline`**：`Promise` + `p-limit` 限并发（`min(16, cores-2)` 量级）。`pipeline` 逐项独立流过各 stage、**无 barrier**；任一 thunk/stage 抛错 → 该项归 `null`（与 Workflow 语义一致，core 里有 `.filter(Boolean)`）。
-- **`phase` / `log`**：打到 stderr 或进度条。
+- **`agent`**: Run a **tool-use loop** via `anthropic.messages.create`. The key technique — implement `Read / Write / WebSearch` as **client-side tools** (model calls → you execute locally: fs read/write / network fetch → feed results back into the conversation). This way the existing `core/` prompts — "use Read to page through...", "Write to...", "WebSearch to verify..." — **work without any modification**. This is what makes rewriting unnecessary.
+  - When `schema` is provided: pass the schema as the `input_schema` of a `StructuredOutput` tool, use `tool_choice` to force the model to call it at the end, and return the parsed object. **Carry over the lesson from core: do not set `required` in schemas** (missing fields are caught by core's JS fallbacks; do not let validation failures trigger infinite retry loops). When no `schema` is provided, return the final text.
+  - Model names come from `models` (consistent with core's default tiers: scout=haiku, verify/dedup=sonnet, refine/logic/summary/timeline=opus, final check=haiku).
+- **`parallel` / `pipeline`**: Use `Promise` + `p-limit` to cap concurrency (on the order of `min(16, cores-2)`). `pipeline` passes each item independently through all stages with **no barrier**; if any thunk/stage throws, that item becomes `null` (consistent with Workflow semantics — core has `.filter(Boolean)` throughout).
+- **`phase` / `log`**: Write to stderr or a progress bar.
 
-> 联网核实：优先用 Anthropic 的 server-side web search 工具；或在客户端 WebSearch 工具里接一个搜索 API。动手前查 `claude-api` skill 确认当前 web search 工具名/版本与 tool-use 写法。
+> Web verification: prefer Anthropic's server-side web search tool; alternatively, implement a WebSearch client tool backed by a search API. **Check the `claude-api` skill before starting** to confirm the current web search tool name/version and the correct tool-use syntax.
 
-### 2. `universal/cli.js` —— 命令行外壳
+### 2. `universal/cli.js` — command-line shell
 
-- 解析 argv → 组装 `A`（与 Claude Code 版 args 同形，见 `core/meta.js` 顶部契约 + `../claude-code-skill/SKILL.md` Step 0）：`{ topic, date, background, outputDir, skillDir, scope, verifyDepth, headingPolicy, models, files:[{path,label,lines,bytes,title,subtitle,outPath,...}] }`。
-- **预检**：docx/pdf → md（shell 调 `markitdown`，或用 `mammoth`）；`wc -l`/`-c` 填 lines/bytes；grep 探小标题。
-- `skillDir` 指向能读到 `references/` 的位置（复用 `../claude-code-skill/references/`，或在打包时拷一份）。
-- 调 `runPipeline(A, engine)`，按返回处理（glossary 落盘、`failed/incomplete/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions`——同 SKILL.md「返回处理」）。
+- Parse argv → assemble `A` (same shape as the Claude Code edition's args — see the contract at the top of `core/meta.js` and `../claude-code-skill/SKILL.md` Step 0): `{ topic, date, background, outputDir, skillDir, scope, verifyDepth, headingPolicy, models, files:[{path,label,lines,bytes,title,subtitle,outPath,...}] }`.
+- **Pre-flight checks**: convert docx/pdf → md (shell out to `markitdown`, or use `mammoth`); fill in `lines`/`bytes` via `wc -l`/`-c`; grep for sub-headings.
+- `skillDir` points to a location where `references/` is readable (reuse `../claude-code-skill/references/`, or copy it in during packaging).
+- Call `runPipeline(A, engine)` and handle the return value (write glossary to disk; handle `failed/incomplete/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions` — same as "return handling" in SKILL.md).
 
-### 3. 打包
+### 3. Packaging
 
-`package.json`（`type: module`，`bin: transcriber`）+ `@anthropic-ai/sdk` + `p-limit`（+ `mammoth` 或依赖系统 markitdown）+ `.env.example`（`ANTHROPIC_API_KEY`）+ README。
+`package.json` (`type: module`, `bin: transcriber`) + `@anthropic-ai/sdk` + `p-limit` (+ `mammoth` or system `markitdown` dependency) + `.env.example` (`ANTHROPIC_API_KEY`) + README.
 
-## CLI 设想
+## CLI sketch
 
 ```bash
 transcriber --files "a.docx" "b.docx" --topic "Mixue" --date 2025-02 \
-  --background "蜜雪集团各团队系列采访…" --scope refine,logic,summary \
+  --background "Mixue Group cross-team interview series..." --scope refine,logic,summary \
   --verify key --out ./output --models scout=haiku,refine=opus
 ```
 
-输出与 Claude Code 版一致：`<out>/校对表.md`、`Transcripts/*.md`、`逻辑顺序/*.md`、`<主题>访谈总结.md`、`<主题>时间线.md`。
+Output is identical to the Claude Code edition: `<out>/校对表.md`, `Transcripts/*.md`, `逻辑顺序/*.md`, `<topic>访谈总结.md`, `<topic>时间线.md`.
 
-## 建造顺序
+## Build order
 
-1. 查 `claude-api` skill 定 API 写法（model id / tool-use 结构化输出 / web search 工具）。
-2. 写 `engines/api.js` 的 tool-use 循环（Read/Write/WebSearch/StructuredOutput 四个客户端工具）+ `parallel`/`pipeline`（p-limit）。
-3. 写 `cli.js`（argv→A、docx→md、调 runPipeline、返回处理）。
-4. 端到端测：用 `~/Downloads/2025-02-21_范 大咖事业群，原料研发.txt` 跑一份，对照 Claude Code 版已知良好产出（用户 Obsidian `Company Research/Mixue/`）。
-5. 打包 + README + `.env.example`。
+1. Check the `claude-api` skill to lock down the API syntax (model id / tool-use structured output / web search tool).
+2. Write the tool-use loop in `engines/api.js` (four client tools: Read / Write / WebSearch / StructuredOutput) + `parallel`/`pipeline` (p-limit).
+3. Write `cli.js` (argv → A, docx → md, call runPipeline, handle return value).
+4. End-to-end test: run a single file through using `~/Downloads/2025-02-21_范 大咖事业群，原料研发.txt`, compare against the known-good Claude Code edition output (user's Obsidian `Company Research/Mixue/`).
+5. Packaging + README + `.env.example`.
 
-## 别再踩的坑（都已固化在 core，引擎别破坏其前提）
+## Pitfalls already fixed in core — do not break their assumptions in the engine
 
-schema 不设 required；侦察固定 haiku；聚类欠并（弱称不当合并键）；verify 分块 12；refine 大块写入禁微改；人名强名守卫；verify 断路器（连错 2 次即停——引擎要把检索错误如实抛给模型，让 prompt 里的断路器逻辑生效）；中文排版三规范已在 prompt 内。
+Do not set `required` in schemas; scout is always haiku; clustering underfires (weak labels must not be merged); verify splits at 12 chunks; large-block refine writes must not silently apply micro-edits; person-name guard is active; verify circuit-breaker (2 consecutive errors → stop — the engine must surface retrieval errors honestly so the circuit-breaker logic in the prompt can trigger); the three Chinese typesetting rules are already embedded in the prompts.
 
-## 参考
+## References
 
-- `../core/`（真相来源：runPipeline + prompts + schemas + 纯逻辑）。
-- `../claude-code-skill/SKILL.md`（Step 0 预检 + args 契约 + 返回处理，照搬到 CLI）。
-- `../engines/api.js`（接口占位 + 实现说明）。
-- `claude-api` skill —— API/SDK 细节，动手前必查。
+- `../core/` (source of truth: runPipeline + prompts + schemas + pure logic).
+- `../claude-code-skill/SKILL.md` (Step 0 pre-flight + args contract + return handling — copy directly into CLI).
+- `../engines/api.js` (interface placeholder + implementation notes).
+- `claude-api` skill — API/SDK details; consult before starting.

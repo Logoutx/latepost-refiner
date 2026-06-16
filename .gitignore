@@ -1,10 +1,10 @@
-# 构建产物
+# Build artifacts
 *.zip
 
-# 系统
+# System
 .DS_Store
 
-# Python（universal/ 待建）
+# Python (in case markitdown or tooling is used)
 __pycache__/
 *.py[cod]
 .venv/
@@ -12,10 +12,10 @@ venv/
 .env
 *.egg-info/
 
-# Node
+# Node (universal/ build)
 node_modules/
 
-# 跑测时的输出/临时目录
+# Test run outputs / temp dirs
 /output/
 /tmp/
 *.local.md

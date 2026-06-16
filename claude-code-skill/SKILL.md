@@ -1,172 +1,184 @@
 ---
 name: transcriber
 description: >-
-  精校、整理访谈/采访/口述的“粗转录”文字稿（rough interview transcript cleanup & refine），并可顺带产出时间线与访谈总结。
-  适用场景：用户手上有一份或多份对话体的访谈转录（常见于公司调研、人物专访、播客、用户访谈、纪录片采访），
-  想要——删口癖与口语重复、把破碎口语理顺、按主题加小标题、交叉校对并修正语音转写造成的人名/品牌/术语错误、
-  统一发言人标注与文件标题，同时保留全部事实细节（不是做摘要）。
-  只要用户说到“精校/整理/校对 转录或访谈稿”“把录音转的文字整理成能读的”“clean up this interview transcript”
-  “这几份采访/访谈转录帮我处理一下”“加小标题、改错别字、统一人名”等，即使没明说“技能”，也应主动使用本技能。
-  不适用：从音频做语音转文字（ASR）、整篇翻译、或只要一句话摘要而不需要保留全文的场景。
+  Refine and clean up rough interview / Q&A / oral-history transcripts (rough interview transcript cleanup & refine),
+  and optionally produce a timeline and an interview summary. Use when the user has one or more dialogue-style
+  interview transcripts (common in company research, profiles, podcasts, user interviews, documentary interviews)
+  and wants to — remove verbal tics and spoken repetition, smooth out broken speech, add topic sub-headings,
+  cross-check and fix ASR-induced name/brand/term errors, unify speaker labels and file titles — while keeping
+  every factual detail (this is NOT summarization).
+  Trigger whenever the user says things like “精校/整理/校对 转录或访谈稿”, “把录音转的文字整理成能读的”,
+  “clean up this interview transcript”, “这几份采访/访谈转录帮我处理一下”, “加小标题、改错别字、统一人名” —
+  use this skill proactively even if they don't say the word “skill”.
+  Not for: audio-to-text (ASR), full-document translation, or one-line summaries that don't need the full text preserved.
 ---
 
-# Transcriber —— 访谈转录精校与整理
+# Transcriber — Interview transcript refinement & cleanup
 
-把粗糙的口语转录（录音转写、人工速记）整理成**可读、可信、可检索**的访谈稿，并可继续产出时间线与总结。核心信念：这是**精校（refine）不是改写，更不是摘要**——保留说话人的语气、观点和全部事实细节，只去掉噪音、修掉转写错误、加上结构。
+Turn rough spoken transcripts (ASR output, manual stenography) into **readable, trustworthy, searchable** interview
+documents, and optionally go on to produce a timeline and a summary. Core belief: this is **refine, not rewrite, and
+definitely not summarization** — preserve the speaker's tone, opinions, and every factual detail; only remove noise,
+fix transcription errors, and add structure.
 
-## 何时用 / 不用
-- **用**：有对话体转录、要清理+加结构+纠人名术语错误；要把多份相关访谈做成一套可检索的研究资料；要在精校基础上产出时间线/总结。
-- **不用**：从音频直接转文字（ASR，本技能假设已有文字稿）；整篇翻译；只要简短摘要、不在乎全文。
+## When to use / not use
+- **Use**: you have dialogue-style transcripts and need cleanup + structure + name/term fixes; you want to turn several
+  related interviews into one searchable research set; you want a timeline/summary built on top of the refined text.
+- **Don't use**: audio-to-text (ASR — this skill assumes you already have text); full-document translation; you only
+  want a short summary and don't care about the full text.
 
-## 省 token / 省时间的核心原则
-**笨重文本（原始转录、网页）只待在子代理上下文里，用完即弃；主代理（orchestrator）的上下文只保留蒸馏后的小产物——校对表、文件清单、成稿路径。** 主代理永远不要把整份转录或整页搜索结果读进自己的上下文：读源文件、联网核实都派给子代理，让它们只回报压缩结论。这是本技能控成本的命门，下面每一步都按它来。
+## Core principle: save tokens / save time
+**Heavy text (raw transcripts, web pages) stays only in subagent contexts and is discarded after use; the main agent's
+(orchestrator's) context holds only the distilled small artifacts — the glossary, the file list, the output paths.**
+The main agent must never read a whole transcript or a full page of search results into its own context: delegate
+source-file reading and web verification to subagents that report back only compressed conclusions. This is the cost
+lever for the whole skill, and every step below follows it.
 
-## 工作流总览
-0. **一次性问清楚**（输出位置 + 采访谁/谈了什么/领域公司人 + 范围），然后埋头自主执行、中途不打扰
-1. **并行侦察 → 建统一校对表**（每份文件一个侦察子代理只回报压缩清单；主代理合并、跨文件互证、批量核实残余）
-2. **逐份精校**（并行精校子代理，共享同一张校对表）
-2.5 **逻辑顺序稿**（可选）：把每份问答从录音顺序重排成叙事顺序（保序重排·原文照搬）
-3. **时间线**（对照公开资料）
-4. **访谈总结**（要点 / quote / 洞察）
-5. **收尾**：把过程中攒下的、只有读完才能定的少数疑点一次性问用户；交付成稿与核实结论
+## Workflow overview
+0. **Ask everything up front** (output location + who/what/the domain-companies-people + scope), then run autonomously without interrupting.
+1. **Parallel scouting → build a unified glossary** (one scout subagent per file reporting only a compressed list; the main agent merges, cross-validates across files, batch-verifies the residue).
+2. **Refine each file** (parallel refine subagents sharing one glossary).
+2.5 **Logical-order rewrite** (optional): re-sequence each file's Q&A from recording order into narrative order (order-preserving rewrite, verbatim).
+3. **Timeline** (against public sources).
+4. **Interview summary** (key points / quotes / insights).
+5. **Wrap-up**: ask the user, in one batch, the few open questions that could only be settled after reading; deliver the outputs and the verification conclusions.
 
-> **关键节奏**：能提前问的（Step 0）开头**一次问完**，之后尽量自主执行、**不要为零碎问题反复回头打扰用户**；只有“读完才能确定”的少数疑点，攒到 Step 5 一起问。
-> 范围可裁剪：只要精校就停在第 2 步；要全流程就做到第 4 步。Step 0 一并确认这次做到哪一步。
+> **Key rhythm**: ask everything askable up front (Step 0) **in one round**, then run autonomously and **don't keep coming back with piecemeal questions**; only the few doubts that "can only be settled after reading" get saved up for Step 5.
+> Scope is trimmable: refine-only stops at Step 2; the full pipeline goes through Step 4. Confirm in Step 0 how far this run goes.
 
 ---
 
-## Step 0 — 一次性问清楚（前置访谈）
+## Step 0 — Ask everything up front (pre-interview)
 
-交互**集中在开头一轮**：把“用户凭记忆当场就能回答的信息”全部问完，然后自主执行、中途不打扰。开头做四件事，尽量并在一两次交互里：
+Concentrate interaction **in one opening round**: ask everything the user "can answer from memory on the spot", then run autonomously without interrupting. Do four things up front, ideally in one or two exchanges:
 
-1. **定输出位置。** 在对话里直接问用户输出文件夹的绝对路径——**先给一个合理默认让用户确认或改**，别让他凭空打全路径。该用户研究笔记常放在 Obsidian 的 `Company Research` 库，**默认建议**：
+1. **Set the output location.** Ask the user for the absolute path of the output folder right in the conversation — **offer a sensible default to confirm or change**, don't make them type a full path from scratch. This user keeps research notes in the Obsidian `Company Research` vault, so the **default suggestion** is:
    `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Outer Mind/Company Research/<项目名>`
-   （`<项目名>` 你按本次主题/公司起一个，如 `Mixue`、`Xige`）。用户给了别的路径就用别的；目录不存在就 `mkdir -p` 创建。**成稿规则**：精校转录 → `<所选文件夹>/Transcripts/`；时间线、总结 → `<所选文件夹>/` 根目录。
+   (pick a `<项目名>` from this run's topic/company, e.g. `Mixue`, `Xige`). Use a different path if the user gives one; `mkdir -p` if it doesn't exist. **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; timeline and summary → `<chosen folder>/` root.
 
-2. **请用户当场口述背景**（这些不用等你读全文就能给，给了你才能一路不打扰地跑完）：
-   - **采访谁**：发言人名单（含记者/主持是谁）+ 每位被访者当时的 title/背景，哪怕只是花名或英文名。
-   - **谈了什么**：主题 / 所属行业领域；涉及的公司、机构、关键人物。
-   - 这两项直接决定后面怎么按“领域 + 名字”联网核实、怎么标发言人。
-   - **能从文件名先推断的，先把答案填好让用户确认/补充**（如文件名「Retail Talk with ex-FUDI 顾隽华」→ 先问“采访对象是顾隽华(ex-FUDI)、聊零售/仓储会员店，对吗？”），减少用户打字。
+2. **Have the user describe the background on the spot** (these don't require reading the full text, and they let you run to the end without interrupting):
+   - **Who was interviewed**: the speaker list (including which reporter/host is who) + each interviewee's title/background at the time, even just a nickname or English name.
+   - **What was discussed**: topic / industry domain; the companies, organizations, and key people involved.
+   - These two drive how you later web-verify by "domain + name" and how you label speakers.
+   - **Pre-fill what you can infer from filenames and have the user confirm/amend** (e.g. filename 「Retail Talk with ex-FUDI 顾隽华」 → first ask “采访对象是顾隽华(ex-FUDI)、聊零售/仓储会员店，对吗？”), to reduce typing.
 
-3. **预检（派发前的便宜活）**：`.docx/.pdf` 先按全局规则转成 markdown；`wc -l`/`wc -c` 记每份行数与字节数；`grep -nE '^#{1,3} |^【'` 探测源文件是否已带（记者/速记的）小标题。
+3. **Pre-flight (cheap work before dispatch)**: convert `.docx/.pdf` to markdown per the global rules; record each file's line and byte count with `wc -l`/`wc -c`; probe for existing (reporter/steno) sub-headings with `grep -nE '^#{1,3} |^【'`.
 
-4. **用 AskUserQuestion 把离散选择一次问掉**：①范围（仅精校 / +逻辑顺序稿 / +总结 / +时间线 / 全流程；可多选）；②（可省，默认核关键实体）联网核实深度；③标题格式是否用默认 `英文名（中文名）当时title`；④（仅当预检发现已有小标题）问“保留原小标题”还是“按内容重新生成”。
-   - **逻辑顺序稿**＝在精校稿之外，把同一访谈的问答从“录音顺序”重排成“叙事顺序”，让散落各处、同属一条线的问答聚成完整故事（保序重排·原文照搬，不改写不摘要）。每份精校稿对应一份，opt-in。
+4. **Use AskUserQuestion to settle the discrete choices in one shot**: ① scope (refine only / + logical-order rewrite / + summary / + timeline / full pipeline; multi-select); ② (optional, defaults to verifying key entities) web-verification depth; ③ whether to use the default title format `英文名（中文名）当时title`; ④ (only if pre-flight found existing sub-headings) ask “保留原小标题” vs “按内容重新生成”.
+   - **Logical-order rewrite** = beyond the refined transcript, re-sequence one interview's Q&A from "recording order" into "narrative order", so scattered exchanges that belong to one thread come together into a complete story (order-preserving rewrite, verbatim, no rewriting or summarizing). One per refined transcript, opt-in.
 
-然后**告诉用户**：“接下来我自己读全文、建校对表、联网核实、逐份精校，中途不打扰你——要几分钟。少数只有读完才能确定的疑点（个别真名、某段归属、某个存疑术语）攒到最后一次性问你。” 之后进入自主执行。
+Then **tell the user**: “接下来我自己读全文、建校对表、联网核实、逐份精校，中途不打扰你——要几分钟。少数只有读完才能确定的疑点（个别真名、某段归属、某个存疑术语）攒到最后一次性问你。” Then go autonomous.
 
 ---
 
-## Claude Code 快路径（Workflow，可用时优先）
+## Claude Code fast path (Workflow, preferred when available)
 
-本会话若有 **Workflow 工具**（Claude Code），Step 0 之后不必逐步执行 Step 1–4：把答案组装成 args 一次派发，侦察→核实→建表→精校+结尾核对→总结/时间线全在工作流里完成（模型分层已内置：侦察 haiku，核实 sonnet，精校/总结/时间线 opus，结尾核对 haiku；合并去重在 JS 层做“泛称感知”——只在共享实名/术语时并，X总/董事长 等敬称不当合并键，避免把不同人并成一团；同输入重跑命中缓存）。
+If this session has the **Workflow tool** (Claude Code), you don't have to run Steps 1–4 by hand after Step 0: assemble the answers into args and dispatch once — scout → verify → glossary → refine + ending-check → summary/timeline all happen inside the workflow (model tiering is built in: scout haiku, verify sonnet, refine/summary/timeline opus, ending-check haiku; merge/dedup happens in JS with "honorific-aware" clustering — merge only on shared real names/terms, treating X总/董事长-style honorifics as non-merge keys to avoid lumping different people together; re-running the same input hits the cache).
 
 ```js
-Workflow({ scriptPath: '<本技能目录>/workflow.js', args: {
-  topic, date, background,            // 主题/公司；采访时间；Step 0 口述背景（领域+人+公司）
-  outputDir,                          // 用户选定的输出文件夹（绝对路径）
-  skillDir: '<本技能目录>',
-  scope: ['refine','logic','summary','timeline'],   // 按 Step 0 的范围答案裁剪（'logic'=逻辑顺序重排稿，依赖 refine）
-  verifyDepth: 'key',                 // 'key'（默认）/ 'deep' / 'none'
-  headingPolicy: 'none',              // 预检命中已有小标题时按用户答案设 'regenerate' / 'keep'
-  models: undefined,                  // 可覆盖 {scout,verify,refine,summary,timeline}
+Workflow({ scriptPath: '<this skill dir>/workflow.js', args: {
+  topic, date, background,            // topic/company; interview date; Step 0 background (domain + people + companies)
+  outputDir,                          // the user's chosen output folder (absolute path)
+  skillDir: '<this skill dir>',
+  scope: ['refine','logic','summary','timeline'],   // trim per the Step 0 scope answer ('logic' = logical-order rewrite, depends on refine)
+  verifyDepth: 'key',                 // 'key' (default) / 'deep' / 'none'
+  headingPolicy: 'none',              // set 'regenerate' / 'keep' per the user's answer when pre-flight found existing sub-headings
+  models: undefined,                  // optionally override {scout,verify,refine,summary,timeline}
   files: [{ path, label, lines, bytes, title, subtitle, outPath, speakerHints, notes }],
 } })
 ```
 
-`files` 每项：`path` 源文件、`label` 短名、`lines` 行数与 `bytes` 字节数（预检所得）、`title` 成稿 H1（按输出规范起好）、`subtitle` 第二行斜体说明、`outPath` = `<输出>/Transcripts/<title>.md`、`speakerHints/notes` 把 Step 0 问到的该份线索写进去。单份 <400 行会自动走“一遍过”快捷分支。
+Each `files` item: `path` source file, `label` short name, `lines` line count and `bytes` byte count (from pre-flight), `title` output H1 (per the output spec), `subtitle` the second italic line, `outPath` = `<output>/Transcripts/<title>.md`, `speakerHints/notes` carry the per-file clues from Step 0. A single file < 400 lines automatically takes the "one-pass" shortcut branch.
 
-**返回处理**：①把返回的 `glossary` 全文 `Write` 到 `<输出目录>/校对表.md` 存档（落盘前快速扫一眼排版：核实依据、同指理由等成句中文说明应用阿拉伯数字、盘古空格、全角弯引号——子代理多已写对，发现漏网的顺手改掉）；②`failed` 里的文件按 Step 1–2 手动补做；③`incomplete` 里的成稿结尾没写全，派精校子代理续写到结尾；④`unchecked` 里的成稿是“完整性核对代理失败”——别当成已通过，用 Bash tail 对照源文件结尾自查；⑤`scoutSuspect`（侦察回传内容乱码、重试后仍坏——多因网络中途毁坏生成流）非空时：成稿不受影响（精校读源文件），但**校对表里这几份对应的条目不可信**——告知用户、建议网络稳定后对这些文件单独重跑侦察重建校对表；⑥`headingConflicts` 里的文件侦察发现带原有小标题但按 'none' 跑了——并入 Step 5 问用户保留/重做，需要时单独重跑该文件；⑦`suspectedDuplicates`（写法不同但疑似同指、脚本未自动合并的组，如周勇/尹勇）已并进 `openQuestions`——Step 5 一并问用户是否同指；⑧`networkUnverified`（核实代理因网络故障**熔断跳过、没查成**的项，区别于“查过但查无此人”）非空时——在 Step 5 的一次性提问里给用户一个**补核选项**（“网络恢复了吗？要不要把这 N 项补查一遍”）；用户确认后派**一个** sonnet 子代理用 WebSearch 只核这些项（同样纪律：查到依据才算 resolved、绝不臆造、连续报错即停），把结论追加到 `<输出目录>/校对表.md` 末尾的「## 补核结论」一节；若补核**改正了成稿里已用的人名/术语写法**，告知用户并提议对相应成稿做一次定向替换（人名遵守同样的强名守卫：补核结论与成稿强名不符时只报告、不擅自改）；⑨`openQuestions` 并入 Step 5 一次性问；⑩`logic`（逻辑顺序重排稿）已由工作流写到 `<输出>/逻辑顺序/`——每项的 `missingSections` 若非空，表示按精校稿小标题覆盖核对疑似漏排了该段，抽查对应逻辑稿、必要时单独重跑该份；⑪总结/时间线已由工作流写盘。然后直接进 Step 5。
+**Return handling**: ① `Write` the returned `glossary` in full to `<output dir>/校对表.md` to archive (before writing, glance over the typesetting: verification sources, same-referent reasons, and other full-sentence Chinese notes should use Arabic numerals, Pangu spacing, full-width curly quotes — subagents mostly get this right; fix any stragglers); ② files in `failed` get done by hand per Steps 1–2; ③ for `incomplete` the output didn't reach the ending — dispatch a refine subagent to continue to the end; ④ `unchecked` means the "ending-completeness check agent failed" — don't treat it as passed; self-check against the source ending with `tail`; ⑤ when `scoutSuspect` is non-empty (scout returned garbled content and was still broken after retry — usually a network-corrupted generation stream): the outputs are unaffected (refine reads the source file), but **those files' entries in the glossary are untrustworthy** — tell the user and suggest re-running scouting on those files alone once the network is stable, to rebuild the glossary; ⑥ files in `headingConflicts` were found to have existing sub-headings but ran under 'none' — fold into the Step 5 questions (keep/redo), re-running that file alone if needed; ⑦ `suspectedDuplicates` (groups written differently but suspected of being the same referent that the script did not auto-merge, e.g. 周勇/尹勇) are already folded into `openQuestions` — ask the user in Step 5 whether they're the same; ⑧ when `networkUnverified` (items the verify agent **skipped via the circuit breaker — never actually verified**, as opposed to "checked but not found") is non-empty — in the Step 5 batch, offer the user a **re-verify option** (“网络恢复了吗？要不要把这 N 项补查一遍”); on confirmation, dispatch **one** sonnet subagent to verify just those via WebSearch (same discipline: only resolved with cited evidence, never fabricate, stop on consecutive errors), append the conclusions to a 「## 补核结论」 section at the end of `<output dir>/校对表.md`; if the re-verify **corrects a name/term spelling already used in the outputs**, tell the user and propose one targeted replacement in those outputs (names follow the same strong-name guard: when a re-verify conclusion conflicts with an output's strong name, only report, don't silently change); ⑨ fold `openQuestions` into the single Step 5 batch; ⑩ `logic` (the logical-order rewrites) have already been written by the workflow to `<output>/逻辑顺序/` — if any item's `missingSections` is non-empty, it means the per-section coverage check against the refined transcript's sub-headings suspects that section was dropped from the rewrite; spot-check that rewrite and re-run that file alone if needed; ⑪ summary/timeline have already been written to disk by the workflow. Then go straight to Step 5.
 
-Workflow 不可用（如 claude.ai）→ 按下面 Step 1–4 手动执行。
-
----
-
-## Step 1 — 并行侦察，建立统一校对表
-
-**为什么**：语音转写最爱错人名/品牌/专名，同一个人/品牌在不同文件里常被写成好几种样子（音译、英文名、花名混用）。先把全部内容看完、互相印证，才能定一张**统一**校对表，让所有文件改得一致——这就是“交叉验证”。**但主代理不亲自读全文**：按核心原则，把读派给子代理，主代理只收压缩清单。
-
-1. **并行侦察子代理**：用 Agent 工具为**每一份**转录起一个轻量子代理（可后台并行）。每个子代理 `Read` 自己那份源文件（**只读一遍**），**不做联网、不精校**，只回报一份**压缩清单**：
-   - 发言人有哪些称呼、各对应谁；
-   - 反复出现的人名/品牌/术语，及其各种写法（带一句定位线索，便于跨文件对齐）；
-   - 明显的转写错误（同音字、英文听写错、`（音）`、夹在文中的时间戳/英文乱码）。
-   原始转录文本留在子代理上下文里，**不进主上下文**。
-2. **主代理合并 + 内部互证**：把各清单合并，能在转录内部互证的（A 文件给全名、B 文件只给花名）直接统一；标出“残余”——内部无法确定、需公开资料核实的人名/品牌/公司/产品。
-3. **批量核实残余（派子代理）**：把残余清单交给**一个核实子代理**，用 WebSearch/WebFetch 按“领域 + 名字”**批量**查公开资料/新闻/工商信息，网页留在它的上下文里，只回报“确认写法/身份 + 依据”。默认**只核关键实体**（创始人/公司/主品牌），别逐个小术语都查。核实到的改正并去掉`（音）`；查不到、拿不准的保留`（音）`或`（音，存疑）`，**绝不臆造**。
-4. **产出校对表**（模板见 `references/glossary-template.md`）：采访背景、发言人统一称呼、人名/品牌/术语“各种写法 → 统一为”、需特别处理的转写错误、精校规范要点。`Write` 到 `<输出目录>/校对表.md`（与成稿一起存档——真名核实结论本身就是研究资料），供后面所有精校共享。
-
-> 若只有一份短文件：不必拆侦察/精校两段，直接派一个子代理“读一遍 → 建迷你校对表 → 精校”一遍过即可（主代理仍不读全文）。
+Workflow not available (e.g. claude.ai) → run Steps 1–4 by hand below.
 
 ---
 
-## Step 2 — 逐份精校（并行执行 + 规范）
+## Step 1 — Parallel scouting, build the unified glossary
 
-多份转录互相独立，**用并行精校子代理**，每份一个：`Read` 共享校对表（`<输出目录>/校对表.md`）→ `Read` 源文件 → 按下面规范精校 → `Write` 到 `<输出>/Transcripts/<标题>.md` → 回报小标题与关键修正。给每个子代理的 prompt 要自包含：校对表路径、源文件路径、输出路径、该文件发言人映射与特别提醒、下面全部规范、标题格式；长文件提醒“分多次写入、覆盖到结尾”。完成后**抽查**：核对最长文件的结尾完整性、随机看 1–2 个小标题段（**别把整份成稿读回主上下文**，要完整核就再派子代理）。只有一两份也可主代理自己做。
+**Why**: ASR loves to get names/brands/proper-nouns wrong, and the same person/brand often appears written several different ways across files (transliteration, English name, nicknames mixed). You have to read everything and cross-corroborate before you can fix a **unified** glossary that makes all files consistent — that's "cross-validation". **But the main agent does not read the full text itself**: per the core principle, delegate reading to subagents and the main agent receives only compressed lists.
 
-精校规范（每份照此，理解“为什么”而非死记）：
-1. **保持对话体**，保留发言人标签（`黄某：` / `Kimo：`），不要改写成叙述文章。
-2. **删口癖与口语重复**（“对对对、嗯、那个、就是说、这个东西”等无意义口头禅、合并语义重复句），**但不改语气风格与原意、不加他没说过的观点**。
-   **纯粹确认写法的来回直接折叠成结果**：口头拼字（“吴，哪个杰？”“捷报的捷——提手旁那个”“哦，口天的吴”）在书面稿里没有残值——写出正确字本身就是答案。在名字首次出现处直接写**澄清后的写法**（如「吴捷」），整段问字对话删去。三条边界：①必须用**澄清后**的字（捷，不是先听到的杰）；②来回里夹了有信息量的内容（名字来历、玩笑）的，内容照留、只删机械确认；③没澄清出结果的，保留（音），不臆造。这类拼字澄清同时是该写法的**最强内部证据**，校对表与全文统一以它为准。
-3. **理顺可读性**：破碎口语整理通顺、修语序颠倒与冗余助词；**有信息量/有个性的金句照留**（如“不喜欢就拉倒”“每个环节掉链子就去死”，不要抹平）。
-4. **按主题加 `##` 小标题**：准确概括该段、**不篡改原意、不加原文没有的结论**、**一律不编号**（自描述短语，不加 `1.`/`一、`；一份通常 6–20 个）。若源文件**已带（记者/速记的）小标题**——这种情况不多——**先问用户**是保留还是按内容重做，别默认擅自处理。
-5. **修转写错误**：严格按校对表统一人名/品牌/术语；删时间戳（如 `（09:02）`）与英文听写乱码——能判断词义的用正确中/英文替代，判断不了的顺掉，不留乱码。
-6. **保留全部事实细节**（数字/金额/时间/产品名/工艺/渠道/观点）——**这是精校不是摘要**，不删实质内容。
-7. **规范发言人标注**：采访方追问统一归对应记者名；被访方旁白/同事补充统一标“同事”；群访多发言人按身份/角色标注（拿不准就用花名/角色）。
-8. **文件抬头**：首行 `# 标题`（格式见“输出规范”），第二行斜体说明，如 `*采访者：XXX、YYY｜时间：2021 年底*`。
-9. **中文标点：引号一律用全角 `“”`（内层 `‘’`）**——禁用 ASCII 直引号 `"`/`'`、禁用 `「」`/`『』`。转写常把引号输成直引号，逐一改成全角弯引号；其余中文标点（，。；：？！）也用全角。代码/英文专名/路径里的 ASCII 引号不动。
-10. **数字用阿拉伯数字**：把口语/转写的汉字数字改成阿拉伯数字（“十六个部门”→“16 个部门”，“六七十 B 大模型”→“60-70B 大模型”，“三四百人”→“300-400 人”，约数范围用连字符）。**例外——很短的口语化小数目保留汉字**：“两个人”“三五个”“一两次”“七八年”“一两句话”这类约定俗成的口语表达不必转。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。成语/固定词不动（“三心二意”“五花八门”“一五一十”）。
-11. **中文与英文/数字之间加一个半角空格**（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插入一个空格（“用 GPT-4 做”“16 个部门”“覆盖 80% 用户”“A 轮融资”“2021 年底”）。**不加空格的情形**：①数字与紧跟的单位/符号之间（`60-70B`、`80%`、`3.5 倍`的倍是中文量词要空、`$50`、`5G`、`A4`）；②与全角标点相邻处（“他说：GPT 很强。”冒号后不另加）；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
+1. **Parallel scout subagents**: use the Agent tool to spin up a lightweight subagent for **each** transcript (can run in parallel in the background). Each subagent `Read`s its own source file (**once only**), does **no web access, no refining**, and reports only a **compressed list**:
+   - what speaker labels appear and who each maps to;
+   - the recurring names/brands/terms and their various spellings (with a one-line locating clue, to align across files);
+   - obvious transcription errors (homophones, English mishearings, `（音）`, timestamps/English garble embedded in the text).
+   The raw transcript stays in the subagent's context, **never enters the main context**.
+2. **Main agent merges + internally corroborates**: merge the lists; whatever can be corroborated within the transcripts (file A gives the full name, file B only the nickname) gets unified directly; flag the "residue" — the names/brands/companies/products that can't be determined internally and need public-source verification.
+3. **Batch-verify the residue (dispatch a subagent)**: hand the residue list to **one verify subagent** that uses WebSearch/WebFetch to **batch**-look up public sources / news / business-registry info by "domain + name", keeping the pages in its own context and reporting back only "confirmed spelling/identity + source". By default **verify only key entities** (founders/companies/main brands), don't look up every minor term. Fix and drop the `（音）` for what's verified; keep `（音）` or `（音，存疑）` for what can't be found or is uncertain — **never fabricate**.
+4. **Produce the glossary** (template in `references/glossary-template.md`): interview background, unified speaker labels, "various spellings → unified as" for names/brands/terms, transcription errors needing special handling, refinement-spec key points. `Write` it to `<output dir>/校对表.md` (archived alongside the outputs — the real-name verification conclusions are themselves research material), shared by all subsequent refining.
 
-**分块与长文件**：一次整理一段连续主题（约 ≤20 个问答），**不在 topic 中间断开**，最后拼成完整一篇。长文件（上千行）：先 `Write` 抬头+开头几段，再用 `Edit` 以“已写入的最后一句话”为锚点**接力追加**，分多次直到结尾；写完核对结尾段是否对得上原文结尾，**不得遗漏后半部分**。**每次写入都写尽量大的整块（一整段主题、上千字），术语/人名按校对表初次落笔就写对——别写完后再回头做一堆“改一两个字”的细小 `Edit`（每次小改都要重新过一遍全文与校对表，十几个小改成倍拖慢）。**
+> If there is only one short file: no need to split scouting/refining into two stages — just dispatch one subagent to "read once → build a mini glossary → refine" in a single pass (the main agent still doesn't read the full text).
 
 ---
 
-## Step 2.5 — 逻辑顺序稿（仅范围内时做）
+## Step 2 — Refine each file (parallel + spec)
 
-在精校稿之外，再给每份访谈出一份**逻辑顺序稿**：把问答从“录音顺序”重排成“叙事顺序”，让散落访谈各处、其实同属一条线的问答聚到一起，读起来是完整的故事。**这是重排不是改写、更不是摘要**——问答块整段照搬精校稿原文、一字不改一处不漏，只换位置。
+The transcripts are independent of each other, so **use parallel refine subagents**, one per file: `Read` the shared glossary (`<output dir>/校对表.md`) → `Read` the source file → refine per the spec below → `Write` to `<output>/Transcripts/<title>.md` → report the sub-headings and key fixes. Each subagent's prompt must be self-contained: glossary path, source path, output path, that file's speaker mapping and special notes, the full spec below, the title format; for long files remind it to "write in multiple passes, cover to the end". When done, **spot-check**: verify the longest file's ending completeness and randomly read 1–2 sub-heading sections (**don't read a whole output back into the main context**; dispatch another subagent to check thoroughly). With only one or two files the main agent may also do it itself.
 
-并行子代理，每份一个：`Read` 该份**精校稿**（不是源转录——名/术语已统一）→ 理出这次访谈的主线（3–7 条叙事线索，各给不编号 `##` 小标题）→ 每条线索选内部顺序逻辑（历史按时间、决策按 问题→洞察→决定→结果、产品/事件按 起因→经过→结果）→ 把属于该线索的问答整段照原文搬来排好。仅在某段被移走后指代/承接断了时，加一句 `> [编者] …` 衔接或把孤立的“他”补成名字，**绝不改写原话、不补受访者没说的、不下结论**。开头加 `## 主线脉络（导读）` 一段话讲清主线与重排逻辑。**不丢不重**：精校稿每段实质问答都要出现且只出现一次。结构模板见 `references/deliverables.md`。`Write` 到 `<输出>/逻辑顺序/<标题>.md`（**不动精校稿**——精校稿仍是忠实录音顺序的可引用存档）。完成后抽查：逻辑稿是否覆盖了精校稿的全部小标题（按小标题清单核，别整份读回主上下文）。
+Refinement spec (apply to each file; understand the "why" rather than memorizing):
+1. **Keep the dialogue form**, preserve speaker labels (`黄某：` / `Kimo：`), don't rewrite into a narrative article.
+2. **Remove verbal tics and spoken repetition** (meaningless fillers like “对对对、嗯、那个、就是说、这个东西”, merge semantically repeated sentences), **but don't change tone/style/meaning, and don't add opinions they didn't express**.
+   **Collapse pure spelling-confirmation exchanges into the result**: oral spelling-out (“吴，哪个杰？”“捷报的捷——提手旁那个”“哦，口天的吴”) has no residual value in the written document — writing the correct character IS the answer. Write the **clarified spelling** directly at the name's first appearance (e.g. 「吴捷」) and delete the whole spelling-out exchange. Three boundaries: ① use the **clarified** character (捷, not the first-heard 杰); ② if the exchange contains informative content (the name's origin, a joke), keep that content and only delete the mechanical confirmation; ③ if no result was clarified, keep `（音）`, don't fabricate. Such spelling clarifications are also the **strongest internal evidence** for that spelling — the glossary and the whole text unify on it.
+3. **Smooth readability**: tidy broken speech, fix word-order inversions and redundant particles; **keep informative/characterful quotable lines** (e.g. “不喜欢就拉倒”“每个环节掉链子就去死”, don't flatten them).
+4. **Add `##` sub-headings by topic**: accurately summarize the section, **don't distort the meaning or add conclusions not in the original**, **never number them** (self-describing phrases, no `1.`/`一、`; usually 6–20 per file). If the source file **already has (reporter/steno) sub-headings** — uncommon — **ask the user first** whether to keep them or redo by content; don't decide on your own by default.
+5. **Fix transcription errors**: unify names/brands/terms strictly per the glossary; delete timestamps (e.g. `（09:02）`) and English-mishearing garble — replace with the correct Chinese/English where the meaning is recoverable, smooth it away where not, leave no garble.
+6. **Keep every factual detail** (numbers/amounts/dates/product names/processes/channels/opinions) — **this is refine, not summarization**; don't cut substantive content.
+7. **Standardize speaker labels**: interviewer follow-ups all go to the corresponding reporter's name; interviewee-side asides/colleague additions are labeled “同事”; group interviews with multiple speakers are labeled by identity/role (use nickname/role when unsure).
+8. **File header**: first line `# 标题` (format in "Output spec"), second line an italic note, e.g. `*采访者：XXX、YYY｜时间：2021 年底*`.
+9. **Chinese punctuation: quotes always full-width `“”` (inner `‘’`)** — no ASCII straight quotes `"`/`'`, no `「」`/`『』`. ASR often outputs straight quotes; convert them all to full-width curly quotes; other Chinese punctuation (，。；：？！) is full-width too. Leave ASCII quotes inside code / English proper nouns / paths.
+10. **Use Arabic numerals**: convert spoken/transcribed Chinese-character numbers to Arabic numerals (“十六个部门”→“16 个部门”, “六七十 B 大模型”→“60-70B 大模型”, “三四百人”→“300-400 人”, ranges with a hyphen). **Exception — keep Chinese characters for very short colloquial small counts**: idiomatic expressions like “两个人”“三五个”“一两次”“七八年”“一两句话” need not convert. Exact counts with a measure word (16 个、3 轮、5 家) always use Arabic numerals. Don't touch idioms/set phrases (“三心二意”“五花八门”“一五一十”).
+11. **One half-width space between Chinese and Latin letters/numerals** (Pangu spacing): insert a space where a Han character is adjacent to a Latin letter or Arabic numeral (“用 GPT-4 做”“16 个部门”“覆盖 80% 用户”“A 轮融资”“2021 年底”). **No space when**: ① a number is adjacent to its unit/symbol (`60-70B`、`80%`、`3.5 倍` where 倍 is a Chinese measure word so a space IS needed, `$50`、`5G`、`A4`); ② adjacent to full-width punctuation (“他说：GPT 很强。” — no extra space after the colon); ③ between English/numerals and ASCII punctuation. Don't double up spaces that are already correctly paired.
 
----
-
-## Step 3 — 时间线（仅范围内时做）
-
-把访谈口述与**公开资料**对照，按年份/阶段排出公司/人物的发展线；标注每条是【访谈】/【公开】/【公开+访谈】，附关键人物对照表。结构模板见 `references/deliverables.md`。**联网核实同样派子代理批量做**（按“公司名 + 融资/成立/创始人”查新闻、工商、融资库），网页留在子代理上下文、不进主上下文。访谈与公开冲突时两边都列、注明分歧，不强行二选一。写到 `<输出>/<主题>时间线.md`。
-
-## Step 4 — 访谈总结（仅范围内时做）
-
-基于精校后的内容，给 ①分类要点（按角色/主题，每条带具体事实）②金句 Quotes（按人，忠实引用，只去口癖不改意）③行业与公司/人物洞察（点出看点与风险，体现判断而非复述）。结构模板见 `references/deliverables.md`。写到 `<输出>/<主题>访谈总结.md`。
-
----
-
-## Step 5 — 收尾：一次性补问 + 交付
-
-自主执行中冒出的“只有读完/查完才能定、又必须用户拍板”的少数问题，**记成清单、到这里一次问完**（别每冒一个就回头打断）。典型可延后项：
-- 联网也查不到、内部也无法互证的**真名/身份**（列出来问用户知不知道）。
-- 某段对话**归属不清**（实在听不出是谁说的）。
-- 某个**存疑术语 / 产品名**，上下文不足以判断。
-- 是否**保留某段明显跑题**的闲聊（给“保留 / 删 / 折叠成一句”选项）。
-
-把这些攒成**一次** AskUserQuestion 或一条消息问完。同时交付：成稿路径、各份小标题与关键修正、真名核实结论（已核实 vs 未公开）。没有待问项就直接交付，不必凑问题。
+**Chunking & long files**: process one continuous topic at a time (about ≤20 Q&A), **don't break in the middle of a topic**, and stitch into one complete piece at the end. For long files (thousands of lines): first `Write` the header + opening sections, then `Edit` to **append in a relay** anchored on "the last sentence already written", in multiple passes until the end; after writing, check the ending section matches the source ending — **don't drop the second half**. **Each write should write the largest whole block that fits (a full topic section, thousands of characters), getting names/terms right on first writing per the glossary — don't go back afterward and make a pile of tiny "change-a-character" `Edit`s (each tiny edit reprocesses the whole transcript and glossary; a dozen tiny edits multiply the slowdown).**
 
 ---
 
-## 输出规范（统一约定）
+## Step 2.5 — Logical-order rewrite (only when in scope)
 
-- **位置**：精校转录 → `<所选文件夹>/Transcripts/`；逻辑顺序稿 → `<所选文件夹>/逻辑顺序/`；时间线、总结 → `<所选文件夹>/`。
-- **文件标题格式**：`英文名（中文名）当时的title`。
-  - 同时有英文名和中文真名：`Allan（刘晛）CFO·合伙人`、`Joey（邢夏淳）合伙人·CEO`。
-  - 只有中文名（无英文名）：`胡欢 酵色合伙人`（名 + title，不用括号）。
-  - 真名查不到、只有花名/英文名：保留花名 + title，如 `Sherrie 酵色·负责投放`，**不臆造中文名**。
-  - 群访多人：按 `团队/角色（各花名+分工）` 命名。
-  - 文件名与文内 H1 标题保持一致。
-- **真名核实结论**写进时间线的“关键人物对照表”：已核实的标真名+依据，查不到的标“真名未公开”。
+Beyond the refined transcript, produce one **logical-order rewrite** per interview: re-sequence the Q&A from "recording order" into "narrative order", so exchanges scattered across the interview that actually belong to one thread come together and read as a complete story. **This is re-sequencing, not rewriting or summarizing** — copy Q&A blocks verbatim from the refined transcript, not a character changed, nothing dropped, only repositioned.
 
-## 几条容易翻车的点
-- **主代理别读全文/网页**——读源文件、联网都派子代理，主上下文只收压缩结论（控成本的命门）。
-- 别只读片段就建表——交叉验证靠各侦察子代理看完各自全文、再合并互证。
-- 别把精校做成摘要——事实细节是研究价值所在。
-- 拿不准的名字别硬改——保留`（音）`比改错强。
-- 长文件别写一半就停——务必接力到结尾并核对。
-- 别中途反复打扰用户——Step 0 一次问完，零碎疑点攒到 Step 5（见“关键节奏”）。
+Parallel subagents, one per file: `Read` that **refined transcript** (not the source — names/terms are already unified) → work out this interview's main threads (3–7 narrative threads, each with an unnumbered `##` sub-heading) → pick an internal ordering for each thread (history by time; decisions by problem→insight→decision→result; a product/event by cause→process→result) → move the exchanges belonging to each thread over verbatim and arrange them. Only when moving a section breaks a reference/connective, add one `> [编者] …` bridge or fill a bare “他” with the name; **never rewrite the original wording, never add what the interviewee didn't say, never draw conclusions**. Add a `## 主线脉络（导读）` section at the top: one paragraph stating the main thread and your re-sequencing logic. **No loss, no dup**: every substantive exchange in the refined transcript appears once and only once. Structure template in `references/deliverables.md`. `Write` to `<output>/逻辑顺序/<title>.md` (**leave the refined transcript untouched** — it stays the faithful, recording-order, citable archive). When done, spot-check: does the rewrite cover all of the refined transcript's sub-headings (check against the sub-heading list, don't read the whole thing back into the main context).
+
+---
+
+## Step 3 — Timeline (only when in scope)
+
+Cross-reference the interview narration with **public sources**, lay out the company's/person's development line by year/phase; tag each entry as 【访谈】/【公开】/【公开+访谈】, with a key-people reference table appended. Structure template in `references/deliverables.md`. **Web verification is likewise batched to a subagent** (look up news, business registry, funding databases by "company + funding/founding/founder"), keeping pages in the subagent's context, not the main context. When interview and public sources conflict, list both and note the divergence; don't force a pick. Write to `<output>/<主题>时间线.md`.
+
+## Step 4 — Interview summary (only when in scope)
+
+Based on the refined content, give ① categorized key points (by role/topic, each with a concrete fact); ② quotes (by person, faithful, only verbal tics removed, meaning unchanged); ③ industry and company/person insights (point out the angle and the risk, show judgment rather than restatement). Structure template in `references/deliverables.md`. Write to `<output>/<主题>访谈总结.md`.
+
+---
+
+## Step 5 — Wrap-up: one batch of follow-up questions + delivery
+
+The few questions that came up during autonomous execution that "can only be settled after reading/verifying, yet need the user to decide" — **note them down and ask in one batch here** (don't interrupt every time one comes up). Typical deferrable items:
+- **Real names/identities** that web search couldn't find and internal corroboration couldn't settle (list them and ask if the user knows).
+- A passage whose **attribution is unclear** (genuinely can't tell who said it).
+- A **doubtful term / product name** with insufficient context to judge.
+- Whether to **keep an obviously off-topic** chat passage (offer “保留 / 删 / 折叠成一句”).
+
+Gather these into **one** AskUserQuestion or one message. Deliver at the same time: output paths, each file's sub-headings and key fixes, the real-name verification conclusions (verified vs. not public). If there's nothing to ask, just deliver — don't manufacture questions.
+
+---
+
+## Output spec (shared conventions)
+
+- **Location**: refined transcripts → `<chosen folder>/Transcripts/`; logical-order rewrites → `<chosen folder>/逻辑顺序/`; timeline and summary → `<chosen folder>/`.
+- **File title format**: `英文名（中文名）当时的title`.
+  - Both an English name and a Chinese real name: `Allan（刘晛）CFO·合伙人`, `Joey（邢夏淳）合伙人·CEO`.
+  - Only a Chinese name (no English name): `胡欢 酵色合伙人` (name + title, no parentheses).
+  - Real name not found, only a nickname/English name: keep the nickname + title, e.g. `Sherrie 酵色·负责投放`, **don't fabricate a Chinese name**.
+  - Group interview with multiple people: name it as `团队/角色（各花名+分工）`.
+  - Keep the filename and the in-file H1 title identical.
+- **Real-name verification conclusions** go in the timeline's "关键人物对照表": verified ones tagged with the real name + source, ones not found tagged “真名未公开”.
+
+## A few easy places to trip up
+- **The main agent must not read full text/web pages** — delegate source reading and web access to subagents; the main context receives only compressed conclusions (the cost lever).
+- Don't build the glossary from fragments — cross-validation relies on each scout subagent reading its own full file, then merging and corroborating.
+- Don't turn refining into summarizing — the factual detail is where the research value is.
+- Don't force-change uncertain names — keeping `（音）` beats getting it wrong.
+- Don't stop a long file halfway — relay to the end and check.
+- Don't keep interrupting the user — ask once in Step 0, save piecemeal doubts for Step 5 (see "Key rhythm").
