@@ -11,7 +11,8 @@ const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [],
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
-// summary/时间线/逻辑顺序稿 都以本会话精校成稿为输入；scope 含交付物却不含 refine 会静默零产出——早失败、可诊断
+// summary / timeline / logical-order rewrite all take this session's refined output as input; a scope with a
+  // deliverable but no refine would silently produce nothing — so fail early and diagnosably.
 if ((scope.includes('summary') || scope.includes('timeline') || scope.includes('logic')) && !scope.includes('refine')) {
   return EMPTY_RETURN('summary/时间线/逻辑顺序稿依赖本会话 refine 产物，scope 须同时含 refine（本工作流不支持只对历史成稿单独出交付物）')
 }
@@ -23,10 +24,10 @@ let failed = []
 let headingConflicts = []
 let scoutSuspect = []
 let dedup = null
-let refinedPairs = []   // [{ f, rep }]：成功精校的文件与其报告（含 headings），供逻辑顺序阶段读 f.title/outPath 与按小标题核完整性
+let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
 if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
-  // 单份短文件：一遍过（镜像 SKILL.md 的快捷路径），跳过 Scout/Verify
+  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify
   const f = A.files[0]
   engine.phase('Refine')
   engine.log(`单份短文件（${f.lines} 行）：一遍过精校，不建独立校对表`)
@@ -43,8 +44,8 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   engine.phase('Scout')
   let findings = await engine.parallel(A.files.map((f) => () =>
     engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, model: M.scout, schema: SCOUT_SCHEMA })))
-  // 垃圾侦察自愈：检测到乱码侦察就各重试一次（一次 haiku 很便宜）；仍乱码则标 scoutSuspect，交付时告知该份校对表不可靠。
-  // 成稿不受影响——精校读源文件、不盲信校对表——但研究存档的校对表那一份会脏。
+  // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
+  // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
@@ -54,18 +55,18 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)
   engine.log(`侦察完成 ${findings.filter(Boolean).length}/${A.files.length} 份${scoutSuspect.length ? `（${scoutSuspect.join('、')} 重试后仍疑损坏，校对表该份不可靠）` : ''}`)
-  // 仍乱码的侦察整份剔除出合并：不污染校对表正文，也不让 verify/dedup 拿乱码去联网空转。
-  // 该份 refine 仍照跑（精校读源文件、不靠校对表），scoutSuspect 照常提示用户重跑该份侦察。
-  // 若全部 scout 都乱码，cleanFindings 全空 → merged 各类皆空 → doVerify 自然为假、dedupList 为空，整段安全短路。
+  // Still-garbled scout results are dropped entirely from the merge: this prevents polluting the glossary body and avoids wasting verify/dedup web-lookup calls on garbage input.
+  // Refine for that file still runs normally (it reads the source file directly, not the scout output); scoutSuspect still prompts the user to re-run scout for that file.
+  // If every scout is garbled, cleanFindings is all-null → merged lists are all empty → doVerify is naturally false and dedupList is empty, so the whole verify/dedup block short-circuits safely.
   const cleanFindings = findings.map((fd) => (fd && scoutLooksGarbled(fd)) ? null : fd)
   const merged = mergeFindings(cleanFindings, A.files)
   headingConflicts = findHeadingConflicts(cleanFindings, A.files, A.headingPolicy)
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
   engine.phase('Verify')
-  // verify（联网核实，分块并行）与 dedup（语义同指核查，读全量实体）互不依赖，同一 parallel 里并发
+  // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
-  // terms 也算（verifyChunks 本就送检术语；deep 档要求全量核实术语，门槛漏 terms 会让纯术语访谈静默跳过核实）
+  // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
   const doVerify = A.verifyDepth !== 'none' && (merged.people.length || merged.brands.length || merged.terms.length)
   const vc = doVerify ? verifyChunks(merged, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
   if (doVerify) {
@@ -83,7 +84,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   ])
   const goodParts = (vparts || []).filter(Boolean)
   if (vc.chunks.length) {
-    // 行级清洗：schema 不再强制字段，劣化输出可能缺 query/canonical——缺关键字段的行直接弃掉
+    // Row-level sanitisation: the schema no longer enforces fields, so degraded output may be missing query/canonical — rows missing critical fields are dropped outright
     verified = {
       resolved: goodParts.flatMap((p) => p.resolved || []).filter((r) => r && r.query && r.canonical),
       unresolved: goodParts.flatMap((p) => p.unresolved || []).filter((r) => r && r.query),
@@ -113,8 +114,8 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
-// 逻辑顺序重排（可选）：逐份读精校稿、重排成叙事顺序，并发跑。完整性靠免费 JS 核对——
-// 精校 report 的 headings vs 逻辑稿 report 的 threads[].source_sections 求差，漏的小标题进 missingSections。
+// Logic-order resequencing (optional): reads each refined transcript and reorders it into narrative order, run concurrently. Completeness is verified by a zero-cost JS check —
+// diff the headings in the refine report against threads[].source_sections in the logic report; any headings not covered go into missingSections.
 let logic = []
 if (scope.includes('logic') && refinedPairs.length) {
   engine.phase('Logic')

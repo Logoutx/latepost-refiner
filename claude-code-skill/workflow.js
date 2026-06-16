@@ -11,20 +11,21 @@ export const meta = {
   ],
 }
 
-// args 契约（主代理在 Step 0 预检后组装）：
+// args contract (assembled by the main agent after the Step 0 pre-flight):
 // { topic, date, background, outputDir, skillDir,
-//   scope: ['refine','logic','summary','timeline'] 按需裁剪（'logic'=逻辑顺序重排稿，依赖 refine 产物）,
+//   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
 //   models?: {scout,verify,refine,summary,timeline},
 //   files: [{ path, label, lines, bytes?, title, subtitle, outPath, speakerHints?, notes? }] }
-//   （bytes 可选：预检 wc -c 所得，用于按密度收紧读取分页，防超限截断）
+//   (bytes optional: from pre-flight `wc -c`; used to shrink the read pagination by density to avoid over-limit truncation)
 
-// ===== 本文件由 build/build-cc.mjs 从 core/* 生成——请勿手改；改 core/ 后重跑 build =====
+// ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====
 
 // ---------- schemas ----------
-// 注意：所有 schema 一律不设 required——StructuredOutput 的校验失败会触发无上限的重试循环
-// （实测网络劣化把输出截断时，一个 required 字段让 verify 代理空转 151 次 / 20 分钟）。
-// 字段缺失由 JS 侧默认值兜底（|| [] / 归一为 null），缺字段最坏退化成“保留（音）”，比重试循环安全得多。
+// NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
+// (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent
+// 151 times / 20 minutes.) Missing fields are covered by JS-side defaults (|| [] / normalised to null);
+// the worst-case for a missing field is falling back to “retain (phonetic)” — far safer than a retry loop.
 const entitySchema = (extra) => ({
   type: 'object',
   properties: Object.assign({
@@ -121,7 +122,7 @@ const LOGIC_REPORT_SCHEMA = {
 }
 
 
-// ---------- 精校规范（与 SKILL.md Step 2 保持一致） ----------
+// ---------- proofreading rules (kept in sync with SKILL.md Step 2) ----------
 const RULES = `精校规范（务必全部遵守）：
 1. 保持对话体，保留发言人标签（如「张璐：」），不要改写成叙述文章。
 2. 删口癖与口语重复（对对对/嗯/那个/就是说/这个这个），合并语义重复句；不改语气风格与原意，不替发言人加观点。纯粹确认写法的来回**折叠成结果**：口头拼字（“吴，哪个杰？”“捷报的捷——提手旁那个”“哦，口天的吴”）在书面稿里没有残值，在名字首次出现处直接写澄清后的写法（「吴捷」），整段问字对话删去——但必须用**澄清后**的字（捷，非先听到的杰）；夹有信息量内容（名字来历/玩笑）的只删机械确认、内容照留；没澄清出结果的保留（音）。
@@ -137,33 +138,45 @@ const RULES = `精校规范（务必全部遵守）：
 12. 长文件分多次接力写（先 Write 抬头+开头，再用 Edit 以已写入的最后一句为锚点追加），务必覆盖到源文件结尾。**每次 Write/Edit 都在单次输出上限内写尽量大的整块（通常一次写完一整段主题、上千字），用尽量少的写入次数完成——别一行一行或一小段一小段地追加。**
 13. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。`
 
-// 中文排版三规范（与 RULES 9/10/11 同源）：凡生成中文的子代理都注入——精校经 RULES 已含，
-// 总结/时间线另行注入此压缩版（时间线数字/年份/金额最密集，最需要②③）。
+// Chinese typesetting rules (same source as RULES items 9/10/11): injected into every sub-agent that generates Chinese.
+// Proofreading agents already get them via RULES; summaries/timelines inject this compact version separately
+// (timelines are the densest for numbers/years/amounts, so rules ② and ③ matter most there).
 const TYPESET = `中文排版三规范（务必遵守）：
 ①引号一律用全角 “”（内层 ‘’），禁用 ASCII 直引号 "/' 与「」『』（代码/英文/路径除外）；其余中文标点也用全角。
 ②数字用阿拉伯数字（十六→16、六七十 B→60-70B、三四百→300-400，约数范围用连字符）；很短的口语小数目（两个人/三五个/一两次）与成语（三心二意/五花八门）保留汉字。
 ③盘古空格：中文与英文/阿拉伯数字相邻处加一个半角空格（用 GPT-4 做、16 个、覆盖 80%、A 轮、2021 年）；数字与紧跟的单位/符号间（60-70B、80%、$50）、与全角标点相邻处不加。`
 
-// 单文件一遍过分支不建独立校对表——用一个 sentinel 而非散落字面串，timelinePrompt 据此走“无校对表”兜底
+// Single-file one-pass branch does not build a standalone glossary — use a sentinel constant rather than scattered
+// string literals so that timelinePrompt can branch into the “no glossary” fallback path.
 const SINGLE_FILE_GLOSSARY = '（单文件一遍过，未建独立校对表；校对决定见成稿与精校报告）'
 
 
-// ---------- 纯 JS 合并（无模型成本） ----------
-// 泛称/敬称是“弱键”：单独共享它不足以判定同一人。转录里「张总」可能同时指受访者(被礼貌称张总)
-// 和董事长，「陆总/老师/董事长」同理。若按任意共享串链式合并，一个歧义敬称会把多个不同的人并成一团。
-// 因此：只在共享“强名”（实名/产品名/术语等非泛称）时才合并；仅共享弱键不合并（宁可欠并，不可错并——
-// 欠并留两条目，精校读原文自会归位；错并把两个人写成一个，会污染成稿）。
+// ---------- pure JS merge (no model cost) ----------
+// Generic titles / honorifics are “weak keys”: sharing one alone is insufficient to identify the same person.
+// In a transcript “张总” may simultaneously refer to the interviewee (politely addressed as 张总) and the
+// chairman; “陆总 / 老师 / 董事长” follow the same pattern. Chaining clusters on any shared string means a
+// single ambiguous honorific would collapse multiple distinct people into one blob.
+// Rule: only merge when a “strong name” (real name / product name / term — not a generic title) is shared;
+// never merge on weak keys alone. Under-merging is safer than over-merging:
+// under-merging leaves two entries and the proofreader resolves them from the source text;
+// over-merging writes two different people as one, corrupting the final transcript.
 function isWeakKey(s) {
-  return /^[一-龥]{1,2}总$/.test(s)            // 张总、陆总、王总…
+  return /^[一-龥]{1,2}总$/.test(s)            // e.g. 张总, 陆总, 王总 (one/two-char surname + 总)
     || /(老师|总监|经理|主管)$/.test(s)
     || /^(董事长|老板|老板娘|总经理|总裁|创始人|CEO|CFO|CTO|COO|PR|嘉宾|记者|主持人|同事|领导)$/.test(s)
 }
-// 侦察有时把身份描述塞进 canonical（如「张总（蜜雪冰城董事长）」），会骗过 isWeakKey 的 ^X总$。
-// 判断“是不是弱称”前先剥掉括注，露出核心称谓——仅人名守卫用，不动 clusterEntities 的合并键。
+// The scout sometimes stuffs an identity description into canonical (e.g. “张总（蜜雪冰城董事长）”),
+// which defeats the `^X总$` pattern in `isWeakKey`. Strip parenthetical annotations before testing
+// whether a string is a weak title, exposing the bare honorific.
+// Used only in the name guard — does not touch the merge keys inside `clusterEntities`.
 const stripDesc = (s) => (s || '').replace(/[（(][^）)]*[）)]/g, '').trim()
-// 垃圾侦察检测：网络中途毁坏生成流时，scout 会回传“结构合法但内容乱码”的 JSON（一长串罕用汉字，schema 拦不住），
-// 污染校对表。判据：合法实体名/发言人标签都很短、且长名必有标点（如「大咖国际（…）」）断开；乱码是十几二十个汉字
-// 不带任何标点的连串。实测干净侦察最长连串 ≤6，损坏的达 41——取阈值 16，两边余量极大、几乎不会误判。
+// Garbled-scout detection: when the network corrupts the generation stream mid-flight, the scout returns
+// structurally valid JSON whose content is gibberish (a long run of rare CJK characters that the schema
+// cannot reject), which would pollute the glossary. The signal: legitimate entity names and speaker labels
+// are short, and long names are always interrupted by punctuation (e.g. “大咖国际（…）”); garbled output
+// is a run of a dozen or more CJK characters with no punctuation at all.
+// Empirically, the longest clean run is ≤ 6; corrupted output reached 41 — threshold set at 16,
+// leaving a wide margin on both sides with virtually no false positives.
 function longestHanziRun(s) {
   let max = 0, cur = 0
   for (const ch of (s || '')) {
@@ -173,7 +186,7 @@ function longestHanziRun(s) {
 }
 function scoutLooksGarbled(f) {
   if (!f) return false
-  if (!(f.speakers || []).length) return true   // 任何访谈都至少有一个发言人；空 = 损坏
+  if (!(f.speakers || []).length) return true   // every interview has at least one speaker; empty = corrupted
   const names = []
   for (const e of [...(f.people || []), ...(f.brands || []), ...(f.terms || [])]) {
     names.push(e.canonical || ''); for (const v of e.variants || []) names.push(v)
@@ -199,9 +212,10 @@ function clusterEntities(entries) {
   }
   return clusters.map((c) => {
     const counts = {}
-    // 计票用 trim 后的 canonical，并跳过空/纯空白——否则空 canonical 可能被选为簇代表，渲染出空 **加粗**
+    // vote using trimmed canonicals, skipping empty/whitespace-only values —
+    // otherwise an empty canonical could be elected as cluster representative and render as an empty **bold** span
     for (const e of c.entries) { const k = (e.canonical || '').trim(); if (k) counts[k] = (counts[k] || 0) + 1 }
-    // 兜底：万一全簇 canonical 皆空，退用 names 里第一个非空强名/任意名
+    // fallback: if every canonical in the cluster is empty, use the first non-empty strong name (or any name)
     const canonical = Object.keys(counts).sort((x, y) => counts[y] - counts[x] || y.length - x.length)[0]
       || Array.from(c.names)[0] || ''
     const variants = Array.from(c.names).filter((n) => n !== canonical)
@@ -247,12 +261,20 @@ function mergeFindings(findings, files) {
   }
 }
 
-// 核实清单分块（不丢弃 worthy 实体）：单个核实代理塞太多项会逐条联网串行检索、拖慢整轮（实测 30 项一锅 ≈ 30 次串行检索 ~10min，
-// 且早期 90+ 项还会反复重试超时 ~35min）。病根是单代理过载——分块并行，每块 ≤ VERIFY_CHUNK，块内串行、块间并发，谁都不会被压垮，也不丢任何 worthy 条目。
-// 块大小取小（12）：核实是网络往返密集型，块越小越能并行摊薄检索时延（~30 项 → 3 块并发，verify 阶段从 ~10min 降到 ~3–4min）；
-// 块越大省不了 token 却串行更久。代价是多几个 sonnet 代理（便宜且并行），还需 ≤ 并发上限 min(16,核数-2) 才不排队。
-// key（默认）：只送“值得核实”的——公众人物 / 跨文件互证 / 写法混乱（≥2 变体）；w=0 的低优先级内部术语不送检（精校按原文归一，会记日志）。
-// deep：全量送检。两档都按权重排序后分块；MAX_CHUNKS×CHUNK=144 为失控护栏，足够覆盖 deep 实测 ~95 项。
+// Verification list chunking (no worthy entities dropped): stuffing too many items into a single verify agent
+// causes it to look up each one serially over the network, slowing the whole round
+// (observed: 30 items in one batch ≈ 30 serial lookups ~10 min; in earlier runs 90+ items caused repeated
+// timeout retries, ~35 min). The root cause is single-agent overload — chunking and parallelising,
+// with ≤ VERIFY_CHUNK per chunk, serial within a chunk and concurrent across chunks, avoids overload
+// without dropping any worthy entry.
+// Small chunk size (12): verification is network-round-trip-intensive; smaller chunks maximise parallelism,
+// amortising lookup latency (~30 items → 3 concurrent chunks, verify phase drops from ~10 min to ~3–4 min).
+// Larger chunks save no tokens but serialise longer. The cost is a few extra Sonnet agents (cheap and parallel),
+// subject to ≤ concurrency limit min(16, cpu_count-2) to avoid queuing.
+// key (default): only send “worthy” entities — public figures / cross-file corroboration / variant confusion (≥ 2 variants);
+// low-priority internal terms with w=0 are excluded (the proofreader normalises them from the source; logged).
+// deep: send everything. Both modes sort by weight before chunking; MAX_CHUNKS×CHUNK=144 is a runaway guard,
+// large enough to cover the ~95 items observed in practice for deep mode.
 const VERIFY_CHUNK = 12
 const MAX_CHUNKS = 12
 const entityWorth = (e) => (e.public_figure ? 4 : 0) + (e.crossFile ? 2 : 0) + ((e.variants || []).length >= 2 ? 1 : 0)
@@ -280,7 +302,8 @@ function verifyChunks(merged, depth) {
   return { chunks, eligible: pool.length, excluded, overflow }
 }
 
-// H 的输入：全量实体（含 w=0 的低存在感条目——同音同指最爱藏这儿），含类别与出处，供语义同指核查
+// Input to the dedup agent: the full entity list (including w=0 low-salience entries — homophones and
+// co-referents most often hide here), with category and source file, for semantic co-reference checking.
 function dedupListText(merged) {
   const lines = []
   for (const [kind, list] of [['person', merged.people], ['brand', merged.brands], ['term', merged.terms]]) {
@@ -289,37 +312,46 @@ function dedupListText(merged) {
   return lines.join('\n')
 }
 
-// 收尾完整性报告与权威输出路径：rep.path 是精校代理自报的，downstream 一律用我们命令它写入的 f.outPath
+// Completion report and authoritative output path: rep.path is self-reported by the proofreading agent;
+// all downstream consumers use f.outPath, which is the path we instructed it to write to.
 const withCheck = (rep, chk, f) => Object.assign({}, rep, {
   outPath: f.outPath,
-  // 归一成严格三态：true/false/null——check 代理失败或返回缺字段（schema 不强制）都算 null（未核对），
-  // 否则 undefined 会同时漏过 incomplete 和 unchecked 两张网
+  // Normalise to a strict three-state: true / false / null.
+  // A failed check agent or a response missing this field (schema does not enforce it) both map to null (unchecked).
+  // Leaving it as undefined would let it slip through both the "incomplete" and "unchecked" guards.
   complete: (chk && typeof chk.complete === 'boolean') ? chk.complete : null,
-  checkNote: chk ? (chk.note || '') : 'check 代理失败',
+  checkNote: chk ? (chk.note || '') : 'check agent failed',
 })
 
-// 预检 grep 的兜底：侦察发现源文件带小标题、而 headingPolicy 仍是 'none'（预检没拦住）→ 收尾时必须问用户
+// Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
+// headingPolicy is still 'none' (the pre-flight check didn't catch it), the user must be asked at wrap-up.
 function findHeadingConflicts(findings, files, policy) {
   if ((policy || 'none') !== 'none') return []
   return files.filter((f, i) => findings[i] && findings[i].has_existing_headings).map((f) => f.label)
 }
 
 function renderGlossary(merged, verified, dedup, a) {
-  // 先把核实结论应用回正文条目：query 命中条目的 canonical 或任一 variant，就用核实后的写法当
-  // canonical（原写法折进 variants），身份并进 hint——存档的校对表正文自身就是对的，不靠脚注纠错
+  // Apply verified results back into the body entries first: if query matches an entry's canonical or
+  // any variant, replace canonical with the verified spelling (folding the original into variants)
+  // and merge the identity into hint — the archived glossary body is authoritative; no footnote corrections.
   const resolvedMap = new Map()
   for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
-  const applied = new Set()   // 真正写入正文的核实结论
-  const rejected = new Set()  // 被人名守卫拦下的核实结论
+  const applied = new Set()   // verified conclusions actually applied into the table body
+  const rejected = new Set()  // verified conclusions blocked by the person-name guard
   const applyVerified = (e, isPerson) => {
     const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
     if (!hit) return e
     const names = [e.canonical, ...(e.variants || [])]
-    // 人名守卫：本条目已含某个实名（强名），核实却给出另一个不在本条目内的强名——疑似张冠李戴
-    // （实测网络劣化时 verify 幻觉过 张璐→张红超，把受访者改写成董事长）。不改写正文，只附注存疑：
-    // 把一个人改成另一个人的伤害远大于留一个待核名。弱称（张总/董事长）解析成实名仍照常应用——那正是核实的本职。
-    // 注意：守卫看的是“本条目所有名字里的强名集合”（ownStrong），不只 canonical——
-    // 聚类可能把弱称（张总）选作 canonical 而把实名（张璐）放进 variants，只看 canonical 会漏防。
+    // Name guard: if this entry already contains a real name (strong name) and the verifier returns a
+    // different strong name not present in this entry, it likely indicates a misattribution
+    // (observed in the wild during network degradation: verify hallucinated 张璐→张红超, rewriting the
+    // interviewee as the chairman). Do not rewrite the body; append a warning note instead.
+    // The harm of replacing one person with another far outweighs leaving a name unresolved.
+    // Weak titles (张总 / 董事长) resolving to a real name are still applied normally — that is the
+    // whole point of verification.
+    // Note: the guard checks `ownStrong`, the set of strong names across ALL names in this entry, not
+    // just canonical — clustering may elect a weak title (张总) as canonical while placing the real name
+    // (张璐) in variants; checking only canonical would leave the guard blind to those cases.
     const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
     if (isPerson && hit.canonical && ownStrong.length
         && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
@@ -355,8 +387,10 @@ function renderGlossary(merged, verified, dedup, a) {
   if (verified && ((verified.resolved || []).length || (verified.unresolved || []).length)) {
     sec.push('', '## 联网核实结论（已采纳的已应用到上表正文；标 ⚠ 的与正文强名冲突、未采纳，待人工确认）')
     for (const r of verified.resolved || []) {
-      // 拒绝优先：只要任一条目对它起了人名守卫就标 ⚠（同一结论若同时被另一条目合法采纳，仍宁可多警示——
-      // 把一个人改成另一个人的伤害远大于一次多余告警）。措辞用“与部分条目强名冲突”，兼容“别处已采纳”的情形。
+      // Rejection takes priority: flag ⚠ if any entry triggered the name guard for this result
+      // (even if another entry legitimately accepted the same result, a spurious warning is far less harmful
+      // than silently replacing one person with another). The wording “与部分条目强名不符” covers the case
+      // where the result was accepted elsewhere.
       const bad = rejected.has(r)
       sec.push(`- ${bad ? '⚠ ' : ''}${r.query} → **${r.canonical}**${r.identity ? `（${r.identity}）` : ''}${bad ? ' ｜ 与部分条目强名不符、疑似张冠李戴，请人工确认' : ''} ｜ 依据：${r.source}`)
     }
@@ -374,17 +408,21 @@ function renderGlossary(merged, verified, dedup, a) {
   return sec.join('\n')
 }
 
-// 防御：滤掉模型偶发的占位/自我否定项（实测会冒出 members<2 或 why 写“撤回/不适用”的噪声组）
+// Defensive filter: drop the model's occasional placeholder/self-negating entries
+// (observed in the wild: groups with members < 2, or why = “撤回 / 不适用” noise).
 function cleanSuspects(suspects) {
   return (suspects || [])
     .filter((s) => s && (s.members || []).length >= 2 && !/撤回|不适用|不适合|不属于|仅供参考/.test(s.why || ''))
     .map((s) => Object.assign({}, s, { kind: s.kind || '未标类', why: s.why || '' }))
 }
 
-// dedup 结果分两路：term/brand 且给了有效 preferred → 可直接套用的“写法统一”指令；其余（人名身份合并 / 拿不准）→ 待人工确认的 flag
+// Split dedup results into two paths: term/brand entries with a valid `preferred` → actionable
+// “unify spelling” directives applied automatically; everything else (person identity merges / uncertain cases)
+// → flags requiring manual confirmation.
 function splitSuspects(dedup) {
   const directives = [], flags = []
-  // 主流程已先过 cleanSuspects，这里再过一遍是防御（直接调用/劣化输入也不抛）
+  // The main flow already calls cleanSuspects before this; the second pass here is defensive
+  // (direct calls and degraded inputs must not throw).
   for (const s of cleanSuspects((dedup && dedup.suspects) || [])) {
     const m = s.members || []
     if ((s.kind === 'term' || s.kind === 'brand') && s.preferred && m.includes(s.preferred) && m.length >= 2) directives.push(s)
@@ -393,13 +431,16 @@ function splitSuspects(dedup) {
   return { directives, flags }
 }
 
-// 断路器产物：核实代理因网络故障熔断、未核实的项——这些不是“查无此人”，是“没查成”，
-// 网络恢复后值得补核。单列出来供收尾时向用户提供“补核”选项（处理流程见 SKILL.md 返回处理）
+// Circuit-breaker output: items left unverified because the verify agent was tripped by a network failure.
+// These are not “not found” — they were never looked up. Worth re-verifying once the network recovers.
+// Surfaced separately so the wrap-up step can offer the user a “re-verify” option
+// (see SKILL.md for the handling flow).
 function pickNetworkUnverified(verified) {
   return ((verified && verified.unresolved) || []).filter((u) => u && /网络故障|网络错误|连接|超时|断路|熔断|中断|检索失败|检索报错|timed? ?out|network|connection/i.test(u.note || ''))
 }
 
-// 只有待确认的 flag 进 openQuestions（写法统一指令已自动套用，无需再问）
+// Only pending flags go into openQuestions (spelling-unification directives have already been applied automatically
+// and do not need to be surfaced to the user).
 function dedupQuestions(dedup) {
   return splitSuspects(dedup).flags.map((s) => `疑似同指（${s.kind}）：${(s.members || []).join(' ／ ')} 是否指同一对象？（${s.why}）——脚本未自动合并，请确认`)
 }
@@ -408,12 +449,15 @@ function dedupQuestions(dedup) {
 
 
 // ---------- prompt builders ----------
-// 计算式读取计划：读文件的分页方式不交给模型自己判断（haiku 会按 100–200 行小口啃出 8–9 次往返，
-// opus 才会大口读——同一句“分页读完”两种解读）。脚本已知 f.lines，直接给出逐条 Read 清单，
-// 模型照单执行，读取行为与模型档位脱钩。页大小受 Read 工具 ~25K token 上限约束：
-// 密集中文访谈 ~30–40 tok/行 → 600 行/页安全。
-const READ_PAGE = 600          // 行数上限：密集中文 ~600 行 ≈ 18–22K tok，留足余量
-const READ_BYTES_PER_PAGE = 45000  // 密度护栏：~45KB/页 ≈ 18K tok（中文 UTF-8 ≈ 2.5 B/tok）；只用于下调页大小防超限截断，绝不上调（页过大若超限会静默丢内容，省一次往返不值得）
+// Computed read plan: pagination is specified explicitly rather than left to the model
+// (Haiku tends to take 8–9 small 100–200-line bites; Opus reads large chunks —
+// the same instruction “page through the file” is interpreted differently per tier).
+// Since f.lines is known at script time, we emit an exact Read checklist; the model
+// just executes it, so read behavior is decoupled from model tier.
+// Page size is constrained by the Read tool's ~25K-token limit:
+// dense Chinese interviews run ~30–40 tok/line → 600 lines/page is safe.
+const READ_PAGE = 600          // line cap: dense Chinese ~600 lines ≈ 18–22K tok, with headroom
+const READ_BYTES_PER_PAGE = 45000  // density guard: ~45 KB/page ≈ 18K tok (Chinese UTF-8 ≈ 2.5 B/tok); only used to lower page size to prevent silent truncation at the token limit — never raised (an oversized page that gets cut silently loses content, not worth saving one round-trip)
 function readPlan(f) {
   const n = f.lines || 0
   if (!n) return `用 Read 分页读完整份文件（每页 ${READ_PAGE} 行，一直读到最后一行）。`
@@ -472,7 +516,7 @@ ${table}
 }
 
 function refinePrompt(f, glossary, finding, a) {
-  // 侦察结果可能缺字段（schema 不强制，避免校验重试循环）——锚点缺失就让精校自行 Read 源文件结尾
+  // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
   const anchorNote = anchor.text
     ? `【收尾锚点】源文件共 ${anchor.line || f.lines} 行，最后一句：「${anchor.text}」。成稿必须覆盖到此处（收尾客套可折成一句说明；正文绝不能中途断掉）。`
@@ -578,8 +622,8 @@ ${TYPESET}
 写到 ${a.outputDir}/${a.topic}时间线.md。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
 }
 
-// 逻辑顺序重排稿：读**精校稿**（非源转录，名/术语已统一），把问答从录音顺序重排成叙事顺序。
-// 保序重排·原文照搬（无损）：问答块整段照搬、只换位置，仅在移动打断指代处加 [编者] 衔接。
+// Logic-reordered draft: reads the **refined transcript** (not the raw source — names/terms already unified), reordering Q&A from recording order into narrative order.
+// Order-preserving reconstruction (lossless): Q&A blocks are copied verbatim, positions only are swapped; [Editor] bridging notes added only where a move breaks a reference.
 function logicWritePrompt(f, a) {
   return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。
 
@@ -614,7 +658,8 @@ const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [],
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
-// summary/时间线/逻辑顺序稿 都以本会话精校成稿为输入；scope 含交付物却不含 refine 会静默零产出——早失败、可诊断
+// summary / timeline / logical-order rewrite all take this session's refined output as input; a scope with a
+  // deliverable but no refine would silently produce nothing — so fail early and diagnosably.
 if ((scope.includes('summary') || scope.includes('timeline') || scope.includes('logic')) && !scope.includes('refine')) {
   return EMPTY_RETURN('summary/时间线/逻辑顺序稿依赖本会话 refine 产物，scope 须同时含 refine（本工作流不支持只对历史成稿单独出交付物）')
 }
@@ -626,10 +671,10 @@ let failed = []
 let headingConflicts = []
 let scoutSuspect = []
 let dedup = null
-let refinedPairs = []   // [{ f, rep }]：成功精校的文件与其报告（含 headings），供逻辑顺序阶段读 f.title/outPath 与按小标题核完整性
+let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
 if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
-  // 单份短文件：一遍过（镜像 SKILL.md 的快捷路径），跳过 Scout/Verify
+  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify
   const f = A.files[0]
   engine.phase('Refine')
   engine.log(`单份短文件（${f.lines} 行）：一遍过精校，不建独立校对表`)
@@ -646,8 +691,8 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   engine.phase('Scout')
   let findings = await engine.parallel(A.files.map((f) => () =>
     engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, model: M.scout, schema: SCOUT_SCHEMA })))
-  // 垃圾侦察自愈：检测到乱码侦察就各重试一次（一次 haiku 很便宜）；仍乱码则标 scoutSuspect，交付时告知该份校对表不可靠。
-  // 成稿不受影响——精校读源文件、不盲信校对表——但研究存档的校对表那一份会脏。
+  // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
+  // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
@@ -657,18 +702,18 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)
   engine.log(`侦察完成 ${findings.filter(Boolean).length}/${A.files.length} 份${scoutSuspect.length ? `（${scoutSuspect.join('、')} 重试后仍疑损坏，校对表该份不可靠）` : ''}`)
-  // 仍乱码的侦察整份剔除出合并：不污染校对表正文，也不让 verify/dedup 拿乱码去联网空转。
-  // 该份 refine 仍照跑（精校读源文件、不靠校对表），scoutSuspect 照常提示用户重跑该份侦察。
-  // 若全部 scout 都乱码，cleanFindings 全空 → merged 各类皆空 → doVerify 自然为假、dedupList 为空，整段安全短路。
+  // Still-garbled scout results are dropped entirely from the merge: this prevents polluting the glossary body and avoids wasting verify/dedup web-lookup calls on garbage input.
+  // Refine for that file still runs normally (it reads the source file directly, not the scout output); scoutSuspect still prompts the user to re-run scout for that file.
+  // If every scout is garbled, cleanFindings is all-null → merged lists are all empty → doVerify is naturally false and dedupList is empty, so the whole verify/dedup block short-circuits safely.
   const cleanFindings = findings.map((fd) => (fd && scoutLooksGarbled(fd)) ? null : fd)
   const merged = mergeFindings(cleanFindings, A.files)
   headingConflicts = findHeadingConflicts(cleanFindings, A.files, A.headingPolicy)
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
   engine.phase('Verify')
-  // verify（联网核实，分块并行）与 dedup（语义同指核查，读全量实体）互不依赖，同一 parallel 里并发
+  // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
-  // terms 也算（verifyChunks 本就送检术语；deep 档要求全量核实术语，门槛漏 terms 会让纯术语访谈静默跳过核实）
+  // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
   const doVerify = A.verifyDepth !== 'none' && (merged.people.length || merged.brands.length || merged.terms.length)
   const vc = doVerify ? verifyChunks(merged, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
   if (doVerify) {
@@ -686,7 +731,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   ])
   const goodParts = (vparts || []).filter(Boolean)
   if (vc.chunks.length) {
-    // 行级清洗：schema 不再强制字段，劣化输出可能缺 query/canonical——缺关键字段的行直接弃掉
+    // Row-level sanitisation: the schema no longer enforces fields, so degraded output may be missing query/canonical — rows missing critical fields are dropped outright
     verified = {
       resolved: goodParts.flatMap((p) => p.resolved || []).filter((r) => r && r.query && r.canonical),
       unresolved: goodParts.flatMap((p) => p.unresolved || []).filter((r) => r && r.query),
@@ -716,8 +761,8 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
-// 逻辑顺序重排（可选）：逐份读精校稿、重排成叙事顺序，并发跑。完整性靠免费 JS 核对——
-// 精校 report 的 headings vs 逻辑稿 report 的 threads[].source_sections 求差，漏的小标题进 missingSections。
+// Logic-order resequencing (optional): reads each refined transcript and reorders it into narrative order, run concurrently. Completeness is verified by a zero-cost JS check —
+// diff the headings in the refine report against threads[].source_sections in the logic report; any headings not covered go into missingSections.
 let logic = []
 if (scope.includes('logic') && refinedPairs.length) {
   engine.phase('Logic')
@@ -765,9 +810,9 @@ return {
 }
 
 
-// ===== bootstrap：Claude Code 引擎 =====
-// 由 build/build-cc.mjs 追加到 bundle 末尾。运行在 Workflow 沙箱里，
-// agent / parallel / pipeline / phase / log / args 都是全局——直接转给 core 的 runPipeline。
+// ===== bootstrap: Claude Code engine =====
+// Appended to the end of the bundle by build/build-cc.mjs. Runs inside the Workflow sandbox,
+// where agent / parallel / pipeline / phase / log / args are globals — hand them straight to core's runPipeline.
 const __A = (typeof args === 'string') ? JSON.parse(args) : (args || {})
 const __engine = { agent, parallel, pipeline, phase, log }
 return await runPipeline(__A, __engine)

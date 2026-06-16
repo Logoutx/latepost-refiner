@@ -1,12 +1,15 @@
 import { RULES, TYPESET, SINGLE_FILE_GLOSSARY } from './spec.js'
 
 // ---------- prompt builders ----------
-// 计算式读取计划：读文件的分页方式不交给模型自己判断（haiku 会按 100–200 行小口啃出 8–9 次往返，
-// opus 才会大口读——同一句“分页读完”两种解读）。脚本已知 f.lines，直接给出逐条 Read 清单，
-// 模型照单执行，读取行为与模型档位脱钩。页大小受 Read 工具 ~25K token 上限约束：
-// 密集中文访谈 ~30–40 tok/行 → 600 行/页安全。
-export const READ_PAGE = 600          // 行数上限：密集中文 ~600 行 ≈ 18–22K tok，留足余量
-export const READ_BYTES_PER_PAGE = 45000  // 密度护栏：~45KB/页 ≈ 18K tok（中文 UTF-8 ≈ 2.5 B/tok）；只用于下调页大小防超限截断，绝不上调（页过大若超限会静默丢内容，省一次往返不值得）
+// Computed read plan: pagination is specified explicitly rather than left to the model
+// (Haiku tends to take 8–9 small 100–200-line bites; Opus reads large chunks —
+// the same instruction “page through the file” is interpreted differently per tier).
+// Since f.lines is known at script time, we emit an exact Read checklist; the model
+// just executes it, so read behavior is decoupled from model tier.
+// Page size is constrained by the Read tool's ~25K-token limit:
+// dense Chinese interviews run ~30–40 tok/line → 600 lines/page is safe.
+export const READ_PAGE = 600          // line cap: dense Chinese ~600 lines ≈ 18–22K tok, with headroom
+export const READ_BYTES_PER_PAGE = 45000  // density guard: ~45 KB/page ≈ 18K tok (Chinese UTF-8 ≈ 2.5 B/tok); only used to lower page size to prevent silent truncation at the token limit — never raised (an oversized page that gets cut silently loses content, not worth saving one round-trip)
 export function readPlan(f) {
   const n = f.lines || 0
   if (!n) return `用 Read 分页读完整份文件（每页 ${READ_PAGE} 行，一直读到最后一行）。`
@@ -65,7 +68,7 @@ ${table}
 }
 
 export function refinePrompt(f, glossary, finding, a) {
-  // 侦察结果可能缺字段（schema 不强制，避免校验重试循环）——锚点缺失就让精校自行 Read 源文件结尾
+  // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
   const anchorNote = anchor.text
     ? `【收尾锚点】源文件共 ${anchor.line || f.lines} 行，最后一句：「${anchor.text}」。成稿必须覆盖到此处（收尾客套可折成一句说明；正文绝不能中途断掉）。`
@@ -171,8 +174,8 @@ ${TYPESET}
 写到 ${a.outputDir}/${a.topic}时间线.md。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
 }
 
-// 逻辑顺序重排稿：读**精校稿**（非源转录，名/术语已统一），把问答从录音顺序重排成叙事顺序。
-// 保序重排·原文照搬（无损）：问答块整段照搬、只换位置，仅在移动打断指代处加 [编者] 衔接。
+// Logic-reordered draft: reads the **refined transcript** (not the raw source — names/terms already unified), reordering Q&A from recording order into narrative order.
+// Order-preserving reconstruction (lossless): Q&A blocks are copied verbatim, positions only are swapped; [Editor] bridging notes added only where a move breaks a reference.
 export function logicWritePrompt(f, a) {
   return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。
 

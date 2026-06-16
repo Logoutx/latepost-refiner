@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# 从本目录（claude-code-skill/）打两个发布 zip，供上传 claude.ai 手动跑：
-#   transcriber.zip       —— 个人版（保留 Obsidian 默认输出路径）
-#   transcriber-share.zip —— 分享版（Obsidian 路径换成通用 ~/Documents/Research/<项目名>）
-# zip 内顶层目录名为 transcriber/（= 部署名，对应 ~/.claude/skills/transcriber）。
-# 用法：claude-code-skill/build-zips.sh [输出目录，默认 ~/Downloads]
+# Build two release zips from this directory (claude-code-skill/) for manual upload to claude.ai:
+#   transcriber.zip       —— personal build (keeps the default Obsidian output path)
+#   transcriber-share.zip —— share build (Obsidian path swapped for the generic ~/Documents/Research/<项目名>)
+# The zip's top-level dir is named transcriber/ (= the deployed name, matching ~/.claude/skills/transcriber).
+# Usage: claude-code-skill/build-zips.sh [output dir, default ~/Downloads]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HOME/Downloads}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-build() {  # $1=zip 名  $2=是否泛化(yes/no)
+build() {  # $1=zip name  $2=genericize? (yes/no)
   rm -rf "$TMP/transcriber"
   cp -R "$HERE" "$TMP/transcriber"
-  rm -f "$TMP/transcriber/build-zips.sh"   # 不把构建脚本打进去
+  rm -f "$TMP/transcriber/build-zips.sh"   # don't ship the build script itself
   if [ "$2" = "yes" ]; then
     python3 - "$TMP/transcriber/SKILL.md" <<'PY'
 import sys

@@ -11,11 +11,11 @@ export const meta = {
   ],
 }
 
-// args 契约（主代理在 Step 0 预检后组装）：
+// args contract (assembled by the main agent after the Step 0 pre-flight):
 // { topic, date, background, outputDir, skillDir,
-//   scope: ['refine','logic','summary','timeline'] 按需裁剪（'logic'=逻辑顺序重排稿，依赖 refine 产物）,
+//   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
 //   models?: {scout,verify,refine,summary,timeline},
 //   files: [{ path, label, lines, bytes?, title, subtitle, outPath, speakerHints?, notes? }] }
-//   （bytes 可选：预检 wc -c 所得，用于按密度收紧读取分页，防超限截断）
+//   (bytes optional: from pre-flight `wc -c`; used to shrink the read pagination by density to avoid over-limit truncation)
 

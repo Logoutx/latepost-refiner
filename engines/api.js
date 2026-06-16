@@ -1,28 +1,34 @@
-// ===== API 引擎（Universal 版用，待实现）=====
-// core/pipeline.js 的 runPipeline(A, engine) 面向一个 engine 接口编写；Claude Code 版
-// 由 Workflow 全局直接充当 engine（见 build/bootstrap-cc.js）。Universal 版在这里用
-// Anthropic SDK 实现同一个接口，于是 core/ 的 prompt / schema / 纯逻辑 / 流水线一字不改地复用。
+// ===== API Engine (for the Universal build — not yet implemented) =====
+// runPipeline(A, engine) in core/pipeline.js is written against an engine interface; the
+// Claude Code build lets the global Workflow object serve directly as the engine
+// (see build/bootstrap-cc.js). The Universal build implements that same interface here
+// using the Anthropic SDK, so everything in core/ — prompts, schemas, pure logic,
+// the pipeline — can be reused verbatim.
 //
-// 待在 Transcriber-Universal 会话里实现（见 ../universal/BRIEF.md）。需提供 5 个原语：
+// To be implemented in the Transcriber-Universal session (see ../universal/BRIEF.md).
+// Must provide 5 primitives:
 //
 //   agent(prompt, { label, model, schema, phase }) -> Promise<obj | string | null>
-//       · 用 anthropic.messages.create；有 schema 时走 tool-use（input_schema = schema，
-//         tool_choice 强制）并返回解析后的对象；无 schema 返回最终文本。
-//       · 把 Read / Write / WebSearch 实现成**客户端工具**（tool-use 循环里本地执行、回灌结果），
-//         于是 core 里“用 Read 分页读…”“Write 到…”“WebSearch 核实…”的 prompt 原样可用——
-//         这是两版共享 ~90% 的关键。
-//       · schema 失败不抛死循环（沿用 core 教训：schema 不设 required，缺字段 JS 兜底）。
+//       · Uses anthropic.messages.create; when a schema is provided, routes through
+//         tool-use (input_schema = schema, tool_choice forced) and returns the parsed
+//         object; without a schema, returns the final text content.
+//       · Implements Read / Write / WebSearch as **client-side tools** (executed locally
+//         inside the tool-use loop, results fed back), so prompts in core/ that say
+//         "use Read to page through…", "Write to…", "WebSearch to verify…" work
+//         unchanged — this is the key to ~90% code sharing between the two builds.
+//       · Schema failures must not throw into a dead loop (lesson learned from core/:
+//         do not set required fields on schemas; let JS fill in defaults for missing fields).
 //
-//   parallel(thunks) -> Promise<arr>          // p-limit 限并发（min(16, cores-2) 量级）；throw 的 thunk 归 null
-//   pipeline(items, ...stages) -> Promise<arr> // 每项独立流过各 stage，无 barrier；stage 抛错该项归 null
-//   phase(title) -> void                       // 进度相位（打到 stderr / 进度条）
-//   log(msg) -> void                           // narrator 行
+//   parallel(thunks) -> Promise<arr>          // p-limit concurrency (order of min(16, cores-2)); failing thunks resolve to null
+//   pipeline(items, ...stages) -> Promise<arr> // each item flows through all stages independently, no barrier; stage errors resolve that item to null
+//   phase(title) -> void                       // progress phase marker (written to stderr / progress bar)
+//   log(msg) -> void                           // narrator line
 //
-// 用法（Universal CLI 里）：
+// Usage (inside the Universal CLI):
 //   import { runPipeline } from '../core/pipeline.js'
 //   const engine = makeApiEngine({ apiKey: process.env.ANTHROPIC_API_KEY, models, concurrency })
-//   const result = await runPipeline(A, engine)   // A 由 argv 解析，与 Claude Code 版同形
+//   const result = await runPipeline(A, engine)   // A is parsed from argv, same shape as the Claude Code build
 
 export function makeApiEngine(/* { apiKey, models, concurrency = 8, onPhase, onLog } */) {
-  throw new Error('API 引擎待实现——见 universal/BRIEF.md（在 Transcriber-Universal 会话里建）')
+  throw new Error('API engine not yet implemented — see universal/BRIEF.md (build inside the Transcriber-Universal session)')
 }
