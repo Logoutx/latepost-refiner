@@ -2,39 +2,61 @@
 
 把粗糙的访谈/采访/口述 **AI 转录**精校成可读、可信、可检索的研究稿——删口癖、理顺口语、按主题加小标题、交叉校对并修正语音转写造成的人名/品牌/术语错误、统一发言人标注；并可顺带产出**逻辑顺序重排稿**、访谈总结、时间线。核心信念：**精校（refine）不是改写、更不是摘要**——保留说话人的语气、观点和全部事实细节，只去噪音、修转写错、加结构。
 
-本仓库收两个 edition：
+## 一套核心，两个 edition
 
-| 目录 | edition | 载体 | 依赖 |
-|---|---|---|---|
-| [`claude-code-skill/`](claude-code-skill/) | **Claude Code 版** | 一个 skill（`SKILL.md` + `workflow.js` 编排 + `references/`） | 在 Claude Code 里跑（用 Workflow 工具并行编排）；同一个 skill 也可打包上传 claude.ai 手动跑 |
-| [`universal/`](universal/) | **Universal 版** | 独立 Anthropic SDK 的 Python CLI（**待建**，见 `universal/BRIEF.md`） | 只要 Python + `ANTHROPIC_API_KEY`，任意机器可跑 |
+逻辑只写一遍，放在 [`core/`](core/)；两个 edition 各自只加一层薄薄的「运行时引擎」。
+
+```
+core/                唯一真相来源（两 edition 共享）
+  meta.js            Workflow 元信息（相位等）
+  spec.js            schemas + 编辑规范 RULES/TYPESET + 全部纯逻辑
+                     （聚类/合并/校对表渲染/核实分块/人名守卫/乱码检测…）
+  prompts.js         9 个 prompt builder + readPlan/headingNote
+  pipeline.js        runPipeline(A, engine) —— 流水线，面向一个 engine 接口
+engines/
+  api.js             Universal 版引擎（待实现）：用 Anthropic SDK 兑现 engine 接口
+                     （Claude Code 版的引擎就是 Workflow 全局，见 build/bootstrap-cc.js）
+build/
+  build-cc.mjs       把 core/* + Claude Code 引擎打包成自包含的 workflow.js
+  bootstrap-cc.js    Claude Code 引擎（agent/parallel/… 转给 Workflow 全局）
+claude-code-skill/   ★ Claude Code / claude.ai edition（部署单元）
+  workflow.js        ← 由 build 生成，请勿手改
+  SKILL.md           主代理指令（手写，edition 专属）
+  references/        校对表 / 交付物模板
+  build-zips.sh      打 claude.ai 上传用的 zip
+universal/           ★ Universal edition（独立 Anthropic SDK CLI，待建）
+  BRIEF.md           构建任务书
+```
+
+`runPipeline(A, engine)` 只依赖一个 engine 接口的 5 个原语：`agent / parallel / pipeline / phase / log`。
+- **Claude Code 版**：这 5 个就是 Workflow 工具的全局，`build/bootstrap-cc.js` 直接转交。
+- **Universal 版**：`engines/api.js` 用 Anthropic SDK 兑现它们——关键技巧是把 `Read / Write / WebSearch` 实现成**客户端工具**，于是 `core/` 里「用 Read 分页读…」「Write 到…」的 prompt 一字不改地复用。
+
+→ prompts / schemas / 编辑规范 / 纯逻辑 / 流水线 **~90% 写一次**；每个 edition 只维护一层引擎。
+
+## 为什么 Claude Code 版要「生成」
+
+Workflow 工具的脚本沙箱**禁 import / fs**，只能是单文件、用其全局。所以 `build/build-cc.mjs` 把 `core/*`（ESM 模块）去掉 import/export、按依赖序拼接、保留 `export const meta` 居首，产出自包含的 `claude-code-skill/workflow.js`。
+
+**开发循环**：改 `core/*` → `node build/build-cc.mjs` 重新生成 `workflow.js`。**不要手改 `claude-code-skill/workflow.js`**（会被下次 build 覆盖）。
 
 ## 流水线（两版同源）
 
-并行侦察（haiku）→ JS 合并/泛称感知聚类 → 分块联网核实 + 语义同指去重（sonnet）→ 统一校对表 → 逐份精校 + 结尾完整性核对（opus + haiku）→ 逻辑顺序重排稿（opus，可选）→ 访谈总结 / 时间线（opus）。模型分层、断路器、人名强名守卫、中文排版三规范等设计细节见各版源码注释与 `claude-code-skill/SKILL.md`。
+并行侦察（haiku）→ JS 合并/泛称感知聚类 → 分块联网核实 + 语义同指去重（sonnet）→ 统一校对表 → 逐份精校 + 结尾完整性核对（opus + haiku）→ 逻辑顺序重排稿（opus，可选）→ 访谈总结 / 时间线（opus）。模型分层、断路器、人名强名守卫、中文排版三规范等设计见 `core/` 源码注释与 `claude-code-skill/SKILL.md`。
 
-## claude-code-skill — 怎么装/怎么用
+## claude-code-skill — 装 / 用
 
-这份 skill 通过**符号链接**挂在 Claude Code 的技能目录下，本仓库是它的源头：
-
+通过**符号链接**挂在 Claude Code 技能目录下，本仓库是源头：
 ```
-~/.claude/skills/transcriber  ->  <this repo>/claude-code-skill
+~/.claude/skills/transcriber  ->  <repo>/claude-code-skill
 ```
-
-- 改了 `claude-code-skill/` 里的文件，Claude Code 下个会话即生效（链接同一份真身）。
-- 在新机器上启用：把本仓库 clone 下来，建同名符号链接即可：
-  ```bash
-  ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/transcriber
-  ```
-- 打 claude.ai 上传用的 zip（个人版 + 分享版）：
-  ```bash
-  claude-code-skill/build-zips.sh        # → ~/Downloads/transcriber.zip / transcriber-share.zip
-  ```
-  分享版会把 Obsidian 专属默认输出路径换成通用的 `~/Documents/Research/<项目名>`。
+- 新机器启用：`git clone` 后 `ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/transcriber`。
+- 改逻辑：改 `core/*` → `node build/build-cc.mjs` → skill 下个会话即生效。
+- 打 claude.ai 上传 zip：`bash claude-code-skill/build-zips.sh`（个人版 + 分享版，分享版自动把 Obsidian 默认路径换成通用 `~/Documents/Research/<项目名>`）。
 
 ## universal — 现状
 
-仅有 `BRIEF.md`（完整构建任务书），**代码待建**。它把 `claude-code-skill/` 的全部逻辑移植成独立调用 Anthropic API 的 Python CLI（orchestrator 自己读文件喂 prompt、asyncio 并行、tool-use 做结构化输出、server-side web search 做核实）。从 `universal/BRIEF.md` 起手。
+仅有 `BRIEF.md`。代码待在自己的会话里建：实现 `engines/api.js`（5 个原语）+ `universal/cli.js`（argv→A、docx→md、调 `runPipeline`）。流水线/prompts/schemas/纯逻辑全部从 `core/` 复用，从 `universal/BRIEF.md` 起手。
 
 ## 一份正式产出长啥样
 
