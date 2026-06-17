@@ -26,7 +26,7 @@ fix transcription errors, and add structure.
 - **Don't use**: audio-to-text (ASR — this skill assumes you already have text); full-document translation; you only
   want a short summary and don't care about the full text.
 
-## Core principle: save tokens, save time while provide a human-quailty transcript 
+## Core principle: save tokens, save time while providing a human-quality transcript
 **Heavy text (raw transcripts, web pages) stays only in subagent contexts and is discarded after use; the main agent's
 (orchestrator's) context holds only the distilled small artifacts — the glossary, the file list, the output paths.**
 The main agent must never read a whole transcript or a full page of search results into its own context: delegate
