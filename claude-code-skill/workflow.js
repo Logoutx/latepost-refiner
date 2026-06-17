@@ -637,6 +637,25 @@ function glossaryConflicts(prior, verified) {
   return out
 }
 
+// P4b — cross-batch weak-name ambiguity flag: mergeIntoPrior deliberately does NOT merge weak-only
+// honorific entries (张总 / 李总), because two interviews' "张总" may be different people — auto-merging
+// would be the over-merge bug. But silently accumulating two identical "张总" rows across batches isn't
+// surfaced by dedup (which only sees the current batch). So when this batch has a weak-only entity whose
+// canonical exactly matches a prior weak-only entry, flag it as an open question (with both hints) for the
+// human to disambiguate / supply a real name — never auto-merged.
+const isStrongName = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).some((n) => n && !isWeakKey(n))
+function weakDupFlags(prior, fresh) {
+  if (!prior) return []
+  const priorWeak = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])].filter((e) => e.canonical && isWeakKey(stripDesc(e.canonical)) && !isStrongName(e))
+  const out = []
+  for (const fe of [...(fresh.people || []), ...(fresh.brands || []), ...(fresh.terms || [])]) {
+    if (!fe.canonical || !isWeakKey(stripDesc(fe.canonical)) || isStrongName(fe)) continue
+    const pe = priorWeak.find((e) => stripDesc(e.canonical) === stripDesc(fe.canonical))
+    if (pe) out.push(`称呼歧义：「${stripDesc(fe.canonical)}」往次校对表与本轮各有一条（往次：${pe.hint || '无说明'}；本轮：${fe.hint || '无说明'}）——可能同一人、也可能不同人；弱称呼脚本不自动合并，请确认是否同指并尽量补真名。`)
+  }
+  return out
+}
+
 
 
 
@@ -878,6 +897,7 @@ const prior = (A.priorGlossaryText && !A.fresh) ? parseGlossary(A.priorGlossaryT
 A.prior = prior
 A.doNotMerge = (prior && prior.doNotMerge) || []   // P4: human-confirmed distinct referents, carried forward to dedup + render
 let conflicts = []                                  // P4: this batch's verify conclusions that disagree with the prior glossary
+let weakDups = []                                   // P4b: cross-batch weak-honorific (张总/李总) ambiguities to disambiguate
 if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人名 / ${prior.brands.length} 品牌 / ${prior.terms.length} 术语、${(prior.verified.resolved || []).length} 条核实结论——本轮在其上累积`)
 
 let glossary = ''
@@ -970,6 +990,8 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   const merged = prior ? mergeIntoPrior(prior, mergedThisBatch) : mergedThisBatch
   const allVerified = prior ? mergeVerified(prior.verified, verified) : verified
   const allDedup = prior ? { suspects: mergeDedup(prior.dedupSuspects, (dedup && dedup.suspects) || []) } : dedup
+  weakDups = prior ? weakDupFlags(prior, mergedThisBatch) : []
+  if (weakDups.length) engine.log(`称呼歧义：${weakDups.length} 个弱称呼跨批次重复（未合并）——并入 openQuestions 待人工辨认`)
   if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
   glossary = renderGlossary(merged, allVerified, allDedup, A)
 
@@ -1031,7 +1053,7 @@ return {
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups),
   summary,
   timeline,
 }

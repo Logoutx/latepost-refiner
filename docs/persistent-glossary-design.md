@@ -86,4 +86,6 @@ a conflicting canonical surfaces as an `openQuestion` (P4).
   verified/errors/notes/dedup + scout seeding + write-back. Lossless + spelling-consistent.
 - **P2** — verify-cache exclusion: skip entities already in the carried-forward verified set.
 - **P3** — promote 发言人统一标注 to a cross-interview `发言人登记` registry.
-- **P4** — `确认不同指（勿合并）` section fed back into dedup; surface canonical conflicts.
+- **P4** — `确认不同指（勿合并）` section fed back into dedup; `glossaryConflicts` surfaces
+  verify-vs-glossary disagreements; `weakDupFlags` surfaces cross-batch weak-honorific
+  ambiguities (张总) for human disambiguation — all into openQuestions, never auto-merged.

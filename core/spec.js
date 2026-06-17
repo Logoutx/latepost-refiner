@@ -611,3 +611,22 @@ export function glossaryConflicts(prior, verified) {
   return out
 }
 
+// P4b — cross-batch weak-name ambiguity flag: mergeIntoPrior deliberately does NOT merge weak-only
+// honorific entries (张总 / 李总), because two interviews' "张总" may be different people — auto-merging
+// would be the over-merge bug. But silently accumulating two identical "张总" rows across batches isn't
+// surfaced by dedup (which only sees the current batch). So when this batch has a weak-only entity whose
+// canonical exactly matches a prior weak-only entry, flag it as an open question (with both hints) for the
+// human to disambiguate / supply a real name — never auto-merged.
+const isStrongName = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).some((n) => n && !isWeakKey(n))
+export function weakDupFlags(prior, fresh) {
+  if (!prior) return []
+  const priorWeak = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])].filter((e) => e.canonical && isWeakKey(stripDesc(e.canonical)) && !isStrongName(e))
+  const out = []
+  for (const fe of [...(fresh.people || []), ...(fresh.brands || []), ...(fresh.terms || [])]) {
+    if (!fe.canonical || !isWeakKey(stripDesc(fe.canonical)) || isStrongName(fe)) continue
+    const pe = priorWeak.find((e) => stripDesc(e.canonical) === stripDesc(fe.canonical))
+    if (pe) out.push(`称呼歧义：「${stripDesc(fe.canonical)}」往次校对表与本轮各有一条（往次：${pe.hint || '无说明'}；本轮：${fe.hint || '无说明'}）——可能同一人、也可能不同人；弱称呼脚本不自动合并，请确认是否同指并尽量补真名。`)
+  }
+  return out
+}
+
