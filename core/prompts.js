@@ -27,6 +27,20 @@ export function headingNote(policy) {
   return ''
 }
 
+// Known-entities seed from a persistent per-company glossary (P1): when prior interviews for this
+// company have already been processed, tell the scout the established 写法 so it reuses them instead
+// of re-deriving (and risking a divergent spelling), and focuses its budget on genuinely new entities.
+function knownNote(a) {
+  const p = a.prior
+  if (!p) return ''
+  const top = (list, n) => (list || []).slice(0, n).map((e) => e.canonical + (e.variants && e.variants.length ? `（亦作 ${e.variants.slice(0, 3).join('、')}）` : '')).filter(Boolean).join('；')
+  const ppl = top(p.people, 40), br = top(p.brands, 40), tm = top(p.terms, 40)
+  const spk = Array.from(new Set((p.speakersByFile || []).flatMap((g) => g.speakers || []).map((s) => s.label + (s.identity ? `=${s.identity}` : '')).filter(Boolean))).slice(0, 30).join('；')
+  if (!ppl && !br && !tm && !spk) return ''
+  return `【已知实体（本公司往次访谈已确认，请沿用这些写法、不要另起新写法；重点是发现新实体与新变体，并把本份里这些已知实体出现的新变体写进 variants）】
+${ppl ? `人名：${ppl}\n` : ''}${br ? `品牌/公司/产品：${br}\n` : ''}${tm ? `术语：${tm}\n` : ''}${spk ? `已知发言人：${spk}` : ''}`
+}
+
 export function scoutPrompt(f, a) {
   return `你是访谈转录「侦察」子代理。
 
@@ -35,6 +49,7 @@ export function scoutPrompt(f, a) {
 本份文件：${f.path}（约 ${f.lines} 行）
 ${f.speakerHints ? `已知发言人线索：${f.speakerHints}` : ''}
 ${f.notes ? `额外提醒：${f.notes}` : ''}
+${knownNote(a)}
 
 任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
 ${readPlan(f)}
@@ -118,7 +133,7 @@ export function dedupPrompt(listText, a) {
 - 每组 members 至少 2 个写法；给出 kind（person/brand/term）、why（一句话理由）。没有可疑项就返回空 suspects=[]。
 - **preferred（关键）**：当 kind 是 **term/brand**（术语/口号/品牌/产品名）且你有把握时，给出该组的**正确标准写法**（必须是 members 里的某一个，如「真鲜醇 / 真鲜纯」给 preferred=「真鲜纯」）——这会作为“写法统一”指令直接交给精校套用，省去它来回改字。**人名（person）一律留空 preferred**（合并人名身份须人工确认，绝不自动并）；术语但你拿不准标准写法的也留空。
 
-实体清单（canonical ← 变体 ｜ 线索 ｜ 类别/出处）：
+${(a.doNotMerge && a.doNotMerge.length) ? `已人工确认为**不同对象**、**勿再标记为疑似同指**：${a.doNotMerge.map((p) => (p || []).join('／')).join('；')}\n` : ''}实体清单（canonical ← 变体 ｜ 线索 ｜ 类别/出处）：
 ${listText}
 
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`

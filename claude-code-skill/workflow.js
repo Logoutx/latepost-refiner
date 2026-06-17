@@ -16,6 +16,9 @@ export const meta = {
 //   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
 //   models?: {scout,verify,refine,summary,timeline},
+//   priorGlossaryText?: full text of an existing <outputDir>/校对表.md (per-company persistent glossary, P1) —
+//     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
+//   fresh?: true to ignore any prior glossary and rebuild from scratch.
 //   files: [{ path, label, lines, bytes?, title, subtitle, outPath, speakerHints?, notes? }] }
 //   (bytes optional: from pre-flight `wc -c`; used to shrink the read pagination by density to avoid over-limit truncation)
 
@@ -365,7 +368,10 @@ function renderGlossary(merged, verified, dedup, a) {
     }
     applied.add(hit)
     const variants = Array.from(new Set(names.filter((n) => n && n !== hit.canonical)))
-    const hint = [hit.identity ? `${hit.identity}（已核实）` : '', e.hint].filter(Boolean).join('；')
+    // Idempotent: don't re-prepend the identity tag if it's already in the hint (a persisted glossary
+    // is parsed + re-rendered every batch, so a naive prepend would bloat the hint each run).
+    const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
+    const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
     return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
   }
   const sec = []
@@ -375,6 +381,10 @@ function renderGlossary(merged, verified, dedup, a) {
     sec.push(`**${s.label}**`)
     for (const sp of s.speakers) { if (sp && sp.label) sec.push(`- ${sp.label} → ${sp.role || '?'}${sp.identity ? `（${sp.identity}）` : ''}`) }
   }
+  // Cross-interview speaker registry (P3): a derived view unifying speakers that recur across ≥2 files
+  // (chiefly the interviewer), so refine labels them consistently and the human sees who recurs.
+  const reg = buildSpeakerRegistry(merged.speakersByFile)
+  if (reg.length) { sec.push('', '## 发言人登记（跨访谈）'); for (const r of reg) sec.push(`- ${r.label}（${r.role}）${r.identity ? ` ｜ ${r.identity}` : ''} ｜ 出现：${r.files.join('、')}`) }
   const block = (title, list, isPerson) => {
     sec.push('', `## ${title}（写法 → 统一）`)
     for (const e0 of list) {
@@ -408,6 +418,11 @@ function renderGlossary(merged, verified, dedup, a) {
   if (flags.length) {
     sec.push('', '## 疑似同指（待人工确认，未自动合并）', '> 写法不同但疑似指同一对象——脚本不会自动并（尤其人名），请人工/精校据原文定夺；不是同指就忽略。')
     for (const s of flags) sec.push(`- ${(s.members || []).join(' ／ ')}（${s.kind}）：${s.why}`)
+  }
+  // Human-confirmed distinct referents (P4): carried forward so dedup won't re-flag them next batch.
+  if (a.doNotMerge && a.doNotMerge.length) {
+    sec.push('', '## 确认不同指（勿合并）', '> 人工确认：以下各组写法相近但确为不同对象，dedup 勿再标记为疑似同指。')
+    for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
   }
   return sec.join('\n')
 }
@@ -449,6 +464,179 @@ function dedupQuestions(dedup) {
   return splitSuspects(dedup).flags.map((s) => `疑似同指（${s.kind}）：${(s.members || []).join(' ／ ')} 是否指同一对象？（${s.why}）——脚本未自动合并，请确认`)
 }
 
+// ---------- persistent per-company glossary (P1) ----------
+// parseGlossary is the inverse of renderGlossary: it reads a previously-written 校对表.md back
+// into the same structures mergeFindings/renderGlossary use, so a company's glossary becomes
+// cumulative memory rather than per-batch output. The render format is regular and stable;
+// any line that doesn't match a known grammar is preserved in `extra` so user free-text is
+// never lost. 补核结论 (re-verify addendum) rows are folded into `verified.resolved`.
+function parseEntityLine(l) {
+  const m = l.match(/^- \*\*(.+?)\*\* ← (.*)$/)
+  if (!m) return null
+  const parts = (m[2] || '').split(' ｜ ')
+  const varsRaw = (parts.shift() || '—').trim()
+  const variants = varsRaw === '—' ? [] : varsRaw.split(' / ').map((x) => x.trim()).filter(Boolean)
+  let hint = '', crossFile = false
+  for (const p of parts) { if (p.trim() === '多份互证') crossFile = true; else if (p.trim()) hint = hint ? `${hint} ｜ ${p.trim()}` : p.trim() }
+  return { canonical: m[1], variants, hint, crossFile }
+}
+function parseResolvedLine(body, out) {
+  let s = body, rejected = false
+  if (s.startsWith('⚠ ')) { rejected = true; s = s.slice(2) }
+  const rm = s.match(/^(.+?) → \*\*(.+?)\*\*(?:（(.+?)）)?(?:\s*｜\s*(?!依据：).*?)?\s*｜\s*依据：(.*)$/)
+  if (rm) { out.push({ query: rm[1], canonical: rm[2], identity: rm[3] || '', source: rm[4], rejected }); return true }
+  return false
+}
+function parseGlossary(md) {
+  const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [] }
+  if (!md || !md.trim()) return g
+  const lines = md.split('\n')
+  const mh = (lines.find((l) => /统一校对表/.test(l)) || '').match(/^#\s*(.+?)\s*统一校对表（采访时间\s*(.+?)）/)
+  if (mh) { g.topic = mh[1]; g.date = mh[2] }
+  const sections = []
+  let cur = { title: '__preamble__', body: [] }
+  for (const l of lines) { const m = l.match(/^##\s+(.*)$/); if (m) { sections.push(cur); cur = { title: m[1], body: [] } } else cur.body.push(l) }
+  sections.push(cur)
+  const get = (re) => sections.find((s) => re.test(s.title))
+  const bg = get(/^采访背景/); if (bg) g.background = bg.body.join('\n').trim()
+  const spk = get(/^发言人统一标注/)
+  if (spk) {
+    let grp = null
+    for (const l of spk.body) {
+      const mb = l.match(/^\*\*(.+?)\*\*\s*$/)
+      if (mb) { grp = { label: mb[1], speakers: [] }; g.speakersByFile.push(grp); continue }
+      const ms = l.match(/^- (.+?) → (.+?)(?:（(.+)）)?$/)
+      if (ms && grp) grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' })
+    }
+  }
+  const parseEntities = (sec) => { const out = []; if (!sec) return out; for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else g.extra.push(l) } return out }
+  g.people = parseEntities(get(/^人名（写法/))
+  g.brands = parseEntities(get(/^品牌.*（写法/))
+  g.terms = parseEntities(get(/^术语.*（写法/))
+  const errs = get(/^需特别处理的转写错误/)
+  if (errs) for (const l of errs.body) { const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/); if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] }) }
+  const nt = get(/^各份特别提醒/)
+  if (nt) for (const l of nt.body) { const m = l.match(/^- (.+)$/); if (m) g.notes.push(m[1]) }
+  for (const vsec of [get(/^联网核实结论/), get(/^补核结论/)]) {
+    if (!vsec) continue
+    for (const l of vsec.body) {
+      if (!l.startsWith('- ')) continue
+      const body = l.slice(2)
+      const un = body.match(/^(.+?)：未能核实，保留（音）(?:\s*｜\s*(.*))?$/)
+      if (un) { g.verified.unresolved.push({ query: un[1], note: un[2] || '' }); continue }
+      if (!parseResolvedLine(body, g.verified.resolved)) g.extra.push(l)
+    }
+  }
+  const dr = get(/^写法统一/)
+  if (dr) for (const l of dr.body) {
+    const m = l.match(/^- (.+?) → 统一写 \*\*(.+?)\*\*（(.*)）$/)
+    if (m) { const members = m[1].split(' / ').map((x) => x.trim()).filter(Boolean); if (!members.includes(m[2])) members.push(m[2]); g.dedupSuspects.push({ members, kind: 'term', preferred: m[2], why: m[3] }) }
+  }
+  const fl = get(/^疑似同指/)
+  if (fl) for (const l of fl.body) { const m = l.match(/^- (.+?)（(.+?)）：(.*)$/); if (m) g.dedupSuspects.push({ members: m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean), kind: m[2], why: m[3] }) }
+  const dn = get(/^确认不同指/)
+  if (dn) for (const l of dn.body) { const m = l.match(/^- (.+)$/); if (m) { const grp = m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean); if (grp.length >= 2) g.doNotMerge.push(grp) } }
+  // 发言人登记（跨访谈）is a derived view of speakersByFile — re-generated by renderGlossary, so we don't
+  // parse it back (its lines are simply never visited, never landing in `extra`).
+  return g
+}
+
+// Cumulative merge of this batch's fresh clusters into the prior glossary.
+// Prior canonical wins (the user has had a chance to edit it); fresh variants/hints are folded in;
+// an entry that shares no STRONG name with any prior entry is added as new; unmatched prior entries
+// are carried forward unchanged. Under-merge (two entries) is preferred over over-merge, same as clusterEntities.
+function strongSet(e) { return new Set([e.canonical, ...(e.variants || [])].map(stripDesc).filter((n) => n && !isWeakKey(n))) }
+function mergeEntityLists(priorList, freshList) {
+  const out = (priorList || []).map((e) => Object.assign({}, e, { variants: [...(e.variants || [])] }))
+  for (const fe of freshList || []) {
+    const fs = strongSet(fe)
+    let home = null
+    if (fs.size) home = out.find((pe) => { const ps = strongSet(pe); for (const n of fs) if (ps.has(n)) return true; return false })
+    if (home) {
+      const names = new Set([home.canonical, ...(home.variants || []), fe.canonical, ...(fe.variants || [])].filter(Boolean))
+      names.delete(home.canonical)
+      home.variants = Array.from(names)
+      home.crossFile = true
+      if (!home.hint && fe.hint) home.hint = fe.hint
+      home.public_figure = home.public_figure || fe.public_figure
+      if (!home.category && fe.category) home.category = fe.category
+    } else out.push(Object.assign({}, fe, { variants: [...(fe.variants || [])] }))
+  }
+  return out
+}
+function mergeIntoPrior(prior, fresh) {
+  if (!prior) return fresh
+  const seen = new Set(); const speakers = []
+  for (const grp of [...(prior.speakersByFile || []), ...(fresh.speakersByFile || [])]) { if (grp && grp.label && !seen.has(grp.label)) { seen.add(grp.label); speakers.push(grp) } }
+  return {
+    people: mergeEntityLists(prior.people, fresh.people),
+    brands: mergeEntityLists(prior.brands, fresh.brands),
+    terms: mergeEntityLists(prior.terms, fresh.terms),
+    speakersByFile: speakers,
+    errors: [...(prior.errors || []), ...(fresh.errors || [])],
+    notes: Array.from(new Set([...(prior.notes || []), ...(fresh.notes || [])])),
+  }
+}
+// Carry prior verify conclusions forward; fresh overrides prior for the same query; a resolved query
+// is removed from unresolved.
+function mergeVerified(priorV, freshV) {
+  const r = new Map(), u = new Map()
+  for (const v of [priorV, freshV]) { if (!v) continue; for (const x of v.resolved || []) if (x && x.query) r.set(x.query, x); for (const x of v.unresolved || []) if (x && x.query) u.set(x.query, x) }
+  for (const q of r.keys()) u.delete(q)
+  return { resolved: Array.from(r.values()), unresolved: Array.from(u.values()) }
+}
+// Carry prior dedup suspects forward, de-duped by member-set + kind signature.
+function mergeDedup(priorSuspects, freshSuspects) {
+  const m = new Map()
+  for (const s of [...(priorSuspects || []), ...(freshSuspects || [])]) { if (s && (s.members || []).length >= 2) m.set((s.members || []).map((x) => stripDesc(x)).sort().join('|') + '#' + (s.kind || ''), s) }
+  return Array.from(m.values())
+}
+
+// P2 — verify-cache exclusion: drop entities already covered by the prior glossary's verify conclusions
+// from THIS batch's verify list (they stay in the cumulative glossary via mergeIntoPrior + carried-forward
+// verified — they just aren't re-checked). The real cost/latency win of the persistent glossary.
+function excludeVerified(merged, prior) {
+  if (!prior) return merged
+  const done = new Set()
+  for (const r of (prior.verified && prior.verified.resolved) || []) { if (r && r.query) done.add(stripDesc(r.query)); if (r && r.canonical) done.add(stripDesc(r.canonical)) }
+  if (!done.size) return merged
+  const covered = (e) => [e.canonical, ...(e.variants || [])].some((n) => done.has(stripDesc(n)))
+  const filt = (list) => (list || []).filter((e) => !covered(e))
+  return Object.assign({}, merged, { people: filt(merged.people), brands: filt(merged.brands), terms: filt(merged.terms) })
+}
+
+// P3 — cross-interview speaker registry: unify speakers recurring across ≥ 2 files (chiefly the interviewer)
+// into one entry with the files they appear in. A derived view of speakersByFile (re-generated each render).
+function buildSpeakerRegistry(speakersByFile) {
+  const map = new Map()
+  for (const g of speakersByFile || []) {
+    for (const sp of g.speakers || []) {
+      if (!sp || !sp.label) continue
+      let e = map.get(sp.label)
+      if (!e) { e = { label: sp.label, role: sp.role || '?', identity: sp.identity || '', files: [] }; map.set(sp.label, e) }
+      if (!e.identity && sp.identity) e.identity = sp.identity
+      if (g.label && !e.files.includes(g.label)) e.files.push(g.label)
+    }
+  }
+  return Array.from(map.values()).filter((e) => e.files.length >= 2)
+}
+
+// P4 — conflict surfacing: when this batch's verify resolves a name the prior glossary already records
+// under a DIFFERENT strong canonical, surface it as an open question rather than silently keeping or
+// overwriting either. (mergeIntoPrior keeps the prior canonical; this just flags the disagreement.)
+function glossaryConflicts(prior, verified) {
+  if (!prior || !verified) return []
+  const priorEntries = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])]
+  const out = []
+  for (const r of verified.resolved || []) {
+    if (!r || !r.query || !r.canonical) continue
+    const pe = priorEntries.find((e) => [e.canonical, ...(e.variants || [])].map(stripDesc).includes(stripDesc(r.query)))
+    if (pe && stripDesc(pe.canonical) !== stripDesc(r.canonical) && !(pe.variants || []).map(stripDesc).includes(stripDesc(r.canonical)) && !isWeakKey(stripDesc(pe.canonical)))
+      out.push(`核实冲突：本轮核实「${r.query}」→「${r.canonical}」，但往次校对表记为「${pe.canonical}」——请确认以哪个为准（未自动改写）`)
+  }
+  return out
+}
+
 
 
 
@@ -479,6 +667,20 @@ function headingNote(policy) {
   return ''
 }
 
+// Known-entities seed from a persistent per-company glossary (P1): when prior interviews for this
+// company have already been processed, tell the scout the established 写法 so it reuses them instead
+// of re-deriving (and risking a divergent spelling), and focuses its budget on genuinely new entities.
+function knownNote(a) {
+  const p = a.prior
+  if (!p) return ''
+  const top = (list, n) => (list || []).slice(0, n).map((e) => e.canonical + (e.variants && e.variants.length ? `（亦作 ${e.variants.slice(0, 3).join('、')}）` : '')).filter(Boolean).join('；')
+  const ppl = top(p.people, 40), br = top(p.brands, 40), tm = top(p.terms, 40)
+  const spk = Array.from(new Set((p.speakersByFile || []).flatMap((g) => g.speakers || []).map((s) => s.label + (s.identity ? `=${s.identity}` : '')).filter(Boolean))).slice(0, 30).join('；')
+  if (!ppl && !br && !tm && !spk) return ''
+  return `【已知实体（本公司往次访谈已确认，请沿用这些写法、不要另起新写法；重点是发现新实体与新变体，并把本份里这些已知实体出现的新变体写进 variants）】
+${ppl ? `人名：${ppl}\n` : ''}${br ? `品牌/公司/产品：${br}\n` : ''}${tm ? `术语：${tm}\n` : ''}${spk ? `已知发言人：${spk}` : ''}`
+}
+
 function scoutPrompt(f, a) {
   return `你是访谈转录「侦察」子代理。
 
@@ -487,6 +689,7 @@ function scoutPrompt(f, a) {
 本份文件：${f.path}（约 ${f.lines} 行）
 ${f.speakerHints ? `已知发言人线索：${f.speakerHints}` : ''}
 ${f.notes ? `额外提醒：${f.notes}` : ''}
+${knownNote(a)}
 
 任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
 ${readPlan(f)}
@@ -570,7 +773,7 @@ function dedupPrompt(listText, a) {
 - 每组 members 至少 2 个写法；给出 kind（person/brand/term）、why（一句话理由）。没有可疑项就返回空 suspects=[]。
 - **preferred（关键）**：当 kind 是 **term/brand**（术语/口号/品牌/产品名）且你有把握时，给出该组的**正确标准写法**（必须是 members 里的某一个，如「真鲜醇 / 真鲜纯」给 preferred=「真鲜纯」）——这会作为“写法统一”指令直接交给精校套用，省去它来回改字。**人名（person）一律留空 preferred**（合并人名身份须人工确认，绝不自动并）；术语但你拿不准标准写法的也留空。
 
-实体清单（canonical ← 变体 ｜ 线索 ｜ 类别/出处）：
+${(a.doNotMerge && a.doNotMerge.length) ? `已人工确认为**不同对象**、**勿再标记为疑似同指**：${a.doNotMerge.map((p) => (p || []).join('／')).join('；')}\n` : ''}实体清单（canonical ← 变体 ｜ 线索 ｜ 类别/出处）：
 ${listText}
 
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
@@ -668,6 +871,15 @@ if ((scope.includes('summary') || scope.includes('timeline') || scope.includes('
   return EMPTY_RETURN('summary/时间线/逻辑顺序稿依赖本会话 refine 产物，scope 须同时含 refine（本工作流不支持只对历史成稿单独出交付物）')
 }
 
+// Persistent per-company glossary (P1): if Step 0 found an existing 校对表.md and passed its text,
+// parse it into prior memory to seed scout + accumulate into. A.fresh forces a from-scratch rebuild.
+// Attached to A so scoutPrompt can read it. Absent/empty → null → behaviour identical to a first run.
+const prior = (A.priorGlossaryText && !A.fresh) ? parseGlossary(A.priorGlossaryText) : null
+A.prior = prior
+A.doNotMerge = (prior && prior.doNotMerge) || []   // P4: human-confirmed distinct referents, carried forward to dedup + render
+let conflicts = []                                  // P4: this batch's verify conclusions that disagree with the prior glossary
+if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人名 / ${prior.brands.length} 品牌 / ${prior.terms.length} 术语、${(prior.verified.resolved || []).length} 条核实结论——本轮在其上累积`)
+
 let glossary = ''
 let netUnverified = []
 let refined = []
@@ -710,7 +922,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   // Refine for that file still runs normally (it reads the source file directly, not the scout output); scoutSuspect still prompts the user to re-run scout for that file.
   // If every scout is garbled, cleanFindings is all-null → merged lists are all empty → doVerify is naturally false and dedupList is empty, so the whole verify/dedup block short-circuits safely.
   const cleanFindings = findings.map((fd) => (fd && scoutLooksGarbled(fd)) ? null : fd)
-  const merged = mergeFindings(cleanFindings, A.files)
+  const mergedThisBatch = mergeFindings(cleanFindings, A.files)
   headingConflicts = findHeadingConflicts(cleanFindings, A.files, A.headingPolicy)
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
@@ -718,13 +930,16 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
   // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
-  const doVerify = A.verifyDepth !== 'none' && (merged.people.length || merged.brands.length || merged.terms.length)
-  const vc = doVerify ? verifyChunks(merged, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
+  // P2: don't re-verify entities the prior glossary already confirmed — verify only this batch's new ones.
+  const verifyTarget = excludeVerified(mergedThisBatch, prior)
+  if (prior) { const sk = (mergedThisBatch.people.length + mergedThisBatch.brands.length + mergedThisBatch.terms.length) - (verifyTarget.people.length + verifyTarget.brands.length + verifyTarget.terms.length); if (sk > 0) engine.log(`核实缓存：跳过 ${sk} 项往次已核实实体，本轮只核新实体`) }
+  const doVerify = A.verifyDepth !== 'none' && (verifyTarget.people.length || verifyTarget.brands.length || verifyTarget.terms.length)
+  const vc = doVerify ? verifyChunks(verifyTarget, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
   if (doVerify) {
     engine.log(`核实：${vc.eligible} 项分 ${vc.chunks.length} 块并行送检${vc.excluded > 0 ? `，${vc.excluded} 项低优先级未送检（由精校按原文归一）` : ''}`)
     if (vc.overflow > 0) engine.log(`核实：实体过多，${vc.overflow} 项超出 ${VERIFY_CHUNK * MAX_CHUNKS} 上限未送检`)
   }
-  const dedupList = dedupListText(merged)
+  const dedupList = dedupListText(mergedThisBatch)
   const [vparts, dedupRes] = await engine.parallel([
     () => vc.chunks.length
       ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, schema: VERIFY_SCHEMA })))
@@ -745,9 +960,18 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
     netUnverified = pickNetworkUnverified(verified)
     if (netUnverified.length) engine.log(`其中 ${netUnverified.length} 项因网络故障未核实——收尾时可向用户提供补核选项（networkUnverified）`)
   }
+  conflicts = prior ? glossaryConflicts(prior, verified) : []
+  if (conflicts.length) engine.log(`核实冲突：${conflicts.length} 项本轮核实与往次校对表不一致——并入 openQuestions 待人工确认（未自动改写）`)
   dedup = dedupRes ? { suspects: cleanSuspects(dedupRes.suspects) } : null
   if (dedup && dedup.suspects.length) engine.log(`疑似同指：标记 ${dedup.suspects.length} 组待人工确认`)
-  glossary = renderGlossary(merged, verified, dedup, A)
+  // Accumulate this batch into the prior glossary (P1): verify/dedup ran on this batch's findings;
+  // prior conclusions are carried forward (not re-verified). Render the cumulative glossary — refine
+  // below reads it, so 写法 stay consistent across the company's whole interview set.
+  const merged = prior ? mergeIntoPrior(prior, mergedThisBatch) : mergedThisBatch
+  const allVerified = prior ? mergeVerified(prior.verified, verified) : verified
+  const allDedup = prior ? { suspects: mergeDedup(prior.dedupSuspects, (dedup && dedup.suspects) || []) } : dedup
+  if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
+  glossary = renderGlossary(merged, allVerified, allDedup, A)
 
   let positional = []
   if (scope.includes('refine')) {
@@ -807,7 +1031,7 @@ return {
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts),
   summary,
   timeline,
 }

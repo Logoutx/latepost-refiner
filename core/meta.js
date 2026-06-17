@@ -16,6 +16,9 @@ export const meta = {
 //   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
 //   models?: {scout,verify,refine,summary,timeline},
+//   priorGlossaryText?: full text of an existing <outputDir>/校对表.md (per-company persistent glossary, P1) —
+//     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
+//   fresh?: true to ignore any prior glossary and rebuild from scratch.
 //   files: [{ path, label, lines, bytes?, title, subtitle, outPath, speakerHints?, notes? }] }
 //   (bytes optional: from pre-flight `wc -c`; used to shrink the read pagination by density to avoid over-limit truncation)
 

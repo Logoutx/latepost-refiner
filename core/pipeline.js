@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, findHeadingConflicts, renderGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, findHeadingConflicts, renderGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, checkPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 export async function runPipeline(A, engine) {
@@ -16,6 +16,15 @@ if (!Array.isArray(A.files) || A.files.length === 0) {
 if ((scope.includes('summary') || scope.includes('timeline') || scope.includes('logic')) && !scope.includes('refine')) {
   return EMPTY_RETURN('summary/时间线/逻辑顺序稿依赖本会话 refine 产物，scope 须同时含 refine（本工作流不支持只对历史成稿单独出交付物）')
 }
+
+// Persistent per-company glossary (P1): if Step 0 found an existing 校对表.md and passed its text,
+// parse it into prior memory to seed scout + accumulate into. A.fresh forces a from-scratch rebuild.
+// Attached to A so scoutPrompt can read it. Absent/empty → null → behaviour identical to a first run.
+const prior = (A.priorGlossaryText && !A.fresh) ? parseGlossary(A.priorGlossaryText) : null
+A.prior = prior
+A.doNotMerge = (prior && prior.doNotMerge) || []   // P4: human-confirmed distinct referents, carried forward to dedup + render
+let conflicts = []                                  // P4: this batch's verify conclusions that disagree with the prior glossary
+if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人名 / ${prior.brands.length} 品牌 / ${prior.terms.length} 术语、${(prior.verified.resolved || []).length} 条核实结论——本轮在其上累积`)
 
 let glossary = ''
 let netUnverified = []
@@ -59,7 +68,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   // Refine for that file still runs normally (it reads the source file directly, not the scout output); scoutSuspect still prompts the user to re-run scout for that file.
   // If every scout is garbled, cleanFindings is all-null → merged lists are all empty → doVerify is naturally false and dedupList is empty, so the whole verify/dedup block short-circuits safely.
   const cleanFindings = findings.map((fd) => (fd && scoutLooksGarbled(fd)) ? null : fd)
-  const merged = mergeFindings(cleanFindings, A.files)
+  const mergedThisBatch = mergeFindings(cleanFindings, A.files)
   headingConflicts = findHeadingConflicts(cleanFindings, A.files, A.headingPolicy)
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
@@ -67,13 +76,16 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
   // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
-  const doVerify = A.verifyDepth !== 'none' && (merged.people.length || merged.brands.length || merged.terms.length)
-  const vc = doVerify ? verifyChunks(merged, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
+  // P2: don't re-verify entities the prior glossary already confirmed — verify only this batch's new ones.
+  const verifyTarget = excludeVerified(mergedThisBatch, prior)
+  if (prior) { const sk = (mergedThisBatch.people.length + mergedThisBatch.brands.length + mergedThisBatch.terms.length) - (verifyTarget.people.length + verifyTarget.brands.length + verifyTarget.terms.length); if (sk > 0) engine.log(`核实缓存：跳过 ${sk} 项往次已核实实体，本轮只核新实体`) }
+  const doVerify = A.verifyDepth !== 'none' && (verifyTarget.people.length || verifyTarget.brands.length || verifyTarget.terms.length)
+  const vc = doVerify ? verifyChunks(verifyTarget, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
   if (doVerify) {
     engine.log(`核实：${vc.eligible} 项分 ${vc.chunks.length} 块并行送检${vc.excluded > 0 ? `，${vc.excluded} 项低优先级未送检（由精校按原文归一）` : ''}`)
     if (vc.overflow > 0) engine.log(`核实：实体过多，${vc.overflow} 项超出 ${VERIFY_CHUNK * MAX_CHUNKS} 上限未送检`)
   }
-  const dedupList = dedupListText(merged)
+  const dedupList = dedupListText(mergedThisBatch)
   const [vparts, dedupRes] = await engine.parallel([
     () => vc.chunks.length
       ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, schema: VERIFY_SCHEMA })))
@@ -94,9 +106,18 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
     netUnverified = pickNetworkUnverified(verified)
     if (netUnverified.length) engine.log(`其中 ${netUnverified.length} 项因网络故障未核实——收尾时可向用户提供补核选项（networkUnverified）`)
   }
+  conflicts = prior ? glossaryConflicts(prior, verified) : []
+  if (conflicts.length) engine.log(`核实冲突：${conflicts.length} 项本轮核实与往次校对表不一致——并入 openQuestions 待人工确认（未自动改写）`)
   dedup = dedupRes ? { suspects: cleanSuspects(dedupRes.suspects) } : null
   if (dedup && dedup.suspects.length) engine.log(`疑似同指：标记 ${dedup.suspects.length} 组待人工确认`)
-  glossary = renderGlossary(merged, verified, dedup, A)
+  // Accumulate this batch into the prior glossary (P1): verify/dedup ran on this batch's findings;
+  // prior conclusions are carried forward (not re-verified). Render the cumulative glossary — refine
+  // below reads it, so 写法 stay consistent across the company's whole interview set.
+  const merged = prior ? mergeIntoPrior(prior, mergedThisBatch) : mergedThisBatch
+  const allVerified = prior ? mergeVerified(prior.verified, verified) : verified
+  const allDedup = prior ? { suspects: mergeDedup(prior.dedupSuspects, (dedup && dedup.suspects) || []) } : dedup
+  if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
+  glossary = renderGlossary(merged, allVerified, allDedup, A)
 
   let positional = []
   if (scope.includes('refine')) {
@@ -156,7 +177,7 @@ return {
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts),
   summary,
   timeline,
 }
