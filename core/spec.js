@@ -405,7 +405,10 @@ export function renderGlossary(merged, verified, dedup, a) {
 // (observed in the wild: groups with members < 2, or why = “撤回 / 不适用” noise).
 export function cleanSuspects(suspects) {
   return (suspects || [])
-    .filter((s) => s && (s.members || []).length >= 2 && !/撤回|不适用|不适合|不属于|仅供参考/.test(s.why || ''))
+    // require ≥ 2 DISTINCT members: a self-duplicate group (e.g. 真鲜纯/真鲜纯, from a scout listing one
+    // term under both brand and term) is noise — and as a directive it would render an empty-left
+    // “ → 统一写 **X**” line. A real same-referent group always has ≥ 2 distinct spellings.
+    .filter((s) => s && new Set((s.members || []).map((m) => stripDesc(m))).size >= 2 && !/撤回|不适用|不适合|不属于|仅供参考/.test(s.why || ''))
     .map((s) => Object.assign({}, s, { kind: s.kind || '未标类', why: s.why || '' }))
 }
 
