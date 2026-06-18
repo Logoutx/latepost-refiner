@@ -1,0 +1,170 @@
+// ===== Shared runtime layer =====
+// Engine selection + file prep + a one-call runJob(), used by BOTH the CLI (cli.js) and
+// the local web server (server.js) so provider quirks and docx-conversion live in one place.
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
+import { runPipeline } from '../core/pipeline.js'
+import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
+import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
+import { makeApiEngine } from '../engines/api.js'
+import { makeOpenAIEngine } from '../engines/openai.js'
+import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
+
+export const CONVERT_EXT = new Set(['.docx', '.pptx', '.xlsx', '.pdf'])
+export const HEADING_RE = /^(#{1,3}\s|【.+】\s*$|第[一二三四五六七八九十0-9]+[、.．]\s*\S)/m
+// Strip a leading date prefix (2025-02-21_ / 2025-02-21 ) from a filename stem for the title.
+export const deriveTitle = (src) => path.basename(src, path.extname(src)).replace(/^\d{4}-\d{2}-\d{2}[_\s]+/, '').trim()
+
+export function convertToMarkdown(src, workDir) {
+  const ext = path.extname(src).toLowerCase()
+  if (!CONVERT_EXT.has(ext)) return src // .txt / .md used as-is
+  fs.mkdirSync(workDir, { recursive: true })
+  const dest = path.join(workDir, path.basename(src, ext) + '.md')
+  try {
+    const md = execFileSync('markitdown', [src], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+    fs.writeFileSync(dest, md, 'utf8')
+    return dest
+  } catch (e) {
+    throw new Error(`无法转换 ${path.basename(src)} → markdown：需要 markitdown（pipx install markitdown，置于 PATH）。原始错误：${e.message}`)
+  }
+}
+
+// Build one file entry from a source path (convert, count lines/bytes, detect headings,
+// derive title / subtitle / outPath). Returns { entry, hasHeadings, headingWarning }.
+export function prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) {
+  const mdPath = convertToMarkdown(src, workDir)
+  const content = fs.readFileSync(mdPath, 'utf8')
+  const lines = content.split('\n').length
+  const bytes = Buffer.byteLength(content, 'utf8')
+  const hasHeadings = HEADING_RE.test(content)
+  const title = deriveTitle(src)
+  const entry = {
+    path: mdPath, label: title, title,
+    subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
+    outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
+    lines, bytes,
+  }
+  const headingWarning = hasHeadings && headingPolicy === 'none'
+    ? `${path.basename(src)} 疑似已带小标题，而 headingPolicy=none——可用 headingPolicy=keep|regenerate 重跑该份`
+    : null
+  return { entry, hasHeadings, headingWarning }
+}
+
+const allTiers = (id) => ({ haiku: id, sonnet: id, opus: id, fable: id })
+
+// Select the engine for a provider. apiKey (if given) overrides the env lookup — the web
+// UI passes the key the user typed; the CLI passes nothing and falls back to env vars.
+// modelOverride (if given) pins every tier to one model id (used by per-category routing).
+export function selectEngine({ provider = 'anthropic', baseURL, concurrency, apiKey, modelOverride, env = process.env, onPhase, onLog }) {
+  provider = String(provider).toLowerCase()
+  if (provider === 'anthropic') {
+    const key = apiKey || env.ANTHROPIC_API_KEY
+    if (!key) throw new Error('未设 ANTHROPIC_API_KEY')
+    return { provider, engine: makeApiEngine({ apiKey: key, concurrency, models: modelOverride ? allTiers(modelOverride) : undefined, onPhase, onLog }), info: { label: 'Anthropic', baseURL: 'default', keyVar: 'ANTHROPIC_API_KEY' } }
+  }
+  const cfg = PROVIDERS[provider]
+  if (!cfg) throw new Error(`未知 provider「${provider}」。可选：anthropic, ${PROVIDER_NAMES.join(', ')}`)
+  const found = resolveKey(provider, env)
+  const key = apiKey || found.key
+  if (!key) throw new Error(`未设 ${cfg.keyEnv.join(' / ')}（${cfg.label} 的 API key）`)
+  const url = baseURL || cfg.baseURL
+  return {
+    provider,
+    engine: makeOpenAIEngine({ apiKey: key, baseURL: url, models: modelOverride ? allTiers(modelOverride) : cfg.models, maxTokensParam: cfg.maxTokensParam, forceStructured: cfg.forceStructured, nativeSearch: cfg.nativeSearch, concurrency, onPhase, onLog }),
+    info: { label: cfg.label, baseURL: url, keyVar: apiKey ? cfg.keyEnv[0] : found.varName, note: cfg.note },
+  }
+}
+
+// Build a router engine from a per-category config (web UI's "按类别混合"). Sub-engines with
+// identical (provider, key, baseURL, model) are shared so they also share one concurrency limit.
+// categories: { mechanical:{provider,apiKey,baseURL,modelOverride}, web:{...,tavilyKey}, correction:{...}, smart:{...} }
+export function buildRouterEngine({ categories, concurrency, env = process.env, onPhase, onLog }) {
+  const cache = new Map()
+  const sig = (c) => [c.provider, c.apiKey || '', c.baseURL || '', c.modelOverride || ''].join('')
+  const engines = {}
+  for (const key of CATEGORY_KEYS) {
+    const c = categories && categories[key]
+    if (!c || !c.provider) throw new Error(`类别「${key}」未配置 provider/key`)
+    const s = sig(c)
+    if (!cache.has(s)) cache.set(s, selectEngine({ provider: c.provider, apiKey: c.apiKey, baseURL: c.baseURL, modelOverride: c.modelOverride, concurrency, env, onLog }).engine)
+    engines[key] = cache.get(s)
+  }
+  return makeRouterEngine({ engines, onPhase, onLog })
+}
+
+// Persist the returned glossary (pure-JS output; no agent writes it). Cumulative across runs.
+export function persistGlossary(result, glossaryPath) {
+  if (result.glossary && result.glossary !== SINGLE_FILE_GLOSSARY) {
+    fs.mkdirSync(path.dirname(glossaryPath), { recursive: true })
+    fs.writeFileSync(glossaryPath, result.glossary, 'utf8')
+    return true
+  }
+  return false
+}
+
+// One-call run used by the web server. `files` are uploads: [{ name, base64 }] (raw bytes,
+// any type — docx/pdf converted via markitdown). onPhase/onLog stream progress.
+export async function runJob(params, { onPhase, onLog } = {}) {
+  const {
+    provider = 'anthropic', apiKey, baseURL, tavilyKey,
+    files = [], topic = 'untitled', date = '', background = '',
+    scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
+    models, outputDir, fresh = false, concurrency,
+    skillDir,
+  } = params
+  if (!files.length) throw new Error('未提供任何文件')
+  const outDir = path.resolve(outputDir || `${process.env.HOME}/Documents/Research/${topic}`)
+  const workDir = path.join(outDir, '.uploads')
+  fs.mkdirSync(workDir, { recursive: true })
+
+  // 1. materialize uploads to disk, then prepare each
+  const fileEntries = []
+  const warnings = []
+  for (const f of files) {
+    if (!f || !f.name) continue
+    const src = path.join(workDir, path.basename(f.name))
+    fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
+    const { entry, headingWarning } = prepareFile(src, { topic, date, headingPolicy, outputDir: outDir, workDir })
+    if (headingWarning) warnings.push(headingWarning)
+    fileEntries.push(entry)
+  }
+
+  // 2. prior glossary (persistent per-company校对表)
+  const glossaryPath = path.join(outDir, '校对表.md')
+  let priorGlossaryText
+  if (!fresh && fs.existsSync(glossaryPath)) priorGlossaryText = fs.readFileSync(glossaryPath, 'utf8')
+
+  // 3. engine. Three modes: an injected engine (tests), per-category routing (web UI's
+  //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
+  //    run from the web category's key (or the top-level tavilyKey).
+  const categories = params.categories
+  const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
+  const prevTavily = process.env.TAVILY_API_KEY
+  if (webTavily) process.env.TAVILY_API_KEY = webTavily
+  let sel
+  if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
+  else if (categories) sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
+  else sel = selectEngine({ provider, baseURL, concurrency, apiKey, onPhase, onLog })
+
+  const A = {
+    topic, date, background, outputDir: outDir,
+    skillDir: skillDir || DEFAULT_SKILL_DIR,
+    scope, verifyDepth, headingPolicy, models, priorGlossaryText, fresh, files: fileEntries,
+  }
+
+  try {
+    const r = await runPipeline(A, sel.engine)
+    const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
+    return { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+  } finally {
+    if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
+  }
+}
+
+export { PROVIDERS, PROVIDER_NAMES }

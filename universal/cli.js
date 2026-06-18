@@ -13,10 +13,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync } from 'node:child_process'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
-import { makeApiEngine } from '../engines/api.js'
+import { selectEngine, prepareFile } from './jobs.js'
+
+// re-exported for tests (definitions live in jobs.js, the shared runtime)
+export { deriveTitle, HEADING_RE } from './jobs.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -31,7 +33,7 @@ export function parseArgs(argv) {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
-    '--background-file': 'backgroundFile',
+    '--background-file': 'backgroundFile', '--base-url': 'baseURL',
   }
   let i = 0
   while (i < argv.length) {
@@ -59,29 +61,6 @@ export const parseModels = (s) => {
   return m
 }
 
-// ---------- pre-flight: docx/pdf → md ----------
-const CONVERT_EXT = new Set(['.docx', '.pptx', '.xlsx', '.pdf'])
-
-function convertToMarkdown(src, workDir) {
-  const ext = path.extname(src).toLowerCase()
-  if (!CONVERT_EXT.has(ext)) return src // .txt / .md used as-is
-  fs.mkdirSync(workDir, { recursive: true })
-  const dest = path.join(workDir, path.basename(src, ext) + '.md')
-  // markitdown handles docx/pptx/xlsx/pdf (per the user's document-conversion convention).
-  try {
-    const md = execFileSync('markitdown', [src], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
-    fs.writeFileSync(dest, md, 'utf8')
-    return dest
-  } catch (e) {
-    throw new Error(`无法转换 ${path.basename(src)} → markdown：需要 markitdown（pipx install markitdown，置于 PATH）。原始错误：${e.message}`)
-  }
-}
-
-export const HEADING_RE = /^(#{1,3}\s|【.+】\s*$|第[一二三四五六七八九十0-9]+[、.．]\s*\S)/m
-
-// Strip a leading date prefix (2025-02-21_ / 2025-02-21 ) from a filename stem for the title.
-export const deriveTitle = (src) => path.basename(src, path.extname(src)).replace(/^\d{4}-\d{2}-\d{2}[_\s]+/, '').trim()
-
 async function main() {
   const a = parseArgs(process.argv.slice(2))
 
@@ -107,6 +86,13 @@ async function main() {
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
   --fresh                忽略既有 校对表.md，从零重建
+
+模型来源:
+  --provider <名>        anthropic（默认）| deepseek | glm | kimi | openai
+  --base-url <URL>       覆盖 provider 默认 endpoint（如 GLM 国际站 api.z.ai、Kimi 国内 .cn）
+  key 环境变量           anthropic→ANTHROPIC_API_KEY · deepseek→DEEPSEEK_API_KEY ·
+                         glm→ZHIPUAI_API_KEY/ZAI_API_KEY · kimi→MOONSHOT_API_KEY · openai→OPENAI_API_KEY
+  联网核实（非 anthropic）需 TAVILY_API_KEY（否则 verify/timeline 降级；refine 精校不联网、不受影响）
 `)
     process.exit(process.argv.length <= 2 ? 1 : 0)
   }
@@ -124,31 +110,18 @@ async function main() {
     console.error(`警告：${skillDir}/references/deliverables.md 不存在——总结/时间线/逻辑稿的结构模板将读不到。用 --skill-dir 指向含 references/ 的目录。`)
   }
 
-  // Build files[] (convert, count lines/bytes, detect headings).
+  // Build files[] via the shared runtime (convert docx/pdf, count lines/bytes, detect headings).
   const workDir = path.join(outputDir, '.converted')
   const headingPolicy = a.headingPolicy || 'none'
   const files = []
   for (const raw of a.files) {
     const src = path.resolve(raw)
     if (!fs.existsSync(src)) { console.error(`错误：找不到文件 ${src}`); process.exit(2) }
-    const mdPath = convertToMarkdown(src, workDir)
-    const content = fs.readFileSync(mdPath, 'utf8')
-    const lines = content.split('\n').length
-    const bytes = Buffer.byteLength(content, 'utf8')
-    const hasHeadings = HEADING_RE.test(content)
-    if (hasHeadings && headingPolicy === 'none') {
-      console.error(`提示：${path.basename(src)} 疑似已带小标题，而 --heading-policy=none；流水线会在 headingConflicts 中提示，按需用 --heading-policy keep|regenerate 重跑。`)
-    }
-    const title = deriveTitle(src)
-    files.push({
-      path: mdPath,
-      label: title,
-      title,
-      subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
-      outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
-      lines,
-      bytes,
-    })
+    let prepared
+    try { prepared = prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) }
+    catch (e) { console.error('错误：' + e.message); process.exit(2) }
+    if (prepared.headingWarning) console.error('提示：' + prepared.headingWarning)
+    files.push(prepared.entry)
   }
 
   // Persistent per-company glossary (P1): seed from an existing 校对表.md unless --fresh.
@@ -170,10 +143,20 @@ async function main() {
     files,
   }
 
-  const engine = makeApiEngine({
-    apiKey: process.env.ANTHROPIC_API_KEY,
-    concurrency: a.concurrency ? Number(a.concurrency) : undefined,
-  })
+  // Engine: anthropic (native server-side web search) or an OpenAI-compatible provider,
+  // selected by the shared runtime (reads the right key env; --base-url overrides endpoint).
+  const concurrency = a.concurrency ? Number(a.concurrency) : undefined
+  let sel
+  try { sel = selectEngine({ provider: a.provider, baseURL: a.baseURL, concurrency }) }
+  catch (e) { console.error('错误：' + e.message); process.exit(2) }
+  const engine = sel.engine
+  if (sel.provider !== 'anthropic') {
+    console.error(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
+    if (sel.info.note) console.error(`注意：${sel.info.note}`)
+    if (!process.env.TAVILY_API_KEY && (A.scope.includes('timeline') || A.verifyDepth !== 'none')) {
+      console.error('提示：未设 TAVILY_API_KEY——非 anthropic provider 的联网核实/时间线将降级（refine 不受影响）。')
+    }
+  }
 
   const t0 = Date.now()
   console.error(`\n开始：${files.length} 份文件 · scope=${A.scope.join(',')} · verify=${A.verifyDepth} · 输出 ${outputDir}\n`)
