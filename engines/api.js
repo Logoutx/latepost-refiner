@@ -27,7 +27,7 @@
 import os from 'node:os'
 import Anthropic from '@anthropic-ai/sdk'
 import pLimit from 'p-limit'
-import { TOOL_SPECS, runFileTool } from './fileops.js'
+import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
 
 // Tier name → model id. core/pipeline.js passes tier names ('haiku','sonnet','opus')
 // plus the literal 'haiku' for completeness checks; a full id passes through unchanged.
@@ -51,21 +51,21 @@ function maxTokensFor(modelId) {
 // Adaptive thinking helps the high-judgment tiers; Haiku 4.5 is left without a thinking config.
 const thinkingFor = (modelId) => (/opus|sonnet|fable/.test(modelId) ? { type: 'adaptive' } : undefined)
 
-// Server-side web tools (GA, dynamic filtering, no beta header). Given to every agent;
-// the prompts that must not search ("不联网") simply don't — same as the Claude Code build,
-// where subagents carry the full toolset and the prompt governs use.
+// Server-side web tools (GA, dynamic filtering, no beta header). Only verify/timeline
+// agents receive these tools; offline stages should not be able to browse.
 const WEB_TOOLS = [
   { type: 'web_search_20260209', name: 'web_search' },
   { type: 'web_fetch_20260209', name: 'web_fetch' },
 ]
+const ONLINE_LABEL = /^(verify|timeline)/
 
 // Client-side tools (shared logic in fileops.js), in Anthropic tool shape.
 const CLIENT_TOOLS = TOOL_SPECS.map((s) => ({ name: s.name, description: s.description, input_schema: s.parameters }))
 
 const MAX_TURNS = 100 // tool-loop ceiling per agent (reads + writes + edits + searches + nudges)
 
-function execTool(tu) {
-  const r = runFileTool(tu.name, tu.input || {})
+function execTool(tu, filePolicy) {
+  const r = runFileTool(tu.name, tu.input || {}, filePolicy)
   const block = { type: 'tool_result', tool_use_id: tu.id, content: r.text }
   if (!r.ok) block.is_error = true
   return block
@@ -76,6 +76,7 @@ export function makeApiEngine(opts = {}) {
     apiKey = process.env.ANTHROPIC_API_KEY,
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     models, // optional tier→model-id override (e.g. {opus:'claude-fable-5'}); else MODEL_IDS
+    filePolicy,
     onPhase,
     onLog,
   } = opts
@@ -85,6 +86,7 @@ export function makeApiEngine(opts = {}) {
 
   const client = opts.client || new Anthropic({ apiKey, maxRetries: 4 })
   const limit = pLimit(concurrency)
+  const safeFilePolicy = makeFilePolicy(filePolicy)
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
@@ -116,7 +118,8 @@ export function makeApiEngine(opts = {}) {
   async function runAgent(prompt, { model, schema, label } = {}) {
     const modelId = resolveModelFor(model)
     const thinking = thinkingFor(modelId)
-    const tools = [...CLIENT_TOOLS, ...WEB_TOOLS]
+    const tools = [...CLIENT_TOOLS]
+    if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) {
       tools.push({
         name: 'structured_output',
@@ -147,7 +150,7 @@ export function makeApiEngine(opts = {}) {
 
       const clientUses = toolUses.filter((b) => b.name !== 'structured_output')
       if (clientUses.length) {
-        messages.push({ role: 'user', content: clientUses.map(execTool) })
+        messages.push({ role: 'user', content: clientUses.map((tu) => execTool(tu, safeFilePolicy)) })
         continue
       }
 

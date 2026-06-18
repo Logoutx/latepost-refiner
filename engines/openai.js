@@ -4,11 +4,9 @@
 // engines/api.js (the Anthropic engine) so the same core/ prompts, schemas, and pipeline
 // run unchanged; only the wire format and a few per-provider quirks differ.
 //
-// Client tools Read/Write/Edit share fileops.js. Web verification uses CLIENT-side
-// web_search (Tavily, gated on TAVILY_API_KEY) + web_fetch (plain fetch) — these providers
-// have no Anthropic-style server search, so verify/timeline degrade gracefully without a
-// search backend (entities go to unresolved via the prompt's circuit-breaker). 精校
-// (refine), which never goes online, is unaffected.
+// Client tools Read/Write/Edit share fileops.js. Online stages either use a provider
+// native search tool (where available) or CLIENT-side web_search (Tavily, gated on
+// TAVILY_API_KEY) + web_fetch (plain fetch). Offline stages never receive web tools.
 //
 // Structured output: a `structured_output` function tool the model is told to call. When
 // it ends a turn without calling it: nudge, then (forceStructured providers) force it via
@@ -18,7 +16,7 @@
 import os from 'node:os'
 import OpenAI from 'openai'
 import pLimit from 'p-limit'
-import { TOOL_SPECS, runFileTool } from './fileops.js'
+import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
 
 const MAX_TURNS = 100
 const toFn = (s) => ({ type: 'function', function: { name: s.name, description: s.description, parameters: s.parameters } })
@@ -52,7 +50,7 @@ function parseJSON(s) {
 
 async function webSearch(query) {
   const key = process.env.TAVILY_API_KEY
-  if (!key) return 'web_search 不可用：未配置 TAVILY_API_KEY（这些 provider 无内置联网搜索；联网核实需设 TAVILY_API_KEY，或改用 --provider anthropic 自带服务端搜索）。'
+  if (!key) return 'web_search 不可用：未配置 TAVILY_API_KEY（当前 provider 未使用原生联网搜索；联网核实需设 TAVILY_API_KEY，或改用带原生搜索的 provider）。'
   try {
     const r = await fetch('https://api.tavily.com/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -85,12 +83,14 @@ export function makeOpenAIEngine(opts = {}) {
     forceStructured = true,
     nativeSearch = null, // provider native web search: { tool, echo? } — used on online stages
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
+    filePolicy,
     onPhase, onLog,
   } = opts
   if (!opts.client && !apiKey) throw new Error('makeOpenAIEngine: 缺少 API key')
 
   const client = opts.client || new OpenAI({ apiKey, baseURL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
+  const safeFilePolicy = makeFilePolicy(filePolicy)
   const usage = { input: 0, output: 0, agents: 0, failed: 0 }
   const resolveModel = (m) => models[m] || m || models.opus || 'gpt-4o'
 
@@ -108,7 +108,7 @@ export function makeOpenAIEngine(opts = {}) {
     const args = parseJSON(call.function && call.function.arguments) || {}
     if (name === 'web_search') return await webSearch(args.query || '')
     if (name === 'web_fetch') return await webFetch(args.url || '')
-    return runFileTool(name, args).text // Read / Write / Edit
+    return runFileTool(name, args, safeFilePolicy).text // Read / Write / Edit
   }
 
   // Last-resort structured output when the model won't call the tool on its own.
@@ -145,10 +145,10 @@ export function makeOpenAIEngine(opts = {}) {
   async function runAgent(prompt, { model, schema, label } = {}) {
     const modelId = resolveModel(model)
     const tools = [...FILE_TOOLS]
-    if (ONLINE_LABEL.test(label || '') && nativeSearch && nativeSearch.tool) {
-      tools.push(nativeSearch.tool, WEB_FETCH_TOOL) // provider native search + client fetch
-    } else {
-      tools.push(...WEB_TOOLS) // client Tavily search + fetch
+    const online = ONLINE_LABEL.test(label || '')
+    if (online) {
+      if (nativeSearch && nativeSearch.tool) tools.push(nativeSearch.tool, WEB_FETCH_TOOL) // provider native search + client fetch
+      else tools.push(...WEB_TOOLS) // client Tavily search + fetch
     }
     if (schema) tools.push(structuredTool(schema))
     const content = schema

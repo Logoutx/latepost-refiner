@@ -9,10 +9,55 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 const MAX_LINE = 2000 // truncate pathologically long lines in Read output
+const DEFAULT_POLICY = Object.freeze({
+  readRoots: [process.cwd()],
+  writeRoots: [process.cwd()],
+  readPaths: [],
+  writePaths: [],
+})
 
-export function readFile(input = {}) {
-  const fp = input.file_path
-  if (!fp) return { ok: false, text: 'Read: 缺少 file_path' }
+const asArray = (v) => Array.isArray(v) ? v : (v ? [v] : [])
+const uniq = (xs) => Array.from(new Set(xs.filter(Boolean)))
+const resolveList = (xs) => uniq(asArray(xs).map((x) => path.resolve(String(x))))
+
+export function makeFilePolicy(policy = {}) {
+  return {
+    readRoots: resolveList(policy.readRoots || DEFAULT_POLICY.readRoots),
+    writeRoots: resolveList(policy.writeRoots || DEFAULT_POLICY.writeRoots),
+    readPaths: resolveList(policy.readPaths || DEFAULT_POLICY.readPaths),
+    writePaths: resolveList(policy.writePaths || DEFAULT_POLICY.writePaths),
+  }
+}
+
+function insideRoot(target, root) {
+  const rel = path.relative(root, target)
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+function allowed(target, roots, exactPaths) {
+  const abs = path.resolve(String(target || ''))
+  return exactPaths.includes(abs) || roots.some((root) => insideRoot(abs, root))
+}
+
+function checkAccess(kind, filePath, policy) {
+  if (!filePath) return { ok: false, text: `${kind}: 缺少 file_path` }
+  const p = makeFilePolicy(policy)
+  const abs = path.resolve(String(filePath))
+  const roots = kind === 'Read' ? p.readRoots : p.writeRoots
+  const exact = kind === 'Read'
+    ? uniq([...p.readPaths, ...p.writePaths])
+    : p.writePaths
+  if (!allowed(abs, roots, exact)) {
+    const hint = roots.concat(exact).join('；') || '（无）'
+    return { ok: false, text: `${kind}: 路径不在允许范围内: ${abs}；允许范围: ${hint}` }
+  }
+  return { ok: true, path: abs }
+}
+
+export function readFile(input = {}, policy) {
+  const access = checkAccess('Read', input.file_path, policy)
+  if (!access.ok) return access
+  const fp = access.path
   if (!fs.existsSync(fp)) return { ok: false, text: `Read: 文件不存在: ${fp}` }
   const all = fs.readFileSync(fp, 'utf8').split('\n')
   const start = Math.max(0, Number(input.offset) || 0)
@@ -25,20 +70,23 @@ export function readFile(input = {}) {
   return { ok: true, text: body }
 }
 
-export function writeFile(input = {}) {
-  const fp = input.file_path
-  if (!fp) return { ok: false, text: 'Write: 缺少 file_path' }
+export function writeFile(input = {}, policy) {
+  const access = checkAccess('Write', input.file_path, policy)
+  if (!access.ok) return access
+  const fp = access.path
   const content = input.content == null ? '' : String(input.content)
   fs.mkdirSync(path.dirname(fp), { recursive: true })
   fs.writeFileSync(fp, content, 'utf8')
   return { ok: true, text: `已写入 ${Buffer.byteLength(content, 'utf8')} 字节 → ${fp}` }
 }
 
-export function editFile(input = {}) {
-  const fp = input.file_path
+export function editFile(input = {}, policy) {
+  const access = checkAccess('Edit', input.file_path, policy)
+  if (!access.ok) return access
+  const fp = access.path
   const oldStr = input.old_string
   const newStr = input.new_string == null ? '' : String(input.new_string)
-  if (!fp || oldStr == null) return { ok: false, text: 'Edit: 缺少 file_path 或 old_string' }
+  if (oldStr == null) return { ok: false, text: 'Edit: 缺少 old_string' }
   if (oldStr === '') return { ok: false, text: 'Edit: old_string 不能为空' }
   if (!fs.existsSync(fp)) return { ok: false, text: `Edit: 文件不存在: ${fp}` }
   let text = fs.readFileSync(fp, 'utf8')
@@ -51,11 +99,11 @@ export function editFile(input = {}) {
 }
 
 // Dispatch by tool name; never throws (errors → { ok:false }).
-export function runFileTool(name, input) {
+export function runFileTool(name, input, policy) {
   try {
-    if (name === 'Read') return readFile(input)
-    if (name === 'Write') return writeFile(input)
-    if (name === 'Edit') return editFile(input)
+    if (name === 'Read') return readFile(input, policy)
+    if (name === 'Write') return writeFile(input, policy)
+    if (name === 'Edit') return editFile(input, policy)
     return { ok: false, text: `未知工具: ${name}` }
   } catch (e) {
     return { ok: false, text: `${name} 执行出错: ${e.message}` }

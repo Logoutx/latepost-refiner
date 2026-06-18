@@ -284,7 +284,7 @@ async function handleFiles(fileList) {
   for (const f of arr) picked.push({ name: f.name, base64: await fileToBase64(f) })
   fb.classList.add('has')
   fb.innerHTML = '<b>' + picked.length + ' 份文件已选</b> · 点此重新选择'
-  $('fileList').innerHTML = picked.map(p => `<li>· ${p.name}</li>`).join('')
+  $('fileList').innerHTML = picked.map(p => `<li>· ${esc(p.name)}</li>`).join('')
 }
 
 function getScope() {
@@ -354,18 +354,18 @@ function handleEvent(raw) {
 function renderResult(r) {
   $('resultCard').style.display = 'block'
   const out = []
-  out.push(`<p>provider：<b>${r.providerInfo ? r.providerInfo.label : r.provider}</b>　输出目录：<code>${r.outputDir}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
-  out.push(`<h3 class="ok">精校成稿 ${r.refined.length} 份</h3><ul>` + r.refined.map(x => `<li><code>${x.outPath || x.path}</code></li>`).join('') + '</ul>')
-  if (r.glossaryPath) out.push(`<p>统一校对表：<code>${r.glossaryPath}</code></p>`)
-  const warn = (label, items, fmt) => { if (items && items.length) out.push(`<h3 class="warn">${label}（${items.length}）</h3><ul>` + items.map(fmt || (x => `<li>${typeof x === 'string' ? x : JSON.stringify(x)}</li>`)).join('') + '</ul>') }
+  out.push(`<p>provider：<b>${esc(r.providerInfo ? r.providerInfo.label : r.provider)}</b>　输出目录：<code>${esc(r.outputDir)}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
+  out.push(`<h3 class="ok">精校成稿 ${Number(r.refined.length) || 0} 份</h3><ul>` + r.refined.map(x => `<li><code>${esc(x.outPath || x.path)}</code></li>`).join('') + '</ul>')
+  if (r.glossaryPath) out.push(`<p>统一校对表：<code>${esc(r.glossaryPath)}</code></p>`)
+  const warn = (label, items, fmt) => { if (items && items.length) out.push(`<h3 class="warn">${esc(label)}（${items.length}）</h3><ul>` + items.map(fmt || (x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`)).join('') + '</ul>') }
   warn('未完成（需手动补做）', r.failed)
-  warn('疑似中途截断', r.incomplete, x => `<li><code>${x.path}</code>${x.note ? '：' + x.note : ''}</li>`)
-  warn('结尾完整性未核', r.unchecked, x => `<li><code>${x}</code></li>`)
+  warn('疑似中途截断', r.incomplete, x => `<li><code>${esc(x.path)}</code>${x.note ? '：' + esc(x.note) : ''}</li>`)
+  warn('结尾完整性未核', r.unchecked, x => `<li><code>${esc(x)}</code></li>`)
   warn('侦察疑损坏（校对表该份不可靠）', r.scoutSuspect)
   warn('源文件已带小标题（headingPolicy=none）', r.headingConflicts)
-  warn('疑似同指（待人工确认，未自动合并）', r.suspectedDuplicates, x => `<li>${(x.members || []).join(' / ')}</li>`)
-  warn('因网络故障未核实', r.networkUnverified, x => `<li>${typeof x === 'string' ? x : (x.query || JSON.stringify(x))}</li>`)
-  if (r.logic && r.logic.length) out.push(`<h3>逻辑顺序稿 ${r.logic.filter(l => l.path).length}/${r.logic.length}</h3><ul>` + r.logic.filter(l => l.path).map(l => `<li><code>${l.path}</code></li>`).join('') + '</ul>')
+  warn('疑似同指（待人工确认，未自动合并）', r.suspectedDuplicates, x => `<li>${esc((x.members || []).join(' / '))}</li>`)
+  warn('因网络故障未核实', r.networkUnverified, x => `<li>${esc(typeof x === 'string' ? x : (x.query || JSON.stringify(x)))}</li>`)
+  if (r.logic && r.logic.length) out.push(`<h3>逻辑顺序稿 ${r.logic.filter(l => l.path).length}/${r.logic.length}</h3><ul>` + r.logic.filter(l => l.path).map(l => `<li><code>${esc(l.path)}</code></li>`).join('') + '</ul>')
   if (r.summary) out.push(`<p>访谈总结：${esc(String(r.summary).split('\n')[0])}</p>`)
   if (r.timeline) out.push(`<p>时间线：${esc(String(r.timeline).split('\n')[0])}</p>`)
   if (r.openQuestions && r.openQuestions.length) out.push(`<h3>收尾待问（${r.openQuestions.length}）</h3><ul>` + r.openQuestions.map(q => `<li>${esc(typeof q === 'string' ? q : JSON.stringify(q))}</li>`).join('') + '</ul>')

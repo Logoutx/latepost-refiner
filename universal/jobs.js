@@ -16,6 +16,24 @@ import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
 
+export function loadDotEnv(filePath = path.join(REPO_ROOT, '.env'), env = process.env) {
+  if (!fs.existsSync(filePath)) return false
+  const text = fs.readFileSync(filePath, 'utf8')
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!m || env[m[1]] !== undefined) continue
+    let value = m[2].trim()
+    const quoted = value.match(/^(['"])([\s\S]*)\1$/)
+    if (quoted) value = quoted[2]
+    else value = value.replace(/\s+#.*$/, '').trim()
+    env[m[1]] = value
+  }
+  return true
+}
+loadDotEnv()
+
 export const CONVERT_EXT = new Set(['.docx', '.pptx', '.xlsx', '.pdf'])
 export const HEADING_RE = /^(#{1,3}\s|【.+】\s*$|第[一二三四五六七八九十0-9]+[、.．]\s*\S)/m
 // Strip a leading date prefix (2025-02-21_ / 2025-02-21 ) from a filename stem for the title.
@@ -58,15 +76,25 @@ export function prepareFile(src, { topic, date, headingPolicy, outputDir, workDi
 
 const allTiers = (id) => ({ haiku: id, sonnet: id, opus: id, fable: id })
 
+export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [] }) {
+  const outDir = path.resolve(outputDir || process.cwd())
+  return {
+    readRoots: [outDir, path.resolve(skillDir)],
+    writeRoots: [outDir],
+    readPaths: files.map((f) => f && f.path).filter(Boolean),
+    writePaths: files.map((f) => f && f.outPath).filter(Boolean),
+  }
+}
+
 // Select the engine for a provider. apiKey (if given) overrides the env lookup — the web
 // UI passes the key the user typed; the CLI passes nothing and falls back to env vars.
 // modelOverride (if given) pins every tier to one model id (used by per-category routing).
-export function selectEngine({ provider = 'anthropic', baseURL, concurrency, apiKey, modelOverride, env = process.env, onPhase, onLog }) {
+export function selectEngine({ provider = 'anthropic', baseURL, concurrency, apiKey, modelOverride, filePolicy, env = process.env, onPhase, onLog }) {
   provider = String(provider).toLowerCase()
   if (provider === 'anthropic') {
     const key = apiKey || env.ANTHROPIC_API_KEY
     if (!key) throw new Error('未设 ANTHROPIC_API_KEY')
-    return { provider, engine: makeApiEngine({ apiKey: key, concurrency, models: modelOverride ? allTiers(modelOverride) : undefined, onPhase, onLog }), info: { label: 'Anthropic', baseURL: 'default', keyVar: 'ANTHROPIC_API_KEY' } }
+    return { provider, engine: makeApiEngine({ apiKey: key, concurrency, models: modelOverride ? allTiers(modelOverride) : undefined, filePolicy, onPhase, onLog }), info: { label: 'Anthropic', baseURL: 'default', keyVar: 'ANTHROPIC_API_KEY' } }
   }
   const cfg = PROVIDERS[provider]
   if (!cfg) throw new Error(`未知 provider「${provider}」。可选：anthropic, ${PROVIDER_NAMES.join(', ')}`)
@@ -76,7 +104,7 @@ export function selectEngine({ provider = 'anthropic', baseURL, concurrency, api
   const url = baseURL || cfg.baseURL
   return {
     provider,
-    engine: makeOpenAIEngine({ apiKey: key, baseURL: url, models: modelOverride ? allTiers(modelOverride) : cfg.models, maxTokensParam: cfg.maxTokensParam, forceStructured: cfg.forceStructured, nativeSearch: cfg.nativeSearch, concurrency, onPhase, onLog }),
+    engine: makeOpenAIEngine({ apiKey: key, baseURL: url, models: modelOverride ? allTiers(modelOverride) : cfg.models, maxTokensParam: cfg.maxTokensParam, forceStructured: cfg.forceStructured, nativeSearch: cfg.nativeSearch, concurrency, filePolicy, onPhase, onLog }),
     info: { label: cfg.label, baseURL: url, keyVar: apiKey ? cfg.keyEnv[0] : found.varName, note: cfg.note },
   }
 }
@@ -84,7 +112,7 @@ export function selectEngine({ provider = 'anthropic', baseURL, concurrency, api
 // Build a router engine from a per-category config (web UI's "按类别混合"). Sub-engines with
 // identical (provider, key, baseURL, model) are shared so they also share one concurrency limit.
 // categories: { mechanical:{provider,apiKey,baseURL,modelOverride}, web:{...,tavilyKey}, correction:{...}, smart:{...} }
-export function buildRouterEngine({ categories, concurrency, env = process.env, onPhase, onLog }) {
+export function buildRouterEngine({ categories, concurrency, filePolicy, env = process.env, onPhase, onLog }) {
   const cache = new Map()
   const sig = (c) => [c.provider, c.apiKey || '', c.baseURL || '', c.modelOverride || ''].join('')
   const engines = {}
@@ -92,7 +120,7 @@ export function buildRouterEngine({ categories, concurrency, env = process.env, 
     const c = categories && categories[key]
     if (!c || !c.provider) throw new Error(`类别「${key}」未配置 provider/key`)
     const s = sig(c)
-    if (!cache.has(s)) cache.set(s, selectEngine({ provider: c.provider, apiKey: c.apiKey, baseURL: c.baseURL, modelOverride: c.modelOverride, concurrency, env, onLog }).engine)
+    if (!cache.has(s)) cache.set(s, selectEngine({ provider: c.provider, apiKey: c.apiKey, baseURL: c.baseURL, modelOverride: c.modelOverride, concurrency, filePolicy, env, onLog }).engine)
     engines[key] = cache.get(s)
   }
   return makeRouterEngine({ engines, onPhase, onLog })
@@ -144,17 +172,19 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
   //    run from the web category's key (or the top-level tavilyKey).
   const categories = params.categories
+  const resolvedSkillDir = path.resolve(skillDir || DEFAULT_SKILL_DIR)
+  const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
   const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY
   if (webTavily) process.env.TAVILY_API_KEY = webTavily
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
-  else if (categories) sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
-  else sel = selectEngine({ provider, baseURL, concurrency, apiKey, onPhase, onLog })
+  else if (categories) sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
+  else sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
 
   const A = {
     topic, date, background, outputDir: outDir,
-    skillDir: skillDir || DEFAULT_SKILL_DIR,
+    skillDir: resolvedSkillDir,
     scope, verifyDepth, headingPolicy, models, priorGlossaryText, fresh, files: fileEntries,
   }
 

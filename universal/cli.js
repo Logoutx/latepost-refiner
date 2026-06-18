@@ -15,7 +15,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
-import { selectEngine, prepareFile } from './jobs.js'
+import { selectEngine, prepareFile, buildFilePolicy } from './jobs.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -92,7 +92,7 @@ async function main() {
   --base-url <URL>       覆盖 provider 默认 endpoint（如 GLM 国际站 api.z.ai、Kimi 国内 .cn）
   key 环境变量           anthropic→ANTHROPIC_API_KEY · deepseek→DEEPSEEK_API_KEY ·
                          glm→ZHIPUAI_API_KEY/ZAI_API_KEY · kimi→MOONSHOT_API_KEY · openai→OPENAI_API_KEY
-  联网核实（非 anthropic）需 TAVILY_API_KEY（否则 verify/timeline 降级；refine 精校不联网、不受影响）
+  联网核实              Anthropic/GLM/Kimi 用 provider 原生搜索；DeepSeek/OpenAI 需 TAVILY_API_KEY
 `)
     process.exit(process.argv.length <= 2 ? 1 : 0)
   }
@@ -146,8 +146,9 @@ async function main() {
   // Engine: anthropic (native server-side web search) or an OpenAI-compatible provider,
   // selected by the shared runtime (reads the right key env; --base-url overrides endpoint).
   const concurrency = a.concurrency ? Number(a.concurrency) : undefined
+  const filePolicy = buildFilePolicy({ outputDir, skillDir, files })
   let sel
-  try { sel = selectEngine({ provider: a.provider, baseURL: a.baseURL, concurrency }) }
+  try { sel = selectEngine({ provider: a.provider, baseURL: a.baseURL, concurrency, filePolicy }) }
   catch (e) { console.error('错误：' + e.message); process.exit(2) }
   const engine = sel.engine
   if (sel.provider !== 'anthropic') {

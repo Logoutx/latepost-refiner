@@ -37,7 +37,7 @@ const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': '
 
 // provider metadata for the UI (no secrets). `models` = the tier→id map so the UI can
 // suggest tool-capable model ids; `nativeSearch` flags whether the provider can do web
-// search itself (only Anthropic today) — used for the 联网搜索 hint.
+// search itself — used for the 联网搜索 hint.
 const providerMeta = [
   { name: 'anthropic', label: 'Anthropic（默认，自带联网搜索）', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '', nativeSearch: true, models: { haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-8' }, modelNote: '' },
   ...PROVIDER_NAMES.map((n) => ({ name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: n === 'deepseek' ? '只用 deepseek-chat（支持工具调用）；v4-pro/flash 默认思考模式、不支持工具，本流程勿用' : '' })),

@@ -7,6 +7,17 @@
     "transcriber": "universal/cli.js",
     "transcriber-web": "universal/server.js"
   },
+  "files": [
+    ".env.example",
+    "README.md",
+    "build/",
+    "claude-code-skill/",
+    "core/",
+    "docs/",
+    "engines/",
+    "eval/",
+    "universal/"
+  ],
   "exports": {
     "./core": "./core/pipeline.js",
     "./engine": "./engines/api.js"
@@ -23,7 +34,7 @@
     "p-limit": "^7.3.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "MIT"
 }
