@@ -4,7 +4,8 @@
   "description": "访谈转录精校流水线：侦察 → 联网核实 → 统一校对表 → 并行精校 + 完整性核对 → 逻辑顺序稿 / 访谈总结 / 时间线。Claude Code Workflow 与独立 CLI 两个 edition 共用 core/。",
   "type": "module",
   "bin": {
-    "transcriber": "universal/cli.js"
+    "transcriber": "universal/cli.js",
+    "transcriber-web": "universal/server.js"
   },
   "exports": {
     "./core": "./core/pipeline.js",
@@ -12,11 +13,13 @@
   },
   "scripts": {
     "transcriber": "node universal/cli.js",
+    "web": "node universal/server.js",
     "build:cc": "node build/build-cc.mjs",
     "eval": "node eval/run.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
+    "openai": "^6.44.0",
     "p-limit": "^7.3.0"
   },
   "engines": {

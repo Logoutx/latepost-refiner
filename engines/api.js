@@ -24,11 +24,10 @@
 //   const engine = makeApiEngine({ apiKey: process.env.ANTHROPIC_API_KEY, models, concurrency })
 //   const result = await runPipeline(A, engine)
 
-import fs from 'node:fs'
-import path from 'node:path'
 import os from 'node:os'
 import Anthropic from '@anthropic-ai/sdk'
 import pLimit from 'p-limit'
+import { TOOL_SPECS, runFileTool } from './fileops.js'
 
 // Tier name → model id. core/pipeline.js passes tier names ('haiku','sonnet','opus')
 // plus the literal 'haiku' for completeness checks; a full id passes through unchanged.
@@ -60,110 +59,27 @@ const WEB_TOOLS = [
   { type: 'web_fetch_20260209', name: 'web_fetch' },
 ]
 
-// Client-side tools we execute locally. input_schema here MAY use `required` (the
-// no-required rule is only for the model's *output* schemas, to avoid validation-retry
-// loops). Read mirrors Claude Code's cat -n / offset+limit behaviour the readPlan assumes.
-const CLIENT_TOOLS = [
-  {
-    name: 'Read',
-    description: '读取本地文件。返回带行号的内容（行号<TAB>原文，行号从 offset+1 开始）。大文件用 offset/limit 分页。',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_path: { type: 'string', description: '文件绝对路径' },
-        offset: { type: 'integer', description: '起始行（0 基，即跳过前 offset 行）；默认 0' },
-        limit: { type: 'integer', description: '读取行数；默认 2000' },
-      },
-      required: ['file_path'],
-    },
-  },
-  {
-    name: 'Write',
-    description: '把内容写入本地文件（覆盖；自动创建父目录）。',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_path: { type: 'string', description: '文件绝对路径' },
-        content: { type: 'string', description: '完整文件内容' },
-      },
-      required: ['file_path', 'content'],
-    },
-  },
-  {
-    name: 'Edit',
-    description: '对已有文件做精确字符串替换（old_string 必须唯一，除非 replace_all）。',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_path: { type: 'string', description: '文件绝对路径' },
-        old_string: { type: 'string', description: '要替换的原文（须与文件内容精确匹配）' },
-        new_string: { type: 'string', description: '替换为的新内容' },
-        replace_all: { type: 'boolean', description: '是否替换所有出现；默认 false' },
-      },
-      required: ['file_path', 'old_string', 'new_string'],
-    },
-  },
-]
+// Client-side tools (shared logic in fileops.js), in Anthropic tool shape.
+const CLIENT_TOOLS = TOOL_SPECS.map((s) => ({ name: s.name, description: s.description, input_schema: s.parameters }))
 
-const MAX_LINE = 2000 // truncate pathologically long lines in Read output
 const MAX_TURNS = 100 // tool-loop ceiling per agent (reads + writes + edits + searches + nudges)
 
 function execTool(tu) {
-  const id = tu.id
-  const ok = (text) => ({ type: 'tool_result', tool_use_id: id, content: String(text) })
-  const err = (text) => ({ type: 'tool_result', tool_use_id: id, content: String(text), is_error: true })
-  const inp = tu.input || {}
-  try {
-    if (tu.name === 'Read') {
-      const fp = inp.file_path
-      if (!fp) return err('Read: 缺少 file_path')
-      if (!fs.existsSync(fp)) return err(`Read: 文件不存在: ${fp}`)
-      const all = fs.readFileSync(fp, 'utf8').split('\n')
-      const start = Math.max(0, Number(inp.offset) || 0)
-      const lim = Number(inp.limit) > 0 ? Number(inp.limit) : 2000
-      const slice = all.slice(start, start + lim)
-      if (!slice.length) return ok(`(offset ${start} 处无内容；文件共 ${all.length} 行)`)
-      const body = slice
-        .map((ln, i) => `${String(start + i + 1).padStart(6)}\t${ln.length > MAX_LINE ? ln.slice(0, MAX_LINE) + '…[truncated]' : ln}`)
-        .join('\n')
-      return ok(body)
-    }
-    if (tu.name === 'Write') {
-      const fp = inp.file_path
-      if (!fp) return err('Write: 缺少 file_path')
-      const content = inp.content == null ? '' : String(inp.content)
-      fs.mkdirSync(path.dirname(fp), { recursive: true })
-      fs.writeFileSync(fp, content, 'utf8')
-      return ok(`已写入 ${Buffer.byteLength(content, 'utf8')} 字节 → ${fp}`)
-    }
-    if (tu.name === 'Edit') {
-      const fp = inp.file_path
-      const oldStr = inp.old_string
-      const newStr = inp.new_string == null ? '' : String(inp.new_string)
-      if (!fp || oldStr == null) return err('Edit: 缺少 file_path 或 old_string')
-      if (oldStr === '') return err('Edit: old_string 不能为空')
-      if (!fs.existsSync(fp)) return err(`Edit: 文件不存在: ${fp}`)
-      let text = fs.readFileSync(fp, 'utf8')
-      const count = text.split(oldStr).length - 1
-      if (count === 0) return err('Edit: 文件中找不到 old_string（须精确匹配，含空白与换行）')
-      if (count > 1 && !inp.replace_all) return err(`Edit: old_string 出现 ${count} 次——请加 replace_all:true 或提供更具体的片段`)
-      text = inp.replace_all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr)
-      fs.writeFileSync(fp, text, 'utf8')
-      return ok(`已编辑 ${fp}（替换 ${inp.replace_all ? count : 1} 处）`)
-    }
-    return err(`未知工具: ${tu.name}`)
-  } catch (e) {
-    return err(`${tu.name} 执行出错: ${e.message}`)
-  }
+  const r = runFileTool(tu.name, tu.input || {})
+  const block = { type: 'tool_result', tool_use_id: tu.id, content: r.text }
+  if (!r.ok) block.is_error = true
+  return block
 }
 
 export function makeApiEngine(opts = {}) {
   const {
     apiKey = process.env.ANTHROPIC_API_KEY,
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
+    models, // optional tier→model-id override (e.g. {opus:'claude-fable-5'}); else MODEL_IDS
     onPhase,
     onLog,
   } = opts
+  const resolveModelFor = (m) => (models && models[m]) || resolveModel(m)
   // opts.client lets tests inject a mock; production constructs from apiKey.
   if (!opts.client && !apiKey) throw new Error('makeApiEngine: 缺少 ANTHROPIC_API_KEY（传入 opts.apiKey 或设环境变量）')
 
@@ -198,7 +114,7 @@ export function makeApiEngine(opts = {}) {
       .trim()
 
   async function runAgent(prompt, { model, schema, label } = {}) {
-    const modelId = resolveModel(model)
+    const modelId = resolveModelFor(model)
     const thinking = thinkingFor(modelId)
     const tools = [...CLIENT_TOOLS, ...WEB_TOOLS]
     if (schema) {
