@@ -12,6 +12,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { runJob, PROVIDERS, PROVIDER_NAMES } from './jobs.js'
@@ -21,8 +22,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const INDEX = path.join(__dirname, 'web', 'index.html')
 const HOST = '127.0.0.1'
 const BASE_PORT = Number(process.env.PORT) || 8765
-
-let running = false // serialize runs (single-user local tool; avoids env races + contention)
+export const API_TOKEN_HEADER = 'x-transcriber-token'
 
 function readBody(req, limit = 96 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -35,6 +35,62 @@ function readBody(req, limit = 96 * 1024 * 1024) {
 }
 const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) }
 
+function injectToken(html, token) {
+  const boot = `<script>window.__TRANSCRIBER_TOKEN__=${JSON.stringify(token)}</script>`
+  return html.replace('<script>', `${boot}\n<script>`)
+}
+
+function sameOrigin(req) {
+  const origin = req.headers.origin
+  if (!origin) return true
+  try {
+    const u = new URL(origin)
+    return u.protocol === 'http:' && u.host === req.headers.host
+  } catch {
+    return false
+  }
+}
+
+function requireApiRequest(req, res, token) {
+  if (req.headers[API_TOKEN_HEADER] !== token) {
+    json(res, { error: 'forbidden' }, 403)
+    return false
+  }
+  if (!sameOrigin(req)) {
+    json(res, { error: 'origin not allowed' }, 403)
+    return false
+  }
+  const ct = String(req.headers['content-type'] || '')
+  if (!/^application\/json(?:\s*;|$)/i.test(ct)) {
+    json(res, { error: 'content-type must be application/json' }, 415)
+    return false
+  }
+  return true
+}
+
+export function sanitizeRunParams(raw = {}) {
+  const params = { ...raw }
+  delete params.__engine
+  delete params.skillDir
+  if (params.categories && typeof params.categories === 'object') {
+    params.categories = Object.fromEntries(Object.entries(params.categories).map(([key, value]) => {
+      const c = value && typeof value === 'object' ? value : {}
+      return [key, {
+        provider: c.provider,
+        apiKey: c.apiKey,
+        modelOverride: c.modelOverride,
+        tavilyKey: c.tavilyKey,
+      }]
+    }))
+  }
+  return params
+}
+
+function rememberOpenable(openablePaths, result) {
+  if (result && typeof result.outputDir === 'string') openablePaths.add(path.resolve(result.outputDir))
+  if (result && typeof result.glossaryPath === 'string') openablePaths.add(path.resolve(result.glossaryPath))
+}
+
 // provider metadata for the UI (no secrets). `models` = the tier→id map so the UI can
 // suggest tool-capable model ids; `nativeSearch` flags whether the provider can do web
 // search itself — used for the 联网搜索 hint.
@@ -43,55 +99,66 @@ const providerMeta = [
   ...PROVIDER_NAMES.map((n) => ({ name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: n === 'deepseek' ? '只用 deepseek-chat（支持工具调用）；v4-pro/flash 默认思考模式、不支持工具，本流程勿用' : '' })),
 ]
 
-const server = http.createServer(async (req, res) => {
-  const { url, method } = req
-  try {
-    if (method === 'GET' && (url === '/' || url === '/index.html')) {
-      const html = fs.readFileSync(INDEX, 'utf8')
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      return res.end(html)
-    }
-    if (method === 'GET' && url === '/api/providers') return json(res, { providers: providerMeta, categories: CATEGORIES })
-
-    if (method === 'POST' && url === '/api/run') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
-      const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-      if (running) { send('error', { message: '已有任务在运行，请等待其完成。' }); send('done', {}); return res.end() }
-      running = true
-      try {
-        const params = JSON.parse((await readBody(req)).toString('utf8'))
-        send('phase', { title: '启动' })
-        const result = await runJob(params, {
-          onPhase: (t) => send('phase', { title: t }),
-          onLog: (m) => send('log', { message: m }),
-        })
-        send('result', result)
-      } catch (e) {
-        send('error', { message: e.message })
-      } finally {
-        running = false
-        send('done', {})
-        res.end()
+export function createAppServer({ token = crypto.randomBytes(32).toString('hex'), runJobImpl = runJob, openImpl = (p) => execFile('open', [p], () => {}) } = {}) {
+  let running = false // serialize runs (single-user local tool; avoids env races + contention)
+  const openablePaths = new Set()
+  const server = http.createServer(async (req, res) => {
+    const { url, method } = req
+    try {
+      if (method === 'GET' && (url === '/' || url === '/index.html')) {
+        const html = injectToken(fs.readFileSync(INDEX, 'utf8'), token)
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        return res.end(html)
       }
-      return
-    }
+      if (method === 'GET' && url === '/api/providers') return json(res, { providers: providerMeta, categories: CATEGORIES })
 
-    if (method === 'POST' && url === '/api/open') {
-      const body = JSON.parse((await readBody(req)).toString('utf8'))
-      const p = body && body.path
-      if (typeof p === 'string' && fs.existsSync(p)) { execFile('open', [p], () => {}); return json(res, { ok: true }) }
-      return json(res, { ok: false, error: '路径不存在' }, 400)
-    }
+      if (method === 'POST' && url === '/api/run') {
+        if (!requireApiRequest(req, res, token)) return
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
+        const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        if (running) { send('error', { message: '已有任务在运行，请等待其完成。' }); send('done', {}); return res.end() }
+        running = true
+        try {
+          const params = sanitizeRunParams(JSON.parse((await readBody(req)).toString('utf8')))
+          send('phase', { title: '启动' })
+          const result = await runJobImpl(params, {
+            onPhase: (t) => send('phase', { title: t }),
+            onLog: (m) => send('log', { message: m }),
+          })
+          rememberOpenable(openablePaths, result)
+          send('result', result)
+        } catch (e) {
+          send('error', { message: e.message })
+        } finally {
+          running = false
+          send('done', {})
+          res.end()
+        }
+        return
+      }
 
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
-    res.end('not found')
-  } catch (e) {
-    json(res, { error: e.message }, 500)
-  }
-})
+      if (method === 'POST' && url === '/api/open') {
+        if (!requireApiRequest(req, res, token)) return
+        const body = JSON.parse((await readBody(req)).toString('utf8'))
+        const p = body && body.path
+        const abs = typeof p === 'string' ? path.resolve(p) : ''
+        if (abs && openablePaths.has(abs) && fs.existsSync(abs)) { openImpl(abs); return json(res, { ok: true }) }
+        return json(res, { ok: false, error: '路径不可打开或不存在' }, 400)
+      }
+
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('not found')
+    } catch (e) {
+      json(res, { error: e.message }, 500)
+    }
+  })
+  server.apiToken = token
+  return server
+}
 
 // Bind, retrying a few ports if the default is taken.
-function listen(port, attempts = 10) {
+export function listen(port, attempts = 10) {
+  const server = createAppServer()
   server.once('error', (e) => {
     if (e.code === 'EADDRINUSE' && attempts > 0) { listen(port + 1, attempts - 1) }
     else { console.error('启动失败：', e.message); process.exit(1) }
@@ -106,5 +173,7 @@ function listen(port, attempts = 10) {
     // run non-interactively (piped, CI, a preview harness) — and never when NO_OPEN is set.
     if (!process.env.NO_OPEN && process.stdout.isTTY) execFile('open', [u], () => {})
   })
+  return server
 }
-listen(BASE_PORT)
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) listen(BASE_PORT)

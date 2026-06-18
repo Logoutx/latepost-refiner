@@ -23,6 +23,7 @@
     "./engine": "./engines/api.js"
   },
   "scripts": {
+    "test": "node --test",
     "transcriber": "node universal/cli.js",
     "web": "node universal/server.js",
     "build:cc": "node build/build-cc.mjs",

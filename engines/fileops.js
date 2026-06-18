@@ -34,9 +34,51 @@ function insideRoot(target, root) {
   return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel))
 }
 
-function allowed(target, roots, exactPaths) {
-  const abs = path.resolve(String(target || ''))
-  return exactPaths.includes(abs) || roots.some((root) => insideRoot(abs, root))
+function realpathMaybe(target) {
+  try { return fs.realpathSync.native(target) } catch { return null }
+}
+
+function isSymlink(target) {
+  try { return fs.lstatSync(target).isSymbolicLink() } catch { return false }
+}
+
+function realRoots(roots) {
+  return roots.map((root) => realpathMaybe(root) || root)
+}
+
+function insideAnyRoot(target, roots) {
+  return roots.some((root) => insideRoot(target, root))
+}
+
+function nearestExistingParent(target) {
+  let dir = path.dirname(target)
+  while (!fs.existsSync(dir)) {
+    const next = path.dirname(dir)
+    if (next === dir) return null
+    dir = next
+  }
+  return dir
+}
+
+function lexicalAllowed(target, roots, exactPaths) {
+  return exactPaths.includes(target) || insideAnyRoot(target, roots)
+}
+
+function realTargetAllowed(target, roots) {
+  const real = realpathMaybe(target)
+  if (!real) return false
+  return insideAnyRoot(real, realRoots(roots))
+}
+
+function writeParentAllowed(target, roots) {
+  const parent = nearestExistingParent(target)
+  if (!parent) return false
+  const realParent = realpathMaybe(parent)
+  if (!realParent) return false
+  if (insideAnyRoot(realParent, realRoots(roots))) return true
+  // The output root itself may not exist on a first run; allow creating it when the
+  // nearest existing parent is an ancestor of the configured root.
+  return roots.some((root) => insideRoot(target, root) && insideRoot(root, parent))
 }
 
 function checkAccess(kind, filePath, policy) {
@@ -44,12 +86,27 @@ function checkAccess(kind, filePath, policy) {
   const p = makeFilePolicy(policy)
   const abs = path.resolve(String(filePath))
   const roots = kind === 'Read' ? p.readRoots : p.writeRoots
-  const exact = kind === 'Read'
-    ? uniq([...p.readPaths, ...p.writePaths])
-    : p.writePaths
-  if (!allowed(abs, roots, exact)) {
+  const exact = kind === 'Read' ? uniq([...p.readPaths, ...p.writePaths]) : p.writePaths
+  if (!lexicalAllowed(abs, roots, exact)) {
     const hint = roots.concat(exact).join('；') || '（无）'
     return { ok: false, text: `${kind}: 路径不在允许范围内: ${abs}；允许范围: ${hint}` }
+  }
+
+  if (kind === 'Read') {
+    const explicitSource = p.readPaths.includes(abs)
+    const exists = fs.existsSync(abs)
+    if (exists && !explicitSource && !realTargetAllowed(abs, roots)) {
+      return { ok: false, text: `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}` }
+    }
+  } else {
+    if (isSymlink(abs)) return { ok: false, text: `${kind}: 拒绝写入符号链接: ${abs}` }
+    if (fs.existsSync(abs)) {
+      if (!realTargetAllowed(abs, roots)) {
+        return { ok: false, text: `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}` }
+      }
+    } else if (!writeParentAllowed(abs, roots)) {
+      return { ok: false, text: `${kind}: 父目录解析后不在允许范围内: ${abs}` }
+    }
   }
   return { ok: true, path: abs }
 }

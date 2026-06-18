@@ -175,6 +175,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id)
+const API_TOKEN = window.__TRANSCRIBER_TOKEN__ || ''
+const jsonHeaders = () => ({ 'Content-Type': 'application/json', 'X-Transcriber-Token': API_TOKEN })
 let PROVIDERS = [], CATEGORIES = []
 let picked = [] // {name, base64}
 let mode = 'single'
@@ -326,7 +328,7 @@ async function run() {
   $('resultCard').style.display = 'none'; $('result').innerHTML = ''
 
   try {
-    const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) })
+    const resp = await fetch('/api/run', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(params) })
     const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = ''
     while (true) {
       const { done, value } = await reader.read(); if (done) break
@@ -371,7 +373,7 @@ function renderResult(r) {
   if (r.openQuestions && r.openQuestions.length) out.push(`<h3>收尾待问（${r.openQuestions.length}）</h3><ul>` + r.openQuestions.map(q => `<li>${esc(typeof q === 'string' ? q : JSON.stringify(q))}</li>`).join('') + '</ul>')
   if (r.usage) out.push(`<p class="hint">用量：${r.usage.agents} 个代理调用 · 输入 ${(r.usage.input || 0).toLocaleString()} / 输出 ${(r.usage.output || 0).toLocaleString()} tok</p>`)
   $('result').innerHTML = out.join('')
-  const ob = $('openBtn'); if (ob) ob.onclick = () => fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: r.outputDir }) })
+  const ob = $('openBtn'); if (ob) ob.onclick = () => fetch('/api/open', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path: r.outputDir }) })
 }
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) }
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
