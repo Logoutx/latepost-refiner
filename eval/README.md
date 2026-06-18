@@ -17,8 +17,8 @@ Filler removal is LLM judgment, so a real eval runs the model:
    `{id: refinedText}` and write it to a JSON file (e.g. `/tmp/eval_out.json`).
 2. `node eval/run.mjs /tmp/eval_out.json`
 
-Exit code is non-zero if any protected word was over-deleted. Once the Universal SDK engine lands, a
-self-contained runner can produce the results JSON directly instead of the agent-dispatch step.
+Exit code is non-zero if any protected word was over-deleted. With the Universal SDK engine now
+available, a self-contained runner can produce the results JSON directly instead of the agent-dispatch step.
 
 ## Baseline (2026-06, opus refine)
 cut_recall 100% (10/10) · keep_rate 100% (24/24) · over-deletions 0 — the rule cuts every target filler

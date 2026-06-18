@@ -17,8 +17,8 @@ Batch 1 is unchanged; batches 2+ get spelling-consistent, cheaper, and faster.
 
 - **Spelling consistency across a company's whole interview set** — the scout no longer
   re-derives a name from scratch each batch and risks a different 写法.
-- **Kills run-to-run verify/dedup variance** — entities verified once are carried forward,
-  not re-litigated.
+- **Removes run-to-run verify/dedup variance** — entities verified once are carried forward,
+  not re-checked.
 - **Unifies the recurring interviewer** (黄俊杰 appears in every interview) and core team
   across files via a speaker registry.
 - **Cheaper** — verify runs only on this batch's *new* findings, not the cumulative set.
@@ -64,7 +64,7 @@ a conflicting canonical surfaces as an `openQuestion` (P4).
 - **`core/meta.js`** — args contract += `priorGlossaryText?`, `fresh?`.
 - **`SKILL.md`** — Step 0 detect+read; Step 5 write the cumulative glossary back.
 
-## Backward-compat & safety
+## Backward compatibility & safety
 
 - **Zero migration.** No prior file → identical to today; the output it writes becomes
   batch 2's seed. `args.fresh=true` opts out and rebuilds from scratch.

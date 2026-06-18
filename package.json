@@ -1,7 +1,7 @@
 {
   "name": "interview-transcriber",
   "version": "1.0.0",
-  "description": "访谈转录精校流水线：侦察 → 联网核实 → 统一校对表 → 并行精校 + 完整性核对 → 逻辑顺序稿 / 访谈总结 / 时间线。Claude Code Workflow 与独立 CLI 两个 edition 共用 core/。",
+  "description": "访谈转录精校流水线：侦察、联网核实、统一校对表、并行精校加完整性核对，可选产出逻辑顺序稿、访谈总结、时间线。Claude Code Workflow 版和独立命令行版共用一套 core/。",
   "type": "module",
   "bin": {
     "transcriber": "universal/cli.js",

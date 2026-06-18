@@ -1,4 +1,4 @@
-# Transcriber-Universal — Build Task Book
+# Transcriber-Universal — Build Brief
 
 ## One-line goal
 
@@ -68,7 +68,7 @@ Output is identical to the Claude Code edition: `<out>/校对表.md`, `Transcrip
 
 ## Pitfalls already fixed in core — do not break their assumptions in the engine
 
-Do not set `required` in schemas; scout is always haiku; clustering underfires (weak labels must not be merged); verify splits at 12 chunks; large-block refine writes must not silently apply micro-edits; person-name guard is active; verify circuit-breaker (2 consecutive errors → stop — the engine must surface retrieval errors honestly so the circuit-breaker logic in the prompt can trigger); the three Chinese typesetting rules are already embedded in the prompts.
+Do not set `required` in schemas; scout is always haiku; clustering deliberately under-merges (weak labels must not be merged); verify splits into chunks of 12; large-block refine writes must not silently apply micro-edits; person-name guard is active; verify circuit-breaker (2 consecutive errors → stop — the engine must surface retrieval errors honestly so the circuit-breaker logic in the prompt can trigger); the three Chinese typesetting rules are already embedded in the prompts.
 
 ## References
 
