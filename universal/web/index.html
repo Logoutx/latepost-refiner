@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>访谈转录精校 · 本地版</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #fffefb; --ink: #1c1a17; --muted: #6b6660; --line: #e3ded6;
+    --accent: #b4532a; --accent-ink: #fff; --ok: #2f7d4f; --warn: #b07203; --err: #b3261e;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "PingFang SC", "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16140f; --card:#211e18; --ink:#ece7df; --muted:#9a948a; --line:#34302a;
+            --accent:#d9784e; --ok:#5fb27e; --warn:#d6a24a; --err:#e07a72; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 80px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: .2px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 20px; margin-top: 18px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 5px; }
+  label .opt { color: var(--muted); font-weight: 400; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 14px;
+  }
+  textarea { resize: vertical; min-height: 56px; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  .hint { font-size: 12px; color: var(--muted); margin: 5px 0 0; }
+  .checks { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 6px; }
+  .checks label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 500; }
+  .checks input { width: auto; }
+  .filebox { border: 1.5px dashed var(--line); border-radius: 10px; padding: 16px; text-align: center; cursor: pointer; color: var(--muted); font-size: 13px; }
+  .filebox.has { border-style: solid; color: var(--ink); text-align: left; }
+  .filebox b { color: var(--ink); }
+  #fileList { margin: 8px 0 0; padding: 0; list-style: none; font-size: 13px; }
+  #fileList li { padding: 2px 0; color: var(--muted); }
+  .actions { display: flex; align-items: center; gap: 14px; margin-top: 20px; }
+  button.run { background: var(--accent); color: var(--accent-ink); border: none; border-radius: 9px; padding: 11px 22px; font: inherit; font-weight: 600; font-size: 15px; cursor: pointer; }
+  button.run:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer; }
+  details summary { cursor: pointer; font-size: 13px; color: var(--muted); font-weight: 600; }
+  details[open] summary { margin-bottom: 8px; }
+  #console { font-family: var(--mono); font-size: 12.5px; background: #0e0d0b; color: #d7cfc2; border-radius: 10px; padding: 14px; height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  #console .ph { color: #e0925f; font-weight: 700; }
+  #console .er { color: #ef8d84; }
+  #result { font-size: 14px; }
+  #result .ok { color: var(--ok); } #result .warn { color: var(--warn); } #result .er { color: var(--err); }
+  #result h3 { font-size: 14px; margin: 14px 0 6px; }
+  #result ul { margin: 4px 0; padding-left: 20px; } #result li { margin: 2px 0; }
+  code { font-family: var(--mono); font-size: 12.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  .pill { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); margin-left: 8px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+  .segbtn { background: var(--bg); color: var(--muted); border: none; padding: 7px 16px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .segbtn.on { background: var(--accent); color: var(--accent-ink); }
+  .catrow { display: grid; grid-template-columns: 200px 1fr; gap: 10px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }
+  .catrow:first-child { border-top: none; }
+  .catlabel { font-size: 13px; font-weight: 600; padding-top: 8px; }
+  .catlabel .opt { display: block; font-weight: 400; font-size: 11px; }
+  .catfields { display: grid; gap: 8px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>访谈转录精校 <span class="pill">本地网页版</span></h1>
+    <p>删口癖 · 理顺口语 · 加小标题 · 交叉校对人名/品牌/术语 · 统一发言人 —— 保留全部事实，不做摘要。</p>
+  </header>
+
+  <div class="card">
+    <h2>模型</h2>
+    <div class="seg">
+      <button type="button" class="segbtn on" data-mode="single">统一一家</button>
+      <button type="button" class="segbtn" data-mode="mixed">按类别混合</button>
+    </div>
+
+    <div id="paneSingle">
+      <div class="row">
+        <div>
+          <label>Provider</label>
+          <select id="provider"></select>
+          <p class="hint" id="providerNote"></p>
+        </div>
+        <div>
+          <label>API Key <span class="opt" id="keyHint"></span></label>
+          <input type="password" id="apiKey" placeholder="你的 API key（仅本机内存使用、不落盘）" autocomplete="off">
+        </div>
+      </div>
+      <label style="margin-top:14px">联网搜索 <span class="opt">（仅 verify / timeline 用；精校 refine 从不联网）</span></label>
+      <input type="password" id="tavilyKey" placeholder="Tavily API Key（tvly-…）" autocomplete="off">
+      <p class="hint" id="searchNote"></p>
+      <details style="margin-top:12px">
+        <summary>高级：endpoint / 模型覆盖</summary>
+        <label>Base URL <span class="opt">（留空用默认；GLM 国际站、Kimi 国内等）</span></label>
+        <input type="text" id="baseURL" placeholder="">
+        <label>模型覆盖 <span class="opt">（如 scout=haiku,refine=opus；留空用该 provider 默认分层）</span></label>
+        <input type="text" id="models" placeholder="">
+        <p class="hint" id="modelHint"></p>
+      </details>
+    </div>
+
+    <div id="paneMixed" class="hidden">
+      <p class="hint">每一类可用不同的家与 key——便宜活给便宜模型、精校给最强、联网核实给有联网的家。设为「（用默认）」的类别走下面这把默认 key。</p>
+      <p class="hint">「联网核实」选的家 = 联网搜索用谁：Anthropic / GLM / Kimi 用各自自带搜索（无需 Tavily）；DeepSeek / OpenAI 经 Tavily 搜索（下方填 Tavily key）。</p>
+      <div class="row">
+        <div><label>默认 Provider</label><select id="defProvider"></select></div>
+        <div><label>默认 API Key</label><input type="password" id="defKey" placeholder="默认 key（设为「用默认」的类别走它）" autocomplete="off"></div>
+      </div>
+      <div id="catRows" style="margin-top:8px"></div>
+      <details style="margin-top:10px">
+        <summary>联网搜索（混合模式）</summary>
+        <label>Tavily API Key <span class="opt">（「联网核实」类若用非 anthropic 的家则需要；用 anthropic 则不用）</span></label>
+        <input type="password" id="mixTavily" placeholder="tvly-..." autocomplete="off">
+      </details>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>稿件</h2>
+    <div class="filebox" id="filebox" tabindex="0">
+      点此选择转录文件（可多选）<br><span class="opt">.txt / .md / .docx / .pptx / .xlsx / .pdf（docx/pdf 自动转换）</span>
+    </div>
+    <input type="file" id="files" multiple class="hidden"
+           accept=".txt,.md,.docx,.pptx,.xlsx,.pdf,text/plain,text/markdown">
+    <ul id="fileList"></ul>
+    <div class="row" style="margin-top:8px">
+      <div><label>主题 topic <span class="opt">（用于文件名）</span></label><input type="text" id="topic" placeholder="如 蜜雪冰城"></div>
+      <div><label>采访时间 <span class="opt">（YYYY-MM）</span></label><input type="text" id="date" placeholder="2025-02"></div>
+    </div>
+    <label>采访背景 <span class="opt">（指导侦察 / 联网核实，越具体越好）</span></label>
+    <textarea id="background" placeholder="如：蜜雪冰城集团跨部门访谈系列，受访者为大咖事业群原料研发负责人……"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>产出</h2>
+    <label>范围 scope <span class="opt">（精校必选；其余依赖精校产物）</span></label>
+    <div class="checks">
+      <label><input type="checkbox" checked disabled> 精校 refine</label>
+      <label><input type="checkbox" value="logic"> 逻辑顺序稿</label>
+      <label><input type="checkbox" value="summary"> 访谈总结</label>
+      <label><input type="checkbox" value="timeline"> 时间线</label>
+    </div>
+    <div class="row3" style="margin-top:12px">
+      <div><label>联网核实 verify</label><select id="verify"><option value="key">key（关键实体）</option><option value="deep">deep（尽量全核）</option><option value="none">none（不联网）</option></select></div>
+      <div><label>小标题 heading</label><select id="heading"><option value="none">none（按内容重新生成）</option><option value="keep">keep（保留原小标题）</option><option value="regenerate">regenerate（去掉重做）</option></select></div>
+      <div><label>并发 <span class="opt">（可空）</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
+    </div>
+    <label>输出目录 <span class="opt">（留空用 ~/Documents/Research/&lt;topic&gt;）</span></label>
+    <input type="text" id="out" placeholder="">
+    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 忽略既有校对表，从零重建（--fresh）</label></div>
+  </div>
+
+  <div class="actions">
+    <button class="run" id="run">开始精校</button>
+    <span class="hint" id="status"></span>
+  </div>
+
+  <div class="card" id="consoleCard" style="display:none">
+    <h2>进度</h2>
+    <div id="console"></div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none">
+    <h2>结果</h2>
+    <div id="result"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id)
+let PROVIDERS = [], CATEGORIES = []
+let picked = [] // {name, base64}
+let mode = 'single'
+
+const provOptions = (withDefault) => (withDefault ? '<option value="">（用默认）</option>' : '') + PROVIDERS.map(p => `<option value="${p.name}">${p.label}</option>`).join('')
+const hintModel = (tier) => tier === 'opus' ? 'claude-opus-4-8 / gpt-5.5' : tier === 'haiku' ? 'claude-haiku-4-5 / deepseek-chat' : 'claude-sonnet-4-6'
+
+async function loadConfig() {
+  const r = await fetch('/api/providers'); const j = await r.json()
+  PROVIDERS = j.providers; CATEGORIES = j.categories || []
+  $('provider').innerHTML = provOptions(false); $('provider').onchange = onProvider; onProvider()
+  $('defProvider').innerHTML = provOptions(false)
+  buildCatRows()
+  document.querySelectorAll('.segbtn').forEach(b => b.onclick = () => setMode(b.dataset.mode))
+}
+function onProvider() {
+  const p = PROVIDERS.find(x => x.name === $('provider').value) || {}
+  $('keyHint').textContent = '（' + (p.keyEnv || []).join(' / ') + '）'
+  $('providerNote').textContent = p.note || ''
+  $('baseURL').placeholder = p.baseURL || '默认'
+  $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
+  $('searchNote').textContent = p.nativeSearch
+    ? '该家自带联网搜索（已接入），无需 Tavily key（留空即可）。'
+    : '该家无自带联网搜索：填 Tavily key 才能让 verify / timeline 联网（不填则降级；精校 refine 不受影响）。想让别的家专门跑联网核实，用上方「按类别混合」。'
+  $('modelHint').textContent = modelSuggest(p)
+}
+function modelSuggest(p) {
+  if (!p.models) return ''
+  const s = '建议模型：精校用 ' + p.models.opus + '；机械 / 核实用 ' + p.models.haiku
+  return p.modelNote ? (s + '。⚠ ' + p.modelNote) : s
+}
+function setMode(m) {
+  mode = m
+  document.querySelectorAll('.segbtn').forEach(b => b.classList.toggle('on', b.dataset.mode === m))
+  $('paneSingle').classList.toggle('hidden', m !== 'single')
+  $('paneMixed').classList.toggle('hidden', m !== 'mixed')
+}
+function buildCatRows() {
+  $('catRows').innerHTML = CATEGORIES.map(c => `
+    <div class="catrow">
+      <div class="catlabel">${c.label}<span class="opt">${c.stages.join(' · ')}</span></div>
+      <div class="catfields">
+        <select class="catProvider" data-cat="${c.key}">${provOptions(true)}</select>
+        <input class="catKey hidden" data-cat="${c.key}" type="password" placeholder="该类 API key" autocomplete="off">
+        <input class="catModel" data-cat="${c.key}" type="text" placeholder="模型覆盖（可空，如 ${hintModel(c.tierHint)}）">
+      </div>
+    </div>`).join('')
+  document.querySelectorAll('.catProvider').forEach(sel => sel.onchange = () => {
+    const cat = sel.dataset.cat
+    document.querySelector('.catKey[data-cat="' + cat + '"]').classList.toggle('hidden', !sel.value)
+    const meta = PROVIDERS.find(x => x.name === sel.value)
+    const tier = (CATEGORIES.find(c => c.key === cat) || {}).tierHint || 'opus'
+    const mInput = document.querySelector('.catModel[data-cat="' + cat + '"]')
+    mInput.placeholder = (meta && meta.models)
+      ? ('模型覆盖（可空，建议 ' + meta.models[tier] + (meta.modelNote ? '；⚠ ' + meta.modelNote : '') + '）')
+      : '模型覆盖（可空，如 ' + hintModel((CATEGORIES.find(c => c.key === cat) || {}).tierHint) + '）'
+  })
+}
+
+function collectModel() {
+  if (mode === 'single') {
+    const apiKey = $('apiKey').value.trim()
+    if (!apiKey) throw new Error('请填写 API key。')
+    return { provider: $('provider').value, apiKey, baseURL: $('baseURL').value.trim() || undefined, tavilyKey: $('tavilyKey').value.trim() || undefined, models: parseModels($('models').value) }
+  }
+  const defProvider = $('defProvider').value, defKey = $('defKey').value.trim()
+  const categories = {}
+  for (const c of CATEGORIES) {
+    const provSel = document.querySelector('.catProvider[data-cat="' + c.key + '"]').value
+    const keyVal = document.querySelector('.catKey[data-cat="' + c.key + '"]').value.trim()
+    const modelOverride = document.querySelector('.catModel[data-cat="' + c.key + '"]').value.trim() || undefined
+    const provider = provSel || defProvider
+    const apiKey = provSel ? keyVal : defKey
+    if (!provider) throw new Error('「' + c.label + '」未选 provider（或填默认 provider）。')
+    if (!apiKey) throw new Error('「' + c.label + '」缺少 API key（' + (provSel ? '该类' : '默认') + ' key 为空）。')
+    categories[c.key] = { provider, apiKey, modelOverride }
+  }
+  const t = $('mixTavily').value.trim()
+  if (t && categories.web) categories.web.tavilyKey = t
+  return { categories }
+}
+
+// file picking → base64
+const fb = $('filebox')
+fb.onclick = () => $('files').click()
+fb.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') $('files').click() }
+fb.ondragover = (e) => { e.preventDefault(); fb.classList.add('has') }
+fb.ondragleave = () => { if (!picked.length) fb.classList.remove('has') }
+fb.ondrop = (e) => { e.preventDefault(); handleFiles(e.dataTransfer.files) }
+$('files').onchange = (e) => handleFiles(e.target.files)
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader()
+    r.onload = () => {
+      const bytes = new Uint8Array(r.result); let bin = ''; const C = 0x8000
+      for (let i = 0; i < bytes.length; i += C) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + C))
+      res(btoa(bin))
+    }
+    r.onerror = rej; r.readAsArrayBuffer(file)
+  })
+}
+async function handleFiles(fileList) {
+  const arr = Array.from(fileList || [])
+  if (!arr.length) return
+  picked = []
+  for (const f of arr) picked.push({ name: f.name, base64: await fileToBase64(f) })
+  fb.classList.add('has')
+  fb.innerHTML = '<b>' + picked.length + ' 份文件已选</b> · 点此重新选择'
+  $('fileList').innerHTML = picked.map(p => `<li>· ${p.name}</li>`).join('')
+}
+
+function getScope() {
+  const scope = ['refine']
+  document.querySelectorAll('.checks input[value]').forEach(c => { if (c.checked) scope.push(c.value) })
+  return scope
+}
+function parseModels(s) {
+  s = (s || '').trim(); if (!s) return undefined
+  const m = {}; for (const pair of s.split(',')) { const [k, v] = pair.split('='); if (k && v) m[k.trim()] = v.trim() }
+  return Object.keys(m).length ? m : undefined
+}
+
+const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight }
+
+$('run').onclick = run
+async function run() {
+  if (!picked.length) return setStatus('请先选择至少一份转录文件。', true)
+  if (!$('topic').value.trim()) return setStatus('请填写主题 topic。', true)
+  let modelParams
+  try { modelParams = collectModel() } catch (e) { return setStatus(e.message, true) }
+
+  const params = {
+    ...modelParams,
+    files: picked,
+    topic: $('topic').value.trim(),
+    date: $('date').value.trim(),
+    background: $('background').value.trim(),
+    scope: getScope(),
+    verifyDepth: $('verify').value,
+    headingPolicy: $('heading').value,
+    outputDir: $('out').value.trim() || undefined,
+    fresh: $('fresh').checked,
+    concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
+  }
+
+  $('run').disabled = true; setStatus('运行中……（大文件 opus 精校可能数分钟）')
+  $('consoleCard').style.display = 'block'; $('console').innerHTML = ''
+  $('resultCard').style.display = 'none'; $('result').innerHTML = ''
+
+  try {
+    const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) })
+    const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = ''
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break
+      buf += dec.decode(value, { stream: true })
+      let idx
+      while ((idx = buf.indexOf('\n\n')) >= 0) { handleEvent(buf.slice(0, idx)); buf = buf.slice(idx + 2) }
+    }
+  } catch (e) { log('连接中断：' + e.message, 'er') }
+  finally { $('run').disabled = false; setStatus('') }
+}
+
+function handleEvent(raw) {
+  let ev = 'message', data = ''
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event: ')) ev = line.slice(7)
+    else if (line.startsWith('data: ')) data += line.slice(6)
+  }
+  let obj = {}; try { obj = JSON.parse(data) } catch {}
+  if (ev === 'phase') log('▸ ' + obj.title, 'ph')
+  else if (ev === 'log') log('  ' + obj.message)
+  else if (ev === 'error') { log('✗ ' + obj.message, 'er'); setStatus(obj.message, true) }
+  else if (ev === 'result') renderResult(obj)
+}
+
+function renderResult(r) {
+  $('resultCard').style.display = 'block'
+  const out = []
+  out.push(`<p>provider：<b>${r.providerInfo ? r.providerInfo.label : r.provider}</b>　输出目录：<code>${r.outputDir}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
+  out.push(`<h3 class="ok">精校成稿 ${r.refined.length} 份</h3><ul>` + r.refined.map(x => `<li><code>${x.outPath || x.path}</code></li>`).join('') + '</ul>')
+  if (r.glossaryPath) out.push(`<p>统一校对表：<code>${r.glossaryPath}</code></p>`)
+  const warn = (label, items, fmt) => { if (items && items.length) out.push(`<h3 class="warn">${label}（${items.length}）</h3><ul>` + items.map(fmt || (x => `<li>${typeof x === 'string' ? x : JSON.stringify(x)}</li>`)).join('') + '</ul>') }
+  warn('未完成（需手动补做）', r.failed)
+  warn('疑似中途截断', r.incomplete, x => `<li><code>${x.path}</code>${x.note ? '：' + x.note : ''}</li>`)
+  warn('结尾完整性未核', r.unchecked, x => `<li><code>${x}</code></li>`)
+  warn('侦察疑损坏（校对表该份不可靠）', r.scoutSuspect)
+  warn('源文件已带小标题（headingPolicy=none）', r.headingConflicts)
+  warn('疑似同指（待人工确认，未自动合并）', r.suspectedDuplicates, x => `<li>${(x.members || []).join(' / ')}</li>`)
+  warn('因网络故障未核实', r.networkUnverified, x => `<li>${typeof x === 'string' ? x : (x.query || JSON.stringify(x))}</li>`)
+  if (r.logic && r.logic.length) out.push(`<h3>逻辑顺序稿 ${r.logic.filter(l => l.path).length}/${r.logic.length}</h3><ul>` + r.logic.filter(l => l.path).map(l => `<li><code>${l.path}</code></li>`).join('') + '</ul>')
+  if (r.summary) out.push(`<p>访谈总结：${esc(String(r.summary).split('\n')[0])}</p>`)
+  if (r.timeline) out.push(`<p>时间线：${esc(String(r.timeline).split('\n')[0])}</p>`)
+  if (r.openQuestions && r.openQuestions.length) out.push(`<h3>收尾待问（${r.openQuestions.length}）</h3><ul>` + r.openQuestions.map(q => `<li>${esc(typeof q === 'string' ? q : JSON.stringify(q))}</li>`).join('') + '</ul>')
+  if (r.usage) out.push(`<p class="hint">用量：${r.usage.agents} 个代理调用 · 输入 ${(r.usage.input || 0).toLocaleString()} / 输出 ${(r.usage.output || 0).toLocaleString()} tok</p>`)
+  $('result').innerHTML = out.join('')
+  const ob = $('openBtn'); if (ob) ob.onclick = () => fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: r.outputDir }) })
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) }
+function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
+
+loadConfig()
+</script>
+</body>
+</html>

@@ -13,9 +13,11 @@ core/                唯一真相来源（两 edition 共享）
                      （聚类/合并/校对表渲染/核实分块/人名守卫/乱码检测…）
   prompts.js         9 个 prompt builder + readPlan/headingNote
   pipeline.js        runPipeline(A, engine) —— 流水线，面向一个 engine 接口
-engines/
-  api.js             Universal 版引擎：用 Anthropic SDK 兑现 engine 接口
-                     （Claude Code 版的引擎就是 Workflow 全局，见 build/bootstrap-cc.js）
+engines/             Universal 版引擎（Claude Code 版的引擎是 Workflow 全局，见 build/bootstrap-cc.js）
+  api.js             Anthropic SDK 引擎（--provider anthropic）
+  openai.js          OpenAI 兼容引擎（--provider deepseek/glm/kimi/openai）
+  providers.js       OpenAI 兼容 provider registry（endpoint/key/quirks/模型分层）
+  fileops.js         两引擎共用的 Read/Write/Edit 客户端工具逻辑
 build/
   build-cc.mjs       把 core/* + Claude Code 引擎打包成自包含的 workflow.js
   bootstrap-cc.js    Claude Code 引擎（agent/parallel/… 转给 Workflow 全局）
@@ -75,7 +77,38 @@ node universal/cli.js \
 - 校对表写到 `<out>/校对表.md` 并跨次累积（持久化校对表）；`--fresh` 从零重建。
 - 无参数运行打印完整用法（`node universal/cli.js`）。
 
-实现：`engines/api.js`（用 Anthropic SDK 兑现 5 原语，Read/Write/Edit 客户端工具 + 服务端 web 工具 + StructuredOutput 强制结构化）+ `universal/cli.js`（argv→A、预检、调 `runPipeline`、处理返回）。流水线/prompts/schemas/纯逻辑全部从 `core/` 复用。
+### 本地网页版（双击启动，无需 Apple 签名）
+
+不想用命令行、又不想折腾 Apple 签名/公证打包成 .app——直接跑成本地网页：一个只用 Node 内置模块的 localhost 服务器，开个浏览器页面填表、看进度、出文件。
+
+```bash
+npm run web              # 或 node universal/server.js；打印 http://127.0.0.1:8765 并自动开浏览器
+# 或在 Finder 双击 universal/launch.command（首次会自动 npm install）
+```
+
+页面里选 provider、填 API key（**只在本机内存用、不落盘不外传不记录**）、拖入转录文件、填主题/背景、勾选产出范围，点「开始精校」即可；进度实时流式显示，完成后列出成稿/校对表/各类提醒，一键「打开输出文件夹」。docx/pdf 自动转换（需 markitdown）。服务器只绑 `127.0.0.1`、同一时刻只跑一个任务。
+
+### 切换模型 provider
+
+`--provider` 选底层模型来源；除 anthropic 外都是 OpenAI 兼容 API，共用同一个引擎。
+
+| `--provider` | key 环境变量 | 默认 endpoint | 联网核实 |
+|---|---|---|---|
+| `anthropic`（默认） | `ANTHROPIC_API_KEY` | — | 内置服务端 web search |
+| `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com` | 需 `TAVILY_API_KEY` |
+| `glm` | `ZHIPUAI_API_KEY` / `ZAI_API_KEY` | `open.bigmodel.cn/api/paas/v4`（国际站 `--base-url https://api.z.ai/api/paas/v4`） | 需 `TAVILY_API_KEY` |
+| `kimi` | `MOONSHOT_API_KEY` | `api.moonshot.ai/v1`（国内 `--base-url https://api.moonshot.cn/v1`） | 需 `TAVILY_API_KEY` |
+| `openai` | `OPENAI_API_KEY` | `api.openai.com/v1` | 需 `TAVILY_API_KEY` |
+
+```bash
+DEEPSEEK_API_KEY=sk-... node universal/cli.js --provider deepseek \
+  --files "x.txt" --topic "蜜雪冰城" --scope refine --out ./out
+```
+
+- 非 anthropic provider 无内置联网搜索：设 `TAVILY_API_KEY` 才能 verify/timeline 联网；不设则这两步降级（实体进 unresolved），**refine 精校不联网、完全不受影响**。
+- 模型 ID 会变动——registry 内是 2026-06 的默认值，按需 `--models refine=<该 provider 的模型 id>` 覆盖。各家 quirk（DeepSeek 思考模式禁工具、GLM 拒收 temperature:0、Kimi 不支持强制函数调用、OpenAI 用 max_completion_tokens）都在 `engines/providers.js` 编码、引擎已分别处理。
+
+实现：`engines/api.js`（Anthropic SDK：Read/Write/Edit 客户端工具 + 服务端 web + 强制 StructuredOutput）、`engines/openai.js`（OpenAI 兼容：tool_calls 循环 + 客户端 web_search/web_fetch + 强制函数/json 兜底两种结构化）、`engines/providers.js`（provider registry）、`engines/fileops.js`（两引擎共用的 Read/Write/Edit）+ `universal/cli.js`（argv→A、预检、`--provider` 选引擎、调 `runPipeline`、处理返回）。流水线/prompts/schemas/纯逻辑全部从 `core/` 复用。
 
 ## 一份正式产出长啥样
 

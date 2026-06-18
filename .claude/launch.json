@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "transcriber-web",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["universal/server.js"],
+      "port": 8765
+    }
+  ]
+}
