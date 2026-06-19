@@ -79,6 +79,7 @@ node universal/cli.js \
 - docx/pptx/xlsx/pdf 会自动经 `markitdown` 转成 md（需先 `pipx install markitdown` 并在 PATH 上）。
 - 模型默认分层：scout=haiku、verify/dedup=sonnet、refine/logic/summary/timeline=opus、结尾核对=haiku；用 `--models scout=haiku,refine=opus` 覆盖。
 - 校对表写到 `<out>/校对表.md`，并跨批次累积（持久化校对表）；`--fresh` 从零重建。
+- 每次运行还会写 `<out>/review.md`（人工收尾清单）和 `<out>/run.json`（本次运行的配置、输入哈希、产物、提醒、用量），便于交接、追踪和后续 resume。
 - 不带参数运行会打印完整用法（`node universal/cli.js`）。
 
 ### 本地网页版（双击启动，免 Apple 签名）
@@ -123,4 +124,4 @@ DEEPSEEK_API_KEY=sk-... node universal/cli.js --provider deepseek \
 
 ## 一次正式产出有哪些文件
 
-`<输出>/校对表.md`、`<输出>/Transcripts/<标题>.md`（精校稿）、`<输出>/逻辑顺序/<标题>.md`（逻辑顺序重排稿）、`<输出>/<主题>访谈总结.md`、`<输出>/<主题>时间线.md`。
+`<输出>/校对表.md`、`<输出>/Transcripts/<标题>.md`（精校稿）、`<输出>/逻辑顺序/<标题>.md`（逻辑顺序重排稿）、`<输出>/<主题>访谈总结.md`、`<输出>/<主题>时间线.md`、`<输出>/review.md`（待人工确认/补做的收尾清单）、`<输出>/run.json`（运行清单：配置、输入文件哈希、产物路径、提醒、用量）。

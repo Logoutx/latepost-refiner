@@ -359,6 +359,8 @@ function renderResult(r) {
   out.push(`<p>provider：<b>${esc(r.providerInfo ? r.providerInfo.label : r.provider)}</b>　输出目录：<code>${esc(r.outputDir)}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
   out.push(`<h3 class="ok">精校成稿 ${Number(r.refined.length) || 0} 份</h3><ul>` + r.refined.map(x => `<li><code>${esc(x.outPath || x.path)}</code></li>`).join('') + '</ul>')
   if (r.glossaryPath) out.push(`<p>统一校对表：<code>${esc(r.glossaryPath)}</code></p>`)
+  if (r.reviewPath) out.push(`<p>Review queue：<code>${esc(r.reviewPath)}</code></p>`)
+  if (r.manifestPath) out.push(`<p>Run manifest：<code>${esc(r.manifestPath)}</code></p>`)
   const warn = (label, items, fmt) => { if (items && items.length) out.push(`<h3 class="warn">${esc(label)}（${items.length}）</h3><ul>` + items.map(fmt || (x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`)).join('') + '</ul>') }
   warn('未完成（需手动补做）', r.failed)
   warn('疑似中途截断', r.incomplete, x => `<li><code>${esc(x.path)}</code>${x.note ? '：' + esc(x.note) : ''}</li>`)

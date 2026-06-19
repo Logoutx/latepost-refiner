@@ -89,6 +89,8 @@ export function sanitizeRunParams(raw = {}) {
 function rememberOpenable(openablePaths, result) {
   if (result && typeof result.outputDir === 'string') openablePaths.add(path.resolve(result.outputDir))
   if (result && typeof result.glossaryPath === 'string') openablePaths.add(path.resolve(result.glossaryPath))
+  if (result && typeof result.reviewPath === 'string') openablePaths.add(path.resolve(result.reviewPath))
+  if (result && typeof result.manifestPath === 'string') openablePaths.add(path.resolve(result.manifestPath))
 }
 
 // provider metadata for the UI (no secrets). `models` = the tier→id map so the UI can

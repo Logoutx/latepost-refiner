@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
 import { selectEngine, prepareFile, buildFilePolicy } from './jobs.js'
+import { writeRunArtifacts } from './artifacts.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -114,13 +115,14 @@ async function main() {
   const workDir = path.join(outputDir, '.converted')
   const headingPolicy = a.headingPolicy || 'none'
   const files = []
+  const warnings = []
   for (const raw of a.files) {
     const src = path.resolve(raw)
     if (!fs.existsSync(src)) { console.error(`错误：找不到文件 ${src}`); process.exit(2) }
     let prepared
     try { prepared = prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) }
     catch (e) { console.error('错误：' + e.message); process.exit(2) }
-    if (prepared.headingWarning) console.error('提示：' + prepared.headingWarning)
+    if (prepared.headingWarning) { warnings.push(prepared.headingWarning); console.error('提示：' + prepared.headingWarning) }
     files.push(prepared.entry)
   }
 
@@ -160,19 +162,33 @@ async function main() {
   }
 
   const t0 = Date.now()
+  const startedAt = new Date(t0).toISOString()
   console.error(`\n开始：${files.length} 份文件 · scope=${A.scope.join(',')} · verify=${A.verifyDepth} · 输出 ${outputDir}\n`)
   const r = await runPipeline(A, engine)
-  const mins = ((Date.now() - t0) / 60000).toFixed(1)
+  const finishedMs = Date.now()
+  const finishedAt = new Date(finishedMs).toISOString()
+  const durationMs = finishedMs - t0
+  const mins = (durationMs / 60000).toFixed(1)
+  const usage = engine.usage()
+  const result = { ...r, outputDir, glossaryPath: null, provider: sel.provider, providerInfo: sel.info, warnings, usage }
 
   // ---------- return handling (mirrors SKILL.md “返回处理”) ----------
-  if (r.error) { console.error(`\n流水线未执行：${r.error}`); process.exit(1) }
+  if (r.error) {
+    const artifacts = writeRunArtifacts(result, { A, outputDir, startedAt, finishedAt, durationMs, provider: sel.provider, providerInfo: sel.info, warnings, usage })
+    console.error(`\n流水线未执行：${r.error}`)
+    console.error(`Review queue：${artifacts.reviewPath}`)
+    console.error(`Run manifest：${artifacts.manifestPath}`)
+    process.exit(1)
+  }
 
   // Glossary is pure-JS output (no agent writes it) → persist it here. Cumulative across runs.
   if (r.glossary && r.glossary !== SINGLE_FILE_GLOSSARY) {
     fs.mkdirSync(outputDir, { recursive: true })
     fs.writeFileSync(glossaryPath, r.glossary, 'utf8')
+    result.glossaryPath = glossaryPath
     console.error(`\n校对表已写入：${glossaryPath}`)
   }
+  const artifacts = writeRunArtifacts(result, { A, outputDir, startedAt, finishedAt, durationMs, provider: sel.provider, providerInfo: sel.info, warnings, usage })
 
   const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.stringify(x)))).join('、')
   console.error(`\n===== 完成（${mins} 分钟）=====`)
@@ -197,9 +213,11 @@ async function main() {
     console.error(`\n收尾待问（${r.openQuestions.length} 项）：`)
     for (const q of r.openQuestions) console.error(`  · ${typeof q === 'string' ? q : JSON.stringify(q)}`)
   }
+  console.error(`\nReview queue：${artifacts.reviewPath}`)
+  console.error(`Run manifest：${artifacts.manifestPath}`)
 
-  const u = engine.usage()
-  console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${u.cacheRead.toLocaleString()}`)
+  const u = usage
+  console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${(u.cacheRead || 0).toLocaleString()}`)
   process.exit(0)
 }
 
