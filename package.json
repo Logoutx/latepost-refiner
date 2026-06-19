@@ -27,7 +27,10 @@
     "transcriber": "node universal/cli.js",
     "web": "node universal/server.js",
     "build:cc": "node build/build-cc.mjs",
-    "eval": "node eval/run.mjs"
+    "eval": "node eval/run.mjs",
+    "eval:filler": "node eval/run.mjs",
+    "eval:golden": "node eval/golden-run.mjs",
+    "eval:produce": "node eval/produce.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
