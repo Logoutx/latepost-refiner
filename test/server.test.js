@@ -4,7 +4,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { API_TOKEN_HEADER, createAppServer, sanitizeRunParams } from '../universal/server.js'
+import { API_TOKEN_HEADER, createAppServer, fetchProviderModels, sanitizeRunParams } from '../universal/server.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-server-'))
@@ -78,6 +78,102 @@ test('API rejects untokened, non-JSON, and cross-origin run requests', async () 
     })
     assert.equal(wrongOrigin.status, 403)
     assert.equal(called, false)
+  } finally {
+    await close(server)
+  }
+})
+
+test('fetchProviderModels calls OpenAI-compatible /models and picks cost-effective defaults', async () => {
+  let called
+  const result = await fetchProviderModels({
+    provider: 'openai',
+    apiKey: 'sk-test',
+    fetchImpl: async (url, options) => {
+      called = { url, options }
+      return {
+        ok: true,
+        json: async () => ({
+          object: 'list',
+          data: [
+            { id: 'text-embedding-3-large', object: 'model' },
+            { id: 'gpt-5.5', object: 'model', created: 200 },
+            { id: 'gpt-5.4-mini', object: 'model', created: 100 },
+          ],
+        }),
+      }
+    },
+  })
+
+  assert.equal(called.url, 'https://api.openai.com/v1/models')
+  assert.equal(called.options.headers.Authorization, 'Bearer sk-test')
+  assert.deepEqual(result.models.map((m) => m.id), ['gpt-5.5', 'gpt-5.4-mini'])
+  assert.equal(result.defaults.stage.refine, 'gpt-5.4-mini')
+  assert.equal(result.defaults.category.smart, 'gpt-5.4-mini')
+})
+
+test('fetchProviderModels uses Anthropic model-list headers', async () => {
+  let called
+  const result = await fetchProviderModels({
+    provider: 'anthropic',
+    apiKey: 'anthropic-key',
+    fetchImpl: async (url, options) => {
+      called = { url, options }
+      return {
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'claude-opus-4-8', display_name: 'Claude Opus' },
+            { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet' },
+            { id: 'claude-haiku-4-5', display_name: 'Claude Haiku' },
+          ],
+        }),
+      }
+    },
+  })
+
+  assert.equal(called.url, 'https://api.anthropic.com/v1/models')
+  assert.equal(called.options.headers['x-api-key'], 'anthropic-key')
+  assert.equal(called.options.headers['anthropic-version'], '2023-06-01')
+  assert.equal(result.defaults.stage.scout, 'claude-haiku-4-5')
+  assert.equal(result.defaults.stage.refine, 'claude-sonnet-4-6')
+})
+
+test('built-in cost-effective defaults keep cheap GLM flash separate from flashx', async () => {
+  const result = await fetchProviderModels({ provider: 'glm' })
+
+  assert.equal(result.source, 'fallback')
+  assert.equal(result.defaults.stage.scout, 'glm-4.7-flash')
+  assert.equal(result.defaults.stage.refine, 'glm-4.7-flashx')
+})
+
+test('API exposes protected model catalog without leaking keys', async () => {
+  const token = 'secret-token'
+  let sawAuth
+  const server = createAppServer({
+    token,
+    fetchImpl: async (_url, options) => {
+      sawAuth = options.headers.Authorization
+      return {
+        ok: true,
+        json: async () => ({ data: [{ id: 'deepseek-v4-flash', object: 'model' }, { id: 'deepseek-v4-pro', object: 'model' }] }),
+      }
+    },
+  })
+  const port = await listen(server)
+  const headers = { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${port}` }
+  try {
+    const blocked = await request(port, 'POST', '/api/models', { headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    assert.equal(blocked.status, 403)
+
+    const ok = await request(port, 'POST', '/api/models', {
+      headers,
+      body: JSON.stringify({ provider: 'deepseek', apiKey: 'deepseek-key' }),
+    })
+    assert.equal(ok.status, 200)
+    const body = JSON.parse(ok.body)
+    assert.equal(sawAuth, 'Bearer deepseek-key')
+    assert.equal(body.defaults.stage.refine, 'deepseek-v4-flash')
+    assert.equal(ok.body.includes('deepseek-key'), false)
   } finally {
     await close(server)
   }

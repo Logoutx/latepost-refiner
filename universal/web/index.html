@@ -59,6 +59,8 @@
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
   .segbtn { background: var(--bg); color: var(--muted); border: none; padding: 7px 16px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
   .segbtn.on { background: var(--accent); color: var(--accent-ink); }
+  .modelbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .modelbar .hint { margin: 0; flex: 1 1 220px; }
   .catrow { display: grid; grid-template-columns: 200px 1fr; gap: 10px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }
   .catrow:first-child { border-top: none; }
   .catlabel { font-size: 13px; font-weight: 600; padding-top: 8px; }
@@ -70,95 +72,103 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>访谈转录精校 <span class="pill">本地网页版</span></h1>
-    <p>删口癖 · 理顺口语 · 加小标题 · 交叉校对人名/品牌/术语 · 统一发言人 —— 保留全部事实，不做摘要。</p>
+    <h1>访谈转录精校 <span class="pill">本地</span></h1>
+    <p>清理口语、统一名词、保留事实。</p>
   </header>
 
   <div class="card">
     <h2>模型</h2>
     <div class="seg">
-      <button type="button" class="segbtn on" data-mode="single">统一一家</button>
-      <button type="button" class="segbtn" data-mode="mixed">按类别混合</button>
+      <button type="button" class="segbtn on" data-mode="single">单一服务商</button>
+      <button type="button" class="segbtn" data-mode="mixed">按任务分配</button>
     </div>
 
     <div id="paneSingle">
       <div class="row">
         <div>
-          <label>Provider</label>
+          <label>服务商</label>
           <select id="provider"></select>
           <p class="hint" id="providerNote"></p>
         </div>
         <div>
           <label>API Key <span class="opt" id="keyHint"></span></label>
-          <input type="password" id="apiKey" placeholder="你的 API key（仅本机内存使用、不落盘）" autocomplete="off">
+          <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
         </div>
       </div>
-      <label style="margin-top:14px">联网搜索 <span class="opt">（仅 verify / timeline 用；精校 refine 从不联网）</span></label>
-      <input type="password" id="tavilyKey" placeholder="Tavily API Key（tvly-…）" autocomplete="off">
+      <label style="margin-top:14px">联网核实 <span class="opt">精校不联网</span></label>
+      <input type="password" id="tavilyKey" placeholder="Tavily API Key" autocomplete="off">
       <p class="hint" id="searchNote"></p>
       <details style="margin-top:12px">
-        <summary>高级：endpoint / 模型覆盖</summary>
-        <label>Base URL <span class="opt">（留空用默认；GLM 国际站、Kimi 国内等）</span></label>
+        <summary>高级设置</summary>
+        <label>Endpoint <span class="opt">可选</span></label>
         <input type="text" id="baseURL" placeholder="">
-        <label>模型覆盖 <span class="opt">（如 scout=haiku,refine=opus；留空用该 provider 默认分层）</span></label>
+        <label>模型分层 <span class="opt">自动填入，可编辑</span></label>
         <input type="text" id="models" placeholder="">
+        <div class="modelbar">
+          <button type="button" class="ghost" id="fetchModels">更新模型</button>
+          <span class="hint" id="modelFetchStatus"></span>
+        </div>
         <p class="hint" id="modelHint"></p>
       </details>
     </div>
 
     <div id="paneMixed" class="hidden">
-      <p class="hint">每一类可用不同的家与 key——便宜活给便宜模型、精校给最强、联网核实给有联网的家。设为「（用默认）」的类别走下面这把默认 key。</p>
-      <p class="hint">「联网核实」选的家 = 联网搜索用谁：Anthropic / GLM / Kimi 用各自自带搜索（无需 Tavily）；DeepSeek / OpenAI 经 Tavily 搜索（下方填 Tavily key）。</p>
+      <p class="hint">按任务分配不同服务商。留空的任务使用默认设置。</p>
+      <p class="hint">联网核实若使用 DeepSeek / OpenAI，需要 Tavily。</p>
       <div class="row">
-        <div><label>默认 Provider</label><select id="defProvider"></select></div>
-        <div><label>默认 API Key</label><input type="password" id="defKey" placeholder="默认 key（设为「用默认」的类别走它）" autocomplete="off"></div>
+        <div><label>默认服务商</label><select id="defProvider"></select></div>
+        <div><label>默认 API Key</label><input type="password" id="defKey" placeholder="用于留空任务" autocomplete="off"></div>
+      </div>
+      <div class="modelbar">
+        <button type="button" class="ghost" id="fetchMixedModels">更新默认模型</button>
+        <span class="hint" id="mixModelHint"></span>
       </div>
       <div id="catRows" style="margin-top:8px"></div>
       <details style="margin-top:10px">
-        <summary>联网搜索（混合模式）</summary>
-        <label>Tavily API Key <span class="opt">（「联网核实」类若用非 anthropic 的家则需要；用 anthropic 则不用）</span></label>
-        <input type="password" id="mixTavily" placeholder="tvly-..." autocomplete="off">
+        <summary>联网核实密钥</summary>
+        <label>Tavily API Key <span class="opt">DeepSeek / OpenAI 需要</span></label>
+        <input type="password" id="mixTavily" placeholder="Tavily API Key" autocomplete="off">
       </details>
     </div>
   </div>
 
   <div class="card">
-    <h2>稿件</h2>
+    <h2>输入</h2>
     <div class="filebox" id="filebox" tabindex="0">
-      点此选择转录文件（可多选）<br><span class="opt">.txt / .md / .docx / .pptx / .xlsx / .pdf（docx/pdf 自动转换）</span>
+      选择转录文件<br><span class="opt">.txt / .md / .docx / .pptx / .xlsx / .pdf</span>
     </div>
     <input type="file" id="files" multiple class="hidden"
            accept=".txt,.md,.docx,.pptx,.xlsx,.pdf,text/plain,text/markdown">
     <ul id="fileList"></ul>
     <div class="row" style="margin-top:8px">
-      <div><label>主题 topic <span class="opt">（用于文件名）</span></label><input type="text" id="topic" placeholder="如 蜜雪冰城"></div>
-      <div><label>采访时间 <span class="opt">（YYYY-MM）</span></label><input type="text" id="date" placeholder="2025-02"></div>
+      <div><label>主题 <span class="opt">用于文件名</span></label><input type="text" id="topic" placeholder="蜜雪冰城"></div>
+      <div><label>采访时间 <span class="opt">YYYY-MM</span></label><input type="text" id="date" placeholder="2025-02"></div>
     </div>
-    <label>采访背景 <span class="opt">（指导侦察 / 联网核实，越具体越好）</span></label>
-    <textarea id="background" placeholder="如：蜜雪冰城集团跨部门访谈系列，受访者为大咖事业群原料研发负责人……"></textarea>
+    <label>背景 <span class="opt">给模型一点上下文</span></label>
+    <textarea id="background" placeholder="例如：蜜雪冰城跨部门访谈，受访者负责原料研发。"></textarea>
   </div>
 
   <div class="card">
     <h2>产出</h2>
-    <label>范围 scope <span class="opt">（精校必选；其余依赖精校产物）</span></label>
+    <label>交付内容</label>
     <div class="checks">
-      <label><input type="checkbox" checked disabled> 精校 refine</label>
+      <label><input type="checkbox" checked disabled> 精校稿</label>
       <label><input type="checkbox" value="logic"> 逻辑顺序稿</label>
-      <label><input type="checkbox" value="summary"> 访谈总结</label>
+      <label><input type="checkbox" value="summary"> 总结</label>
       <label><input type="checkbox" value="timeline"> 时间线</label>
     </div>
     <div class="row3" style="margin-top:12px">
-      <div><label>联网核实 verify</label><select id="verify"><option value="key">key（关键实体）</option><option value="deep">deep（尽量全核）</option><option value="none">none（不联网）</option></select></div>
-      <div><label>小标题 heading</label><select id="heading"><option value="none">none（按内容重新生成）</option><option value="keep">keep（保留原小标题）</option><option value="regenerate">regenerate（去掉重做）</option></select></div>
-      <div><label>并发 <span class="opt">（可空）</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
+      <div><label>联网核实</label><select id="verify"><option value="key">关键实体</option><option value="deep">尽量核全</option><option value="none">不联网</option></select></div>
+      <div><label>小标题</label><select id="heading"><option value="none">自动生成</option><option value="keep">保留原文</option><option value="regenerate">重新生成</option></select></div>
+      <div><label>并发 <span class="opt">可选</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
     </div>
-    <label>输出目录 <span class="opt">（留空用 ~/Documents/Research/&lt;topic&gt;）</span></label>
+    <label>输出位置 <span class="opt">留空则自动创建</span></label>
     <input type="text" id="out" placeholder="">
-    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 忽略既有校对表，从零重建（--fresh）</label></div>
+    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label></div>
   </div>
 
   <div class="actions">
-    <button class="run" id="run">开始精校</button>
+    <button class="run" id="run">开始</button>
     <span class="hint" id="status"></span>
   </div>
 
@@ -181,14 +191,34 @@ let PROVIDERS = [], CATEGORIES = []
 let picked = [] // {name, base64}
 let mode = 'single'
 
-const provOptions = (withDefault) => (withDefault ? '<option value="">（用默认）</option>' : '') + PROVIDERS.map(p => `<option value="${p.name}">${p.label}</option>`).join('')
+const provOptions = (withDefault) => (withDefault ? '<option value="">默认</option>' : '') + PROVIDERS.map(p => `<option value="${p.name}">${p.label}</option>`).join('')
 const hintModel = (tier) => tier === 'opus' ? 'claude-opus-4-8 / gpt-5.5' : tier === 'haiku' ? 'claude-haiku-4-5 / deepseek-chat' : 'claude-sonnet-4-6'
+const STAGE_ORDER = ['scout', 'verify', 'dedup', 'refine', 'logic', 'summary', 'timeline']
+const providerByName = (name) => PROVIDERS.find(p => p.name === name)
+const uniq = (xs) => Array.from(new Set(xs.filter(Boolean)))
+const modelIdsFor = (p) => uniq(((p && p.catalog) || []).map(m => m.id).concat(Object.values((p && p.models) || {})))
+const stageMapping = (defaults) => STAGE_ORDER.map(k => defaults && defaults[k] ? `${k}=${defaults[k]}` : '').filter(Boolean).join(',')
+const CAT_LABELS = { mechanical: '基础处理', web: '联网核实', correction: '术语去重', smart: '精校与总结' }
+const STAGE_LABELS = { scout: '侦察', check: '核对', verify: '核实', dedup: '去重', refine: '精校', logic: '逻辑稿', summary: '总结', timeline: '时间线' }
+const categoryTitle = (c) => CAT_LABELS[c.key] || c.label
+const stageText = (stages) => (stages || []).map(s => STAGE_LABELS[s] || s).join(' · ')
+
+function optionListFor(p) {
+  return modelIdsFor(p).map(id => `<option value="${escAttr(id)}"></option>`).join('')
+}
 
 async function loadConfig() {
   const r = await fetch('/api/providers'); const j = await r.json()
   PROVIDERS = j.providers; CATEGORIES = j.categories || []
   $('provider').innerHTML = provOptions(false); $('provider').onchange = onProvider; onProvider()
   $('defProvider').innerHTML = provOptions(false)
+  $('defProvider').onchange = () => { fetchDefaultMixedModels(false); refreshCategoryDefaults(true, true) }
+  $('defKey').onblur = () => fetchDefaultMixedModels(false)
+  $('apiKey').onblur = () => fetchSingleModels(false)
+  $('baseURL').onblur = () => fetchSingleModels(false)
+  $('models').oninput = () => { $('models').dataset.touched = '1' }
+  $('fetchModels').onclick = () => fetchSingleModels(true)
+  $('fetchMixedModels').onclick = () => fetchDefaultMixedModels(true)
   buildCatRows()
   document.querySelectorAll('.segbtn').forEach(b => b.onclick = () => setMode(b.dataset.mode))
 }
@@ -199,14 +229,70 @@ function onProvider() {
   $('baseURL').placeholder = p.baseURL || '默认'
   $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
   $('searchNote').textContent = p.nativeSearch
-    ? '该家自带联网搜索（已接入），无需 Tavily key（留空即可）。'
-    : '该家无自带联网搜索：填 Tavily key 才能让 verify / timeline 联网（不填则降级；精校 refine 不受影响）。想让别的家专门跑联网核实，用上方「按类别混合」。'
+    ? '已使用服务商自带搜索。'
+    : '联网核实需要 Tavily；精校不联网。'
   $('modelHint').textContent = modelSuggest(p)
+  $('modelFetchStatus').textContent = p.modelWarning || ''
+  setSingleModelDefaults(false)
 }
 function modelSuggest(p) {
-  if (!p.models) return ''
-  const s = '建议模型：精校用 ' + p.models.opus + '；机械 / 核实用 ' + p.models.haiku
-  return p.modelNote ? (s + '。⚠ ' + p.modelNote) : s
+  if (!p.models && !p.costEffective) return ''
+  const d = (p.costEffective && p.costEffective.stage) || {}
+  const s = '推荐：精校/总结 ' + (d.refine || p.models.opus) + '；机械 ' + (d.scout || p.models.haiku) + '；核实 ' + (d.verify || p.models.sonnet) + '。'
+  return p.modelNote ? (s + p.modelNote) : s
+}
+function setSingleModelDefaults(force) {
+  const input = $('models')
+  if (!force && input.dataset.touched) return
+  const p = providerByName($('provider').value) || {}
+  const mapping = stageMapping(p.costEffective && p.costEffective.stage)
+  if (mapping) input.value = mapping
+}
+async function fetchModelsFor(providerName, apiKey, baseURL, statusEl) {
+  const p = providerByName(providerName)
+  if (!p) return null
+  statusEl.textContent = apiKey ? '正在更新模型...' : '未填 API Key，使用内置推荐。'
+  try {
+    const resp = await fetch('/api/models', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ provider: providerName, apiKey, baseURL }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) throw new Error(data.error || '更新失败')
+    p.catalog = data.models || []
+    p.costEffective = data.defaults || p.costEffective
+    p.modelSource = data.source
+    p.modelWarning = data.warning || ''
+    statusEl.textContent = data.warning || ('已更新 ' + p.catalog.length + ' 个模型。')
+    return p
+  } catch (e) {
+    statusEl.textContent = '模型更新失败：' + e.message
+    return p
+  }
+}
+async function fetchSingleModels(force) {
+  const p = providerByName($('provider').value)
+  if (!p) return
+  await fetchModelsFor(p.name, $('apiKey').value.trim(), $('baseURL').value.trim(), $('modelFetchStatus'))
+  $('modelHint').textContent = modelSuggest(p)
+  setSingleModelDefaults(force)
+}
+async function fetchDefaultMixedModels(force) {
+  const p = providerByName($('defProvider').value)
+  if (!p) return
+  await fetchModelsFor(p.name, $('defKey').value.trim(), '', $('mixModelHint'))
+  refreshCategoryDefaults(force, true)
+}
+async function fetchCatModels(cat, force) {
+  const explicitProvider = document.querySelector('.catProvider[data-cat="' + cat + '"]').value
+  const provider = explicitProvider || $('defProvider').value
+  const key = explicitProvider
+    ? document.querySelector('.catKey[data-cat="' + cat + '"]').value.trim()
+    : $('defKey').value.trim()
+  if (!provider) return
+  await fetchModelsFor(provider, key, '', $('mixModelHint'))
+  setCategoryModelDefault(cat, force)
 }
 function setMode(m) {
   mode = m
@@ -217,29 +303,56 @@ function setMode(m) {
 function buildCatRows() {
   $('catRows').innerHTML = CATEGORIES.map(c => `
     <div class="catrow">
-      <div class="catlabel">${c.label}<span class="opt">${c.stages.join(' · ')}</span></div>
+      <div class="catlabel">${categoryTitle(c)}<span class="opt">${stageText(c.stages)}</span></div>
       <div class="catfields">
         <select class="catProvider" data-cat="${c.key}">${provOptions(true)}</select>
-        <input class="catKey hidden" data-cat="${c.key}" type="password" placeholder="该类 API key" autocomplete="off">
-        <input class="catModel" data-cat="${c.key}" type="text" placeholder="模型覆盖（可空，如 ${hintModel(c.tierHint)}）">
+        <input class="catKey hidden" data-cat="${c.key}" type="password" placeholder="该任务 API Key" autocomplete="off">
+        <input class="catModel" data-cat="${c.key}" type="text" list="modelList-${c.key}" placeholder="自动选择模型">
+        <datalist id="modelList-${c.key}"></datalist>
       </div>
     </div>`).join('')
   document.querySelectorAll('.catProvider').forEach(sel => sel.onchange = () => {
     const cat = sel.dataset.cat
     document.querySelector('.catKey[data-cat="' + cat + '"]').classList.toggle('hidden', !sel.value)
-    const meta = PROVIDERS.find(x => x.name === sel.value)
-    const tier = (CATEGORIES.find(c => c.key === cat) || {}).tierHint || 'opus'
-    const mInput = document.querySelector('.catModel[data-cat="' + cat + '"]')
-    mInput.placeholder = (meta && meta.models)
-      ? ('模型覆盖（可空，建议 ' + meta.models[tier] + (meta.modelNote ? '；⚠ ' + meta.modelNote : '') + '）')
-      : '模型覆盖（可空，如 ' + hintModel((CATEGORIES.find(c => c.key === cat) || {}).tierHint) + '）'
+    fetchCatModels(cat, true)
   })
+  document.querySelectorAll('.catKey').forEach(input => input.onblur = () => fetchCatModels(input.dataset.cat, false))
+  document.querySelectorAll('.catModel').forEach(input => input.oninput = () => { input.dataset.touched = '1' })
+  refreshCategoryDefaults(true, false)
+}
+function categoryMeta(cat) {
+  return CATEGORIES.find(c => c.key === cat) || {}
+}
+function categoryProvider(cat) {
+  return document.querySelector('.catProvider[data-cat="' + cat + '"]').value || $('defProvider').value
+}
+function setCategoryModelDefault(cat, force) {
+  const input = document.querySelector('.catModel[data-cat="' + cat + '"]')
+  if (!input || (!force && input.dataset.touched)) return
+  const meta = categoryMeta(cat)
+  const p = providerByName(categoryProvider(cat)) || {}
+  const suggestion = p.costEffective && p.costEffective.category && p.costEffective.category[cat]
+    ? p.costEffective.category[cat]
+    : p.models && p.models[meta.tierHint]
+  const dl = $('modelList-' + cat)
+  if (dl) dl.innerHTML = optionListFor(p)
+  input.placeholder = suggestion
+    ? ('默认 ' + suggestion)
+    : ('自动选择，如 ' + hintModel(meta.tierHint))
+  if (suggestion) input.value = suggestion
+}
+function refreshCategoryDefaults(force, onlyDefaultProvider) {
+  for (const c of CATEGORIES) {
+    const explicit = document.querySelector('.catProvider[data-cat="' + c.key + '"]').value
+    if (onlyDefaultProvider && explicit) continue
+    setCategoryModelDefault(c.key, force)
+  }
 }
 
 function collectModel() {
   if (mode === 'single') {
     const apiKey = $('apiKey').value.trim()
-    if (!apiKey) throw new Error('请填写 API key。')
+    if (!apiKey) throw new Error('请填写 API Key。')
     return { provider: $('provider').value, apiKey, baseURL: $('baseURL').value.trim() || undefined, tavilyKey: $('tavilyKey').value.trim() || undefined, models: parseModels($('models').value) }
   }
   const defProvider = $('defProvider').value, defKey = $('defKey').value.trim()
@@ -250,8 +363,8 @@ function collectModel() {
     const modelOverride = document.querySelector('.catModel[data-cat="' + c.key + '"]').value.trim() || undefined
     const provider = provSel || defProvider
     const apiKey = provSel ? keyVal : defKey
-    if (!provider) throw new Error('「' + c.label + '」未选 provider（或填默认 provider）。')
-    if (!apiKey) throw new Error('「' + c.label + '」缺少 API key（' + (provSel ? '该类' : '默认') + ' key 为空）。')
+    if (!provider) throw new Error('请选择「' + categoryTitle(c) + '」的服务商。')
+    if (!apiKey) throw new Error('请填写「' + categoryTitle(c) + '」的 API Key。')
     categories[c.key] = { provider, apiKey, modelOverride }
   }
   const t = $('mixTavily').value.trim()
@@ -285,7 +398,7 @@ async function handleFiles(fileList) {
   picked = []
   for (const f of arr) picked.push({ name: f.name, base64: await fileToBase64(f) })
   fb.classList.add('has')
-  fb.innerHTML = '<b>' + picked.length + ' 份文件已选</b> · 点此重新选择'
+  fb.innerHTML = '<b>' + picked.length + ' 份文件</b> · 重新选择'
   $('fileList').innerHTML = picked.map(p => `<li>· ${esc(p.name)}</li>`).join('')
 }
 
@@ -304,8 +417,8 @@ const log = (msg, cls) => { const c = $('console'); const span = document.create
 
 $('run').onclick = run
 async function run() {
-  if (!picked.length) return setStatus('请先选择至少一份转录文件。', true)
-  if (!$('topic').value.trim()) return setStatus('请填写主题 topic。', true)
+  if (!picked.length) return setStatus('请先选择文件。', true)
+  if (!$('topic').value.trim()) return setStatus('请填写主题。', true)
   let modelParams
   try { modelParams = collectModel() } catch (e) { return setStatus(e.message, true) }
 
@@ -323,7 +436,7 @@ async function run() {
     concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
   }
 
-  $('run').disabled = true; setStatus('运行中……（大文件 opus 精校可能数分钟）')
+  $('run').disabled = true; setStatus('运行中... 大文件可能需要几分钟。')
   $('consoleCard').style.display = 'block'; $('console').innerHTML = ''
   $('resultCard').style.display = 'none'; $('result').innerHTML = ''
 
@@ -356,28 +469,29 @@ function handleEvent(raw) {
 function renderResult(r) {
   $('resultCard').style.display = 'block'
   const out = []
-  out.push(`<p>provider：<b>${esc(r.providerInfo ? r.providerInfo.label : r.provider)}</b>　输出目录：<code>${esc(r.outputDir)}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
-  out.push(`<h3 class="ok">精校成稿 ${Number(r.refined.length) || 0} 份</h3><ul>` + r.refined.map(x => `<li><code>${esc(x.outPath || x.path)}</code></li>`).join('') + '</ul>')
-  if (r.glossaryPath) out.push(`<p>统一校对表：<code>${esc(r.glossaryPath)}</code></p>`)
-  if (r.reviewPath) out.push(`<p>Review queue：<code>${esc(r.reviewPath)}</code></p>`)
-  if (r.manifestPath) out.push(`<p>Run manifest：<code>${esc(r.manifestPath)}</code></p>`)
+  out.push(`<p>模型：<b>${esc(r.providerInfo ? r.providerInfo.label : r.provider)}</b>　输出：<code>${esc(r.outputDir)}</code> <button class="ghost" id="openBtn">打开文件夹</button></p>`)
+  out.push(`<h3 class="ok">精校稿 ${Number(r.refined.length) || 0} 份</h3><ul>` + r.refined.map(x => `<li><code>${esc(x.outPath || x.path)}</code></li>`).join('') + '</ul>')
+  if (r.glossaryPath) out.push(`<p>校对表：<code>${esc(r.glossaryPath)}</code></p>`)
+  if (r.reviewPath) out.push(`<p>待处理清单：<code>${esc(r.reviewPath)}</code></p>`)
+  if (r.manifestPath) out.push(`<p>运行记录：<code>${esc(r.manifestPath)}</code></p>`)
   const warn = (label, items, fmt) => { if (items && items.length) out.push(`<h3 class="warn">${esc(label)}（${items.length}）</h3><ul>` + items.map(fmt || (x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`)).join('') + '</ul>') }
-  warn('未完成（需手动补做）', r.failed)
-  warn('疑似中途截断', r.incomplete, x => `<li><code>${esc(x.path)}</code>${x.note ? '：' + esc(x.note) : ''}</li>`)
-  warn('结尾完整性未核', r.unchecked, x => `<li><code>${esc(x)}</code></li>`)
-  warn('侦察疑损坏（校对表该份不可靠）', r.scoutSuspect)
-  warn('源文件已带小标题（headingPolicy=none）', r.headingConflicts)
-  warn('疑似同指（待人工确认，未自动合并）', r.suspectedDuplicates, x => `<li>${esc((x.members || []).join(' / '))}</li>`)
-  warn('因网络故障未核实', r.networkUnverified, x => `<li>${esc(typeof x === 'string' ? x : (x.query || JSON.stringify(x)))}</li>`)
+  warn('未完成', r.failed)
+  warn('疑似截断', r.incomplete, x => `<li><code>${esc(x.path)}</code>${x.note ? '：' + esc(x.note) : ''}</li>`)
+  warn('结尾待核', r.unchecked, x => `<li><code>${esc(x)}</code></li>`)
+  warn('侦察异常', r.scoutSuspect)
+  warn('原文已有小标题', r.headingConflicts)
+  warn('疑似同指', r.suspectedDuplicates, x => `<li>${esc((x.members || []).join(' / '))}</li>`)
+  warn('未完成联网核实', r.networkUnverified, x => `<li>${esc(typeof x === 'string' ? x : (x.query || JSON.stringify(x)))}</li>`)
   if (r.logic && r.logic.length) out.push(`<h3>逻辑顺序稿 ${r.logic.filter(l => l.path).length}/${r.logic.length}</h3><ul>` + r.logic.filter(l => l.path).map(l => `<li><code>${esc(l.path)}</code></li>`).join('') + '</ul>')
   if (r.summary) out.push(`<p>访谈总结：${esc(String(r.summary).split('\n')[0])}</p>`)
   if (r.timeline) out.push(`<p>时间线：${esc(String(r.timeline).split('\n')[0])}</p>`)
-  if (r.openQuestions && r.openQuestions.length) out.push(`<h3>收尾待问（${r.openQuestions.length}）</h3><ul>` + r.openQuestions.map(q => `<li>${esc(typeof q === 'string' ? q : JSON.stringify(q))}</li>`).join('') + '</ul>')
-  if (r.usage) out.push(`<p class="hint">用量：${r.usage.agents} 个代理调用 · 输入 ${(r.usage.input || 0).toLocaleString()} / 输出 ${(r.usage.output || 0).toLocaleString()} tok</p>`)
+  if (r.openQuestions && r.openQuestions.length) out.push(`<h3>待确认（${r.openQuestions.length}）</h3><ul>` + r.openQuestions.map(q => `<li>${esc(typeof q === 'string' ? q : JSON.stringify(q))}</li>`).join('') + '</ul>')
+  if (r.usage) out.push(`<p class="hint">用量：${r.usage.agents} 次调用 · 输入 ${(r.usage.input || 0).toLocaleString()} / 输出 ${(r.usage.output || 0).toLocaleString()} tokens</p>`)
   $('result').innerHTML = out.join('')
   const ob = $('openBtn'); if (ob) ob.onclick = () => fetch('/api/open', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path: r.outputDir }) })
 }
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) }
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;') }
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
 
 loadConfig()
