@@ -45,8 +45,9 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
    - `<out>/review.md`
    - `<out>/run.json`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-5. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
-6. Ask any remaining open questions in one final batch, with exact output paths and next actions.
+5. Run `scripts/audit_refined.mjs <out>/Transcripts/*.md` before handoff. Treat leftover pure filler, stutter repeats, and paragraphs over about 900 characters as quality failures to fix or explicitly surface.
+6. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
+7. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
 ## Manual Fallback
 
@@ -66,12 +67,14 @@ Manual flow:
 6. Check ending completeness and suspicious names/terms.
 7. Produce optional logical-order rewrite, timeline, and summary from the refined outputs.
 8. Write a concise handoff listing paths, warnings, unresolved questions, and any re-verification recommendations.
+9. For any manual fallback output, run `scripts/audit_refined.mjs` before handoff. Do not mark the file clean while the audit reports leftover pure口癖 or overlong combined paragraphs.
 
 ## Quality Bar
 
 - Preserve all substantive facts, figures, dates, products, processes, channels, opinions, and quotes.
 - Keep dialogue form and speaker labels as plain text.
 - Remove口癖, filler, timestamps, repeated confirmation noises, and unrecoverable ASR garbage.
+- Preserve readable dialogue boundaries. Do not collapse many source turns into one giant paragraph; long monologues should be split into coherent 200-600 字 paragraphs, and any single dialogue paragraph over about 900 字 needs review.
 - Do not fabricate names. Keep `（音）` or `（音，存疑）` when evidence is insufficient.
 - Add unnumbered `##` headings by topic; never invent conclusions in headings.
 - Use full-width Chinese punctuation, Arabic numerals for exact counts, and Pangu spacing between Chinese and Latin/numbers.

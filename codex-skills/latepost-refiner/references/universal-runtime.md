@@ -100,6 +100,14 @@ The runtime writes:
 
 Read `review.md` before reporting completion. It consolidates failed files, incomplete endings, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
 
+Run the deterministic quality audit before reporting completion:
+
+```bash
+node codex-skills/latepost-refiner/scripts/audit_refined.mjs <out>/Transcripts/*.md
+```
+
+If it reports `status: fail`, fix the refined transcript or explicitly surface the audit findings. Do not hand off as clean when the audit finds leftover pure filler/stutter repeats or dialogue paragraphs longer than about 900 characters. Soft `empty_phrase_candidates` are review candidates: inspect context before changing, because `这个` and `然后` can be meaningful.
+
 Read `run.json` when auditing a run, resuming a run, or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
 
 ## Return And Handoff
@@ -108,5 +116,6 @@ In the final response to the user:
 - State what was generated and where.
 - Mention unresolved items from `review.md`.
 - Mention whether any `networkUnverified` items should be re-checked.
+- Mention the refined-output audit status, especially any hard failures.
 - Mention whether resume skipped files.
 - Avoid pasting long transcript content into chat.

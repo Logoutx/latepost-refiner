@@ -41,6 +41,9 @@ Collapse spelling-confirmation exchanges into the corrected spelling. If the con
 - Do not number headings.
 - Make headings descriptive but not interpretive beyond the text.
 - If source already has meaningful reporter/steno headings, ask whether to keep or regenerate unless the user already decided.
+- Preserve dialogue boundaries. Do not merge separate source turns merely because the same speaker continues talking.
+- Merge adjacent same-speaker source segments only when they are clearly one sentence split by ASR and the merged paragraph remains readable, usually under 500 Chinese characters.
+- Split long monologues into coherent paragraphs under the same topic; any single dialogue paragraph over about 900 Chinese characters should be treated as a review failure.
 
 ## Names, Brands, Terms
 
@@ -97,3 +100,4 @@ Keep filename and H1 identical where practical.
 - Do not stop mid-topic.
 - Write large blocks correctly on first pass instead of many tiny edits.
 - Verify the output ending matches the source ending.
+- Run the local refined-output audit before handoff when available; fix or report leftover pure filler, stutter repeats, and overlong paragraphs.
