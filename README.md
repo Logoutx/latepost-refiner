@@ -76,7 +76,7 @@ node universal/cli.js \
 # 或装成命令：npm link 之后直接 latepost-refiner --files ...
 ```
 
-- docx/pptx/xlsx/pdf 会自动经 `markitdown` 转成 md（需先 `pipx install markitdown` 并在 PATH 上）。
+- docx/pptx/xlsx/pdf 会自动经 `markitdown` 转成 md（复杂 PDF 走 `docling`）。第一次在某台机器上用，先跑一次 `bash scripts/setup-converters.sh`——幂等，只装缺的，经 pipx 装好 markitdown + docling 并放到 PATH 上。
 - 模型默认分层：scout=haiku、verify/dedup=sonnet、refine/logic/summary/timeline=opus、结尾核对=haiku；用 `--models scout=haiku,refine=opus` 覆盖。
 - 校对表写到 `<out>/校对表.md`，并跨批次累积（持久化校对表）；`--fresh` 从零重建。
 - 每次运行还会写 `<out>/review.md`（人工收尾清单）和 `<out>/run.json`（本次运行的配置、输入哈希、产物、提醒、用量），便于交接、追踪和后续 resume。
@@ -102,7 +102,7 @@ npm run build:binary                          # 需先 brew install bun；产出
 TARGET=bun-darwin-x64 npm run build:binary    # Intel Mac
 ```
 
-`web/index.html` 和 `references/*.md` 都内嵌进可执行文件；.docx 用内置的 mammoth 解析（.pptx/.xlsx/.pdf 仍需 PATH 上有 markitdown）。
+`web/index.html` 和 `references/*.md` 都内嵌进可执行文件；.docx 用内置的 mammoth 解析（.pptx/.xlsx/.pdf 仍需 PATH 上有 markitdown——用 `scripts/setup-converters.sh` 一次装好）。
 
 下载后首次运行，macOS 会拦一次未签名程序：右键点它选“打开”（只需一次），或在终端跑 `xattr -dr com.apple.quarantine latepost-refiner-web`。之后启动，浏览器访问 http://127.0.0.1:8765。
 
