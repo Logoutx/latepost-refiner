@@ -1,0 +1,15 @@
+# Workflow return handling (Claude Code fast path)
+
+The `Workflow({ scriptPath, args })` dispatch returns a result object. Walk these fields, then go straight to **Step 5 (wrap-up)** in `SKILL.md`.
+
+1. **`glossary`** — `Write` it in full to `<output dir>/校对表.md` to archive. It is **cumulative** (it already incorporates any `priorGlossaryText` you passed), so writing it back simply supersedes the old file — no manual merge. Before writing, glance over the typesetting: verification sources, same-referent reasons, and other full-sentence Chinese notes should use Arabic numerals, Pangu spacing, and full-width curly quotes. Subagents mostly get this right; fix any stragglers.
+2. **`failed`** — these files weren't produced. Do them by hand per the manual pipeline (`references/manual-steps.md`, Steps 1–2).
+3. **`incomplete`** — the output didn't reach the ending. Dispatch a refine subagent to continue to the end.
+4. **`unchecked`** — the ending-completeness check agent itself failed. Don't treat the file as passed; self-check against the source ending with `tail`.
+5. **`scoutSuspect`** (non-empty) — scouting returned garbled content and was still broken after a retry, usually a network-corrupted generation stream. The outputs are unaffected (refine reads the source file), but **those files' glossary entries are untrustworthy**. Tell the user and suggest re-running scouting on those files alone once the network is stable.
+6. **`headingConflicts`** — these files already had sub-headings but ran under 'none'. Fold into the Step 5 questions (keep / redo), re-running that file alone if needed.
+7. **`suspectedDuplicates`** — groups written differently but suspected of being the same referent that the script did not auto-merge (e.g. 周勇 / 尹勇). Already folded into `openQuestions`; ask the user in Step 5 whether they're the same.
+8. **`networkUnverified`** (non-empty) — items the verify agent **skipped via the circuit breaker, never actually verified** (as opposed to "checked but not found"). In the Step 5 batch, offer a **re-verify option** (“网络恢复了吗？要不要把这 N 项补查一遍”). On confirmation, dispatch **one** sonnet subagent to verify just those via WebSearch — same discipline: only resolved with cited evidence, never fabricate, stop on consecutive errors — and append the conclusions to a 「## 补核结论」 section at the end of `<output dir>/校对表.md`. If a re-verify **corrects a name/term spelling already used in the outputs**, tell the user and propose one targeted replacement. Names follow the same strong-name guard: when a re-verify conclusion conflicts with an output's strong name, only report it, don't silently change it.
+9. **`openQuestions`** — fold into the single Step 5 batch.
+10. **`logic`** (the logical-order rewrites) — already written by the workflow to `<output>/逻辑顺序/`. If any item's `missingSections` is non-empty, the per-section coverage check suspects that section was dropped from the rewrite; spot-check it and re-run that file alone if needed.
+11. **`summary` / `timeline`** — already written to disk by the workflow.
