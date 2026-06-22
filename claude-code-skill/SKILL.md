@@ -52,13 +52,13 @@ Concentrate interaction **in one opening round**: ask everything the user "can a
 
 1. **Set the output location.** Ask the user for the absolute path of the output folder right in the conversation — **offer a sensible default to confirm or change**, don't make them type a full path from scratch. This user keeps research notes in the Obsidian `Company Research` vault, so the **default suggestion** is:
    `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Outer Mind/Company Research/<项目名>`
-   (pick a `<项目名>` from this run's topic/company, e.g. `Mixue`, `Xige`). Use a different path if the user gives one; `mkdir -p` if it doesn't exist. **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; timeline and summary → `<chosen folder>/` root.
+   (pick a `<项目名>` from this run's topic/company, e.g. `ExampleCo`, `ExampleCo-B`). Use a different path if the user gives one; `mkdir -p` if it doesn't exist. **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; timeline and summary → `<chosen folder>/` root.
 
 2. **Have the user describe the background on the spot** (these don't require reading the full text, and they let you run to the end without interrupting):
    - **Who was interviewed**: the speaker list (including which reporter/host is who) + each interviewee's title/background at the time, even just a nickname or English name.
    - **What was discussed**: topic / industry domain; the companies, organizations, and key people involved.
    - These two drive how you later web-verify by "domain + name" and how you label speakers.
-   - **Pre-fill what you can infer from filenames and have the user confirm/amend** (e.g. filename 「Retail Talk with ex-FUDI 顾隽华」 → first ask “采访对象是顾隽华(ex-FUDI)、聊零售/仓储会员店，对吗？”), to reduce typing.
+   - **Pre-fill what you can infer from filenames and have the user confirm/amend** (e.g. filename 「Retail Talk with ex-RetailCo 王某」 → first ask “采访对象是王某(ex-RetailCo)、聊零售/仓储会员店，对吗？”), to reduce typing.
 
 3. **Pre-flight (cheap work before dispatch)**: convert `.docx/.pdf` to markdown per the global rules; record each file's line and byte count with `wc -l`/`wc -c`; probe for existing (reporter/steno) sub-headings with `grep -nE '^#{1,3} |^【'`. **Persistent company glossary**: if `<outputDir>/校对表.md` already exists from a prior batch for this company, `Read` it in full and carry its text into `priorGlossaryText` (args below) — the workflow seeds scouting from the known entities and **accumulates** this batch into it, keeping spellings consistent across the company's whole interview set and not re-verifying already-confirmed entities. Tell the user you're extending the existing company glossary; pass `fresh: true` only if they explicitly want a from-scratch rebuild.
 
@@ -115,9 +115,9 @@ Gather these into **one** AskUserQuestion or one message. Deliver at the same ti
 
 - **Location**: refined transcripts → `<chosen folder>/Transcripts/`; logical-order rewrites → `<chosen folder>/逻辑顺序/`; timeline and summary → `<chosen folder>/`.
 - **File title format**: `英文名（中文名）当时的title`.
-  - Both an English name and a Chinese real name: `Allan（刘晛）CFO·合伙人`, `Joey（邢夏淳）合伙人·CEO`.
-  - Only a Chinese name (no English name): `胡欢 酵色合伙人` (name + title, no parentheses).
-  - Real name not found, only a nickname/English name: keep the nickname + title, e.g. `Sherrie 酵色·负责投放`, **don't fabricate a Chinese name**.
+  - Both an English name and a Chinese real name: `Allan（王哲）CFO·合伙人`, `Joey（李航）合伙人·CEO`.
+  - Only a Chinese name (no English name): `陈悦 示例品牌合伙人` (name + title, no parentheses).
+  - Real name not found, only a nickname/English name: keep the nickname + title, e.g. `Sherrie 示例品牌·负责投放`, **don't fabricate a Chinese name**.
   - Group interview with multiple people: name it as `团队/角色（各花名+分工）`.
   - Keep the filename and the in-file H1 title identical.
 - **Real-name verification conclusions** go in the timeline's "关键人物对照表": verified ones tagged with the real name + source, ones not found tagged “真名未公开”.
@@ -126,7 +126,7 @@ Gather these into **one** AskUserQuestion or one message. Deliver at the same ti
 
 Read `references/editorial-spec.md` before refining (or assembling a refine subagent prompt). The essence:
 - **Refine ≠ summarize** — keep every substantive fact, figure, date, product, process, opinion, and characterful quote.
-- **Dialogue form**; speaker labels are **plain text** (`张璐：`, never `**张璐：**`).
+- **Dialogue form**; speaker labels are **plain text** (`李明：`, never `**李明：**`).
 - Remove 口癖 / filler / confirmation noises / timestamps / unrecoverable ASR garbage — by meaning, not mechanically (when unsure, keep).
 - **Never fabricate names**; keep `（音）` / `（音，存疑）` when evidence is insufficient; follow `校对表.md` strictly.
 - Add **unnumbered** `##` topic headings; don't invent conclusions in headings.

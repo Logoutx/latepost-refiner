@@ -4,7 +4,7 @@
 // the Claude Code edition assembles in its Step 0 pre-flight, builds the Anthropic-SDK
 // engine, runs runPipeline, and handles the return value (write glossary, report flags).
 //
-//   latepost-refiner --files a.docx b.docx --topic "蜜雪冰城" --date 2025-02 \
+//   latepost-refiner --files a.docx b.docx --topic "示例公司" --date 2025-02 \
 //     --background-file bg.txt --scope refine,summary --verify key --out ./out
 //
 // Output is identical to the Claude Code edition: <out>/校对表.md, <out>/Transcripts/*.md,

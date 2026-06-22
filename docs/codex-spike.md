@@ -36,7 +36,7 @@ The no-key design runs the deterministic merge / clustering / glossary in Node l
 
 The `verify` stage cross-checks names against public sources. Can a Codex subagent (or Codex itself) **web-search on the subscription**, with no Tavily / search-API key?
 
-**Do:** look up a public fact — *the founder / legal name behind 蜜雪冰城* — using Codex's own web capability (no `TAVILY_API_KEY`). Return the answer **plus a source URL**.
+**Do:** look up a public fact — *the founder / legal name behind a well-known consumer brand of your choosing* — using Codex's own web capability (no `TAVILY_API_KEY`). Return the answer **plus a source URL**.
 
 **Pass if:** it returns a sourced answer with **no search/API key**. Note the mechanism (built-in browsing? a tool?).
 

@@ -4,8 +4,8 @@ export const GOLDEN_FIXTURES = [
   {
     id: 'spell-name',
     title: 'collapse spelling confirmation into the clarified name',
-    input: '记者：你刚才说吴杰？\n受访者：吴，哪个杰？不是杰出的杰，是捷报的捷，提手旁那个。吴捷负责原料研发。',
-    mustContain: ['吴捷', '原料研发'],
+    input: '记者：你刚才说吴杰？\n受访者：吴，哪个杰？不是杰出的杰，是捷报的捷，提手旁那个。吴捷负责渠道运营。',
+    mustContain: ['吴捷', '渠道运营'],
     mustNotContain: ['吴杰', '哪个杰', '杰出的杰', '捷报的捷'],
   },
   {

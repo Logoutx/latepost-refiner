@@ -5,7 +5,7 @@ import { scoreGoldenAll, scoreGoldenOne } from '../eval/golden-score.js'
 
 test('golden scorer passes when required properties are present and forbidden text is absent', () => {
   const fx = { id: 'x', title: 'fixture', mustContain: ['吴捷'], mustNotContain: ['吴杰'] }
-  assert.deepEqual(scoreGoldenOne(fx, '吴捷负责原料研发。'), {
+  assert.deepEqual(scoreGoldenOne(fx, '吴捷负责渠道运营。'), {
     id: 'x',
     title: 'fixture',
     mustContain: 1,
@@ -20,7 +20,7 @@ test('golden scorer passes when required properties are present and forbidden te
 
 test('golden scorer reports missing and forbidden properties', () => {
   const fx = { id: 'x', title: 'fixture', mustContain: ['吴捷'], mustNotContain: ['吴杰'] }
-  const row = scoreGoldenOne(fx, '吴杰负责原料研发。')
+  const row = scoreGoldenOne(fx, '吴杰负责渠道运营。')
   assert.equal(row.pass, false)
   assert.deepEqual(row.missing, ['吴捷'])
   assert.deepEqual(row.forbiddenPresent, ['吴杰'])
