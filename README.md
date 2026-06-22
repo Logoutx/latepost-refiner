@@ -34,8 +34,8 @@ universal/           ★ Universal 版（独立的 Anthropic SDK 命令行工具
 ```
 
 `runPipeline(A, engine)` 只依赖一个 engine 接口的 5 个原语：`agent / parallel / pipeline / phase / log`。
-- **Claude Code 版**：这 5 个原语就是 Workflow 工具的全局函数，`build/bootstrap-cc.js` 直接转交。
-- **Universal 版**：`engines/api.js` 用 Anthropic SDK 实现它们。关键做法是把 `Read / Write / Edit` 实现成**客户端工具**（联网核实则用 Anthropic 服务端的 `web_search` / `web_fetch`），于是 `core/` 里那些“用 Read 分页读……”“Write 到……”“用 WebSearch 核实……”的 prompt 一字不改就能复用。
+- **Claude Code 版**：这 5 个原语就是 Workflow 工具的全局函数，`build/bootstrap-cc.js` 直接转交。子代理跑在你的 **Claude Code 会话/订阅上，不需要 API key**（也不碰 `engines/`）。
+- **Universal 版（需 API key）**：`engines/api.js` 用 Anthropic SDK 实现它们。关键做法是把 `Read / Write / Edit` 实现成**客户端工具**（联网核实则用 Anthropic 服务端的 `web_search` / `web_fetch`），于是 `core/` 里那些“用 Read 分页读……”“Write 到……”“用 WebSearch 核实……”的 prompt 一字不改就能复用。
 
 结果：prompt、schema、编辑规范、纯逻辑、流水线**约 90% 只写一次**；每个版本只维护自己那一层引擎。
 
