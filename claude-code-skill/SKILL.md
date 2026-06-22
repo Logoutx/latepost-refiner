@@ -20,6 +20,8 @@ documents, and optionally go on to produce a timeline and a summary. Core belief
 definitely not summarization** — preserve the speaker's tone, opinions, and every factual detail; only remove noise,
 fix transcription errors, and add structure.
 
+> **Talk to the user in Chinese.** Every user-facing message — the Step 0 questions, progress notes, the Step 5 wrap-up — is written in Chinese (the transcripts and deliverables are Chinese anyway). Follow the user's Chinese typesetting rules: 全角弯引号 “”, Arabic numerals, and a half-width space between Chinese and Latin/numbers.
+
 ## When to use / not use
 - **Use**: dialogue-style transcripts needing cleanup + structure + name/term fixes; turning several related
   interviews into one searchable research set; a timeline/summary built on top of the refined text.
@@ -50,9 +52,7 @@ and every step follows it.
 
 Concentrate interaction **in one opening round**: ask everything the user "can answer from memory on the spot", then run autonomously without interrupting. Do four things up front, ideally in one or two exchanges:
 
-1. **Set the output location.** Ask the user for the absolute path of the output folder right in the conversation — **offer a sensible default to confirm or change**, don't make them type a full path from scratch. This user keeps research notes in the Obsidian `Company Research` vault, so the **default suggestion** is:
-   `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Outer Mind/Company Research/<项目名>`
-   (pick a `<项目名>` from this run's topic/company, e.g. `ExampleCo`, `ExampleCo-B`). Use a different path if the user gives one; `mkdir -p` if it doesn't exist. **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; timeline and summary → `<chosen folder>/` root.
+1. **Set the output location — ask every run.** Always ask the user where to save the output and **wait for their answer**; never assume, reuse, or silently default to a folder. Accept an absolute path (they can paste one or drag a folder into the terminal); `mkdir -p` if it doesn't exist. **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; logical-order rewrites → `<chosen folder>/逻辑顺序/`; timeline and summary → `<chosen folder>/` root.
 
 2. **Have the user describe the background on the spot** (these don't require reading the full text, and they let you run to the end without interrupting):
    - **Who was interviewed**: the speaker list (including which reporter/host is who) + each interviewee's title/background at the time, even just a nickname or English name.

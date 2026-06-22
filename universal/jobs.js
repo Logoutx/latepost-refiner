@@ -159,7 +159,8 @@ export async function runJob(params, { onPhase, onLog } = {}) {
     skillDir,
   } = params
   if (!files.length) throw new Error('未提供任何文件')
-  const outDir = path.resolve(outputDir || `${process.env.HOME}/Documents/Research/${topic}`)
+  if (!outputDir || !String(outputDir).trim()) throw new Error('未指定输出文件夹——请明确给出保存位置（不再自动选择）')
+  const outDir = path.resolve(outputDir)
   const workDir = path.join(outDir, '.uploads')
   fs.mkdirSync(workDir, { recursive: true })
 
