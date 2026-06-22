@@ -10,7 +10,7 @@ parse→render→parse idempotency) + one live seeded-scout test. Author note: d
 Today `校对表.md` is per-batch **output** — rebuilt from zero every run, then overwritten.
 Make it per-company **memory** — read at the start of every run to seed the pipeline,
 extended (not replaced) at the end. The output dir already *is* the company folder
-(`Mixue/`, `Xige/`…), so the existing `校对表.md` files become the seed for free.
+(`ExampleCo/`, `ExampleCo-B/`…), so the existing `校对表.md` files become the seed for free.
 Batch 1 is unchanged; batches 2+ get spelling-consistent, cheaper, and faster.
 
 ## Why
@@ -74,11 +74,11 @@ a conflicting canonical surfaces as an `openQuestion` (P4).
 
 ## Verification (mostly free)
 
-- Round-trip: `parseGlossary(renderGlossary(x)) ≈ x` on the **real Mixue 校对表**.
-- `mergeIntoPrior`: 张总→张红超 folds as variant (no dup); a new entity is added; a
+- Round-trip: `parseGlossary(renderGlossary(x)) ≈ x` on the **real ExampleCo 校对表**.
+- `mergeIntoPrior`: 王总→王志远 folds as variant (no dup); a new entity is added; a
   conflicting canonical surfaces, doesn't overwrite.
 - Regression suite stays green; first-run (no prior) byte-identical to today.
-- One live re-run: a Mixue file seeded with the existing 校对表 → verify does less, 写法 hold.
+- One live re-run: a ExampleCo file seeded with the existing 校对表 → verify does less, 写法 hold.
 
 ## Phasing
 
@@ -88,4 +88,4 @@ a conflicting canonical surfaces as an `openQuestion` (P4).
 - **P3** — promote 发言人统一标注 to a cross-interview `发言人登记` registry.
 - **P4** — `确认不同指（勿合并）` section fed back into dedup; `glossaryConflicts` surfaces
   verify-vs-glossary disagreements; `weakDupFlags` surfaces cross-batch weak-honorific
-  ambiguities (张总) for human disambiguation — all into openQuestions, never auto-merged.
+  ambiguities (王总) for human disambiguation — all into openQuestions, never auto-merged.

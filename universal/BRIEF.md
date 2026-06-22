@@ -51,8 +51,8 @@ log(msg) -> void
 ## CLI sketch
 
 ```bash
-latepost-refiner --files "a.docx" "b.docx" --topic "Mixue" --date 2025-02 \
-  --background "Mixue Group cross-team interview series..." --scope refine,logic,summary \
+latepost-refiner --files "a.docx" "b.docx" --topic "ExampleCo" --date 2025-02 \
+  --background "ExampleCo Group cross-team interview series..." --scope refine,logic,summary \
   --verify key --out ./output --models scout=haiku,refine=opus
 ```
 
@@ -63,7 +63,7 @@ Output is identical to the Claude Code edition: `<out>/校对表.md`, `Transcrip
 1. Check the `claude-api` skill to lock down the API syntax (model id / tool-use structured output / web search tool).
 2. Write the tool-use loop in `engines/api.js` (four client tools: Read / Write / WebSearch / StructuredOutput) + `parallel`/`pipeline` (p-limit).
 3. Write `cli.js` (argv → A, docx → md, call runPipeline, handle return value).
-4. End-to-end test: run a single file through using `~/Downloads/2025-02-21_范 大咖事业群，原料研发.txt`, compare against the known-good Claude Code edition output (user's Obsidian `Company Research/Mixue/`).
+4. End-to-end test: run a single file through using `~/Downloads/2025-02-21_王某 某事业部，渠道运营.txt`, compare against the known-good Claude Code edition output (user's Obsidian `Company Research/ExampleCo/`).
 5. Packaging + README + `.env.example`.
 
 ## Pitfalls already fixed in core — do not break their assumptions in the engine

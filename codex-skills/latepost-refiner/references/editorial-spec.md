@@ -9,7 +9,7 @@ Refine, do not summarize. Preserve the speaker's facts, opinions, chronology, to
 ## Dialogue And Speakers
 
 - Keep dialogue form.
-- Speaker labels are plain text, not bold: `张璐：`.
+- Speaker labels are plain text, not bold: `李明：`.
 - Normalize interviewer labels to the reporter/host name.
 - Normalize interviewee-side asides from unnamed colleagues as `同事：`.
 - For group interviews, use names when known; otherwise use role/nickname consistently.
