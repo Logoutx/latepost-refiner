@@ -1,0 +1,4 @@
+interface:
+  display_name: "LatePost Refiner"
+  short_description: "Refine interview transcripts into research-grade deliverables"
+  default_prompt: "Use $latepost-refiner with OpenAI defaults to clean and structure these interview transcripts while preserving every factual detail."
