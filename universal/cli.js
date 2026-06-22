@@ -74,6 +74,7 @@ async function main() {
 必填:
   --files <路径...>      一或多份转录（.txt/.md/.docx/.pptx/.xlsx/.pdf；docx/pdf 自动转 md）
   --topic <主题>         公司/人物主题（用于交付物文件名）
+  --out <目录>           输出根目录（每次都要指定，不再默认）
 
 常用:
   --date <YYYY-MM>       采访时间（写入抬头）
@@ -82,7 +83,6 @@ async function main() {
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
-  --out <目录>           输出根目录（默认 ./<topic>）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
@@ -99,8 +99,9 @@ async function main() {
   }
 
   if (!a.files.length) { console.error('错误：至少需要一个 --files'); process.exit(2) }
+  if (!a.outputDir || !a.outputDir.trim()) { console.error('错误：必须用 --out 指定输出目录（不再默认到 ./<topic>）'); process.exit(2) }
   const topic = a.topic || 'untitled'
-  const outputDir = path.resolve(a.outputDir || `./${topic}`)
+  const outputDir = path.resolve(a.outputDir)
   const skillDir = path.resolve(a.skillDir || path.join(REPO_ROOT, 'claude-code-skill'))
   const date = a.date || ''
   let background = a.background || ''
