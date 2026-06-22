@@ -7,6 +7,8 @@ description: Refine rough LatePost-style interview transcripts into research-gra
 
 Use this skill to turn rough dialogue transcripts into faithful, citable research documents. The job is refinement, not summarization: keep dialogue form, preserve facts and tone, remove noise, correct transcription errors, and add structure.
 
+**Talk to the user in Chinese.** The transcripts and every deliverable are Chinese, so write all user-facing messages — the opening questions, progress notes, and the final handoff — in Chinese too. Follow the user's typesetting: full-width curly quotes “”, Arabic numerals, and a half-width space between Chinese and Latin/numbers.
+
 ## First Choice: Use The Codex Native Runtime
 
 When this skill is running inside Codex, use the subscription-native workflow first. It runs model stages through Codex's own subagents on the signed-in ChatGPT/Codex plan and runs deterministic stages locally through Node. It does not require `OPENAI_API_KEY` or `TAVILY_API_KEY`.
@@ -29,7 +31,7 @@ Read [references/universal-runtime.md](references/universal-runtime.md) only whe
 Ask everything answerable up front, then run autonomously. If filenames already imply the answers, propose your inferred values and ask the user to correct them.
 
 Collect:
-- Output folder. Default to a project folder under the user's research notes when no path is provided.
+- Output folder — ask the user to choose it on every run and wait for the answer; never assume, reuse, or silently default to a folder.
 - Topic/company/person and interview date.
 - Speaker list, reporter/host names, interviewee roles, and any known aliases.
 - Background: industry, companies, people, products, and events discussed.
