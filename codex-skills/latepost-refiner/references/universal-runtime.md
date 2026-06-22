@@ -1,6 +1,9 @@
-# Universal Runtime
+# Universal Runtime API-Key Fallback
 
-Use the repo runtime when available. It is the Codex-friendly equivalent of the Claude Workflow edition and shares the same `core/` pipeline.
+Use this runtime when the user explicitly wants the local web app/CLI or accepts a metered provider fallback. It shares
+the same `core/` pipeline, but it calls provider APIs and therefore requires provider keys.
+
+For the no-key Codex subscription path, use [native-runtime.md](native-runtime.md) instead.
 
 ## Locate And Verify
 
@@ -28,11 +31,12 @@ Open the printed `http://127.0.0.1:<port>` URL. The UI supports:
 - Resume via "跳过已完成文件", backed by `<out>/run.json`.
 - Stop button. Cancellation is cooperative and exits after the current model call returns.
 
-API keys are used in memory for the local run; do not write them to output files, logs, manifests, or review notes.
+API keys are required for real provider calls and are used in memory for the local run; do not write them to output
+files, logs, manifests, or review notes.
 
 ## CLI
 
-For Codex use, default to OpenAI:
+When the user opts into this fallback from Codex, default to OpenAI:
 
 ```bash
 node universal/cli.js \
@@ -85,7 +89,9 @@ Provider keys:
 - Kimi: `MOONSHOT_API_KEY`
 - OpenAI: `OPENAI_API_KEY`
 
-DeepSeek and OpenAI need `TAVILY_API_KEY` for client-side web verification. Anthropic, GLM, and Kimi use provider-native search where supported.
+DeepSeek and OpenAI need `TAVILY_API_KEY` for client-side web verification. Anthropic, GLM, and Kimi use provider-native
+search where supported. This is why the Codex-native path should use built-in browsing instead of this fallback when
+the user wants a no-key run.
 
 ## Output Contract
 

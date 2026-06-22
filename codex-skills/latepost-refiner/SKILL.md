@@ -7,17 +7,22 @@ description: Refine rough LatePost-style interview transcripts into research-gra
 
 Use this skill to turn rough dialogue transcripts into faithful, citable research documents. The job is refinement, not summarization: keep dialogue form, preserve facts and tone, remove noise, correct transcription errors, and add structure.
 
-## First Choice: Use The Universal Runtime
+## First Choice: Use The Codex Native Runtime
 
-When this repo is available locally, prefer the Node Universal runtime over manual execution. It provides the closest Codex equivalent to the Claude Workflow edition: shared prompts, schemas, provider routing, persistent glossary, review queue, run manifest, resume, and local web UI.
+When this skill is running inside Codex, use the subscription-native workflow first. It runs model stages through Codex's own subagents on the signed-in ChatGPT/Codex plan and runs deterministic stages locally through Node. It does not require `OPENAI_API_KEY` or `TAVILY_API_KEY`.
 
-Read [references/universal-runtime.md](references/universal-runtime.md) when:
-- Running the local web app or CLI.
-- Choosing provider/model settings.
-- Resuming a prior run from `run.json`.
-- Explaining output artifacts or verification behavior.
+Read [references/native-runtime.md](references/native-runtime.md) before a full run. It covers:
+- No-key preflight and the completed capability spike.
+- How to use native subagents for scout, verify, dedup, refine, logic, summary, and timeline.
+- How to use `scripts/codex-native.mjs` for deterministic prep, prompt generation, glossary rendering, and `review.md` / `run.json`.
+- How to keep raw transcripts and web pages out of the main context.
 
-For Codex-triggered runs, default to OpenAI unless the user asks for another provider or lacks an OpenAI key. Use the OpenAI model profile in `references/universal-runtime.md`: `gpt-5.4-mini` for mechanical scout/check work and `gpt-5.4` for verification, dedup, refinement, logical rewrite, summary, and timeline. Reserve `gpt-5.5` for an explicit premium/deep run.
+Do not ask for API keys on the primary path. If native subagents or native browsing are unavailable, degrade that stage and record it in `review.md`; use the Universal runtime only after telling the user it is a metered provider/API-key fallback.
+
+Read [references/universal-runtime.md](references/universal-runtime.md) only when:
+- The user explicitly asks for the local web app or CLI.
+- The native Codex path is unavailable and the user accepts an API-key fallback.
+- You need to explain Universal output artifacts or resume behavior.
 
 ## Opening Questions
 
@@ -34,23 +39,28 @@ Collect:
 
 After that, do not interrupt with piecemeal questions. Save post-reading doubts for the final handoff.
 
-## Runtime Workflow
+## Native Runtime Workflow
 
 1. Prepare files: convert supported office/PDF inputs to Markdown, count size, detect existing headings, and choose titles/output paths.
 2. Seed from an existing `<out>/校对表.md` unless the user asks for a fresh glossary.
-3. Run the Universal runtime through the web UI or CLI.
-4. Inspect generated artifacts:
+3. Run `scripts/codex-native.mjs prepare --args run-args.json` to normalize args and generate first-stage prompts.
+4. Spawn native Codex subagents from the generated prompt files:
+   - scout/refine/check: one subagent per source file.
+   - verify/timeline: use built-in Codex browsing; never require Tavily on the primary path.
+   - dedup/logic/summary: native model subagents.
+5. Use the helper after each model-heavy stage to merge compact JSON reports, render `校对表.md`, and write artifacts.
+6. Inspect generated artifacts:
    - `<out>/Transcripts/*.md`
    - `<out>/校对表.md`
    - `<out>/review.md`
    - `<out>/run.json`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-5. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
-6. Ask any remaining open questions in one final batch, with exact output paths and next actions.
+7. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
+8. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
 ## Manual Fallback
 
-Use manual mode only when the runtime is unavailable, the user asks for a one-off hand edit, or the task is too small to justify a full run.
+Use manual mode only when the native runtime is unavailable, the user asks for a one-off hand edit, or the task is too small to justify a full run.
 
 Before manual work, read the references relevant to the requested scope:
 - [references/editorial-spec.md](references/editorial-spec.md) for transcript cleanup rules.
