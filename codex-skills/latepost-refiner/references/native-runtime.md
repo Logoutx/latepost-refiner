@@ -64,7 +64,7 @@ and metadata, not transcript bodies.
 
 ```json
 {
-  "topic": "蜜雪冰城",
+  "topic": "示例公司",
   "date": "2026-06",
   "background": "访谈对象、公司、行业、关键人物、产品、事件线索。",
   "outputDir": "/absolute/path/to/output",
@@ -76,7 +76,7 @@ and metadata, not transcript bodies.
     {
       "path": "/absolute/path/to/source.md",
       "label": "访谈 A",
-      "speakerHints": "记者=张璐；受访者=王某，时任 COO",
+      "speakerHints": "记者=李明；受访者=王某，时任 COO",
       "notes": "重点谈供应链和加盟。"
     }
   ]

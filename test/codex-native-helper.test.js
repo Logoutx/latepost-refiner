@@ -25,12 +25,12 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     const sourceA = path.join(tmp, 'interview-a.md')
     const sourceB = path.join(tmp, 'interview-b.md')
     fs.writeFileSync(sourceA, '记者：嗯，我们聊供应链。\n受访者：我们 2018 年成立。\n', 'utf8')
-    fs.writeFileSync(sourceB, '记者：张总后来怎么投的？\n受访者：大概 500 万。\n', 'utf8')
+    fs.writeFileSync(sourceB, '记者：王总后来怎么投的？\n受访者：大概 500 万。\n', 'utf8')
 
     const args = {
       topic: '测试公司',
       date: '2026-06',
-      background: '测试公司，供应链，创始人张红超。',
+      background: '测试公司，供应链，创始人王志远。',
       outputDir: path.join(tmp, 'out'),
       scope: ['refine'],
       verifyDepth: 'key',
@@ -49,7 +49,7 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     const findings = {
       '访谈 A': {
         speakers: [{ label: '受访者', role: '创始人' }],
-        people: [{ canonical: '张红超', variants: ['张总'], hint: '创始人', public_figure: true }],
+        people: [{ canonical: '王志远', variants: ['王总'], hint: '创始人', public_figure: true }],
         brands: [{ canonical: '测试公司', variants: [], hint: '本次访谈主体' }],
         terms: [],
         errors: [],
@@ -60,7 +60,7 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
       },
       '访谈 B': {
         speakers: [{ label: '受访者', role: '投资人' }],
-        people: [{ canonical: '张红超', variants: ['张总'], hint: '被追问投资情况', public_figure: true }],
+        people: [{ canonical: '王志远', variants: ['王总'], hint: '被追问投资情况', public_figure: true }],
         brands: [],
         terms: [],
         errors: [],
@@ -78,13 +78,13 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     const afterScoutState = readJson(scout.statePath)
     const verified = {
       resolved: [
-        { query: '张红超', canonical: '张红超', identity: '测试身份', source: '测试来源' },
+        { query: '王志远', canonical: '王志远', identity: '测试身份', source: '测试来源' },
       ],
       unresolved: [],
     }
     const verifiedState = afterVerify(normalized, afterScoutState, verified, { suspects: [] })
     assert.ok(fs.existsSync(verifiedState.glossaryPath))
-    assert.match(fs.readFileSync(verifiedState.glossaryPath, 'utf8'), /张红超/)
+    assert.match(fs.readFileSync(verifiedState.glossaryPath, 'utf8'), /王志远/)
     assert.equal(verifiedState.refinePrompts.length, 2)
     assert.equal(verifiedState.checkPrompts.length, 2)
 
