@@ -5,7 +5,9 @@
   "type": "module",
   "bin": {
     "latepost-refiner": "universal/cli.js",
-    "latepost-refiner-web": "universal/server.js"
+    "latepost-refiner-web": "universal/server.js",
+    "transcriber": "universal/cli.js",
+    "transcriber-web": "universal/server.js"
   },
   "files": [
     ".env.example",
@@ -29,7 +31,10 @@
     "build:cc": "node build/build-cc.mjs",
     "build:embed": "node build/embed-assets.mjs",
     "build:binary": "bash build/build-binary.sh",
-    "eval": "node eval/run.mjs"
+    "eval": "node eval/run.mjs",
+    "eval:filler": "node eval/run.mjs",
+    "eval:golden": "node eval/golden-run.mjs",
+    "eval:produce": "node eval/produce.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",

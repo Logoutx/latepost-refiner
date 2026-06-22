@@ -14,6 +14,7 @@ import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
 import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
+import { writeRunArtifacts } from './artifacts.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -148,6 +149,8 @@ export function persistGlossary(result, glossaryPath) {
 // One-call run used by the web server. `files` are uploads: [{ name, base64 }] (raw bytes,
 // any type — docx/pdf converted via markitdown). onPhase/onLog stream progress.
 export async function runJob(params, { onPhase, onLog } = {}) {
+  const startedMs = Date.now()
+  const startedAt = new Date(startedMs).toISOString()
   const {
     provider = 'anthropic', apiKey, baseURL, tavilyKey,
     files = [], topic = 'untitled', date = '', background = '',
@@ -200,7 +203,20 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   try {
     const r = await runPipeline(A, sel.engine)
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
-    return { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    const finishedMs = Date.now()
+    const result = { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    const artifacts = writeRunArtifacts(result, {
+      A,
+      outputDir: outDir,
+      startedAt,
+      finishedAt: new Date(finishedMs).toISOString(),
+      durationMs: finishedMs - startedMs,
+      provider: sel.provider,
+      providerInfo: sel.info,
+      warnings,
+      usage: result.usage,
+    })
+    return { ...result, ...artifacts }
   } finally {
     if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
   }

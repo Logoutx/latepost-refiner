@@ -22,6 +22,8 @@ import { getIndexHtml } from './assets.js'
 const HOST = '127.0.0.1'
 const BASE_PORT = Number(process.env.PORT) || 8765
 export const API_TOKEN_HEADER = 'x-transcriber-token'
+const MODEL_FETCH_TIMEOUT_MS = 10_000
+const ANTHROPIC_MODELS = { haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-8' }
 
 function readBody(req, limit = 96 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -88,17 +90,210 @@ export function sanitizeRunParams(raw = {}) {
 function rememberOpenable(openablePaths, result) {
   if (result && typeof result.outputDir === 'string') openablePaths.add(path.resolve(result.outputDir))
   if (result && typeof result.glossaryPath === 'string') openablePaths.add(path.resolve(result.glossaryPath))
+  if (result && typeof result.reviewPath === 'string') openablePaths.add(path.resolve(result.reviewPath))
+  if (result && typeof result.manifestPath === 'string') openablePaths.add(path.resolve(result.manifestPath))
 }
 
 // provider metadata for the UI (no secrets). `models` = the tier→id map so the UI can
 // suggest tool-capable model ids; `nativeSearch` flags whether the provider can do web
 // search itself — used for the 联网搜索 hint.
-const providerMeta = [
-  { name: 'anthropic', label: 'Anthropic（默认，自带联网搜索）', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '', nativeSearch: true, models: { haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-8' }, modelNote: '' },
-  ...PROVIDER_NAMES.map((n) => ({ name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: n === 'deepseek' ? '只用 deepseek-chat（支持工具调用）；v4-pro/flash 默认思考模式、不支持工具，本流程勿用' : '' })),
+const rawProviderMeta = [
+  { name: 'anthropic', label: 'Anthropic', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '自带联网搜索。', nativeSearch: true, models: ANTHROPIC_MODELS, modelNote: '' },
+  ...PROVIDER_NAMES.map((n) => {
+    const ui = {
+      deepseek: { note: '精校可用；联网核实需 Tavily。', modelNote: '避免 thinking / reasoner 模型，工具调用会受限。' },
+      glm: { note: '自带联网搜索；高级设置可切换 endpoint。', modelNote: '' },
+      kimi: { note: '自带联网搜索；.ai / .cn key 不通用。', modelNote: '' },
+      openai: { note: '精校可用；联网核实需 Tavily。', modelNote: '' },
+    }[n] || {}
+    return { name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: ui.note || PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: ui.modelNote || '' }
+  }),
 ]
 
-export function createAppServer({ token = crypto.randomBytes(32).toString('hex'), runJobImpl = runJob, openImpl = (p) => execFile('open', [p], () => {}) } = {}) {
+function uniqEntries(entries) {
+  const seen = new Set()
+  const out = []
+  for (const entry of entries || []) {
+    const id = String(entry && entry.id ? entry.id : '').trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push({
+      id,
+      label: String(entry.label || entry.display_name || entry.name || id),
+      ownedBy: entry.ownedBy || entry.owned_by || undefined,
+      created: Number(entry.created || entry.created_at || 0) || undefined,
+    })
+  }
+  return out
+}
+
+function modelEntriesFromTiers(models = {}) {
+  return uniqEntries(Object.values(models).map((id) => ({ id })))
+}
+
+function isLikelyTextModel(id) {
+  return !/(embedding|embed|whisper|tts|speech|audio|transcrib|dall|image|vision|moderation|rerank|clip|realtime)/i.test(id)
+}
+
+function roleScore(provider, role, id) {
+  const s = String(id || '').toLowerCase()
+  if (!s || !isLikelyTextModel(s)) return -1_000
+  let score = 0
+
+  if (/(deprecated|legacy|preview|beta)/.test(s)) score -= 10
+  if (/(reasoner|thinking|r1|o1|o3|o4)/.test(s)) score -= provider === 'deepseek' ? 180 : 55
+  if (/(opus|pro|max|ultra|large|5\.5|k2\.6)/.test(s)) score -= role === 'smart' ? 15 : 65
+  if (/(haiku|flash(?!x)|nano|mini|lite|small|turbo|chat|k2\.5)/.test(s)) score += 45
+  if (/(sonnet|flashx|plus|air)/.test(s)) score += role === 'cheap' ? 20 : 75
+
+  if (role === 'cheap') {
+    if (/(haiku|flash(?!x)|nano|mini|lite|small|turbo)/.test(s)) score += 80
+    if (/(sonnet|plus|flashx)/.test(s)) score += 20
+  } else if (role === 'balanced') {
+    if (/(sonnet|flashx|mini|plus|air|chat|k2\.5)/.test(s)) score += 75
+    if (/(haiku|flash(?!x)|nano|lite)/.test(s)) score += 45
+  } else {
+    if (/(sonnet|mini|flashx|plus|k2\.5|chat)/.test(s)) score += 90
+    if (/(haiku|flash(?!x)|nano|lite)/.test(s)) score += 45
+    if (/(opus|pro|5\.5|k2\.6)/.test(s)) score += 25
+  }
+
+  if (provider === 'anthropic') {
+    if (/haiku/.test(s)) score += role === 'cheap' ? 100 : 35
+    if (/sonnet/.test(s)) score += role === 'cheap' ? 45 : 115
+    if (/opus/.test(s)) score += role === 'smart' ? 30 : -40
+  } else if (provider === 'deepseek') {
+    if (/v4-flash|flash/.test(s)) score += 115
+    if (/deepseek-chat|chat/.test(s)) score += 85
+    if (/v4-pro|pro/.test(s)) score += role === 'smart' ? 25 : -25
+  } else if (provider === 'glm') {
+    if (/flashx/.test(s)) score += role === 'cheap' ? 55 : 105
+    if (/flash(?!x)/.test(s)) score += role === 'cheap' ? 115 : 60
+  } else if (provider === 'kimi') {
+    if (/k2\.5/.test(s)) score += 110
+    if (/k2\.6/.test(s)) score += role === 'smart' ? 35 : -30
+  } else if (provider === 'openai') {
+    if (/mini/.test(s)) score += 120
+    if (/nano/.test(s)) score += role === 'cheap' ? 105 : 35
+  }
+
+  return score
+}
+
+function sortByScore(provider, role, entries) {
+  return [...entries]
+    .map((entry) => ({ entry, score: roleScore(provider, role, entry.id) }))
+    .filter((x) => x.score > -500)
+    .sort((a, b) => b.score - a.score || (b.entry.created || 0) - (a.entry.created || 0) || b.entry.id.localeCompare(a.entry.id, 'en', { numeric: true }))
+    .map((x) => x.entry)
+}
+
+function pickModel(provider, role, entries, fallback) {
+  const ranked = sortByScore(provider, role, entries)
+  return (ranked[0] && ranked[0].id) || fallback || (entries[0] && entries[0].id)
+}
+
+function costEffectiveDefaults(provider, entries, fallbackModels = {}) {
+  const fallbackCheap = fallbackModels.haiku || fallbackModels.sonnet || fallbackModels.opus
+  const fallbackBalanced = fallbackModels.sonnet || fallbackCheap
+  const fallbackSmart = fallbackModels.sonnet || fallbackModels.opus || fallbackBalanced
+  const cheap = pickModel(provider, 'cheap', entries, fallbackCheap)
+  const balanced = pickModel(provider, 'balanced', entries, fallbackBalanced)
+  const smart = pickModel(provider, 'smart', entries, fallbackSmart)
+  return {
+    stage: {
+      scout: cheap,
+      verify: balanced,
+      dedup: balanced,
+      refine: smart,
+      logic: smart,
+      summary: smart,
+      timeline: smart,
+    },
+    category: {
+      mechanical: cheap,
+      web: balanced,
+      correction: balanced,
+      smart,
+    },
+  }
+}
+
+function withModelDefaults(meta) {
+  const entries = modelEntriesFromTiers(meta.models)
+  return { ...meta, costEffective: costEffectiveDefaults(meta.name, entries, meta.models) }
+}
+
+const providerMeta = rawProviderMeta.map(withModelDefaults)
+
+function providerByName(name) {
+  return providerMeta.find((p) => p.name === String(name || '').toLowerCase())
+}
+
+function normalizeFetchedModels(data) {
+  const raw = Array.isArray(data && data.data) ? data.data : Array.isArray(data && data.models) ? data.models : []
+  return uniqEntries(raw.map((m) => ({
+    id: m && (m.id || m.name || m.model),
+    label: m && (m.display_name || m.label || m.name || m.id),
+    ownedBy: m && m.owned_by,
+    created: m && (m.created || (m.created_at ? Date.parse(m.created_at) / 1000 : 0)),
+  }))).filter((m) => isLikelyTextModel(m.id))
+}
+
+function modelListRequest(meta, { apiKey, baseURL } = {}) {
+  if (meta.name === 'anthropic') {
+    return {
+      url: 'https://api.anthropic.com/v1/models',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    }
+  }
+  const rawBase = String(baseURL || meta.baseURL || '').trim()
+  const base = new URL(rawBase)
+  if (!/^https?:$/.test(base.protocol)) throw new Error('baseURL 只支持 http/https')
+  const url = new URL(base.href.replace(/\/+$/, '') + '/models')
+  return { url: url.href, headers: { Authorization: `Bearer ${apiKey}` } }
+}
+
+function fallbackModelCatalog(meta, warning) {
+  const models = modelEntriesFromTiers(meta.models)
+  return {
+    provider: meta.name,
+    source: 'fallback',
+    models,
+    defaults: costEffectiveDefaults(meta.name, models, meta.models),
+    warning,
+  }
+}
+
+export async function fetchProviderModels({ provider, apiKey, baseURL, fetchImpl = fetch } = {}) {
+  const meta = providerByName(provider)
+  if (!meta) throw new Error(`未知 provider「${provider || ''}」`)
+  if (!apiKey) return fallbackModelCatalog(meta, '未填 API Key，使用内置推荐。')
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), MODEL_FETCH_TIMEOUT_MS)
+  try {
+    const req = modelListRequest(meta, { apiKey, baseURL })
+    const res = await fetchImpl(req.url, { method: 'GET', headers: req.headers, signal: controller.signal })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    const models = normalizeFetchedModels(data)
+    if (!models.length) throw new Error('响应里没有文本模型')
+    return {
+      provider: meta.name,
+      source: 'provider',
+      models,
+      defaults: costEffectiveDefaults(meta.name, models, meta.models),
+    }
+  } catch (e) {
+    const msg = e && e.name === 'AbortError' ? '请求超时' : e.message
+    return fallbackModelCatalog(meta, `模型列表不可用，已使用内置推荐：${msg}`)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export function createAppServer({ token = crypto.randomBytes(32).toString('hex'), runJobImpl = runJob, openImpl = (p) => execFile('open', [p], () => {}), fetchImpl = fetch } = {}) {
   let running = false // serialize runs (single-user local tool; avoids env races + contention)
   const openablePaths = new Set()
   const server = http.createServer(async (req, res) => {
@@ -110,6 +305,18 @@ export function createAppServer({ token = crypto.randomBytes(32).toString('hex')
         return res.end(html)
       }
       if (method === 'GET' && url === '/api/providers') return json(res, { providers: providerMeta, categories: CATEGORIES })
+
+      if (method === 'POST' && url === '/api/models') {
+        if (!requireApiRequest(req, res, token)) return
+        const body = JSON.parse((await readBody(req, 1024 * 1024)).toString('utf8'))
+        const result = await fetchProviderModels({
+          provider: body && body.provider,
+          apiKey: body && body.apiKey,
+          baseURL: body && body.baseURL,
+          fetchImpl,
+        })
+        return json(res, result)
+      }
 
       if (method === 'POST' && url === '/api/run') {
         if (!requireApiRequest(req, res, token)) return
