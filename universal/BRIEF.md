@@ -1,4 +1,4 @@
-# Transcriber-Universal — Build Brief
+# LatePost-Refiner Universal — Build Brief
 
 ## One-line goal
 
@@ -46,12 +46,12 @@ log(msg) -> void
 
 ### 3. Packaging
 
-`package.json` (`type: module`, `bin: transcriber`) + `@anthropic-ai/sdk` + `p-limit` (+ `mammoth` or system `markitdown` dependency) + `.env.example` (`ANTHROPIC_API_KEY`) + README.
+`package.json` (`type: module`, `bin: latepost-refiner`) + `@anthropic-ai/sdk` + `p-limit` (+ `mammoth` or system `markitdown` dependency) + `.env.example` (`ANTHROPIC_API_KEY`) + README.
 
 ## CLI sketch
 
 ```bash
-transcriber --files "a.docx" "b.docx" --topic "Mixue" --date 2025-02 \
+latepost-refiner --files "a.docx" "b.docx" --topic "Mixue" --date 2025-02 \
   --background "Mixue Group cross-team interview series..." --scope refine,logic,summary \
   --verify key --out ./output --models scout=haiku,refine=opus
 ```

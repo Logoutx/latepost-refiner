@@ -1,5 +1,5 @@
 ---
-name: transcriber
+name: latepost-refiner
 description: >-
   Refine and clean up rough interview / Q&A / oral-history transcripts (rough interview transcript cleanup & refine),
   and optionally produce a timeline and an interview summary. Use when the user has one or more dialogue-style
@@ -13,7 +13,7 @@ description: >-
   Not for: audio-to-text (ASR), full-document translation, or one-line summaries that don't need the full text preserved.
 ---
 
-# Transcriber — Interview transcript refinement & cleanup
+# LatePost-Refiner — Interview transcript refinement & cleanup
 
 Turn rough spoken transcripts (ASR output, manual stenography) into **readable, trustworthy, searchable** interview
 documents, and optionally go on to produce a timeline and a summary. Core belief: this is **refine, not rewrite, and

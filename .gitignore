@@ -15,6 +15,11 @@ venv/
 # Node (universal/ build)
 node_modules/
 
+# Standalone binary build (generated embed + compiled executables)
+/dist/
+universal/embedded-assets.js
+.*.bun-build
+
 # Test run outputs / temp dirs
 /output/
 /tmp/

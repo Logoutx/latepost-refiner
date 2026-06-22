@@ -1,7 +1,7 @@
 export const meta = {
-  name: 'transcriber',
+  name: 'latepost-refiner',
   description: 'Scout → verify → glossary → refine+check → summary/timeline for interview transcripts',
-  whenToUse: 'transcriber 技能的 Claude Code 快路径：多份访谈转录并行侦察、统一校对表、并行精校与交付物生成',
+  whenToUse: 'latepost-refiner 技能的 Claude Code 快路径：多份访谈转录并行侦察、统一校对表、并行精校与交付物生成',
   phases: [
     { title: 'Scout', detail: '每份转录一个侦察代理，返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },

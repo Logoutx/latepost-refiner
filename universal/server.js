@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ===== Transcriber-Universal — local web app =====
+// ===== LatePost-Refiner Universal — local web app =====
 // A tiny localhost-only HTTP server (Node built-ins only) that serves a browser UI and runs
 // the same shared pipeline as the CLI. No Electron, no code-signing, no notarization —
 // you just open a page. Bound to 127.0.0.1; the API key the user types stays in memory for
@@ -17,9 +17,8 @@ import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { runJob, PROVIDERS, PROVIDER_NAMES } from './jobs.js'
 import { CATEGORIES } from '../engines/router.js'
+import { getIndexHtml } from './assets.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const INDEX = path.join(__dirname, 'web', 'index.html')
 const HOST = '127.0.0.1'
 const BASE_PORT = Number(process.env.PORT) || 8765
 export const API_TOKEN_HEADER = 'x-transcriber-token'
@@ -106,7 +105,7 @@ export function createAppServer({ token = crypto.randomBytes(32).toString('hex')
     const { url, method } = req
     try {
       if (method === 'GET' && (url === '/' || url === '/index.html')) {
-        const html = injectToken(fs.readFileSync(INDEX, 'utf8'), token)
+        const html = injectToken(getIndexHtml(), token)
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         return res.end(html)
       }
@@ -176,4 +175,8 @@ export function listen(port, attempts = 10) {
   return server
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) listen(BASE_PORT)
+// Auto-start when run directly as a Node script (`node universal/server.js`, the
+// latepost-refiner-web bin, launch.command). Skipped under the Bun runtime: the compiled binary
+// starts via universal/bin-web.js, and Bun makes this entry check match even for the imported
+// module, which would otherwise bind a second server on the next port.
+if (!process.isBun && process.argv[1] === fileURLToPath(import.meta.url)) listen(BASE_PORT)

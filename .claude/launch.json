@@ -2,9 +2,15 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "transcriber-web",
+      "name": "latepost-refiner-web",
       "runtimeExecutable": "node",
       "runtimeArgs": ["universal/server.js"],
+      "port": 8765
+    },
+    {
+      "name": "latepost-refiner-binary",
+      "runtimeExecutable": "./dist/latepost-refiner-web",
+      "runtimeArgs": [],
       "port": 8765
     }
   ]

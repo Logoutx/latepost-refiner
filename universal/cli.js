@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// ===== Transcriber-Universal CLI =====
+// ===== LatePost-Refiner Universal CLI =====
 // Standalone command-line shell over the shared pipeline. Parses argv into the same `A`
 // the Claude Code edition assembles in its Step 0 pre-flight, builds the Anthropic-SDK
 // engine, runs runPipeline, and handles the return value (write glossary, report flags).
 //
-//   transcriber --files a.docx b.docx --topic "蜜雪冰城" --date 2025-02 \
+//   latepost-refiner --files a.docx b.docx --topic "蜜雪冰城" --date 2025-02 \
 //     --background-file bg.txt --scope refine,summary --verify key --out ./out
 //
 // Output is identical to the Claude Code edition: <out>/校对表.md, <out>/Transcripts/*.md,
@@ -65,10 +65,10 @@ async function main() {
   const a = parseArgs(process.argv.slice(2))
 
   if (a.help || process.argv.length <= 2) {
-    process.stdout.write(`transcriber — 访谈转录精校流水线（Anthropic SDK 版）
+    process.stdout.write(`latepost-refiner — 访谈转录精校流水线（Anthropic SDK 版）
 
 用法:
-  transcriber --files <文件...> --topic <主题> --date <YYYY-MM> [选项]
+  latepost-refiner --files <文件...> --topic <主题> --date <YYYY-MM> [选项]
 
 必填:
   --files <路径...>      一或多份转录（.txt/.md/.docx/.pptx/.xlsx/.pdf；docx/pdf 自动转 md）
@@ -118,7 +118,7 @@ async function main() {
     const src = path.resolve(raw)
     if (!fs.existsSync(src)) { console.error(`错误：找不到文件 ${src}`); process.exit(2) }
     let prepared
-    try { prepared = prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) }
+    try { prepared = await prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) }
     catch (e) { console.error('错误：' + e.message); process.exit(2) }
     if (prepared.headingWarning) console.error('提示：' + prepared.headingWarning)
     files.push(prepared.entry)

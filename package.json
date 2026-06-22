@@ -1,11 +1,11 @@
 {
-  "name": "interview-transcriber",
+  "name": "latepost-refiner",
   "version": "1.0.0",
   "description": "访谈转录精校流水线：侦察、联网核实、统一校对表、并行精校加完整性核对，可选产出逻辑顺序稿、访谈总结、时间线。Claude Code Workflow 版和独立命令行版共用一套 core/。",
   "type": "module",
   "bin": {
-    "transcriber": "universal/cli.js",
-    "transcriber-web": "universal/server.js"
+    "latepost-refiner": "universal/cli.js",
+    "latepost-refiner-web": "universal/server.js"
   },
   "files": [
     ".env.example",
@@ -24,13 +24,16 @@
   },
   "scripts": {
     "test": "node --test",
-    "transcriber": "node universal/cli.js",
+    "latepost-refiner": "node universal/cli.js",
     "web": "node universal/server.js",
     "build:cc": "node build/build-cc.mjs",
+    "build:embed": "node build/embed-assets.mjs",
+    "build:binary": "bash build/build-binary.sh",
     "eval": "node eval/run.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
+    "mammoth": "^1.12.0",
     "openai": "^6.44.0",
     "p-limit": "^7.3.0"
   },

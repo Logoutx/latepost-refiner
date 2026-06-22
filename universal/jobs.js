@@ -6,6 +6,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
+import mammoth from 'mammoth'
+import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
@@ -33,30 +35,37 @@ export function loadDotEnv(filePath = path.join(REPO_ROOT, '.env'), env = proces
   return true
 }
 loadDotEnv()
+loadDotEnv(path.join(process.cwd(), '.env')) // also pick up a .env beside a launched binary
 
 export const CONVERT_EXT = new Set(['.docx', '.pptx', '.xlsx', '.pdf'])
 export const HEADING_RE = /^(#{1,3}\s|【.+】\s*$|第[一二三四五六七八九十0-9]+[、.．]\s*\S)/m
 // Strip a leading date prefix (2025-02-21_ / 2025-02-21 ) from a filename stem for the title.
 export const deriveTitle = (src) => path.basename(src, path.extname(src)).replace(/^\d{4}-\d{2}-\d{2}[_\s]+/, '').trim()
 
-export function convertToMarkdown(src, workDir) {
+export async function convertToMarkdown(src, workDir) {
   const ext = path.extname(src).toLowerCase()
   if (!CONVERT_EXT.has(ext)) return src // .txt / .md used as-is
   fs.mkdirSync(workDir, { recursive: true })
   const dest = path.join(workDir, path.basename(src, ext) + '.md')
+  if (ext === '.docx') {
+    // Pure-JS docx → text (mammoth), so the standalone binary needs no external tool.
+    const { value } = await mammoth.extractRawText({ path: src })
+    fs.writeFileSync(dest, value, 'utf8')
+    return dest
+  }
   try {
     const md = execFileSync('markitdown', [src], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
     fs.writeFileSync(dest, md, 'utf8')
     return dest
   } catch (e) {
-    throw new Error(`无法转换 ${path.basename(src)} → markdown：需要 markitdown（pipx install markitdown，置于 PATH）。原始错误：${e.message}`)
+    throw new Error(`无法转换 ${path.basename(src)} → markdown：.pptx/.xlsx/.pdf 需要 markitdown（pipx install markitdown，置于 PATH）；.docx 已内置 mammoth、无需外部工具。原始错误：${e.message}`)
   }
 }
 
 // Build one file entry from a source path (convert, count lines/bytes, detect headings,
 // derive title / subtitle / outPath). Returns { entry, hasHeadings, headingWarning }.
-export function prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) {
-  const mdPath = convertToMarkdown(src, workDir)
+export async function prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) {
+  const mdPath = await convertToMarkdown(src, workDir)
   const content = fs.readFileSync(mdPath, 'utf8')
   const lines = content.split('\n').length
   const bytes = Buffer.byteLength(content, 'utf8')
@@ -158,7 +167,7 @@ export async function runJob(params, { onPhase, onLog } = {}) {
     if (!f || !f.name) continue
     const src = path.join(workDir, path.basename(f.name))
     fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
-    const { entry, headingWarning } = prepareFile(src, { topic, date, headingPolicy, outputDir: outDir, workDir })
+    const { entry, headingWarning } = await prepareFile(src, { topic, date, headingPolicy, outputDir: outDir, workDir })
     if (headingWarning) warnings.push(headingWarning)
     fileEntries.push(entry)
   }
@@ -172,7 +181,7 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
   //    run from the web category's key (or the top-level tavilyKey).
   const categories = params.categories
-  const resolvedSkillDir = path.resolve(skillDir || DEFAULT_SKILL_DIR)
+  const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
   const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY

@@ -65,7 +65,7 @@ async function webSearch(query) {
 
 async function webFetch(url) {
   try {
-    const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 transcriber' } })
+    const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 latepost-refiner' } })
     if (!r.ok) return `web_fetch 出错：HTTP ${r.status}`
     const html = await r.text()
     const text = html
