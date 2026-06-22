@@ -8,14 +8,17 @@
 #   docling     — complex / multi-column / table-heavy .pdf
 #
 # Idempotent: whatever is already on PATH is left untouched, so it is safe to
-# run on every machine and safe to re-run. Installs via pipx (isolated venvs).
+# run on every machine and safe to re-run. Installs into isolated, per-tool
+# environments via uv (preferred) or pipx.
 #
 # Usage:
 #   bash setup-converters.sh                # ensure markitdown + docling
 #   bash setup-converters.sh --no-docling   # markitdown only (skip the heavy PDF-layout model)
 #   bash setup-converters.sh --check        # report status only, install nothing
 #
-# Needs Python 3.10+ and one of: Homebrew / apt-get / pip (to bootstrap pipx).
+# On a bare Mac it needs only curl (built in): it fetches uv, which brings its
+# own Python — no Homebrew, no system Python, no Xcode tools. If uv or pipx is
+# already installed, it uses that instead.
 set -euo pipefail
 
 WANT_DOCLING=1
@@ -68,39 +71,62 @@ if [ "$need_markitdown" -eq 0 ] && [ "$need_docling" -eq 0 ]; then
   exit 0
 fi
 
-# --- bootstrap pipx if missing ---
-if ! have pipx; then
-  echo "-> pipx not found; installing it..."
+# --- choose an installer; bootstrap one if the machine has none ---
+# Preference: an existing uv or pipx (respect what's there) -> bootstrap uv (one
+# download via curl, brings its own Python) -> pipx via brew/pip. uv is the kind
+# path for a bare Mac: no Homebrew, no system Python, no Xcode tools required.
+INSTALLER=""
+if   have uv;   then INSTALLER=uv
+elif have pipx; then INSTALLER=pipx
+fi
+if [ -z "$INSTALLER" ] && have curl; then
+  echo "-> no installer found; fetching uv (self-contained, needs no Python)..."
+  curl -LsSf https://astral.sh/uv/install.sh | sh || true
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  if have uv; then INSTALLER=uv; fi
+fi
+if [ -z "$INSTALLER" ]; then
+  echo "-> falling back to pipx..."
   if   have brew;    then brew install pipx
   elif have apt-get; then sudo apt-get update -qq && sudo apt-get install -y pipx
   elif have python3; then python3 -m pip install --user pipx
-  else echo "ERROR: need Homebrew, apt-get, or python3+pip to install pipx." >&2; exit 1
+  else echo "ERROR: could not bootstrap an installer (need curl, Homebrew, or python3)." >&2; exit 1
   fi
   ( python3 -m pipx ensurepath >/dev/null 2>&1 || pipx ensurepath >/dev/null 2>&1 || true )
+  INSTALLER=pipx
 fi
-export PATH="$HOME/.local/bin:$PATH"   # pipx puts shims here; reach them in THIS shell too
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"   # reach freshly-installed shims in THIS shell
 
-# prefer Python 3.12 (matches the standard setup) when available
 PYFLAG=""
-have python3.12 && PYFLAG="--python python3.12"
+if [ "$INSTALLER" = pipx ] && have python3.12; then PYFLAG="--python python3.12"; fi
+
+install_tool() {   # $1 = package spec
+  case "$INSTALLER" in
+    # pin 3.12: markitdown[all]/docling need Python >=3.10, and a bare Mac's
+    # system python is often 3.9 — uv fetches a managed 3.12 if none is present.
+    uv)   uv tool install --python 3.12 "$1" ;;
+    pipx) pipx install $PYFLAG "$1" ;;
+  esac
+}
 
 if [ "$need_markitdown" -eq 1 ]; then
-  echo "-> installing markitdown (docx / pptx / xlsx + simple pdf)..."
-  pipx install $PYFLAG 'markitdown[all]'
+  echo "-> installing markitdown via $INSTALLER (docx / pptx / xlsx + simple pdf)..."
+  install_tool 'markitdown[all]'
 fi
 if [ "$need_docling" -eq 1 ]; then
-  echo "-> installing docling (complex pdf; pulls ML layout models, hundreds of MB, slow first run)..."
-  pipx install $PYFLAG docling
+  echo "-> installing docling via $INSTALLER (complex pdf; ML models, hundreds of MB, slow first run)..."
+  install_tool docling
 fi
+if [ "$INSTALLER" = uv ]; then uv tool update-shell >/dev/null 2>&1 || true; fi
 
 echo
 echo "Result:"
 report
 echo
 if have markitdown; then
-  echo "Done. A new terminal picks these up automatically; if a fresh shell still can't"
-  echo "find them, run 'pipx ensurepath' and reopen the terminal."
+  echo "Done. A new terminal will pick these up automatically. If a fresh shell still"
+  echo "can't find them, close and reopen the terminal (the tools live in ~/.local/bin)."
 else
-  echo "markitdown still not on PATH — open a new terminal (pipx installs to ~/.local/bin)"
-  echo "or run: pipx ensurepath"
+  echo "markitdown still not on PATH — close and reopen the terminal, or add ~/.local/bin"
+  echo "to your PATH (that is where the installer placed the tools)."
 fi
