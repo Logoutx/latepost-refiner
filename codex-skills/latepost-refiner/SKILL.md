@@ -41,7 +41,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
 
 ## Native Runtime Workflow
 
-1. Prepare files: convert supported office/PDF inputs to Markdown, count size, detect existing headings, and choose titles/output paths.
+1. Prepare files: convert supported office/PDF inputs to Markdown (needs `markitdown`/`docling` on PATH — if missing, run `bash scripts/setup-converters.sh` once, per [references/native-runtime.md](references/native-runtime.md)), count size, detect existing headings, and choose titles/output paths.
 2. Seed from an existing `<out>/校对表.md` unless the user asks for a fresh glossary.
 3. Run `scripts/codex-native.mjs prepare --args run-args.json` to normalize args and generate first-stage prompts.
 4. Spawn native Codex subagents from the generated prompt files:

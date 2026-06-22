@@ -34,6 +34,21 @@ TAVILY_API_KEY=[]
 Do not ask the user for API keys on the primary path. If a stage cannot use native Codex tools, degrade that stage and
 record it in `review.md`; offer the Universal fallback only as an explicit opt-in.
 
+## Document Converters
+
+If any input is `.docx/.pptx/.xlsx/.pdf`, the Step-0 preflight converts it to Markdown first, then subagents read the
+`.md` (keeps raw bytes out of the main context). This needs `markitdown` (office docs + simple PDF) and `docling`
+(complex / multi-column PDF) on PATH. **If either is missing, run the installer once — it is idempotent and installs
+only what is absent, via pipx:**
+
+```bash
+bash scripts/setup-converters.sh          # ensure markitdown + docling
+bash scripts/setup-converters.sh --check  # report status only, install nothing
+```
+
+These run locally with no API key, so they fit the no-key path. The Universal fallback's binary can also parse `.docx`
+with a built-in library, but on the native path use markitdown for consistency across all formats.
+
 ## Capability Spike Result
 
 The June 2026 spike passed all required gates:
