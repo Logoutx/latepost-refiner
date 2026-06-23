@@ -57,7 +57,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
    - `<out>/review.md`
    - `<out>/run.json`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-7. Run `node scripts/audit_refined.mjs <out>/Transcripts/*.md` before handoff; fix or surface any `status: fail` (leftover pure filler 嗯/呃/对对对, or paragraphs over ~900 字). See [references/native-runtime.md](references/native-runtime.md).
+7. Run the quality audit before handoff — source-aware, one per file: `node codex-skills/latepost-refiner/scripts/audit_refined.mjs --source <源稿.md> --refined <out>/Transcripts/<title>.md` (the script is bundled inside this skill). Fix or surface any `status: fail`: `compression_risk` (refine became a summary — rerun from source), `under_refined`, `ending_missing`, leftover pure filler (嗯/呃/对对对), or paragraphs over ~900 字. See [references/native-runtime.md](references/native-runtime.md).
 8. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
 9. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 

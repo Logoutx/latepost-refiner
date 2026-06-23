@@ -264,13 +264,19 @@ This writes:
 <out>/run.json
 ```
 
-Run the deterministic quality audit on the refined transcripts before handoff:
+Run the deterministic quality audit on the refined transcripts before handoff. The audit script is bundled inside this skill at `codex-skills/latepost-refiner/scripts/audit_refined.mjs`, so a standalone install can run it without the repo worktree. **Use the source-aware form** (one per file — pair each refined output with its source) so it catches compression, not just leftover filler:
 
 ```bash
-node scripts/audit_refined.mjs <out>/Transcripts/*.md
+node codex-skills/latepost-refiner/scripts/audit_refined.mjs --source <源稿.md> --refined <out>/Transcripts/<title>.md
 ```
 
-`status: fail` flags a hard issue — leftover pure filler (嗯/呃, 对对对/是是是, stutter 我我/就就) or a dialogue paragraph over ~900 characters. Fix it or surface it; do not hand off as clean. 啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete.
+`status: fail` flags a hard issue:
+- `compression_risk` — refine became a summary (refined/source 汉字 ratio < 0.55). **Rerun that file from source**, don't try to recover detail from the short output.
+- `under_refined` — coverage kept but filler barely removed.
+- `ending_missing` — the source's last turn isn't reflected in the output.
+- residual pure filler (嗯/呃, 对对对/是是是, 我我/就就) or a dialogue paragraph over ~900 characters.
+
+啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete. (Output-only form `node …/audit_refined.mjs <file.md>` still works when no source is at hand, but it cannot detect compression.)
 
 Always read `review.md` before the final user handoff.
 
