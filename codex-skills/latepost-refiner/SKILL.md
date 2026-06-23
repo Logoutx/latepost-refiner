@@ -31,7 +31,7 @@ Read [references/universal-runtime.md](references/universal-runtime.md) only whe
 Ask everything answerable up front, then run autonomously. If filenames already imply the answers, propose your inferred values and ask the user to correct them.
 
 Collect:
-- Output folder — ask the user to choose it on every run and wait for the answer; never assume, reuse, or silently default to a folder.
+- Output folder — ask, with a default the user can change. Default to `~/Downloads`, or to the last-used folder if you remember one: read `~/.config/latepost-refiner/last-output` first and offer that. After the user settles on a folder, remember it: `mkdir -p ~/.config/latepost-refiner && printf '%s' '<chosen folder>' > ~/.config/latepost-refiner/last-output`.
 - Topic/company/person and interview date.
 - Speaker list, reporter/host names, interviewee roles, and any known aliases.
 - Background: industry, companies, people, products, and events discussed.
