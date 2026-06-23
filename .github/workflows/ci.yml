@@ -47,3 +47,40 @@ jobs:
 
       - name: Check generated workflow drift
         run: git diff --exit-code claude-code-skill/workflow.js
+
+  package:
+    name: Package skill zip
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild Claude Code workflow
+        run: npm run build:cc
+
+      - name: Build the skill zip
+        run: bash claude-code-skill/build-zips.sh "$PWD/dist-zips"
+
+      - name: Publish to the rolling "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create latest \
+            --title "Latest skill build" \
+            --notes "Auto-built from main on every push — download latepost-refiner.zip below." \
+            2>/dev/null || true
+          gh release upload latest dist-zips/latepost-refiner.zip --clobber
