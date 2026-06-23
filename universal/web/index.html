@@ -485,6 +485,12 @@ function renderResult(r) {
   warn('原文已有小标题', r.headingConflicts)
   warn('疑似同指', r.suspectedDuplicates, x => `<li>${esc((x.members || []).join(' / '))}</li>`)
   warn('未完成联网核实', r.networkUnverified, x => `<li>${esc(typeof x === 'string' ? x : (x.query || JSON.stringify(x)))}</li>`)
+  if (r.audit && r.audit.files) {
+    warn('成稿质量抽查未过', r.audit.files.filter(x => x.status === 'fail'), x => `<li><code>${esc(x.file || '')}</code>：${esc((x.failed || []).join(' / '))}${x.metrics ? ` · charRatio=${esc(x.metrics.charRatio)}` : ''}</li>`)
+  }
+  if (r.qualityRepair && r.qualityRepair.attempts && r.qualityRepair.attempts.length) {
+    warn('自动修复记录', r.qualityRepair.attempts, x => `<li><code>${esc(x.file || '')}</code>：第 ${esc(x.attempt || '?')} 轮 ${esc(x.action || 'repair')} / ${esc(x.model || '?')} · ${x.ok ? '已尝试写回' : '失败'}</li>`)
+  }
   if (r.logic && r.logic.length) out.push(`<h3>逻辑顺序稿 ${r.logic.filter(l => l.path).length}/${r.logic.length}</h3><ul>` + r.logic.filter(l => l.path).map(l => `<li><code>${esc(l.path)}</code></li>`).join('') + '</ul>')
   if (r.summary) out.push(`<p>访谈总结：${esc(String(r.summary).split('\n')[0])}</p>`)
   if (r.timeline) out.push(`<p>时间线：${esc(String(r.timeline).split('\n')[0])}</p>`)

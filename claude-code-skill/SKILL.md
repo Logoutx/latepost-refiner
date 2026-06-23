@@ -101,7 +101,11 @@ Each `files` item: `path` source file, `label` short name, `lines`/`bytes` from 
 
 ## Step 5 — Wrap-up: one batch of follow-up questions + delivery
 
-**Before delivering, run the quality audit** on the refined transcripts: `node "<this skill dir>/audit_refined.mjs" "<output dir>/Transcripts/"*.md`. It hard-flags leftover pure filler (嗯/呃, 对对对/是是是, 我我/就就) and dialogue paragraphs over ~900 字 — fix those or surface them. 啊/哦/欸 and 这个/那个 are soft (context-dependent) — don't blanket-delete. (No shell on claude.ai — skip the script there; the editorial rules already cover it.)
+**Before delivering, run the quality audit** on refined transcripts when shell is available. Prefer source-aware mode:
+`node "<this skill dir>/audit_refined.mjs" --source "<source.md>" --refined "<output dir>/Transcripts/<title>.md" --mode refine`.
+It hard-flags compression into summary, under-refinement, missing endings, leftover pure filler/repeats/ASR glue, and dialogue paragraphs over ~900 字. Fix failures and rerun the audit at most 2 times; if still failing, surface it in the handoff. 啊/哦/欸 and 这个/那个 are context-dependent — don't blanket-delete.
+
+On claude.ai there is no shell. Use a weaker model-side checklist before delivery: compare source and output for obvious compression, missing ending, collapsed dialogue turns, residual phrase repeats (因为因为 / 涂鸦涂鸦 / repeated years), and under-cleaned filler. State that this is weaker than the deterministic audit if any doubt remains.
 
 The few questions that came up during autonomous execution that "can only be settled after reading/verifying, yet need the user to decide" — **note them down and ask in one batch here** (don't interrupt every time one comes up). Typical deferrable items:
 - **Real names/identities** that web search couldn't find and internal corroboration couldn't settle (list them and ask if the user knows).

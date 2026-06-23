@@ -10,7 +10,8 @@
 //      under-refinement (filler barely removed).
 //
 // Hard residual noise (output-only, always a fail): 嗯/呃, 对对对/是是是, stutter
-// repeats 我我/就就, paragraphs > ~900 chars.
+// repeats 我我/就就, phrase repeats 因为因为/涂鸦涂鸦, ASR glue such as
+// 20182018/SaaSAPP, broken fragment starts, paragraphs > ~900 chars.
 // Soft (never fails): 啊/哦/欸 modal particles, 那个/这个/就是说 (context-dependent).
 //
 // Source-aware gates (mode: 'refine'):
@@ -38,10 +39,18 @@ export const REFINE_GATES = {
 }
 
 const EMPTY_PHRASE = /那个|这个|就是说|对吧|是吧|对不对|你知道/g
+const PHRASE_REPEAT = /因为因为|本身本身|涂鸦涂鸦|钉钉钉|然后[，,、]\s*然后|([A-Za-z][A-Za-z0-9-]{1,12})(?:\s+\1)+/g
+const YEAR_REPEAT = /(?:20)?(\d{2})\s*年[，,、]\s*(?:20)?\1\s*年/g
+const BROKEN_FRAGMENT_START = /^(?![#*>|])(?:[^：:\n]{1,12}[：:]\s*)?(?:呢[，,、]|那个全国|你说那个是\s*$|当时呢只是说[。.]?)/gm
+const ASR_GLUE = /(?:20\d{2}){2}|一\s*20\d{2}(?:20\d{2})?|SaaSAPP/g
 
 const CHECKS = [
   { name: 'confirmation_repeats', severity: 'hard', pattern: /(?:对){2,}|(?:是){2,}|嗯嗯/g },
   { name: 'stutter_repeats',      severity: 'hard', pattern: /([我你他她它这那就有没不能会要再先])\1/g },
+  { name: 'phrase_repeats',       severity: 'hard', pattern: PHRASE_REPEAT },
+  { name: 'repeated_years',        severity: 'hard', pattern: YEAR_REPEAT },
+  { name: 'broken_fragment_starts', severity: 'hard', pattern: BROKEN_FRAGMENT_START },
+  { name: 'asr_glue',             severity: 'hard', pattern: ASR_GLUE },
   { name: 'filler_particles',     severity: 'hard', pattern: /[嗯呃]/g },                 // 几乎总是垫词
   { name: 'modal_particles',      severity: 'soft', pattern: /[啊哦欸]/g },               // 可能是句末语气词，看上下文
   { name: 'empty_phrase_candidates', severity: 'soft', pattern: EMPTY_PHRASE },
@@ -182,7 +191,7 @@ function usage() {
   node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary]
                                                                   # 对比源文：查压缩/欠精校
 
-输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就 等纯噪音；超约 900 字的对话长段。
+输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就、因为因为/涂鸦涂鸦、重复年份、20182018/SaaSAPP 等纯噪音或 ASR 粘连；超约 900 字的对话长段。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失。
 soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，以及 那个/这个/就是说 等。`
 }

@@ -102,6 +102,14 @@ Read `review.md` before reporting completion. It consolidates failed files, inco
 
 Read `run.json` when auditing a run, resuming a run, or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
 
+The runtime now runs a source-aware quality audit for refined transcripts. It records compression risk, under-refinement, ending coverage, hard residual noise, phrase repeats, ASR glue, broken fragment starts, and long paragraphs. When a refined file fails, the runtime can retry up to 2 repair rounds:
+- compression or missing ending -> rerun that file from the source;
+- under-refined output -> full cleanup against source plus current output;
+- local residual noise -> targeted repair of flagged spans.
+Full-file repair uses the run's selected `refine` model by default, so a cost-effective OpenAI run stays cost-effective unless the user chose a premium profile.
+
+If failures remain after the repair loop, treat `review.md` as the handoff source of truth and do not present the run as clean.
+
 ## Return And Handoff
 
 In the final response to the user:

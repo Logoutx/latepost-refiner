@@ -36,6 +36,24 @@ test('headings are skipped and a clean transcript passes', () => {
   assert.equal(r.hard_issues, 0)
 })
 
+test('hard-fails phrase repeats, broken starts, and ASR glue left in refined output', () => {
+  const bad = [
+    '王某：因为因为当时我们刚开始做这个产品，本身本身是个尝试。',
+    '王某：呢，那个全国的业务是从南京开始。',
+    '王某：你说那个是',
+    '王某：那是 2021 年，2021 年的计划。',
+    '王某：涂鸦涂鸦智能做了公版模组，后来又看了 20182018 年的数据。',
+    '王某：我们先把 APP APP 权限打通，避免 SaaSAPP 黏在一起。',
+  ].join('\n\n')
+  const r = auditText(bad, 'phase2-bad.md')
+  assert.equal(r.status, 'fail')
+  const hard = r.findings.filter((f) => f.severity === 'hard' && f.count).map((f) => f.name)
+  assert.ok(hard.includes('phrase_repeats'), 'phrase/entity repeats')
+  assert.ok(hard.includes('repeated_years'), 'repeated years')
+  assert.ok(hard.includes('broken_fragment_starts'), 'broken speaker starts')
+  assert.ok(hard.includes('asr_glue'), 'ASR glued tokens')
+})
+
 // ---------- source-aware audit (compression / under-refinement) ----------
 
 test('refine mode hard-fails a compressed (summarized) output, primarily on charRatio', () => {

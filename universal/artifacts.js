@@ -100,6 +100,11 @@ function formatAudit(f) {
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
 }
 
+function formatRepairAttempt(a) {
+  if (!a) return ''
+  return `${path.basename(a.file || '')} — 第 ${a.attempt || '?'} 轮 ${a.action || 'repair'} / ${a.model || '?'}：${a.ok ? '已尝试写回' : `失败${a.error ? `（${a.error}）` : ''}`}`
+}
+
 export function reviewSections(result = {}, warnings = []) {
   const logic = result.logic || []
   const sections = [
@@ -107,6 +112,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
+    { title: '成稿质量自动修复记录', items: ((result.qualityRepair && result.qualityRepair.attempts) || []).map(formatRepairAttempt), priority: 'low' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '源文件已带小标题，需决定保留或重做', items: result.headingConflicts || [], priority: 'medium' },
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },
@@ -235,6 +241,18 @@ export function buildRunManifest(result = {}, context = {}) {
     audit: result.audit ? {
       status: result.audit.status,
       files: (result.audit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null })),
+    } : null,
+    qualityRepair: result.qualityRepair ? {
+      maxRetries: result.qualityRepair.maxRetries,
+      attempts: (result.qualityRepair.attempts || []).map((a) => ({
+        file: a.file,
+        attempt: a.attempt,
+        action: a.action,
+        model: a.model,
+        failedBefore: a.failedBefore || [],
+        ok: !!a.ok,
+        error: a.error || null,
+      })),
     } : null,
     usage,
   }

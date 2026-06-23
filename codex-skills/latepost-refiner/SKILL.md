@@ -45,8 +45,15 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
    - `<out>/review.md`
    - `<out>/run.json`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-5. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
-6. Ask any remaining open questions in one final batch, with exact output paths and next actions.
+5. Verify refined transcripts with the source-aware audit when the runtime did not already record it:
+
+```bash
+node "<skill dir>/scripts/audit_refined.mjs" --source "<source.md>" --refined "<out>/Transcripts/<title>.md" --mode refine
+```
+
+Fix audit failures before handoff when possible. Compression or missing endings require rerunning from the source rather than trying to recover from a shortened output; local noise failures may be repaired in place. Limit automatic repair attempts to 2 rounds, then surface remaining failures in `review.md`.
+6. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
+7. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
 ## Manual Fallback
 
@@ -65,7 +72,8 @@ Manual flow:
 5. Refine each transcript independently against the glossary.
 6. Check ending completeness and suspicious names/terms.
 7. Produce optional logical-order rewrite, timeline, and summary from the refined outputs.
-8. Write a concise handoff listing paths, warnings, unresolved questions, and any re-verification recommendations.
+8. Run the source-aware audit if available; if no shell is available, use the weaker no-shell compression checklist from `references/editorial-spec.md`.
+9. Write a concise handoff listing paths, warnings, unresolved questions, and any re-verification recommendations.
 
 ## Quality Bar
 

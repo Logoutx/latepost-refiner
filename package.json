@@ -18,6 +18,7 @@
     "docs/",
     "engines/",
     "eval/",
+    "scripts/",
     "universal/"
   ],
   "exports": {

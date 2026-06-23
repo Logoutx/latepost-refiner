@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
-import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY } from '../core/spec.js'
 import { auditPairs } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
@@ -147,6 +147,122 @@ export function persistGlossary(result, glossaryPath) {
   return false
 }
 
+export const QUALITY_REPAIR_MAX_RETRIES = 2
+
+function auditListForFiles(files = []) {
+  return files
+    .filter((f) => f && f.path && f.outPath && fs.existsSync(f.path) && fs.existsSync(f.outPath))
+    .map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
+}
+
+function repairAction(failed = []) {
+  if (failed.includes('compression_risk') || failed.includes('ending_missing')) return 'rerun_from_source'
+  if (failed.includes('under_refined')) return 'full_cleanup'
+  return 'targeted_repair'
+}
+
+function repairModel(A = {}, action) {
+  const models = A.models || {}
+  if (action === 'targeted_repair') return models.repair || models.refine || models.dedup || 'sonnet'
+  return models.repair || models.refine || 'opus'
+}
+
+function auditPromptSummary(auditFile = {}) {
+  const hard = (auditFile.findings || [])
+    .filter((f) => f.severity === 'hard' && f.count)
+    .map((f) => ({
+      name: f.name,
+      count: f.count,
+      samples: (f.samples || []).slice(0, 8),
+    }))
+  return JSON.stringify({
+    failed: auditFile.failed || [],
+    metrics: auditFile.metrics || {},
+    hard,
+    long_paragraphs: (auditFile.long_paragraphs || []).slice(0, 8),
+  }, null, 2)
+}
+
+function qualityRepairPrompt(A, f, auditFile, attemptNo) {
+  const action = repairAction(auditFile.failed || [])
+  const actionGuide = action === 'rerun_from_source'
+    ? '本次属于压缩/结尾缺失风险：不要试图从当前成稿补回丢失内容。重新从源文件完整精校，当前成稿最多只作标题/结构参考。'
+    : action === 'full_cleanup'
+      ? '本次属于欠精校风险：读取源文件与当前成稿，对整份成稿做一轮完整清噪和顺句，保持覆盖与对话体。'
+      : '本次属于局部质量问题：优先修复 audit 标出的残留口癖、重复、乱码粘连或超长段；如需判断是否改义，再对照源文件。'
+  return `你是访谈精校质量修复代理。目标不是总结，而是让既有精校稿通过质量审计，同时保留全部事实细节与对话体。
+
+【第 ${attemptNo} 次修复】
+【主题】${A.topic || 'untitled'}
+【策略】${actionGuide}
+【源文件】${f.path}（约 ${f.lines || '?'} 行）
+【当前成稿】${f.outPath}
+【输出】修复后仍写回 ${f.outPath}
+
+【审计失败摘要】
+${auditPromptSummary(auditFile)}
+
+【必须遵守】
+- 若 failed 包含 compression_risk 或 ending_missing：Read 源文件全文，重新完整精校；不要从压缩稿中“脑补恢复”。
+- 若 failed 只是残留噪音 / phrase_repeats / broken_fragment_starts / asr_glue / long_paragraphs：可主要 Read 当前成稿，必要时 Read 源文件核对。
+- 不要删掉事实、数字、时间、产品名、观点、举例和有信息量的表达。
+- 保持发言人标签为纯文本，如“记者：”“王某：”。
+- 单个对话段超过约 900 字必须重切；长独白拆成 200-600 字左右的连贯段落。
+- 修复“因为因为 / 本身本身 / 涂鸦涂鸦 / 2021 年，2021 年 / 20182018 / SaaSAPP”等明显 ASR 残留。
+
+${RULES}
+
+完成后只返回一行：已写回 <path>；修复策略=<rerun_from_source|full_cleanup|targeted_repair>；备注=<一句话>。`
+}
+
+export async function auditAndRepairRefined({ A, result, engine, maxRetries = QUALITY_REPAIR_MAX_RETRIES, onLog } = {}) {
+  const files = A.files || []
+  const attempts = []
+  let audit = null
+  const log = (msg) => {
+    if (onLog) onLog(msg)
+    else if (engine && typeof engine.log === 'function') engine.log(msg)
+  }
+
+  for (let round = 0; round <= maxRetries; round += 1) {
+    const pairs = auditListForFiles(files)
+    audit = pairs.length ? auditPairs(pairs) : null
+    if (!audit) break
+    const failed = (audit.files || []).filter((f) => f.status === 'fail')
+    if (!failed.length) break
+    if (round >= maxRetries) {
+      log(`质量审计仍未通过：${failed.map((f) => `${path.basename(f.file)}(${(f.failed || []).join('/')})`).join('、')}`)
+      break
+    }
+
+    if (engine && typeof engine.phase === 'function') engine.phase(`Repair ${round + 1}`)
+    log(`质量修复第 ${round + 1}/${maxRetries} 轮：${failed.length} 份需修复`)
+    const tasks = failed.map((auditFile) => async () => {
+      const file = files.find((f) => path.resolve(f.outPath) === path.resolve(auditFile.file))
+      if (!file) return null
+      const action = repairAction(auditFile.failed || [])
+      const model = repairModel(A, action)
+      const label = `repair:${file.label || path.basename(file.outPath)}`
+      const before = [...(auditFile.failed || [])]
+      try {
+        const response = await engine.agent(qualityRepairPrompt(A, file, auditFile, round + 1), { label, phase: 'Repair', model })
+        const ok = !!response && fs.existsSync(file.outPath)
+        return { file: file.outPath, attempt: round + 1, action, model, failedBefore: before, ok, response: typeof response === 'string' ? response.slice(0, 500) : response }
+      } catch (e) {
+        return { file: file.outPath, attempt: round + 1, action, model, failedBefore: before, ok: false, error: e.message || String(e) }
+      }
+    })
+    const repaired = engine && typeof engine.parallel === 'function'
+      ? await engine.parallel(tasks)
+      : await Promise.all(tasks.map((t) => t()))
+    attempts.push(...repaired.filter(Boolean))
+  }
+
+  result.audit = audit
+  result.qualityRepair = { maxRetries, attempts }
+  return { audit, attempts }
+}
+
 // One-call run used by the web server. `files` are uploads: [{ name, base64 }] (raw bytes,
 // any type — docx/pdf converted via markitdown). onPhase/onLog stream progress.
 export async function runJob(params, { onPhase, onLog } = {}) {
@@ -204,11 +320,10 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   try {
     const r = await runPipeline(A, sel.engine)
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
-    // source-aware quality audit: compare each refined transcript against its source (refine scope)
-    const auditList = r.error ? [] : fileEntries.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
-    const audit = auditList.length ? auditPairs(auditList) : null
+    const result = { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: null }
+    if (!r.error) await auditAndRepairRefined({ A, result, engine: sel.engine, onLog })
     const finishedMs = Date.now()
-    const result = { ...r, audit, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    result.usage = sel.engine.usage()
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

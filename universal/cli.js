@@ -15,9 +15,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
-import { selectEngine, prepareFile, buildFilePolicy } from './jobs.js'
+import { selectEngine, prepareFile, buildFilePolicy, auditAndRepairRefined } from './jobs.js'
 import { writeRunArtifacts } from './artifacts.js'
-import { auditPairs } from '../scripts/audit_refined.mjs'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -166,12 +165,12 @@ async function main() {
   const startedAt = new Date(t0).toISOString()
   console.error(`\n开始：${files.length} 份文件 · scope=${A.scope.join(',')} · verify=${A.verifyDepth} · 输出 ${outputDir}\n`)
   const r = await runPipeline(A, engine)
-  const finishedMs = Date.now()
-  const finishedAt = new Date(finishedMs).toISOString()
-  const durationMs = finishedMs - t0
-  const mins = (durationMs / 60000).toFixed(1)
-  const usage = engine.usage()
-  const result = { ...r, outputDir, glossaryPath: null, provider: sel.provider, providerInfo: sel.info, warnings, usage }
+  let finishedMs = Date.now()
+  let finishedAt = new Date(finishedMs).toISOString()
+  let durationMs = finishedMs - t0
+  let mins = (durationMs / 60000).toFixed(1)
+  let usage = engine.usage()
+  const result = { ...r, outputDir, glossaryPath: null, provider: sel.provider, providerInfo: sel.info, warnings, usage: null }
 
   // ---------- return handling (mirrors SKILL.md “返回处理”) ----------
   if (r.error) {
@@ -189,13 +188,15 @@ async function main() {
     result.glossaryPath = glossaryPath
     console.error(`\n校对表已写入：${glossaryPath}`)
   }
-  // source-aware quality audit (refine scope) — catch compression / under-refinement before handoff
-  const auditList = files.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
-  if (auditList.length) {
-    result.audit = auditPairs(auditList)
-    const bad = result.audit.files.filter((f) => f.status === 'fail')
-    if (bad.length) console.error(`\n⚠ 成稿质量抽查未过 ${bad.length} 份：` + bad.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
-  }
+  await auditAndRepairRefined({ A, result, engine })
+  finishedMs = Date.now()
+  finishedAt = new Date(finishedMs).toISOString()
+  durationMs = finishedMs - t0
+  mins = (durationMs / 60000).toFixed(1)
+  usage = engine.usage()
+  result.usage = usage
+  const badAudit = result.audit && result.audit.files ? result.audit.files.filter((f) => f.status === 'fail') : []
+  if (badAudit.length) console.error(`\n⚠ 成稿质量抽查未过 ${badAudit.length} 份：` + badAudit.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
   const artifacts = writeRunArtifacts(result, { A, outputDir, startedAt, finishedAt, durationMs, provider: sel.provider, providerInfo: sel.info, warnings, usage })
 
   const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.stringify(x)))).join('、')
