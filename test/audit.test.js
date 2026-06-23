@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair } from '../scripts/audit_refined.mjs'
+
+const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
+
+// ---------- output-only audit (cleanliness) ----------
 
 test('hard-fails on leftover filler, confirmation/stutter repeats, and run-on paragraphs', () => {
   const bad = '李明：对对对，嗯，我我觉得是这样。\n\n王某：' + '这是一段很长的独白内容反复说。'.repeat(200)
@@ -28,4 +34,41 @@ test('headings are skipped and a clean transcript passes', () => {
   const r = auditText(clean, 'clean.md')
   assert.equal(r.status, 'ok')
   assert.equal(r.hard_issues, 0)
+})
+
+// ---------- source-aware audit (compression / under-refinement) ----------
+
+test('refine mode hard-fails a compressed (summarized) output, primarily on charRatio', () => {
+  const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('compressed.md'), mode: 'refine' })
+  assert.equal(r.status, 'fail')
+  assert.ok(r.failed.includes('compression_risk'), 'compression_risk fires')
+  assert.ok(r.metrics.charRatio < 0.55, `charRatio ${r.metrics.charRatio} below floor`)
+})
+
+test('refine mode fails an under-refined output (coverage kept, filler not removed) via emptyReduction', () => {
+  const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('under-refined.md'), mode: 'refine' })
+  assert.equal(r.status, 'fail')
+  assert.ok(r.failed.includes('under_refined'), 'under_refined fires')
+  assert.ok(!r.failed.includes('compression_risk'), 'charRatio is high — not compression')
+  assert.ok(r.metrics.charRatio >= 0.55, `charRatio ${r.metrics.charRatio} stays high`)
+})
+
+test('refine mode passes a faithful, properly-cleaned refine', () => {
+  const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('clean.md'), mode: 'refine' })
+  assert.equal(r.status, 'ok')
+  assert.equal(r.failed.length, 0)
+})
+
+test('summary mode does NOT apply the compression gate (a summary is meant to be short)', () => {
+  const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('compressed.md'), mode: 'summary' })
+  assert.ok(!r.failed.includes('compression_risk'), 'no compression gate in summary mode')
+  assert.equal(r.status, 'ok')
+})
+
+test('speakerTurnRatio is reported but never an independent gate (confirming-only)', () => {
+  // A faithful refine that merges same-speaker fragments keeps a healthy ratio;
+  // even a low ratio must not fail on its own when charRatio is fine.
+  const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('clean.md'), mode: 'refine' })
+  assert.equal(typeof r.metrics.speakerTurnRatio, 'number')
+  assert.equal(r.status, 'ok')
 })
