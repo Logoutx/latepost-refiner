@@ -10,6 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
+import { auditFiles } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -203,8 +204,11 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   try {
     const r = await runPipeline(A, sel.engine)
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
+    // deterministic quality audit on the refined transcripts (leftover filler / run-on paragraphs)
+    const auditPaths = r.error ? [] : (r.refined || []).map((x) => x && (x.outPath || x.path)).filter((p) => p && fs.existsSync(p))
+    const audit = auditPaths.length ? auditFiles(auditPaths) : null
     const finishedMs = Date.now()
-    const result = { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    const result = { ...r, audit, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

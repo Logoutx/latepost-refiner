@@ -117,6 +117,7 @@ export function checkPrompt(f, anchor) {
 - 对应上了 → complete=true。
 - 成稿在**远早于结尾处**就以一句收束注（如“后续为离场闲聊，从略”）收住、中间大段源文件内容缺失 → 这是中途截断，**complete=false**，在 note 写明大约从哪一段起缺。
 - 只有当收束注**前一段已对应到源文件末尾区域**时，该收束注才算正常收尾（complete=true）。
+再用 Search/Read 快速抽查成稿质量：若仍有明显纯噪音口癖（嗯、呃、对对对、是是是、我我、就就 等；“那个/这个/就是说”仅在纯卡顿时算）或单段超过约 900 字，写进 note，即使结尾完整也要提醒。
 按 schema 返回 complete 与 note。`
 }
 
