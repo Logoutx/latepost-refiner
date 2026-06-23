@@ -17,6 +17,7 @@ import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
 import { selectEngine, prepareFile, buildFilePolicy } from './jobs.js'
 import { writeRunArtifacts } from './artifacts.js'
+import { auditPairs } from '../scripts/audit_refined.mjs'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -187,6 +188,13 @@ async function main() {
     fs.writeFileSync(glossaryPath, r.glossary, 'utf8')
     result.glossaryPath = glossaryPath
     console.error(`\n校对表已写入：${glossaryPath}`)
+  }
+  // source-aware quality audit (refine scope) — catch compression / under-refinement before handoff
+  const auditList = files.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
+  if (auditList.length) {
+    result.audit = auditPairs(auditList)
+    const bad = result.audit.files.filter((f) => f.status === 'fail')
+    if (bad.length) console.error(`\n⚠ 成稿质量抽查未过 ${bad.length} 份：` + bad.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
   }
   const artifacts = writeRunArtifacts(result, { A, outputDir, startedAt, finishedAt, durationMs, provider: sel.provider, providerInfo: sel.info, warnings, usage })
 
