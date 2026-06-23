@@ -264,6 +264,14 @@ This writes:
 <out>/run.json
 ```
 
+Run the deterministic quality audit on the refined transcripts before handoff:
+
+```bash
+node scripts/audit_refined.mjs <out>/Transcripts/*.md
+```
+
+`status: fail` flags a hard issue — leftover pure filler (嗯/呃, 对对对/是是是, stutter 我我/就就) or a dialogue paragraph over ~900 characters. Fix it or surface it; do not hand off as clean. 啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete.
+
 Always read `review.md` before the final user handoff.
 
 ## Failure Policy
