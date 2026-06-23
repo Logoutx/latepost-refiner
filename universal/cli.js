@@ -74,9 +74,9 @@ async function main() {
 必填:
   --files <路径...>      一或多份转录（.txt/.md/.docx/.pptx/.xlsx/.pdf；docx/pdf 自动转 md）
   --topic <主题>         公司/人物主题（用于交付物文件名）
-  --out <目录>           输出根目录（每次都要指定，不再默认）
 
 常用:
+  --out <目录>           输出根目录（默认 ~/Downloads/<主题>）
   --date <YYYY-MM>       采访时间（写入抬头）
   --background <文本>     采访背景（指导侦察/核实）
   --background-file <路径> 从文件读取背景（背景较长时用）
@@ -99,9 +99,8 @@ async function main() {
   }
 
   if (!a.files.length) { console.error('错误：至少需要一个 --files'); process.exit(2) }
-  if (!a.outputDir || !a.outputDir.trim()) { console.error('错误：必须用 --out 指定输出目录（不再默认到 ./<topic>）'); process.exit(2) }
   const topic = a.topic || 'untitled'
-  const outputDir = path.resolve(a.outputDir)
+  const outputDir = path.resolve(a.outputDir && a.outputDir.trim() ? a.outputDir : `${process.env.HOME}/Downloads/${topic}`)
   const skillDir = path.resolve(a.skillDir || path.join(REPO_ROOT, 'claude-code-skill'))
   const date = a.date || ''
   let background = a.background || ''

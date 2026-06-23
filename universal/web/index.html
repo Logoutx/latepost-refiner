@@ -162,8 +162,8 @@
       <div><label>小标题</label><select id="heading"><option value="none">自动生成</option><option value="keep">保留原文</option><option value="regenerate">重新生成</option></select></div>
       <div><label>并发 <span class="opt">可选</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
     </div>
-    <label>输出位置 <span class="opt">必填</span></label>
-    <input type="text" id="out" placeholder="粘贴一个文件夹的完整路径（每次都要指定）" required>
+    <label>输出位置 <span class="opt">留空用 Downloads/&lt;主题&gt;</span></label>
+    <input type="text" id="out" placeholder="留空则保存到 ~/Downloads/<主题>">
     <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label></div>
   </div>
 
@@ -416,10 +416,12 @@ function parseModels(s) {
 const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight }
 
 $('run').onclick = run
+{ const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置
 async function run() {
   if (!picked.length) return setStatus('请先选择文件。', true)
   if (!$('topic').value.trim()) return setStatus('请填写主题。', true)
-  if (!$('out').value.trim()) return setStatus('请填写输出位置（每次都要指定保存文件夹）。', true)
+  const outVal = $('out').value.trim()
+  if (outVal) localStorage.setItem('lpr_out', outVal)   // 记住上次的输出位置
   let modelParams
   try { modelParams = collectModel() } catch (e) { return setStatus(e.message, true) }
 
@@ -432,7 +434,7 @@ async function run() {
     scope: getScope(),
     verifyDepth: $('verify').value,
     headingPolicy: $('heading').value,
-    outputDir: $('out').value.trim(),
+    outputDir: outVal || undefined,
     fresh: $('fresh').checked,
     concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
   }
