@@ -88,12 +88,19 @@ function formatLogicGap(l) {
   return `${l.label || l.path || 'unknown'}${missing ? ` — 疑漏小标题：${missing}` : ''}`
 }
 
+function formatAudit(f) {
+  const parts = (f.findings || []).filter((x) => x.severity === 'hard' && x.count).map((x) => `${x.name}×${x.count}`)
+  if (f.long_paragraphs && f.long_paragraphs.length) parts.push(`超 900 字段×${f.long_paragraphs.length}`)
+  return `${path.basename(f.file || '')} — ${parts.join('、') || 'fail'}`
+}
+
 export function reviewSections(result = {}, warnings = []) {
   const logic = result.logic || []
   const sections = [
     { title: '未完成，需要补做', items: result.failed || [], priority: 'high' },
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
+    { title: '成稿质量抽查未过（残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '源文件已带小标题，需决定保留或重做', items: result.headingConflicts || [], priority: 'medium' },
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },

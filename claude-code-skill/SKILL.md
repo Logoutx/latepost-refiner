@@ -101,6 +101,8 @@ Each `files` item: `path` source file, `label` short name, `lines`/`bytes` from 
 
 ## Step 5 — Wrap-up: one batch of follow-up questions + delivery
 
+**Before delivering, run the quality audit** on the refined transcripts: `node "<this skill dir>/audit_refined.mjs" "<output dir>/Transcripts/"*.md`. It hard-flags leftover pure filler (嗯/呃, 对对对/是是是, 我我/就就) and dialogue paragraphs over ~900 字 — fix those or surface them. 啊/哦/欸 and 这个/那个 are soft (context-dependent) — don't blanket-delete. (No shell on claude.ai — skip the script there; the editorial rules already cover it.)
+
 The few questions that came up during autonomous execution that "can only be settled after reading/verifying, yet need the user to decide" — **note them down and ask in one batch here** (don't interrupt every time one comes up). Typical deferrable items:
 - **Real names/identities** that web search couldn't find and internal corroboration couldn't settle (list them and ask if the user knows).
 - A passage whose **attribution is unclear** (genuinely can't tell who said it).
