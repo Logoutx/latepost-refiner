@@ -305,11 +305,166 @@ export const withCheck = (rep, chk, f) => Object.assign({}, rep, {
   checkNote: chk ? (chk.note || '') : 'check agent failed',
 })
 
+// ---------- chunked refine for large transcripts ----------
+// A single refine agent on a long transcript is both the wall-clock long pole AND prone to
+// over-compression (one agent squeezes the whole file into a single output budget → it summarizes,
+// the claude.ai-style failure). Splitting a large file into K contiguous line-range chunks refined by
+// K parallel agents fixes both: ~K× faster on the refine phase, and each agent has a bounded span so
+// nothing gets compressed. Safe because refine is LOCAL — each turn is cleaned against the shared
+// glossary, with no whole-file dependency (unlike summary/timeline/logic, which must see everything).
+//
+// The script can't read the transcript (the Workflow sandbox has no fs; raw text never enters the
+// orchestration layer), so the split is computed from line metadata only, and chunk OWNERSHIP is a
+// deterministic shared rule the agents follow: a speaker turn belongs to whichever chunk's line span
+// contains the turn's opening label line — no overlap, no gap. Parts are written to
+// <outPath>.part{idx} and merged by a cheap stitch agent (the script can't concat files either).
+// Chunking is OFF unless the run explicitly asks for speed (A.chunkMode === 'speed'); the per-chunk opus
+// overhead (each chunk agent re-thinks + re-ingests RULES) is an intrinsic ~1.5× token premium, so the
+// user opts into it per run (SKILL.md Step 0 asks speed-vs-cost). When on, settings are CONSERVATIVE —
+// only large files chunk, and into at most 2 — a balanced ~35% refine speedup for ~1.5× tokens.
+// Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
+// NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
+// ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
+// See [[feedback-size-metric]]. Read-tool pagination stays line-addressed (readPlan) because Read is
+// line-based — that's a mechanic, not a size judgment.
+export function contentLength(text) {
+  const t = String(text || '')
+  return (t.match(/[一-龥]/g) || []).length + (t.match(/[A-Za-z0-9]+/g) || []).length
+}
+// Effective 字数 for routing: prefer the precomputed f.chars (from pre-flight); else estimate from
+// bytes (CJK UTF-8 ≈ 3 B/char, mixed ≈ 2.6) or, last resort, lines (~14 正文字/line).
+export function refineSize(f) {
+  if (f && typeof f.chars === 'number') return f.chars
+  if (f && f.bytes) return Math.round(f.bytes / 2.6)
+  return Math.round(((f && f.lines) || 0) * 14)
+}
+export const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
+export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
+export const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
+export function splitForRefine(f, mode) {
+  const lines = (f && f.lines) || 0
+  const label = f && f.label
+  const single = [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label }]
+  const size = refineSize(f)                 // 字数, not lines
+  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return single   // cost mode (default) → one agent
+  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+  const per = Math.ceil(lines / K)
+  // Even-line division; the agent ownership rule (refinePrompt chunk branch) keeps each speaker turn whole,
+  // so a turn is never split across chunks even though the line boundary itself is approximate.
+  const chunks = []
+  for (let i = 0; i < K; i += 1) {
+    const startLine = i * per + 1
+    if (startLine > lines) break // rounding can leave the final slice empty; drop it
+    chunks.push({ idx: chunks.length + 1, count: 0, startLine, endLine: Math.min(lines, (i + 1) * per), isFirst: i === 0, isLast: false, label })
+  }
+  const last = chunks[chunks.length - 1]
+  last.endLine = lines // absorb any rounding remainder into the final chunk
+  last.isLast = true
+  for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
+  return chunks
+}
+export const partPath = (outPath, idx) => `${outPath}.part${idx}`
+
+// Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
+// join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
+// testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
+// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
+// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
+export function stitchParts(texts) {
+  const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
+  if (!parts.length) return ''
+  let out = parts[0]
+  for (let i = 1; i < parts.length; i += 1) {
+    let next = parts[i]
+    const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
+    const nextFirst = (next.split('\n')[0] || '').trim()
+    if (prevLast.startsWith('## ') && prevLast === nextFirst) {
+      next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
+    }
+    out = `${out}\n\n${next}`
+  }
+  return `${out.replace(/\s+$/, '')}\n`
+}
+
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
 // headingPolicy is still 'none' (the pre-flight check didn't catch it), the user must be asked at wrap-up.
 export function findHeadingConflicts(findings, files, policy) {
   if ((policy || 'none') !== 'none') return []
   return files.filter((f, i) => findings[i] && findings[i].has_existing_headings).map((f) => f.label)
+}
+
+// Apply a verified conclusion into an entry — shared by the full render (renderGlossary) and the
+// condensed refine render (renderRefineGlossary). resolvedMap: query→{canonical,identity}; applied/rejected:
+// sets tracking which conclusions landed vs. were blocked by the name guard (for the full render's footnote).
+// Name guard: if an entry already has a real (strong) name and the verifier returns a DIFFERENT strong name
+// not present in the entry, it's likely a misattribution (observed: verify hallucinated 李明→王志远, rewriting
+// the interviewee as the chairman) — don't rewrite; append a ⚠ note. Weak titles (王总 / 董事长) resolving to a
+// real name still apply (that's the point of verification). ownStrong spans ALL names, not just canonical
+// (clustering may elect a weak title as canonical with the real name in variants).
+export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
+  const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
+  if (!hit) return e
+  const names = [e.canonical, ...(e.variants || [])]
+  const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  if (isPerson && hit.canonical && ownStrong.length
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+    rejected.add(hit)
+    const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
+    return Object.assign({}, e, { hint })
+  }
+  applied.add(hit)
+  const variants = Array.from(new Set(names.filter((n) => n && n !== hit.canonical)))
+  // Idempotent: don't re-prepend the identity tag if it's already in the hint (a persisted glossary
+  // is parsed + re-rendered every batch, so a naive prepend would bloat the hint each run).
+  const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
+  const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
+  return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
+}
+
+// Keep a hint short for the condensed refine glossary: the first clause (truncated) plus any ⚠ warnings
+// (the refiner must see ⚠ to skip those rows). Drops the long identity/source prose the refiner doesn't need.
+function trimHint(h) {
+  if (!h) return ''
+  const parts = String(h).split('；')
+  const warn = parts.filter((p) => p.includes('⚠'))
+  const head = (parts.find((p) => !p.includes('⚠')) || '').trim().slice(0, 36)
+  return [head, ...warn].filter(Boolean).join('；')
+}
+
+// Condensed glossary for the chunk-refine agents: only the spelling-unification info a refiner needs —
+// entity tables (canonical ← variants, verified spellings applied, ⚠ marks), 写法统一 directives,
+// 疑似同指 flags, 确认不同指, and compact speaker labels. Drops the archival prose (采访背景, 联网核实结论
+// sources, 转写错误 examples, 各份特别提醒, 跨访谈发言人登记) that bloats the full 校对表. Sent to EACH of the
+// K chunk agents, so trimming it is the main lever on chunked-refine token cost; the full 校对表 is still
+// persisted and used by the single-agent refine path. Verified canonicals are applied exactly as in the
+// full render (same applyVerifiedEntry), so 写法 stay identical.
+export function renderRefineGlossary(merged, verified, dedup, a) {
+  const resolvedMap = new Map()
+  for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
+  const applied = new Set(), rejected = new Set()
+  const sec = [`# ${a.topic} 写法对照（精校用·摘自校对表）`]
+  const spk = []
+  for (const s of merged.speakersByFile || []) for (const sp of s.speakers || []) { if (sp && sp.label) spk.push(`${sp.label} → ${sp.role || '?'}${sp.identity ? `（${sp.identity}）` : ''}`) }
+  const uspk = Array.from(new Set(spk))
+  if (uspk.length) { sec.push('', '## 发言人'); for (const x of uspk) sec.push(`- ${x}`) }
+  const block = (title, list, isPerson) => {
+    const rows = []
+    for (const e0 of list) {
+      const e = applyVerifiedEntry(e0, isPerson, resolvedMap, applied, rejected)
+      const hint = trimHint(e.hint)
+      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}`)
+    }
+    if (rows.length) { sec.push('', `## ${title}`); sec.push(...rows) }
+  }
+  block('人名', merged.people, true)
+  block('品牌 / 公司 / 产品', merged.brands)
+  block('术语 / 专名', merged.terms)
+  const { directives, flags } = splitSuspects(dedup)
+  if (directives.length) { sec.push('', '## 写法统一（初次落笔即写对，勿事后回改）'); for (const s of directives) sec.push(`- ${(s.members || []).filter((x) => x !== s.preferred).join(' / ')} → **${s.preferred}**`) }
+  if (flags.length) { sec.push('', '## 疑似同指（勿自动合并）'); for (const s of flags) sec.push(`- ${(s.members || []).join(' ／ ')}（${s.kind}）`) }
+  if (a.doNotMerge && a.doNotMerge.length) { sec.push('', '## 确认不同指（勿合并）'); for (const p of a.doNotMerge) sec.push(`- ${(p || []).join(' ／ ')}`) }
+  return sec.join('\n')
 }
 
 export function renderGlossary(merged, verified, dedup, a) {
@@ -320,35 +475,7 @@ export function renderGlossary(merged, verified, dedup, a) {
   for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
   const applied = new Set()   // verified conclusions actually applied into the table body
   const rejected = new Set()  // verified conclusions blocked by the person-name guard
-  const applyVerified = (e, isPerson) => {
-    const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
-    if (!hit) return e
-    const names = [e.canonical, ...(e.variants || [])]
-    // Name guard: if this entry already contains a real name (strong name) and the verifier returns a
-    // different strong name not present in this entry, it likely indicates a misattribution
-    // (observed in the wild during network degradation: verify hallucinated 李明→王志远, rewriting the
-    // interviewee as the chairman). Do not rewrite the body; append a warning note instead.
-    // The harm of replacing one person with another far outweighs leaving a name unresolved.
-    // Weak titles (王总 / 董事长) resolving to a real name are still applied normally — that is the
-    // whole point of verification.
-    // Note: the guard checks `ownStrong`, the set of strong names across ALL names in this entry, not
-    // just canonical — clustering may elect a weak title (王总) as canonical while placing the real name
-    // (李明) in variants; checking only canonical would leave the guard blind to those cases.
-    const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
-    if (isPerson && hit.canonical && ownStrong.length
-        && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
-      rejected.add(hit)
-      const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
-      return Object.assign({}, e, { hint })
-    }
-    applied.add(hit)
-    const variants = Array.from(new Set(names.filter((n) => n && n !== hit.canonical)))
-    // Idempotent: don't re-prepend the identity tag if it's already in the hint (a persisted glossary
-    // is parsed + re-rendered every batch, so a naive prepend would bloat the hint each run).
-    const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
-    const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
-    return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
-  }
+  const applyVerified = (e, isPerson) => applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected)
   const sec = []
   sec.push(`# ${a.topic} 统一校对表（采访时间 ${a.date}）`, '', '## 采访背景', a.background, '')
   sec.push('## 发言人统一标注')

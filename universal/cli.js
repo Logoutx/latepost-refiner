@@ -15,7 +15,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
-import { selectEngine, prepareFile, buildFilePolicy } from './jobs.js'
+import { selectEngine, prepareFile, buildFilePolicy, cleanupRefineParts } from './jobs.js'
 import { writeRunArtifacts } from './artifacts.js'
 import { auditPairs } from '../scripts/audit_refined.mjs'
 
@@ -166,6 +166,7 @@ async function main() {
   const startedAt = new Date(t0).toISOString()
   console.error(`\n开始：${files.length} 份文件 · scope=${A.scope.join(',')} · verify=${A.verifyDepth} · 输出 ${outputDir}\n`)
   const r = await runPipeline(A, engine)
+  cleanupRefineParts(files) // tidy <outPath>.partN intermediates from chunked refine
   const finishedMs = Date.now()
   const finishedAt = new Date(finishedMs).toISOString()
   const durationMs = finishedMs - t0
