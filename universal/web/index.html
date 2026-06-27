@@ -164,7 +164,7 @@
     </div>
     <label>输出位置 <span class="opt">留空用 Downloads/&lt;主题&gt;</span></label>
     <input type="text" id="out" placeholder="留空则保存到 ~/Downloads/<主题>">
-    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label></div>
+    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label><label title="把超过约 12000 字的文件拆成 2 块并行精校。多文件批量更快，但更费额度；单文件提升有限。"><input type="checkbox" id="chunkSpeed"> 大文件分块并行（提速·更费额度）</label></div>
   </div>
 
   <div class="actions">
@@ -436,6 +436,7 @@ async function run() {
     headingPolicy: $('heading').value,
     outputDir: outVal || undefined,
     fresh: $('fresh').checked,
+    chunkMode: $('chunkSpeed').checked ? 'speed' : undefined,
     concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
   }
 

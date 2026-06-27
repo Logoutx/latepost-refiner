@@ -36,6 +36,7 @@ export function parseArgs(argv) {
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
+    '--chunk': 'chunkMode',
   }
   let i = 0
   while (i < argv.length) {
@@ -85,6 +86,7 @@ async function main() {
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
+  --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
   --fresh                忽略既有 校对表.md，从零重建
@@ -141,6 +143,7 @@ async function main() {
     verifyDepth: a.verifyDepth || 'key',
     headingPolicy,
     models: parseModels(a.models),
+    chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,   // speed = split big files into parallel chunks; else single agent/file
     priorGlossaryText,
     fresh: !!a.fresh,
     files,
