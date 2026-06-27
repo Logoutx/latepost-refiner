@@ -3,7 +3,7 @@ export const meta = {
   description: 'Scout → verify → glossary → refine+check → summary/timeline for interview transcripts',
   whenToUse: 'latepost-refiner 技能的 Claude Code 快路径：多份访谈转录并行侦察、统一校对表、并行精校与交付物生成',
   phases: [
-    { title: 'Scout', detail: '每份转录一个侦察代理，返回结构化清单（默认 haiku）' },
+    { title: 'Scout', detail: '每份转录一个侦察代理（超大文件自动拆段并行、防单代理卡死），返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },
     { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接；侦察失败也照常精校，默认 opus + 拼接 haiku）' },
     { title: 'Logic', detail: '逐份逻辑顺序重排稿（按主线把问答重排成叙事顺序，默认 opus）' },
@@ -370,16 +370,16 @@ const ONE_PASS_CHARS = 4000          // single file under this many 正文字数
 const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
 const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
-function splitForRefine(f, mode) {
+const singleChunk = (f) => {
+  const lines = (f && f.lines) || 0
+  return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
+}
+// Even-line division into K chunks. The agent ownership rule (refinePrompt / scoutPrompt chunk branch) keeps
+// each speaker turn whole, so a turn is never split across chunks even though the line boundary is approximate.
+function evenLineChunks(f, K) {
   const lines = (f && f.lines) || 0
   const label = f && f.label
-  const single = [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label }]
-  const size = refineSize(f)                 // 字数, not lines
-  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return single   // cost mode (default) → one agent
-  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
   const per = Math.ceil(lines / K)
-  // Even-line division; the agent ownership rule (refinePrompt chunk branch) keeps each speaker turn whole,
-  // so a turn is never split across chunks even though the line boundary itself is approximate.
   const chunks = []
   for (let i = 0; i < K; i += 1) {
     const startLine = i * per + 1
@@ -391,6 +391,69 @@ function splitForRefine(f, mode) {
   last.isLast = true
   for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
   return chunks
+}
+function splitForRefine(f, mode) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)                 // 字数, not lines
+  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // cost mode (default) → one agent
+  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged
+// file (a ~50K-字 merge was observed to stall) chokes the same way refine does. So the scout ALWAYS chunks
+// past SCOUT_CHUNK_CHARS — no chunkMode gate (unlike refine, which is opt-in because Opus fan-out is costly;
+// scout is haiku, so K cheap agents beat one stalled one). Each chunk scouts its own line span; mergeScoutChunks
+// unions the per-chunk findings back into one per-file finding, leaving the rest of the pipeline unchanged.
+const SCOUT_CHUNK_CHARS = 40000         // a normal 2h interview (~20–40K 字) stays one agent; only oversized merges chunk
+const TARGET_SCOUT_CHUNK_CHARS = 20000  // aim ~this many 字/段 — comfortably inside one haiku scout's budget
+const MAX_SCOUT_CHUNKS = 6              // runaway guard (6×20K ≈ 120K 字 covers very large merges)
+function splitForScout(f) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)
+  if (size <= SCOUT_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // normal file → one scout agent (path unchanged)
+  const K = Math.min(MAX_SCOUT_CHUNKS, Math.max(2, Math.ceil(size / TARGET_SCOUT_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Merge K per-chunk scout findings of ONE file back into a single SCOUT_SCHEMA-shaped finding. Lists are
+// unioned (people/brands/terms left to the downstream cross-file clusterEntities to dedup, exactly as
+// same-referent entries from different files are); ending_anchor is taken from the chunk that actually saw
+// the file's end (largest line) and DROPPED if the best anchor falls well short of the file — that means the
+// last chunk's scout didn't return, so refine/check should read the real tail themselves (they handle a
+// missing anchor). Returns null only if EVERY chunk failed; a partial set still yields a usable glossary.
+function mergeScoutChunks(parts, f) {
+  const got = (parts || []).filter(Boolean)
+  if (!got.length) return null
+  const speakers = []; const seenSp = new Set()
+  for (const p of got) for (const s of p.speakers || []) {
+    const k = ((s && s.label) || '').trim()
+    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+  }
+  const cat = (key) => got.flatMap((p) => p[key] || [])
+  const errByKind = {}
+  for (const p of got) for (const er of p.errors || []) {
+    if (!er) continue
+    const k = er.kind || '其他'
+    if (!errByKind[k]) errByKind[k] = { kind: k, examples: [] }
+    for (const ex of er.examples || []) if (!errByKind[k].examples.includes(ex)) errByKind[k].examples.push(ex)
+  }
+  const uniq = (key) => { const out = []; const seen = new Set(); for (const p of got) for (const v of p[key] || []) { const s = String(v).trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s) } } return out }
+  let ending = null
+  for (const p of got) { const a = p.ending_anchor; if (a && typeof a.line === 'number' && (!ending || a.line >= ending.line)) ending = a }
+  const total = (f && f.lines) || 0
+  if (ending && total && ending.line < total * 0.9) ending = null   // last chunk missing → unknown ending; let refine/check read the tail
+  return {
+    speakers,
+    people: cat('people'),
+    brands: cat('brands'),
+    terms: cat('terms'),
+    errors: Object.values(errByKind),
+    themes: uniq('themes'),
+    has_existing_headings: got.some((p) => p.has_existing_headings),
+    ending_anchor: ending || {},
+    special_notes: uniq('special_notes'),
+  }
 }
 const partPath = (outPath, idx) => `${outPath}.part${idx}`
 
@@ -848,18 +911,32 @@ function knownNote(a) {
 ${ppl ? `人名：${ppl}\n` : ''}${br ? `品牌/公司/产品：${br}\n` : ''}${tm ? `术语：${tm}\n` : ''}${spk ? `已知发言人：${spk}` : ''}`
 }
 
-function scoutPrompt(f, a) {
+function scoutPrompt(f, a, chunk) {
+  const isChunk = !!(chunk && chunk.count > 1)
+  const where = isChunk
+    ? `本份文件：${f.path}——这是它的**第 ${chunk.idx}/${chunk.count} 段**（源文件第 ${chunk.startLine}–${chunk.endLine} 行，全文约 ${f.lines} 行）。这是大文件的分段侦察，各段结果会自动合并；只管**本段**，不必顾及别段。`
+    : `本份文件：${f.path}（约 ${f.lines} 行）`
+  const readBlock = isChunk
+    ? `任务：用 Read **只读本段** [${chunk.startLine}, ${chunk.endLine}] 行（已含前后约 ${CHUNK_MARGIN} 行衔接），**不精校、不联网、不大段摘录原文**；只抽取**本段内**出现的实体与发言人。
+读取计划（照此执行，不要用更小的分页）：
+${readPlanRange(f, chunk.startLine, chunk.endLine).map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+    : `任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
+${readPlan(f)}`
+  const endingBullet = isChunk
+    ? (chunk.isLast
+        ? `- ending_anchor：本段含全文结尾——line=文件总行数（约 ${f.lines}）；text=全文最后一句话**原样照抄**。`
+        : `- ending_anchor：本段不是全文结尾——line=本段最后一行行号（约 ${chunk.endLine}）、text 留空或填该行原文即可（合并时以含结尾的那段为准）。`)
+    : `- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。`
   return `你是访谈转录「侦察」子代理。
 
 采访背景：${a.background}
 
-本份文件：${f.path}（约 ${f.lines} 行）
+${where}
 ${f.speakerHints ? `已知发言人线索：${f.speakerHints}` : ''}
 ${f.notes ? `额外提醒：${f.notes}` : ''}
 ${knownNote(a)}
 
-任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
-${readPlan(f)}
+${readBlock}
 读完后按 schema 返回结构化侦察结果：
 - speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
@@ -867,7 +944,7 @@ ${readPlan(f)}
 - errors：明显转写错误按类别举例（同音字错/英文听写错/（音）标记/夹行时间戳/乱码/Word 残讯）。
 - themes：这份大致谈了哪些主题。
 - has_existing_headings：源文件是否已带小标题行（#/##/【】式标题）。
-- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。
+${endingBullet}
 - special_notes：该份特别提醒（拒答/敏感语境要保留、收尾离场后的闲聊、称呼混乱重灾区等）。`
 }
 
@@ -1121,6 +1198,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   }
 }
 
+// Scout one file. A normal interview → one agent (unchanged). An oversized merged file (> SCOUT_CHUNK_CHARS
+// 字) → splitForScout parallel chunk agents, merged by mergeScoutChunks — a RESILIENCE measure so a single
+// scout can't stall on a huge file (the failure mode that motivated this). Returns one SCOUT_SCHEMA-shaped
+// finding, or null if every chunk failed (handled downstream exactly like any other null scout → scoutFailed,
+// refine still runs from source). A partial chunk set still yields a usable per-file finding.
+async function scoutFile(engine, f, A, M, labelPrefix = 'scout') {
+  const chunks = splitForScout(f)
+  if (chunks.length === 1) {
+    return engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+  }
+  engine.log(`侦察分块：大文件 ${f.label}（约 ${refineSize(f)} 字）拆 ${chunks.length} 段并行侦察，防单代理卡死`)
+  const parts = await engine.parallel(chunks.map((c) => () =>
+    engine.agent(scoutPrompt(f, A, c), { label: `${labelPrefix}:${f.label}#${c.idx}/${c.count}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+  return mergeScoutChunks(parts, f)
+}
+
 async function runPipeline(A, engine) {
 const M = Object.assign(
   { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus' },
@@ -1174,15 +1267,13 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
 } else {
   engine.phase('Scout')
   engine.log(`▶ 1/${scope.includes('logic') ? 5 : 4} 侦察 Scout：${A.files.length} 份并行抽取实体（人名 / 品牌 / 术语 / 发言人）`)
-  let findings = await engine.parallel(A.files.map((f) => () =>
-    engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+  let findings = await engine.parallel(A.files.map((f) => () => scoutFile(engine, f, A, M)))
   // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
   // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
-    const retries = await engine.parallel(retryIdx.map((i) => () =>
-      engine.agent(scoutPrompt(A.files[i], A), { label: `scout-retry:${A.files[i].label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+    const retries = await engine.parallel(retryIdx.map((i) => () => scoutFile(engine, A.files[i], A, M, 'scout-retry')))
     retryIdx.forEach((i, k) => { if (retries[k] && !scoutLooksGarbled(retries[k])) findings[i] = retries[k] })
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)

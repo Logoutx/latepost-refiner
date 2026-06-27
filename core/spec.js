@@ -342,16 +342,16 @@ export const ONE_PASS_CHARS = 4000          // single file under this many 正�
 export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
 export const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
-export function splitForRefine(f, mode) {
+const singleChunk = (f) => {
+  const lines = (f && f.lines) || 0
+  return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
+}
+// Even-line division into K chunks. The agent ownership rule (refinePrompt / scoutPrompt chunk branch) keeps
+// each speaker turn whole, so a turn is never split across chunks even though the line boundary is approximate.
+function evenLineChunks(f, K) {
   const lines = (f && f.lines) || 0
   const label = f && f.label
-  const single = [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label }]
-  const size = refineSize(f)                 // 字数, not lines
-  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return single   // cost mode (default) → one agent
-  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
   const per = Math.ceil(lines / K)
-  // Even-line division; the agent ownership rule (refinePrompt chunk branch) keeps each speaker turn whole,
-  // so a turn is never split across chunks even though the line boundary itself is approximate.
   const chunks = []
   for (let i = 0; i < K; i += 1) {
     const startLine = i * per + 1
@@ -363,6 +363,69 @@ export function splitForRefine(f, mode) {
   last.isLast = true
   for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
   return chunks
+}
+export function splitForRefine(f, mode) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)                 // 字数, not lines
+  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // cost mode (default) → one agent
+  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged
+// file (a ~50K-字 merge was observed to stall) chokes the same way refine does. So the scout ALWAYS chunks
+// past SCOUT_CHUNK_CHARS — no chunkMode gate (unlike refine, which is opt-in because Opus fan-out is costly;
+// scout is haiku, so K cheap agents beat one stalled one). Each chunk scouts its own line span; mergeScoutChunks
+// unions the per-chunk findings back into one per-file finding, leaving the rest of the pipeline unchanged.
+export const SCOUT_CHUNK_CHARS = 40000         // a normal 2h interview (~20–40K 字) stays one agent; only oversized merges chunk
+export const TARGET_SCOUT_CHUNK_CHARS = 20000  // aim ~this many 字/段 — comfortably inside one haiku scout's budget
+export const MAX_SCOUT_CHUNKS = 6              // runaway guard (6×20K ≈ 120K 字 covers very large merges)
+export function splitForScout(f) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)
+  if (size <= SCOUT_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // normal file → one scout agent (path unchanged)
+  const K = Math.min(MAX_SCOUT_CHUNKS, Math.max(2, Math.ceil(size / TARGET_SCOUT_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Merge K per-chunk scout findings of ONE file back into a single SCOUT_SCHEMA-shaped finding. Lists are
+// unioned (people/brands/terms left to the downstream cross-file clusterEntities to dedup, exactly as
+// same-referent entries from different files are); ending_anchor is taken from the chunk that actually saw
+// the file's end (largest line) and DROPPED if the best anchor falls well short of the file — that means the
+// last chunk's scout didn't return, so refine/check should read the real tail themselves (they handle a
+// missing anchor). Returns null only if EVERY chunk failed; a partial set still yields a usable glossary.
+export function mergeScoutChunks(parts, f) {
+  const got = (parts || []).filter(Boolean)
+  if (!got.length) return null
+  const speakers = []; const seenSp = new Set()
+  for (const p of got) for (const s of p.speakers || []) {
+    const k = ((s && s.label) || '').trim()
+    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+  }
+  const cat = (key) => got.flatMap((p) => p[key] || [])
+  const errByKind = {}
+  for (const p of got) for (const er of p.errors || []) {
+    if (!er) continue
+    const k = er.kind || '其他'
+    if (!errByKind[k]) errByKind[k] = { kind: k, examples: [] }
+    for (const ex of er.examples || []) if (!errByKind[k].examples.includes(ex)) errByKind[k].examples.push(ex)
+  }
+  const uniq = (key) => { const out = []; const seen = new Set(); for (const p of got) for (const v of p[key] || []) { const s = String(v).trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s) } } return out }
+  let ending = null
+  for (const p of got) { const a = p.ending_anchor; if (a && typeof a.line === 'number' && (!ending || a.line >= ending.line)) ending = a }
+  const total = (f && f.lines) || 0
+  if (ending && total && ending.line < total * 0.9) ending = null   // last chunk missing → unknown ending; let refine/check read the tail
+  return {
+    speakers,
+    people: cat('people'),
+    brands: cat('brands'),
+    terms: cat('terms'),
+    errors: Object.values(errByKind),
+    themes: uniq('themes'),
+    has_existing_headings: got.some((p) => p.has_existing_headings),
+    ending_anchor: ending || {},
+    special_notes: uniq('special_notes'),
+  }
 }
 export const partPath = (outPath, idx) => `${outPath}.part${idx}`
 

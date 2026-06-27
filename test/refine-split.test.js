@@ -4,8 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  splitForRefine, partPath, stitchParts, contentLength,
-  REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS,
+  splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, contentLength,
+  REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
 } from '../core/spec.js'
 import { readPlanRange, refinePrompt, stitchPrompt } from '../core/prompts.js'
@@ -69,6 +69,56 @@ test('speed mode: very large files capped at MAX_REFINE_CHUNKS', () => {
 test('size falls back to bytes, then lines, when chars is absent', () => {
   assert.ok(splitForRefine({ lines: 2000, bytes: 100000, label: 'A' }, 'speed').length >= 2, 'big bytes → chunk')
   assert.equal(splitForRefine({ lines: 50, label: 'A' }, 'speed').length, 1, 'few lines → single')
+})
+
+// ---------- splitForScout / mergeScoutChunks (oversized-file scout resilience) ----------
+
+test('splitForScout: a normal interview stays one scout agent; only oversized merges chunk', () => {
+  for (const chars of [5000, 20000, SCOUT_CHUNK_CHARS]) {
+    assert.equal(splitForScout({ lines: 2000, chars, label: 'A' }).length, 1, `${chars} 字 ≤ threshold → 1 scout`)
+  }
+  const chunks = splitForScout({ lines: 4000, chars: SCOUT_CHUNK_CHARS + 1, label: 'A' })
+  assert.ok(chunks.length >= 2, 'just over the threshold → chunks')
+  assertContiguous(chunks, 4000)            // no gap / no overlap; last chunk reaches the final line
+})
+
+test('splitForScout: chunk count scales with 字数 and caps at MAX_SCOUT_CHUNKS', () => {
+  assert.equal(splitForScout({ lines: 5000, chars: 90000, label: 'A' }).length, 5, 'ceil(90000/20000) = 5 段')
+  const huge = splitForScout({ lines: 9000, chars: 500000, label: 'A' })   // would be 25 → capped
+  assert.equal(huge.length, MAX_SCOUT_CHUNKS, 'capped at the runaway guard')
+  assertContiguous(huge, 9000)
+})
+
+test('splitForScout: not gated by chunkMode (resilience, always on) and unsplittable files stay single', () => {
+  assert.equal(splitForScout({ lines: 1, chars: 999999, label: 'A' }).length, 1, 'lines ≤ 1 can\'t be split → single')
+  assert.ok(splitForScout({ lines: 4000, chars: 80000, label: 'A' }).length >= 2, 'oversized chunks regardless of any speed/cost preference (no mode arg exists)')
+})
+
+test('mergeScoutChunks unions per-chunk findings into one and keeps the file-end anchor', () => {
+  const parts = [
+    { speakers: [{ label: '记者', role: '记者' }, { label: '发言人1', role: '受访者' }], people: [{ canonical: '张三' }], brands: [], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['A'] }], themes: ['开场'], has_existing_headings: false, ending_anchor: { line: 700, text: '中段。' }, special_notes: ['注一'] },
+    { speakers: [{ label: '发言人1', role: '受访者' }], people: [{ canonical: '李四' }], brands: [{ canonical: '某品牌' }], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['B'] }], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 2000, text: '就到这里。' }, special_notes: ['注二'] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 2000 })
+  assert.deepEqual(m.speakers.map((s) => s.label), ['记者', '发言人1'], 'speakers unioned, deduped by label')
+  assert.equal(m.people.length, 2, 'people concatenated (downstream clusterEntities dedups across chunks, as it does across files)')
+  assert.deepEqual(m.themes, ['开场', '收尾'], 'themes unioned')
+  assert.equal(m.has_existing_headings, true, 'has_existing_headings is OR across chunks')
+  assert.equal(m.errors.length, 1, 'same-kind errors merged into one entry')
+  assert.deepEqual(m.errors[0].examples, ['A', 'B'], 'examples concatenated under that kind')
+  assert.deepEqual(m.ending_anchor, { line: 2000, text: '就到这里。' }, 'anchor comes from the chunk that actually saw the file end')
+})
+
+test('mergeScoutChunks drops the ending anchor when the last chunk did not return (refine/check then read the tail)', () => {
+  const parts = [{ speakers: [{ label: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 600, text: '中段。' }, special_notes: [] }]
+  const m = mergeScoutChunks(parts, { lines: 2000 })   // best anchor 600 « 2000×0.9 → ending unknown
+  assert.deepEqual(m.ending_anchor, {}, 'short anchor dropped → empty; downstream reads the real tail itself')
+})
+
+test('mergeScoutChunks returns null only if every chunk failed; a partial set still yields a finding', () => {
+  assert.equal(mergeScoutChunks([null, null], { lines: 2000 }), null, 'all chunks failed → null (→ scoutFailed; refine still runs from source)')
+  const m = mergeScoutChunks([null, { speakers: [{ label: '记者' }], people: [{ canonical: '张三' }], ending_anchor: { line: 2000, text: '尾。' } }], { lines: 2000 })
+  assert.ok(m && m.people.length === 1, 'one surviving chunk still produces a usable glossary')
 })
 
 test('partPath derives sibling intermediate paths', () => {
@@ -297,4 +347,36 @@ test('completeness check runs AFTER deliverables and a failed/stalled check neve
   assert.ok(labels.indexOf('summary') < labels.indexOf('check:A'), 'check runs after the deliverable, not before')
   assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'a failed check surfaces as unchecked; the run still completes')
   assert.equal(r.failed.length, 0, 'the refine itself succeeded')
+})
+
+// ---------- resilience: an oversized merged file can't stall the scout (auto-chunked) ----------
+
+test('oversized file: the SCOUT auto-chunks into parallel sub-scouts, merged into one finding', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 4000, chars: 90000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels))
+  const subScouts = labels.filter((l) => /^scout:A#\d+\/\d+$/.test(l))
+  assert.ok(subScouts.length >= 2, 'the oversized file fanned out into ≥2 sub-scouts (not one whole-file scout)')
+  assert.ok(!labels.includes('scout:A'), 'no single whole-file scout agent for the oversized file')
+  assert.ok(labels.includes('refine:A'), 'refine still runs, on the merged finding')
+  assert.equal(r.refined.length, 1)
+  assert.equal(r.scoutFailed.length, 0, 'the merge produced a finding → not scoutFailed')
+})
+
+test('oversized file: one sub-scout stalling still yields a partial finding — refine unaffected', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 4000, chars: 90000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l === 'scout:A#2/5' }))
+  assert.ok(labels.includes('refine:A'), 'refine runs')
+  assert.equal(r.scoutFailed.length, 0, 'a surviving partial merge is still a finding (the whole scout no longer stalls on one bad chunk)')
+  assert.equal(r.refined.length, 1)
+})
+
+test('oversized file: if every sub-scout stalls, it degrades to scoutFailed — refine still runs from source', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 4000, chars: 90000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => /^scout:A#/.test(l) }))
+  assert.ok(labels.includes('refine:A'), 'refine still runs even when the whole chunked scout fails')
+  assert.deepEqual(r.scoutFailed, ['A'], 'all chunks failed → scoutFailed (same graceful path as a single failed scout)')
+  assert.equal(r.refined.length, 1)
 })
