@@ -5,9 +5,10 @@ export const meta = {
   phases: [
     { title: 'Scout', detail: '每份转录一个侦察代理，返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },
-    { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接）+ 结尾完整性核对（默认 opus + 拼接 haiku + 核对 haiku）' },
+    { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接；侦察失败也照常精校，默认 opus + 拼接 haiku）' },
     { title: 'Logic', detail: '逐份逻辑顺序重排稿（按主线把问答重排成叙事顺序，默认 opus）' },
     { title: 'Deliver', detail: '访谈总结 / 时间线（默认 opus）' },
+    { title: 'Check', detail: '结尾完整性核对——最后跑、不阻塞已落盘的成稿与交付物（默认 haiku）' },
   ],
 }
 

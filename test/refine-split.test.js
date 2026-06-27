@@ -229,16 +229,18 @@ test('renderRefineGlossary keeps the spelling info but drops the archival prose,
 
 // ---------- pipeline routing (mock engine, zero tokens) ----------
 
-function mockEngine(labels) {
+function mockEngine(labels, opts = {}) {
   const reply = (label) => {
     if (/^scout/.test(label)) return { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 1467, text: '就到这里。' }, special_notes: [] }
     if (/^refine/.test(label)) return { path: 'x', headings: ['某节'], key_fixes: [], open_questions: [] }
     if (/^stitch/.test(label)) return '已合并'
     if (/^check/.test(label)) return { complete: true, note: '' }
+    if (/^dedup/.test(label)) return { suspects: [] }
+    if (/^(summary|timeline)/.test(label)) return `/out/${label}.md`
     return null
   }
   return {
-    agent: async (_p, opts) => { labels.push(opts.label); return reply(opts.label) },
+    agent: async (_p, o) => { labels.push(o.label); return (opts.fail && opts.fail(o.label)) ? null : reply(o.label) },
     parallel: (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null))),
     pipeline: async (items, ...stages) => Promise.all((items || []).map(async (item, i) => {
       let v = item
@@ -269,4 +271,30 @@ test('cost mode (default): pipeline keeps a single refine agent even for a large
   assert.ok(labels.includes('refine:A') && labels.includes('refine:B'), 'single refine agent per file')
   assert.ok(!labels.some((l) => /#/.test(l)), 'no chunk agents in cost mode')
   assert.ok(!labels.some((l) => /^stitch/.test(l)), 'no stitch agent in cost mode')
+})
+
+// ---------- resilience: cheap gate agents can't hold the expensive refine hostage ----------
+
+test('refine runs even when scout fails for a file (scout decoupled; surfaced as scoutFailed)', async () => {
+  const labels = []
+  const files = [
+    { path: '/s/A.txt', label: 'A', lines: 500, chars: 5000, title: 'A', subtitle: '*s*', outPath: '/o/Transcripts/A.md' },
+    { path: '/s/B.txt', label: 'B', lines: 500, chars: 5000, title: 'B', subtitle: '*s*', outPath: '/o/Transcripts/B.md' },
+  ]
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files }, mockEngine(labels, { fail: (l) => l === 'scout:B' }))
+  assert.ok(labels.includes('refine:B'), 'B is still refined despite its scout failing')
+  assert.ok(!r.failed.includes('B'), 'a scout failure does not mark the file failed')
+  assert.deepEqual(r.scoutFailed, ['B'], 'B surfaced as scoutFailed (glossary degraded, re-scout later)')
+  assert.equal(r.refined.length, 2, 'both files refined')
+})
+
+test('completeness check runs AFTER deliverables and a failed/stalled check never blocks them', async () => {
+  const labels = []
+  const file = { path: '/s/A.txt', label: 'A', lines: 500, chars: 5000, title: 'A', subtitle: '*s*', outPath: '/o/Transcripts/A.md' }
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('check') }))
+  assert.ok(r.summary, 'the summary deliverable is produced even though the check failed')
+  assert.ok(labels.indexOf('summary') !== -1 && labels.indexOf('check:A') !== -1, 'both ran')
+  assert.ok(labels.indexOf('summary') < labels.indexOf('check:A'), 'check runs after the deliverable, not before')
+  assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'a failed check surfaces as unchecked; the run still completes')
+  assert.equal(r.failed.length, 0, 'the refine itself succeeded')
 })
