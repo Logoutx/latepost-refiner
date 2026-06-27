@@ -96,7 +96,7 @@ Workflow({ scriptPath: '<this skill dir>/workflow.js', args: {
 
 Each `files` item: `path` source file, `label` short name, `chars` 正文字数 (the size metric), `lines`/`bytes` from pre-flight (for Read pagination only), `title` output H1 (per the Output spec), `subtitle` the second italic line, `outPath` = `<output>/Transcripts/<title>.md`, `speakerHints/notes` carry the per-file clues from Step 0. A single file under **~4000 正文字数** automatically takes the "one-pass" shortcut branch (skip scout/glossary); chunking applies only in `chunkMode: 'speed'` (splits big files at speaker-turn boundaries — no pre-flight ranges needed). Speed mode leaves `<outPath>.partN` intermediates next to the final transcript — after the run you can `rm` any `<output>/Transcripts/*.part*` (harmless if left).
 
-**Return handling** → see **[references/return-handling.md](references/return-handling.md)**: walk the result fields (`glossary`, `failed`, `incomplete`, `unchecked`, `scoutSuspect`, `headingConflicts`, `suspectedDuplicates`, `networkUnverified`, `openQuestions`, `logic`, `summary`/`timeline`), then go straight to Step 5.
+**Return handling** → see **[references/return-handling.md](references/return-handling.md)**: it opens with **partial-failure recovery** (if the run dies on a cheap agent after refine landed, resume / finish by hand — never re-refine), then walk the result fields (`glossary`, `failed`, `incomplete`, `unchecked`, `scoutSuspect`, `scoutFailed`, `headingConflicts`, `suspectedDuplicates`, `networkUnverified`, `openQuestions`, `logic`, `summary`/`timeline`), then go straight to Step 5.
 
 **Workflow not available** (e.g. claude.ai) → run the by-hand pipeline in **[references/manual-steps.md](references/manual-steps.md)** (Steps 1–4), then Step 5.
 
