@@ -1,4 +1,4 @@
-import { RULES, TYPESET, SINGLE_FILE_GLOSSARY } from './spec.js'
+import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath } from './spec.js'
 
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
@@ -19,6 +19,21 @@ export function readPlan(f) {
   const steps = []
   for (let o = 0; o < n; o += page) steps.push(`Read(offset=${o}, limit=${page})`)
   return `读取计划（共 ${n} 行，照此执行，不要用更小的分页）：\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+}
+
+// Read plan for one chunk's source span [startLine, endLine], with ~30 lines of lead-in/lead-out so
+// the agent can see the full speaker turns straddling its boundaries (it only EMITS the turns it owns,
+// per the ownership rule in refinePrompt's chunk branch). Same density-aware page sizing as readPlan.
+export const CHUNK_MARGIN = 30
+export function readPlanRange(f, startLine, endLine) {
+  const lines = f.lines || 0
+  const from = Math.max(1, (startLine || 1) - CHUNK_MARGIN)               // 1-indexed first line to read
+  const to = lines ? Math.min(lines, (endLine || lines) + CHUNK_MARGIN) : (endLine || 0) + CHUNK_MARGIN // 1-indexed last line
+  let page = READ_PAGE
+  if (f.bytes && lines) page = Math.min(READ_PAGE, Math.max(150, Math.floor(lines * READ_BYTES_PER_PAGE / f.bytes)))
+  const steps = []
+  for (let o = from - 1; o < to; o += page) steps.push(`Read(offset=${o}, limit=${Math.min(page, to - o)})`) // o is a 0-based offset
+  return steps
 }
 
 export function headingNote(policy) {
@@ -82,13 +97,53 @@ ${table}
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 
-export function refinePrompt(f, glossary, finding, a) {
+export function refinePrompt(f, glossary, finding, a, chunk) {
   // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
+  const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
+  const speakers = (finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'
+
+  // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
+  // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
+  if (chunk && chunk.count > 1) {
+    const outPart = partPath(f.outPath, chunk.idx)
+    const steps = readPlanRange(f, chunk.startLine, chunk.endLine)
+    const headBlock = chunk.isFirst
+      ? `【抬头】你是第 1 块：第一行写 \`# ${f.title}\`，第二行写 \`${f.subtitle}\`，然后从第一个 \`##\` 小标题开始正文。`
+      : `【抬头】你是第 ${chunk.idx} 块（非首块）：**不要写 H1 标题、不要写说明行**，直接从一个 \`##\` 小标题开始正文。`
+    const tailNote = chunk.isLast
+      ? `【收尾】你这一块覆盖到源文件结尾（约第 ${f.lines} 行${anchor.text ? `，最后一句「${anchor.text}」` : ''}）——必须精校到最后，正文绝不能中途断掉（结尾客套可折成一句说明）。`
+      : '【收尾】你不是最后一块，正常精校到你负责的最后一轮发言即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。'
+    return `你是访谈转录「精校」子代理（分块并行：本份共 ${chunk.count} 块，你负责第 ${chunk.idx} 块）。
+
+【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
+${glossary}
+
+【源文件】${f.path}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
+读取计划（首尾各多读约 ${CHUNK_MARGIN} 行邻接内容，好看清边界处的整轮发言；只精校属于你的那些发言轮）：
+${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+【分块边界规则——务必严格，确保各块不重不漏】
+- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
+- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}
+
+【输出】Write 到 ${outPart}
+${headBlock}
+【该份发言人】${speakers}
+${notes ? `【该份特别提醒】\n${notes}` : ''}
+${headingNote(a.headingPolicy)}
+
+${RULES}
+
+${tailNote}
+
+完成后按 schema 返回 path（=${outPart}）、headings（你这一块分的 ## 小标题）、key_fixes、open_questions。`
+  }
+
   const anchorNote = anchor.text
     ? `【收尾锚点】源文件共 ${anchor.line || f.lines} 行，最后一句：「${anchor.text}」。成稿必须覆盖到此处（收尾客套可折成一句说明；正文绝不能中途断掉）。`
     : `【收尾锚点】源文件共约 ${f.lines} 行——先用 Read 看源文件最后约 30 行确认结尾内容，成稿必须覆盖到源文件结尾（收尾客套可折成一句说明；正文绝不能中途断掉）。`
-  const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
   return `你是访谈转录「精校」子代理。
 
 【统一校对表】（「联网核实结论」与「写法统一」两节优先级最高，与前文冲突时以它们为准——但其中**标 ⚠ 的条目未被采纳、勿套用**；「写法统一」里的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
@@ -108,12 +163,36 @@ ${anchorNote}
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
 }
 
+// Merge the K chunk part-files into the final transcript. The script can't touch the filesystem, so a
+// cheap agent does it — but by CONCATENATION (one tool call), never by retyping the content (which would
+// hit the per-response output cap on a long transcript and risk paraphrase). The post-stitch completeness
+// check + the source-aware audit (charRatio) backstop a bad merge.
+export function stitchPrompt(f, chunks) {
+  const parts = chunks.map((c) => partPath(f.outPath, c.idx))
+  const list = parts.map((p, i) => `  ${i + 1}. ${p}`).join('\n')
+  return `你是「分块拼接」子代理。把一份访谈精校稿的 ${chunks.length} 个分块按顺序合并成一份最终成稿——**纯机械拼接、逐字照搬，绝不改写、增删、重述或重新打字录入内容**。
+
+【分块文件（务必按此顺序拼接）】
+${list}
+
+【目标成稿】${f.outPath}
+
+【怎么做——用一次拼接动作，别自己逐字重敲内容】
+- 若你有 \`Concat\` 文件工具：直接调用 \`Concat(file_path="${f.outPath}", sources=[按上面顺序排列的各分块路径])\`，一步到位。
+- 否则若你能跑 shell：用 \`cat "分块1" "分块2" … > "${f.outPath}"\`（**每个路径都用双引号包起来**——路径含空格/中文，不加引号会出错；务必按上面的顺序）。
+- 两者都没有时（最后手段）：Read 第 1 块→Write 到目标成稿；再**逐块** Read→用 Edit 以目标当前结尾为锚点追加（一次只追加一块、绝不整文件重写），直到接完。
+第 1 块已带 \`# ${f.title}\` 抬头、其余块直接是 \`##\` 正文，顺序接上即可；分块之间留一个空行。不要加任何前言、结语、编者注或分隔线。
+
+拼好后用一句话回复：已合并 ${chunks.length} 块到 ${f.outPath}。`
+}
+
 export function checkPrompt(f, anchor) {
   const src = (anchor && anchor.text)
     ? `源转录共 ${anchor.line || '?'} 行，原文最后一句是：“${anchor.text}”。`
     : `先用 Read 读源文件 ${f.path} 的最后约 30 行，确定原文结尾内容。`
   return `你是「结尾完整性」核对代理。${src}
 用 Read 读成稿 ${f.outPath} 的最后约 60 行。**判 complete 前先确认成稿倒数若干段的实质内容确实对应到了源文件结尾（上面的锚点附近）**：
+- **注意：精校稿因删口癖、并碎句，行数与字数本就比源文件少约 15-30%——绝不能因为成稿比源文件短、或行数比源文件少就判 complete=false。完整性只看「源文件结尾那句的实质内容有没有出现在成稿结尾」，不做行数/字数比例的推断。**
 - 对应上了 → complete=true。
 - 成稿在**远早于结尾处**就以一句收束注（如“后续为离场闲聊，从略”）收住、中间大段源文件内容缺失 → 这是中途截断，**complete=false**，在 note 写明大约从哪一段起缺。
 - 只有当收束注**前一段已对应到源文件末尾区域**时，该收束注才算正常收尾（complete=true）。

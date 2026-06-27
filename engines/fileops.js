@@ -7,6 +7,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { stitchParts } from '../core/spec.js'
 
 const MAX_LINE = 2000 // truncate pathologically long lines in Read output
 const DEFAULT_POLICY = Object.freeze({
@@ -155,12 +156,34 @@ export function editFile(input = {}, policy) {
   return { ok: true, text: `已编辑 ${fp}（替换 ${input.replace_all ? count : 1} 处）` }
 }
 
+// Concatenate part files into one target, in order, with the shared stitchParts logic (one blank line
+// between parts, exact-dup seam heading collapsed). Lets the chunked-refine stitch agent merge with a
+// single tool call instead of retyping a long transcript (which would hit the per-response output cap).
+export function concatFiles(input = {}, policy) {
+  const sources = Array.isArray(input.sources) ? input.sources : []
+  if (!sources.length) return { ok: false, text: 'Concat: 缺少 sources（要按顺序合并的分块文件路径数组）' }
+  const wr = checkAccess('Write', input.file_path, policy)
+  if (!wr.ok) return wr
+  const texts = []
+  for (const s of sources) {
+    const rd = checkAccess('Read', s, policy)
+    if (!rd.ok) return rd
+    if (!fs.existsSync(rd.path)) return { ok: false, text: `Concat: 分块文件不存在: ${rd.path}` }
+    texts.push(fs.readFileSync(rd.path, 'utf8'))
+  }
+  const merged = stitchParts(texts)
+  fs.mkdirSync(path.dirname(wr.path), { recursive: true })
+  fs.writeFileSync(wr.path, merged, 'utf8')
+  return { ok: true, text: `已按顺序合并 ${sources.length} 个分块 → ${wr.path}（${Buffer.byteLength(merged, 'utf8')} 字节）` }
+}
+
 // Dispatch by tool name; never throws (errors → { ok:false }).
 export function runFileTool(name, input, policy) {
   try {
     if (name === 'Read') return readFile(input, policy)
     if (name === 'Write') return writeFile(input, policy)
     if (name === 'Edit') return editFile(input, policy)
+    if (name === 'Concat') return concatFiles(input, policy)
     return { ok: false, text: `未知工具: ${name}` }
   } catch (e) {
     return { ok: false, text: `${name} 执行出错: ${e.message}` }
@@ -207,6 +230,18 @@ export const TOOL_SPECS = [
         replace_all: { type: 'boolean', description: '是否替换所有出现；默认 false' },
       },
       required: ['file_path', 'old_string', 'new_string'],
+    },
+  },
+  {
+    name: 'Concat',
+    description: '按给定顺序把多个分块文件逐字拼接、写入目标文件（分块间留一个空行，自动去掉跨接处重复的 ## 小标题）。用于把分块精校的各部分合成最终成稿——一次调用即可，不必自己重打内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: '合并后写入的目标文件绝对路径' },
+        sources: { type: 'array', items: { type: 'string' }, description: '按拼接顺序排列的分块文件绝对路径数组' },
+      },
+      required: ['file_path', 'sources'],
     },
   },
 ]

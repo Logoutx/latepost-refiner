@@ -1,9 +1,42 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, findHeadingConflicts, renderGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags } from './spec.js'
-import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, checkPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, splitForRefine, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags } from './spec.js'
+import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, checkPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
+
+// Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
+// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged by a cheap stitch
+// agent. Returns a REFINE_REPORT-shaped object (path = f.outPath) or null if it
+// could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
+// completeness check + source-aware audit) rather than silently dropped.
+async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
+  const chunks = splitForRefine(f, A.chunkMode)
+  if (chunks.length <= 1) {
+    // Single agent → full glossary (no token multiplication on one agent).
+    return engine.agent(refinePrompt(f, glossary, finding, A),
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  }
+  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
+  // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
+  // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
+  const partReps = await engine.parallel(chunks.map((c) => () =>
+    engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })))
+  const good = partReps.filter(Boolean)
+  if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
+  const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
+  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，结尾核对/审计会进一步标记`)
+  const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+  if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+  return {
+    path: f.outPath,
+    headings: good.flatMap((r) => r.headings || []),
+    key_fixes: good.flatMap((r) => r.key_fixes || []),
+    open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
+    chunked: chunks.length,
+  }
+}
 
 export async function runPipeline(A, engine) {
 const M = Object.assign(
-  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', logic: 'opus', summary: 'opus', timeline: 'opus' },
+  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus' },
   A.models || {}
 )
 const scope = A.scope || ['refine']
@@ -36,14 +69,15 @@ let scoutSuspect = []
 let dedup = null
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
-if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
-  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify
+if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
+  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
+  // Length judged by 正文字数, not lines.
   const f = A.files[0]
   engine.phase('Refine')
-  engine.log(`单份短文件（${f.lines} 行）：一遍过精校，不建独立校对表`)
-  const rep = await engine.agent(singlePassPrompt(f, A), { label: `refine:${f.label}`, model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  engine.log(`▶ 精校 Refine：单份短文件（约 ${refineSize(f)} 字）一遍过，不建独立校对表`)
+  const rep = await engine.agent(singlePassPrompt(f, A), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
   if (rep) {
-    const chk = await engine.agent(checkPrompt(f, null), { label: `check:${f.label}`, model: 'haiku', schema: CHECK_SCHEMA })
+    const chk = await engine.agent(checkPrompt(f, null), { label: `check:${f.label}`, phase: 'Refine', model: 'haiku', schema: CHECK_SCHEMA })
     refined = [withCheck(rep, chk, f)]
     refinedPairs = [{ f, rep: refined[0] }]
   } else {
@@ -52,15 +86,16 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   glossary = SINGLE_FILE_GLOSSARY
 } else {
   engine.phase('Scout')
+  engine.log(`▶ 1/${scope.includes('logic') ? 5 : 4} 侦察 Scout：${A.files.length} 份并行抽取实体（人名 / 品牌 / 术语 / 发言人）`)
   let findings = await engine.parallel(A.files.map((f) => () =>
-    engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, model: M.scout, schema: SCOUT_SCHEMA })))
+    engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
   // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
   // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
     const retries = await engine.parallel(retryIdx.map((i) => () =>
-      engine.agent(scoutPrompt(A.files[i], A), { label: `scout-retry:${A.files[i].label}`, model: M.scout, schema: SCOUT_SCHEMA })))
+      engine.agent(scoutPrompt(A.files[i], A), { label: `scout-retry:${A.files[i].label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
     retryIdx.forEach((i, k) => { if (retries[k] && !scoutLooksGarbled(retries[k])) findings[i] = retries[k] })
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)
@@ -74,6 +109,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
   engine.phase('Verify')
+  engine.log(`▶ 2/${scope.includes('logic') ? 5 : 4} 核实 Verify：关键实体联网核实 + 语义同指排查`)
   // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
   // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
@@ -121,13 +157,17 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   if (weakDups.length) engine.log(`称呼歧义：${weakDups.length} 个弱称呼跨批次重复（未合并）——并入 openQuestions 待人工辨认`)
   if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
   glossary = renderGlossary(merged, allVerified, allDedup, A)
+  // Condensed glossary for chunk-refine agents (full 校对表 still persisted + used by single-agent refine).
+  const refineGlossary = renderRefineGlossary(merged, allVerified, allDedup, A)
 
   let positional = []
   if (scope.includes('refine')) {
     engine.phase('Refine')
+    engine.log(`▶ 3/${scope.includes('logic') ? 5 : 4} 精校 Refine：${A.files.length} 份逐份精校 + 结尾核对${A.chunkMode === 'speed' ? '（大文件分块并行）' : ''}`)
+    // Per file: refine (one agent, or K parallel chunk agents + a stitch agent for large files) →
+    // ending-completeness check on the resulting outPath. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
-      (f, _f, i) => findings[i] && engine.agent(refinePrompt(f, glossary, findings[i], A),
-        { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA }),
+      (f, _f, i) => findings[i] && refineFile(engine, f, glossary, refineGlossary, findings[i], A, M),
       (rep, f, i) => rep && engine.agent(checkPrompt(f, findings[i].ending_anchor),
         { label: `check:${f.label}`, phase: 'Refine', model: 'haiku', schema: CHECK_SCHEMA })
         .then((chk) => withCheck(rep, chk, f)))
@@ -143,8 +183,9 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
 let logic = []
 if (scope.includes('logic') && refinedPairs.length) {
   engine.phase('Logic')
+  engine.log(`▶ 4/5 逻辑顺序 Logic：${refinedPairs.length} 份按主线重排为叙事顺序`)
   const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, model: M.logic, schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, schema: LOGIC_REPORT_SCHEMA })))
   lreps.forEach((lrep, k) => {
     const { f, rep } = refinedPairs[k]
     if (!lrep) { logic.push({ label: f.label, path: null, mainline: '', threads: [], missingSections: [], open_questions: [] }); return }
@@ -160,12 +201,15 @@ if (scope.includes('logic') && refinedPairs.length) {
 }
 
 engine.phase('Deliver')
+if (refined.length && (scope.includes('summary') || scope.includes('timeline'))) {
+  engine.log(`▶ 交付 Deliver：${[scope.includes('summary') && '访谈总结', scope.includes('timeline') && '时间线'].filter(Boolean).join(' + ')}`)
+}
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', model: M.summary })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', model: M.timeline })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline })
     : Promise.resolve(null)),
 ])
 

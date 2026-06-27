@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
-import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
+import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
 import { auditPairs } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
@@ -71,13 +71,14 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const content = fs.readFileSync(mdPath, 'utf8')
   const lines = content.split('\n').length
   const bytes = Buffer.byteLength(content, 'utf8')
+  const chars = contentLength(content)   // 正文字数 (汉字 + 英文词/数字)；文档长度以此衡量，行数仅供 Read 分页
   const hasHeadings = HEADING_RE.test(content)
   const title = deriveTitle(src)
   const entry = {
     path: mdPath, label: title, title,
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
-    lines, bytes,
+    lines, bytes, chars,
   }
   const headingWarning = hasHeadings && headingPolicy === 'none'
     ? `${path.basename(src)} 疑似已带小标题，而 headingPolicy=none——可用 headingPolicy=keep|regenerate 重跑该份`
@@ -135,6 +136,17 @@ export function buildRouterEngine({ categories, concurrency, filePolicy, env = p
     engines[key] = cache.get(s)
   }
   return makeRouterEngine({ engines, onPhase, onLog })
+}
+
+// Remove the <outPath>.partN intermediate files left by chunked refine (the stitch agent merged them
+// into outPath). Deterministic by index — no globbing. Safe to call when no chunking happened.
+export function cleanupRefineParts(fileEntries) {
+  for (const f of fileEntries || []) {
+    if (!f || !f.outPath) continue
+    for (let i = 1; i <= MAX_REFINE_CHUNKS; i += 1) {
+      try { fs.rmSync(partPath(f.outPath, i), { force: true }) } catch { /* ignore */ }
+    }
+  }
 }
 
 // Persist the returned glossary (pure-JS output; no agent writes it). Cumulative across runs.
@@ -198,11 +210,12 @@ export async function runJob(params, { onPhase, onLog } = {}) {
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, priorGlossaryText, fresh, files: fileEntries,
+    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, priorGlossaryText, fresh, files: fileEntries,
   }
 
   try {
     const r = await runPipeline(A, sel.engine)
+    cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
     // source-aware quality audit: compare each refined transcript against its source (refine scope)
     const auditList = r.error ? [] : fileEntries.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
