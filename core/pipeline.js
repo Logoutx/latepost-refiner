@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, splitForRefine, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, checkPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
@@ -32,6 +32,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
     chunked: chunks.length,
   }
+}
+
+// Scout one file. A normal interview → one agent (unchanged). An oversized merged file (> SCOUT_CHUNK_CHARS
+// 字) → splitForScout parallel chunk agents, merged by mergeScoutChunks — a RESILIENCE measure so a single
+// scout can't stall on a huge file (the failure mode that motivated this). Returns one SCOUT_SCHEMA-shaped
+// finding, or null if every chunk failed (handled downstream exactly like any other null scout → scoutFailed,
+// refine still runs from source). A partial chunk set still yields a usable per-file finding.
+async function scoutFile(engine, f, A, M, labelPrefix = 'scout') {
+  const chunks = splitForScout(f)
+  if (chunks.length === 1) {
+    return engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+  }
+  engine.log(`侦察分块：大文件 ${f.label}（约 ${refineSize(f)} 字）拆 ${chunks.length} 段并行侦察，防单代理卡死`)
+  const parts = await engine.parallel(chunks.map((c) => () =>
+    engine.agent(scoutPrompt(f, A, c), { label: `${labelPrefix}:${f.label}#${c.idx}/${c.count}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+  return mergeScoutChunks(parts, f)
 }
 
 export async function runPipeline(A, engine) {
@@ -87,15 +103,13 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
 } else {
   engine.phase('Scout')
   engine.log(`▶ 1/${scope.includes('logic') ? 5 : 4} 侦察 Scout：${A.files.length} 份并行抽取实体（人名 / 品牌 / 术语 / 发言人）`)
-  let findings = await engine.parallel(A.files.map((f) => () =>
-    engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+  let findings = await engine.parallel(A.files.map((f) => () => scoutFile(engine, f, A, M)))
   // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
   // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
-    const retries = await engine.parallel(retryIdx.map((i) => () =>
-      engine.agent(scoutPrompt(A.files[i], A), { label: `scout-retry:${A.files[i].label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+    const retries = await engine.parallel(retryIdx.map((i) => () => scoutFile(engine, A.files[i], A, M, 'scout-retry')))
     retryIdx.forEach((i, k) => { if (retries[k] && !scoutLooksGarbled(retries[k])) findings[i] = retries[k] })
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)

@@ -56,18 +56,32 @@ function knownNote(a) {
 ${ppl ? `人名：${ppl}\n` : ''}${br ? `品牌/公司/产品：${br}\n` : ''}${tm ? `术语：${tm}\n` : ''}${spk ? `已知发言人：${spk}` : ''}`
 }
 
-export function scoutPrompt(f, a) {
+export function scoutPrompt(f, a, chunk) {
+  const isChunk = !!(chunk && chunk.count > 1)
+  const where = isChunk
+    ? `本份文件：${f.path}——这是它的**第 ${chunk.idx}/${chunk.count} 段**（源文件第 ${chunk.startLine}–${chunk.endLine} 行，全文约 ${f.lines} 行）。这是大文件的分段侦察，各段结果会自动合并；只管**本段**，不必顾及别段。`
+    : `本份文件：${f.path}（约 ${f.lines} 行）`
+  const readBlock = isChunk
+    ? `任务：用 Read **只读本段** [${chunk.startLine}, ${chunk.endLine}] 行（已含前后约 ${CHUNK_MARGIN} 行衔接），**不精校、不联网、不大段摘录原文**；只抽取**本段内**出现的实体与发言人。
+读取计划（照此执行，不要用更小的分页）：
+${readPlanRange(f, chunk.startLine, chunk.endLine).map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+    : `任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
+${readPlan(f)}`
+  const endingBullet = isChunk
+    ? (chunk.isLast
+        ? `- ending_anchor：本段含全文结尾——line=文件总行数（约 ${f.lines}）；text=全文最后一句话**原样照抄**。`
+        : `- ending_anchor：本段不是全文结尾——line=本段最后一行行号（约 ${chunk.endLine}）、text 留空或填该行原文即可（合并时以含结尾的那段为准）。`)
+    : `- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。`
   return `你是访谈转录「侦察」子代理。
 
 采访背景：${a.background}
 
-本份文件：${f.path}（约 ${f.lines} 行）
+${where}
 ${f.speakerHints ? `已知发言人线索：${f.speakerHints}` : ''}
 ${f.notes ? `额外提醒：${f.notes}` : ''}
 ${knownNote(a)}
 
-任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
-${readPlan(f)}
+${readBlock}
 读完后按 schema 返回结构化侦察结果：
 - speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
@@ -75,7 +89,7 @@ ${readPlan(f)}
 - errors：明显转写错误按类别举例（同音字错/英文听写错/（音）标记/夹行时间戳/乱码/Word 残讯）。
 - themes：这份大致谈了哪些主题。
 - has_existing_headings：源文件是否已带小标题行（#/##/【】式标题）。
-- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。
+${endingBullet}
 - special_notes：该份特别提醒（拒答/敏感语境要保留、收尾离场后的闲聊、称呼混乱重灾区等）。`
 }
 
