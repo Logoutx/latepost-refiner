@@ -7,8 +7,9 @@ import {
   splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, contentLength,
   REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
+  clusterEntities, entityWorth, verifyChunks, suspectUnverified,
 } from '../core/spec.js'
-import { readPlanRange, refinePrompt, stitchPrompt } from '../core/prompts.js'
+import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt } from '../core/prompts.js'
 import { concatFiles, makeFilePolicy } from '../engines/fileops.js'
 import { runPipeline } from '../core/pipeline.js'
 
@@ -275,6 +276,54 @@ test('renderRefineGlossary keeps the spelling info but drops the archival prose,
   assert.ok(!slim.includes('各份特别提醒'), 'per-file notes dropped')
   // materially shorter than the full archival glossary
   assert.ok(slim.length < full.length * 0.7, `slim ${slim.length} < 70% of full ${full.length}`)
+})
+
+// ---------- ASR-error correction: scout knowledge-canonical + force-verify suspects (fictional names) ----------
+
+test('clusterEntities propagates suspect_asr — a scout flag survives the merge', () => {
+  const [c] = clusterEntities([{ canonical: '苍璧科技', variants: ['苍碧科技'], suspect_asr: true }])
+  assert.equal(c.suspect_asr, true, 'a flagged entity stays flagged after clustering')
+  const [d] = clusterEntities([{ canonical: '示例公司', variants: [] }])
+  assert.ok(!d.suspect_asr, 'an unflagged entity is not flagged')
+})
+
+test('the ASR blind spot: a consistently mis-heard name is worth 0 (so key-mode verify would skip it)', () => {
+  assert.equal(entityWorth({ canonical: '卫昭', variants: [] }), 0, 'single spelling, no variant, not public → worth 0')
+})
+
+test('verifyChunks force-includes a worth-0 suspect in key mode (the core fix), but not a worth-0 non-suspect', () => {
+  const merged = {
+    people: [{ canonical: '卫昭', variants: [], suspect_asr: true }],   // worth 0 BUT suspected → must be sent
+    brands: [{ canonical: '无关公司', variants: [] }],                  // worth 0, not suspected → still skipped
+    terms: [],
+  }
+  const { chunks, eligible } = verifyChunks(merged, 'key')
+  const sent = chunks.join('\n')
+  assert.ok(sent.includes('卫昭'), 'the worth-0 suspect IS sent to verify')
+  assert.ok(!sent.includes('无关公司'), 'a worth-0 non-suspect stays skipped')
+  assert.equal(eligible, 1, 'exactly the suspect is eligible')
+  assert.ok(sent.includes('⚠'), 'the suspect row is flagged so the verify agent prioritises it')
+})
+
+test('suspectUnverified asks about a suspect verify could not resolve, and goes quiet once resolved', () => {
+  const merged = { people: [{ canonical: '苍璧科技', variants: ['苍碧科技'], suspect_asr: true, hint: '激光雷达公司' }], brands: [], terms: [] }
+  const open = suspectUnverified(merged, { resolved: [], unresolved: [] })
+  assert.equal(open.length, 1, 'unresolved suspect → one openQuestion')
+  assert.ok(open[0].includes('苍璧科技'), 'it names the suspect')
+  const done = suspectUnverified(merged, { resolved: [{ query: '苍碧科技', canonical: '苍璧科技' }], unresolved: [] })
+  assert.equal(done.length, 0, 'once verify resolves any of its spellings, no question')
+})
+
+test('renderGlossary flags an unresolved suspect in the archival table (never ships silently)', () => {
+  const merged = { speakersByFile: [], people: [{ canonical: '卫昭', variants: [], suspect_asr: true, hint: 'x' }], brands: [], terms: [], errors: [], notes: [] }
+  const g = renderGlossary(merged, { resolved: [], unresolved: [] }, null, { topic: 'T', date: '2025-09', background: 'bg', doNotMerge: [] })
+  assert.ok(/卫昭.*⚠ 侦察疑为转录误写/.test(g), 'unresolved suspect carries a ⚠ note in the glossary body')
+})
+
+test('scoutPrompt instructs knowledge-canonical and the suspect_asr flag', () => {
+  const p = scoutPrompt({ path: '/s/A.txt', label: 'A', lines: 100 }, { background: 'bg' })
+  assert.ok(p.includes('知名实体用你已知的正确写法') && p.includes('苍璧科技'), 'knowledge-canonical instruction present')
+  assert.ok(p.includes('suspect_asr=true'), 'suspect-flag instruction present')
 })
 
 // ---------- pipeline routing (mock engine, zero tokens) ----------

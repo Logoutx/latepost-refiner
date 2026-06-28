@@ -9,6 +9,7 @@ export const entitySchema = (extra) => ({
     canonical: { type: 'string', description: '该实体最可信的写法' },
     variants: { type: 'array', items: { type: 'string' }, description: '文中出现的其它写法，含疑似同音误写' },
     hint: { type: 'string', description: '一句定位线索（身份/title/语境）' },
+    suspect_asr: { type: 'boolean', description: 'canonical 疑为转录同音/听写误写、但拿不准正确写法时置 true——会强制联网核实这一条（哪怕只出现一处、无其它变体）' },
   }, extra || {}),
 })
 
@@ -209,6 +210,7 @@ export function clusterEntities(entries) {
       hint: hints.join('；'),
       files,
       public_figure: c.entries.some((e) => e.public_figure),
+      suspect_asr: c.entries.some((e) => e.suspect_asr),   // any scout flagged it a likely ASR mishear → force verify
       category: c.entries.map((e) => e.category || e.domain).find(Boolean) || '',
       crossFile: files.length > 1,
     }
@@ -261,12 +263,15 @@ export const VERIFY_CHUNK = 12
 export const MAX_CHUNKS = 12
 export const entityWorth = (e) => (e.public_figure ? 4 : 0) + (e.crossFile ? 2 : 0) + ((e.variants || []).length >= 2 ? 1 : 0)
 export function verifyChunks(merged, depth) {
-  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}`
+  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}${e.suspect_asr ? ' ｜ ⚠侦察疑为转录误写、请优先核实正确写法' : ''}`
   const tagged = []
   for (const [sec, list] of [['人名', merged.people], ['品牌/公司/产品', merged.brands], ['术语', merged.terms]]) {
     for (const e of list) tagged.push({ sec, e, w: entityWorth(e) })
   }
-  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0)).sort((a, b) => b.w - a.w)
+  // key mode normally sends only worth>0, but a consistently mis-heard name has no variants and may not be a
+  // public figure → worth 0 → it would be skipped exactly when it's a silent ASR error. So always include
+  // scout-flagged suspects regardless of worth (this is what closes the consistently-mis-heard-name gap).
+  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0 || t.e.suspect_asr)).sort((a, b) => b.w - a.w)
   const excluded = tagged.length - eligible.length
   let pool = eligible
   let overflow = 0
@@ -554,7 +559,9 @@ export function renderGlossary(merged, verified, dedup, a) {
     sec.push('', `## ${title}（写法 → 统一）`)
     for (const e0 of list) {
       const e = applyVerified(e0, isPerson)
-      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}`)
+      const susp = e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
+        ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
+      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}`)
     }
   }
   block('人名', merged.people, true)
@@ -590,6 +597,23 @@ export function renderGlossary(merged, verified, dedup, a) {
     for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
   }
   return sec.join('\n')
+}
+
+// Scout-flagged ASR suspects that verify did not resolve — surfaced into openQuestions so a likely
+// mis-transcribed name is never shipped silently (the failure mode where scout suspected it, verify
+// either skipped it or couldn't confirm, and the ASR spelling went straight into the 成稿).
+export function suspectUnverified(merged, verified) {
+  const resolved = new Set()
+  for (const r of (verified && verified.resolved) || []) if (r && r.query) resolved.add(r.query)
+  const out = []
+  for (const list of [merged.people, merged.brands, merged.terms]) {
+    for (const e of list || []) {
+      if (e.suspect_asr && ![e.canonical, ...(e.variants || [])].some((n) => resolved.has(n))) {
+        out.push(`疑似转录误写、未核实：「${e.canonical}」${e.hint ? `（${e.hint}）` : ''}——请人工确认正确写法`)
+      }
+    }
+  }
+  return out
 }
 
 // Defensive filter: drop the model's occasional placeholder/self-negating entries
