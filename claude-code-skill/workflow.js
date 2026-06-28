@@ -37,6 +37,7 @@ const entitySchema = (extra) => ({
     canonical: { type: 'string', description: '该实体最可信的写法' },
     variants: { type: 'array', items: { type: 'string' }, description: '文中出现的其它写法，含疑似同音误写' },
     hint: { type: 'string', description: '一句定位线索（身份/title/语境）' },
+    suspect_asr: { type: 'boolean', description: 'canonical 疑为转录同音/听写误写、但拿不准正确写法时置 true——会强制联网核实这一条（哪怕只出现一处、无其它变体）' },
   }, extra || {}),
 })
 
@@ -237,6 +238,7 @@ function clusterEntities(entries) {
       hint: hints.join('；'),
       files,
       public_figure: c.entries.some((e) => e.public_figure),
+      suspect_asr: c.entries.some((e) => e.suspect_asr),   // any scout flagged it a likely ASR mishear → force verify
       category: c.entries.map((e) => e.category || e.domain).find(Boolean) || '',
       crossFile: files.length > 1,
     }
@@ -289,12 +291,15 @@ const VERIFY_CHUNK = 12
 const MAX_CHUNKS = 12
 const entityWorth = (e) => (e.public_figure ? 4 : 0) + (e.crossFile ? 2 : 0) + ((e.variants || []).length >= 2 ? 1 : 0)
 function verifyChunks(merged, depth) {
-  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}`
+  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}${e.suspect_asr ? ' ｜ ⚠侦察疑为转录误写、请优先核实正确写法' : ''}`
   const tagged = []
   for (const [sec, list] of [['人名', merged.people], ['品牌/公司/产品', merged.brands], ['术语', merged.terms]]) {
     for (const e of list) tagged.push({ sec, e, w: entityWorth(e) })
   }
-  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0)).sort((a, b) => b.w - a.w)
+  // key mode normally sends only worth>0, but a consistently mis-heard name has no variants and may not be a
+  // public figure → worth 0 → it would be skipped exactly when it's a silent ASR error. So always include
+  // scout-flagged suspects regardless of worth (this is what closes the consistently-mis-heard-name gap).
+  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0 || t.e.suspect_asr)).sort((a, b) => b.w - a.w)
   const excluded = tagged.length - eligible.length
   let pool = eligible
   let overflow = 0
@@ -582,7 +587,9 @@ function renderGlossary(merged, verified, dedup, a) {
     sec.push('', `## ${title}（写法 → 统一）`)
     for (const e0 of list) {
       const e = applyVerified(e0, isPerson)
-      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}`)
+      const susp = e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
+        ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
+      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}`)
     }
   }
   block('人名', merged.people, true)
@@ -618,6 +625,23 @@ function renderGlossary(merged, verified, dedup, a) {
     for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
   }
   return sec.join('\n')
+}
+
+// Scout-flagged ASR suspects that verify did not resolve — surfaced into openQuestions so a likely
+// mis-transcribed name is never shipped silently (the failure mode where scout suspected it, verify
+// either skipped it or couldn't confirm, and the ASR spelling went straight into the 成稿).
+function suspectUnverified(merged, verified) {
+  const resolved = new Set()
+  for (const r of (verified && verified.resolved) || []) if (r && r.query) resolved.add(r.query)
+  const out = []
+  for (const list of [merged.people, merged.brands, merged.terms]) {
+    for (const e of list || []) {
+      if (e.suspect_asr && ![e.canonical, ...(e.variants || [])].some((n) => resolved.has(n))) {
+        out.push(`疑似转录误写、未核实：「${e.canonical}」${e.hint ? `（${e.hint}）` : ''}——请人工确认正确写法`)
+      }
+    }
+  }
+  return out
 }
 
 // Defensive filter: drop the model's occasional placeholder/self-negating entries
@@ -941,6 +965,8 @@ ${readBlock}
 - speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
+  · **知名实体用你已知的正确写法做 canonical**：若这是你认得的知名公司/产品/机构/公众人物，canonical 一律填**你所知的规范写法**，哪怕转录通篇是另一种听写——把转录里的写法放进 variants。例：转录一直写「苍碧科技」、而你知道这家公司规范写法是「苍璧科技」（碧→璧 同音误写），则 canonical=苍璧科技、variants 含 苍碧科技。别让一个一直被听错的名字、因为转录里写法统一就当成正确写法。
+  · **拿不准就置 suspect_asr=true**：当你怀疑 canonical 可能是转录的同音/听写误写、却又给不出有把握的正确写法时，suspect_asr=true——这会强制对这一条联网核实（哪怕它只出现一处、没有别的变体，正常不会送核的）。一个写法"看着像真名"、却疑似听错的实体，正是最该标的；宁可多标。
 - errors：明显转写错误按类别举例（同音字错/英文听写错/（音）标记/夹行时间戳/乱码/Word 残讯）。
 - themes：这份大致谈了哪些主题。
 - has_existing_headings：源文件是否已带小标题行（#/##/【】式标题）。
@@ -1242,6 +1268,7 @@ if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人
 
 let glossary = ''
 let netUnverified = []
+let asrSuspects = []   // scout-flagged ASR suspects verify couldn't resolve → folded into openQuestions
 let refined = []
 let failed = []
 let headingConflicts = []
@@ -1332,6 +1359,8 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   const allVerified = prior ? mergeVerified(prior.verified, verified) : verified
   const allDedup = prior ? { suspects: mergeDedup(prior.dedupSuspects, (dedup && dedup.suspects) || []) } : dedup
   weakDups = prior ? weakDupFlags(prior, mergedThisBatch) : []
+  asrSuspects = suspectUnverified(mergedThisBatch, allVerified)   // suspects still unresolved after verify → ask the user
+  if (asrSuspects.length) engine.log(`疑似转录误写未核实：${asrSuspects.length} 项——并入 openQuestions 待人工确认正确写法`)
   if (weakDups.length) engine.log(`称呼歧义：${weakDups.length} 个弱称呼跨批次重复（未合并）——并入 openQuestions 待人工辨认`)
   if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
   glossary = renderGlossary(merged, allVerified, allDedup, A)
@@ -1422,7 +1451,7 @@ return {
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects),
   summary,
   timeline,
 }
