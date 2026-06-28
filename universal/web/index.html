@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>访谈转录精校 · 本地版</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16140f" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="访谈精校">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <style>
   :root {
     --bg: #f6f5f2; --card: #fffefb; --ink: #1c1a17; --muted: #6b6660; --line: #e3ded6;
@@ -95,7 +104,7 @@
           <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
         </div>
       </div>
-      <label style="margin-top:14px">联网核实 <span class="opt">精校不联网</span></label>
+      <label style="margin-top:14px">联网核实密钥 <span class="opt">标准/深度核实时使用</span></label>
       <input type="password" id="tavilyKey" placeholder="Tavily API Key" autocomplete="off">
       <p class="hint" id="searchNote"></p>
       <details style="margin-top:12px">
@@ -114,7 +123,7 @@
 
     <div id="paneMixed" class="hidden">
       <p class="hint">按任务分配不同服务商。留空的任务使用默认设置。</p>
-      <p class="hint">联网核实若使用 DeepSeek / OpenAI，需要 Tavily。</p>
+      <p class="hint">标准/深度核实会在精校前校正人名、公司、产品、日期和疑似 ASR 错词；DeepSeek / OpenAI 需要 Tavily。</p>
       <div class="row">
         <div><label>默认服务商</label><select id="defProvider"></select></div>
         <div><label>默认 API Key</label><input type="password" id="defKey" placeholder="用于留空任务" autocomplete="off"></div>
@@ -158,13 +167,14 @@
       <label><input type="checkbox" value="timeline"> 时间线</label>
     </div>
     <div class="row3" style="margin-top:12px">
-      <div><label>联网核实</label><select id="verify"><option value="key">关键实体</option><option value="deep">尽量核全</option><option value="none">不联网</option></select></div>
+      <div><label>核实范围</label><select id="verify"><option value="key">标准（推荐）</option><option value="deep">深度</option><option value="none">关闭</option></select></div>
       <div><label>小标题</label><select id="heading"><option value="none">自动生成</option><option value="keep">保留原文</option><option value="regenerate">重新生成</option></select></div>
       <div><label>并发 <span class="opt">可选</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
     </div>
+    <p class="hint">标准/深度核实会用于精校稿；关闭适合更快、更省额度或不联网的整理。</p>
     <label>输出位置 <span class="opt">留空用 Downloads/&lt;主题&gt;</span></label>
     <input type="text" id="out" placeholder="留空则保存到 ~/Downloads/<主题>">
-    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label></div>
+    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label><label title="把超过约 12000 字的文件拆成 2 块并行精校。多文件批量更快，但更费额度；单文件提升有限。"><input type="checkbox" id="chunkSpeed"> 大文件分块并行（提速·更费额度）</label></div>
   </div>
 
   <div class="actions">
@@ -173,7 +183,7 @@
   </div>
 
   <div class="card" id="consoleCard" style="display:none">
-    <h2>进度</h2>
+    <h2>进度 <span id="elapsed" class="hint" style="font-variant-numeric:tabular-nums;font-weight:normal"></span></h2>
     <div id="console"></div>
   </div>
 
@@ -229,8 +239,8 @@ function onProvider() {
   $('baseURL').placeholder = p.baseURL || '默认'
   $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
   $('searchNote').textContent = p.nativeSearch
-    ? '已使用服务商自带搜索。'
-    : '联网核实需要 Tavily；精校不联网。'
+    ? '标准/深度核实会使用服务商自带搜索，并用于精校稿。'
+    : '标准/深度核实需要 Tavily，并会用于精校稿。'
   $('modelHint').textContent = modelSuggest(p)
   $('modelFetchStatus').textContent = p.modelWarning || ''
   setSingleModelDefaults(false)
@@ -413,7 +423,21 @@ function parseModels(s) {
   return Object.keys(m).length ? m : undefined
 }
 
-const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight }
+const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight; return span }
+
+// --- run clock: a live elapsed timer so a slow phase reads as "still running", not hung ---
+let runStart = 0, phaseStart = 0, phaseEl = null, phaseTitle = '', clockTick = null
+const fmtDur = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') }
+function updateClock() {
+  if (!runStart) return
+  const t = Date.now()
+  const el = $('elapsed'); if (el) el.textContent = '总用时 ' + fmtDur(t - runStart)
+  if (phaseEl) phaseEl.textContent = '▸ ' + phaseTitle + '   ' + fmtDur(t - phaseStart)   // active phase counts up in place
+}
+function startClock() { runStart = Date.now(); phaseStart = runStart; phaseEl = null; phaseTitle = ''; clearInterval(clockTick); clockTick = setInterval(updateClock, 1000); updateClock() }
+function freezePhase() { if (phaseEl) phaseEl.textContent = '▸ ' + phaseTitle + '   用时 ' + fmtDur(Date.now() - phaseStart) }   // pin the finished phase's duration
+function markPhase(title) { freezePhase(); phaseTitle = title; phaseStart = Date.now(); phaseEl = log('▸ ' + title, 'ph') }
+function stopClock() { freezePhase(); clearInterval(clockTick); clockTick = null; const el = $('elapsed'); if (el && runStart) el.textContent = '总用时 ' + fmtDur(Date.now() - runStart); runStart = 0; phaseEl = null }
 
 $('run').onclick = run
 { const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置
@@ -436,12 +460,14 @@ async function run() {
     headingPolicy: $('heading').value,
     outputDir: outVal || undefined,
     fresh: $('fresh').checked,
+    chunkMode: $('chunkSpeed').checked ? 'speed' : undefined,
     concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
   }
 
   $('run').disabled = true; setStatus('运行中... 大文件可能需要几分钟。')
   $('consoleCard').style.display = 'block'; $('console').innerHTML = ''
   $('resultCard').style.display = 'none'; $('result').innerHTML = ''
+  startClock()
 
   try {
     const resp = await fetch('/api/run', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(params) })
@@ -453,7 +479,7 @@ async function run() {
       while ((idx = buf.indexOf('\n\n')) >= 0) { handleEvent(buf.slice(0, idx)); buf = buf.slice(idx + 2) }
     }
   } catch (e) { log('连接中断：' + e.message, 'er') }
-  finally { $('run').disabled = false; setStatus('') }
+  finally { stopClock(); $('run').disabled = false; setStatus('') }
 }
 
 function handleEvent(raw) {
@@ -463,7 +489,7 @@ function handleEvent(raw) {
     else if (line.startsWith('data: ')) data += line.slice(6)
   }
   let obj = {}; try { obj = JSON.parse(data) } catch {}
-  if (ev === 'phase') log('▸ ' + obj.title, 'ph')
+  if (ev === 'phase') markPhase(obj.title)
   else if (ev === 'log') log('  ' + obj.message)
   else if (ev === 'error') { log('✗ ' + obj.message, 'er'); setStatus(obj.message, true) }
   else if (ev === 'result') renderResult(obj)

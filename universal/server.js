@@ -22,6 +22,46 @@ import { getIndexHtml } from './assets.js'
 const HOST = '127.0.0.1'
 const BASE_PORT = Number(process.env.PORT) || 8765
 export const API_TOKEN_HEADER = 'x-transcriber-token'
+
+// PWA manifest + icon so the GUI installs as a local app (Chrome "Install" / Safari "Add to Dock") — a real
+// Dock icon and a chromeless standalone window. Served inline (Node built-ins only; no static-file dir).
+const WEB_MANIFEST = JSON.stringify({
+  name: '访谈转录精校', short_name: '访谈精校', description: '本地访谈转录精校工具',
+  start_url: '/', scope: '/', display: 'standalone',
+  background_color: '#f6f5f2', theme_color: '#f6f5f2',
+  icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }],
+})
+const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#b4532a"/>
+  <g fill="#fff">
+    <rect x="146" y="170" width="220" height="30" rx="15"/>
+    <rect x="146" y="236" width="158" height="30" rx="15"/>
+    <rect x="146" y="302" width="196" height="30" rx="15"/>
+    <rect x="146" y="368" width="112" height="30" rx="15"/>
+  </g>
+</svg>`
+
+// Chromium-family browsers all support --app=<url> for a chromeless standalone window. [.app folder, executable]
+// — usually identical, listed explicitly so a rename can't silently break detection.
+const CHROMIUM_APPS = [
+  ['Google Chrome', 'Google Chrome'], ['Microsoft Edge', 'Microsoft Edge'],
+  ['Brave Browser', 'Brave Browser'], ['Vivaldi', 'Vivaldi'], ['Chromium', 'Chromium'],
+]
+// Open the GUI as a local app: a chromeless --app window in the first installed Chromium browser; else a normal
+// tab in the default browser (Safari/Firefox have no command-line app mode → they degrade to a tab, which is
+// the prior behaviour). Set NO_APP_WINDOW=1 to force a plain tab. Returns the browser name, or null on fallback.
+function openLocalApp(url) {
+  if (!process.env.NO_APP_WINDOW) {
+    for (const [app, exec] of CHROMIUM_APPS) {
+      const bin = `/Applications/${app}.app/Contents/MacOS/${exec}`
+      if (fs.existsSync(bin)) {
+        try { const c = execFile(bin, [`--app=${url}`], { detached: true }, () => {}); c.unref(); return app } catch { /* fall through to a tab */ }
+      }
+    }
+  }
+  execFile('open', [url], () => {})
+  return null
+}
 const MODEL_FETCH_TIMEOUT_MS = 10_000
 const ANTHROPIC_MODELS = { haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-8' }
 
@@ -101,10 +141,10 @@ const rawProviderMeta = [
   { name: 'anthropic', label: 'Anthropic', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '自带联网搜索。', nativeSearch: true, models: ANTHROPIC_MODELS, modelNote: '' },
   ...PROVIDER_NAMES.map((n) => {
     const ui = {
-      deepseek: { note: '精校可用；联网核实需 Tavily。', modelNote: '避免 thinking / reasoner 模型，工具调用会受限。' },
+      deepseek: { note: '精校可用；标准/深度核实需 Tavily。', modelNote: '避免 thinking / reasoner 模型，工具调用会受限。' },
       glm: { note: '自带联网搜索；高级设置可切换 endpoint。', modelNote: '' },
       kimi: { note: '自带联网搜索；.ai / .cn key 不通用。', modelNote: '' },
-      openai: { note: '精校可用；联网核实需 Tavily。', modelNote: '' },
+      openai: { note: '精校可用；标准/深度核实需 Tavily。', modelNote: '' },
     }[n] || {}
     return { name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: ui.note || PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: ui.modelNote || '' }
   }),
@@ -304,6 +344,14 @@ export function createAppServer({ token = crypto.randomBytes(32).toString('hex')
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         return res.end(html)
       }
+      if (method === 'GET' && url === '/manifest.webmanifest') {
+        res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8' })
+        return res.end(WEB_MANIFEST)
+      }
+      if (method === 'GET' && url === '/icon.svg') {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'max-age=86400' })
+        return res.end(APP_ICON_SVG)
+      }
       if (method === 'GET' && url === '/api/providers') return json(res, { providers: providerMeta, categories: CATEGORIES })
 
       if (method === 'POST' && url === '/api/models') {
@@ -375,9 +423,12 @@ export function listen(port, attempts = 10) {
     console.error(`  ${u}\n`)
     console.error('  打开上面的地址即可使用。Ctrl-C 退出。')
     console.error('  说明：API key 在你本机浏览器输入、只在本次运行内存中使用，不落盘、不外传、不记录。\n')
-    // auto-open the browser only for an interactive launch (terminal / .command), not when
+    // auto-open as a local app window (chromeless) for an interactive launch (terminal / .command), not when
     // run non-interactively (piped, CI, a preview harness) — and never when NO_OPEN is set.
-    if (!process.env.NO_OPEN && process.stdout.isTTY) execFile('open', [u], () => {})
+    if (!process.env.NO_OPEN && process.stdout.isTTY) {
+      const app = openLocalApp(u)
+      console.error(app ? `  已用 ${app} 打开独立应用窗口（非浏览器标签页）。\n` : '  已在默认浏览器打开。\n')
+    }
   })
   return server
 }

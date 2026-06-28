@@ -15,7 +15,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
-import { selectEngine, prepareFile, buildFilePolicy, auditAndRepairRefined } from './jobs.js'
+import { selectEngine, prepareFile, buildFilePolicy, auditAndRepairRefined, cleanupRefineParts } from './jobs.js'
 import { writeRunArtifacts } from './artifacts.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
@@ -35,6 +35,7 @@ export function parseArgs(argv) {
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
+    '--chunk': 'chunkMode',
   }
   let i = 0
   while (i < argv.length) {
@@ -81,9 +82,10 @@ async function main() {
   --background <文本>     采访背景（指导侦察/核实）
   --background-file <路径> 从文件读取背景（背景较长时用）
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
-  --verify <档>          key | deep | none（默认 key）
+  --verify <档>          key | deep | none（默认 key；核实结论会用于精校稿）
   --heading-policy <策略> none | keep | regenerate（默认 none）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
+  --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
   --fresh                忽略既有 校对表.md，从零重建
@@ -94,6 +96,7 @@ async function main() {
   key 环境变量           anthropic→ANTHROPIC_API_KEY · deepseek→DEEPSEEK_API_KEY ·
                          glm→ZHIPUAI_API_KEY/ZAI_API_KEY · kimi→MOONSHOT_API_KEY · openai→OPENAI_API_KEY
   联网核实              Anthropic/GLM/Kimi 用 provider 原生搜索；DeepSeek/OpenAI 需 TAVILY_API_KEY
+                         key/deep 会在精校前核实关键实体；none 适合更快/不联网
 `)
     process.exit(process.argv.length <= 2 ? 1 : 0)
   }
@@ -140,6 +143,7 @@ async function main() {
     verifyDepth: a.verifyDepth || 'key',
     headingPolicy,
     models: parseModels(a.models),
+    chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,   // speed = split big files into parallel chunks; else single agent/file
     priorGlossaryText,
     fresh: !!a.fresh,
     files,
@@ -157,7 +161,7 @@ async function main() {
     console.error(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
     if (sel.info.note) console.error(`注意：${sel.info.note}`)
     if (!process.env.TAVILY_API_KEY && (A.scope.includes('timeline') || A.verifyDepth !== 'none')) {
-      console.error('提示：未设 TAVILY_API_KEY——非 anthropic provider 的联网核实/时间线将降级（refine 不受影响）。')
+      console.error('提示：未设 TAVILY_API_KEY——非 anthropic provider 的核实/时间线将降级；精校仍会运行，但少用联网校正。')
     }
   }
 
@@ -165,12 +169,13 @@ async function main() {
   const startedAt = new Date(t0).toISOString()
   console.error(`\n开始：${files.length} 份文件 · scope=${A.scope.join(',')} · verify=${A.verifyDepth} · 输出 ${outputDir}\n`)
   const r = await runPipeline(A, engine)
+  cleanupRefineParts(files) // tidy <outPath>.partN intermediates from chunked refine
   let finishedMs = Date.now()
   let finishedAt = new Date(finishedMs).toISOString()
   let durationMs = finishedMs - t0
   let mins = (durationMs / 60000).toFixed(1)
   let usage = engine.usage()
-  const result = { ...r, outputDir, glossaryPath: null, provider: sel.provider, providerInfo: sel.info, warnings, usage: null }
+  const result = { ...r, outputDir, glossaryPath: null, provider: sel.provider, providerInfo: sel.info, warnings, usage }
 
   // ---------- return handling (mirrors SKILL.md “返回处理”) ----------
   if (r.error) {

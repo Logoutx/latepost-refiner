@@ -85,7 +85,7 @@ test('schema agents return structured_output tool arguments directly', async () 
   assert.deepEqual(result, { ok: true })
   assert.equal(client.calls[0].model, 'mock-opus')
   assert.equal(client.calls[0].max_tokens, 16000)
-  assert.deepEqual(toolNames(client.calls[0]).sort(), ['Edit', 'Read', 'Write', 'structured_output'].sort())
+  assert.deepEqual(toolNames(client.calls[0]).sort(), ['Concat', 'Edit', 'Read', 'Write', 'structured_output'].sort())
 })
 
 test('file tool calls feed local tool results back to the model', async () => {

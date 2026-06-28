@@ -3,11 +3,12 @@ export const meta = {
   description: 'Scout → verify → glossary → refine+check → summary/timeline for interview transcripts',
   whenToUse: 'latepost-refiner 技能的 Claude Code 快路径：多份访谈转录并行侦察、统一校对表、并行精校与交付物生成',
   phases: [
-    { title: 'Scout', detail: '每份转录一个侦察代理，返回结构化清单（默认 haiku）' },
+    { title: 'Scout', detail: '每份转录一个侦察代理（超大文件自动拆段并行、防单代理卡死），返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },
-    { title: 'Refine', detail: '逐份精校 + 结尾完整性核对（默认 opus + haiku）' },
+    { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接；侦察失败也照常精校，默认 opus + 拼接 haiku）' },
     { title: 'Logic', detail: '逐份逻辑顺序重排稿（按主线把问答重排成叙事顺序，默认 opus）' },
     { title: 'Deliver', detail: '访谈总结 / 时间线（默认 opus）' },
+    { title: 'Check', detail: '结尾完整性核对——最后跑、不阻塞已落盘的成稿与交付物（默认 haiku）' },
   ],
 }
 
@@ -15,12 +16,13 @@ export const meta = {
 // { topic, date, background, outputDir, skillDir,
 //   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
-//   models?: {scout,verify,refine,summary,timeline},
+//   models?: {scout,verify,refine,stitch,summary,timeline},  (stitch = chunk-merge agent for large files, default haiku)
 //   priorGlossaryText?: full text of an existing <outputDir>/校对表.md (per-company persistent glossary, P1) —
 //     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
 //   fresh?: true to ignore any prior glossary and rebuild from scratch.
-//   files: [{ path, label, lines, bytes?, title, subtitle, outPath, speakerHints?, notes? }] }
-//   (bytes optional: from pre-flight `wc -c`; used to shrink the read pagination by density to avoid over-limit truncation)
+//   files: [{ path, label, lines, bytes?, chars?, title, subtitle, outPath, speakerHints?, notes? }] }
+//   (chars = 正文字数 (汉字 + 每个英文词/数字各算 1); THE document-length metric — routing (one-pass / chunk) keys on it, not lines.
+//    lines/bytes are for Read pagination only (readPlan). If chars is absent it's estimated from bytes, then lines.)
 
 // ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====
 
@@ -35,6 +37,7 @@ const entitySchema = (extra) => ({
     canonical: { type: 'string', description: '该实体最可信的写法' },
     variants: { type: 'array', items: { type: 'string' }, description: '文中出现的其它写法，含疑似同音误写' },
     hint: { type: 'string', description: '一句定位线索（身份/title/语境）' },
+    suspect_asr: { type: 'boolean', description: 'canonical 疑为转录同音/听写误写、但拿不准正确写法时置 true——会强制联网核实这一条（哪怕只出现一处、无其它变体）' },
   }, extra || {}),
 })
 
@@ -235,6 +238,7 @@ function clusterEntities(entries) {
       hint: hints.join('；'),
       files,
       public_figure: c.entries.some((e) => e.public_figure),
+      suspect_asr: c.entries.some((e) => e.suspect_asr),   // any scout flagged it a likely ASR mishear → force verify
       category: c.entries.map((e) => e.category || e.domain).find(Boolean) || '',
       crossFile: files.length > 1,
     }
@@ -287,12 +291,15 @@ const VERIFY_CHUNK = 12
 const MAX_CHUNKS = 12
 const entityWorth = (e) => (e.public_figure ? 4 : 0) + (e.crossFile ? 2 : 0) + ((e.variants || []).length >= 2 ? 1 : 0)
 function verifyChunks(merged, depth) {
-  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}`
+  const row = (e) => `- ${e.canonical} ← ${e.variants.join(' / ') || '（无变体）'} ｜ ${e.hint || ''}${e.public_figure ? ' ｜ 公众人物' : ''}${e.suspect_asr ? ' ｜ ⚠侦察疑为转录误写、请优先核实正确写法' : ''}`
   const tagged = []
   for (const [sec, list] of [['人名', merged.people], ['品牌/公司/产品', merged.brands], ['术语', merged.terms]]) {
     for (const e of list) tagged.push({ sec, e, w: entityWorth(e) })
   }
-  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0)).sort((a, b) => b.w - a.w)
+  // key mode normally sends only worth>0, but a consistently mis-heard name has no variants and may not be a
+  // public figure → worth 0 → it would be skipped exactly when it's a silent ASR error. So always include
+  // scout-flagged suspects regardless of worth (this is what closes the consistently-mis-heard-name gap).
+  const eligible = (depth === 'deep' ? tagged.slice() : tagged.filter((t) => t.w > 0 || t.e.suspect_asr)).sort((a, b) => b.w - a.w)
   const excluded = tagged.length - eligible.length
   let pool = eligible
   let overflow = 0
@@ -331,11 +338,229 @@ const withCheck = (rep, chk, f) => Object.assign({}, rep, {
   checkNote: chk ? (chk.note || '') : 'check agent failed',
 })
 
+// ---------- chunked refine for large transcripts ----------
+// A single refine agent on a long transcript is both the wall-clock long pole AND prone to
+// over-compression (one agent squeezes the whole file into a single output budget → it summarizes,
+// the claude.ai-style failure). Splitting a large file into K contiguous line-range chunks refined by
+// K parallel agents fixes both: ~K× faster on the refine phase, and each agent has a bounded span so
+// nothing gets compressed. Safe because refine is LOCAL — each turn is cleaned against the shared
+// glossary, with no whole-file dependency (unlike summary/timeline/logic, which must see everything).
+//
+// The script can't read the transcript (the Workflow sandbox has no fs; raw text never enters the
+// orchestration layer), so the split is computed from line metadata only, and chunk OWNERSHIP is a
+// deterministic shared rule the agents follow: a speaker turn belongs to whichever chunk's line span
+// contains the turn's opening label line — no overlap, no gap. Parts are written to
+// <outPath>.part{idx} and merged by a cheap stitch agent (the script can't concat files either).
+// Chunking is OFF unless the run explicitly asks for speed (A.chunkMode === 'speed'); the per-chunk opus
+// overhead (each chunk agent re-thinks + re-ingests RULES) is an intrinsic ~1.5× token premium, so the
+// user opts into it per run (SKILL.md Step 0 asks speed-vs-cost). When on, settings are CONSERVATIVE —
+// only large files chunk, and into at most 2 — a balanced ~35% refine speedup for ~1.5× tokens.
+// Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
+// NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
+// ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
+// See [[feedback-size-metric]]. Read-tool pagination stays line-addressed (readPlan) because Read is
+// line-based — that's a mechanic, not a size judgment.
+function contentLength(text) {
+  const t = String(text || '')
+  return (t.match(/[一-龥]/g) || []).length + (t.match(/[A-Za-z0-9]+/g) || []).length
+}
+// Effective 字数 for routing: prefer the precomputed f.chars (from pre-flight); else estimate from
+// bytes (CJK UTF-8 ≈ 3 B/char, mixed ≈ 2.6) or, last resort, lines (~14 正文字/line).
+function refineSize(f) {
+  if (f && typeof f.chars === 'number') return f.chars
+  if (f && f.bytes) return Math.round(f.bytes / 2.6)
+  return Math.round(((f && f.lines) || 0) * 14)
+}
+const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
+const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
+const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
+const singleChunk = (f) => {
+  const lines = (f && f.lines) || 0
+  return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
+}
+// Even-line division into K chunks. The agent ownership rule (refinePrompt / scoutPrompt chunk branch) keeps
+// each speaker turn whole, so a turn is never split across chunks even though the line boundary is approximate.
+function evenLineChunks(f, K) {
+  const lines = (f && f.lines) || 0
+  const label = f && f.label
+  const per = Math.ceil(lines / K)
+  const chunks = []
+  for (let i = 0; i < K; i += 1) {
+    const startLine = i * per + 1
+    if (startLine > lines) break // rounding can leave the final slice empty; drop it
+    chunks.push({ idx: chunks.length + 1, count: 0, startLine, endLine: Math.min(lines, (i + 1) * per), isFirst: i === 0, isLast: false, label })
+  }
+  const last = chunks[chunks.length - 1]
+  last.endLine = lines // absorb any rounding remainder into the final chunk
+  last.isLast = true
+  for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
+  return chunks
+}
+function splitForRefine(f, mode) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)                 // 字数, not lines
+  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // cost mode (default) → one agent
+  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged
+// file (a ~50K-字 merge was observed to stall) chokes the same way refine does. So the scout ALWAYS chunks
+// past SCOUT_CHUNK_CHARS — no chunkMode gate (unlike refine, which is opt-in because Opus fan-out is costly;
+// scout is haiku, so K cheap agents beat one stalled one). Each chunk scouts its own line span; mergeScoutChunks
+// unions the per-chunk findings back into one per-file finding, leaving the rest of the pipeline unchanged.
+const SCOUT_CHUNK_CHARS = 40000         // a normal 2h interview (~20–40K 字) stays one agent; only oversized merges chunk
+const TARGET_SCOUT_CHUNK_CHARS = 20000  // aim ~this many 字/段 — comfortably inside one haiku scout's budget
+const MAX_SCOUT_CHUNKS = 6              // runaway guard (6×20K ≈ 120K 字 covers very large merges)
+function splitForScout(f) {
+  const lines = (f && f.lines) || 0
+  const size = refineSize(f)
+  if (size <= SCOUT_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // normal file → one scout agent (path unchanged)
+  const K = Math.min(MAX_SCOUT_CHUNKS, Math.max(2, Math.ceil(size / TARGET_SCOUT_CHUNK_CHARS)))
+  return evenLineChunks(f, K)
+}
+
+// Merge K per-chunk scout findings of ONE file back into a single SCOUT_SCHEMA-shaped finding. Lists are
+// unioned (people/brands/terms left to the downstream cross-file clusterEntities to dedup, exactly as
+// same-referent entries from different files are); ending_anchor is taken from the chunk that actually saw
+// the file's end (largest line) and DROPPED if the best anchor falls well short of the file — that means the
+// last chunk's scout didn't return, so refine/check should read the real tail themselves (they handle a
+// missing anchor). Returns null only if EVERY chunk failed; a partial set still yields a usable glossary.
+function mergeScoutChunks(parts, f) {
+  const got = (parts || []).filter(Boolean)
+  if (!got.length) return null
+  const speakers = []; const seenSp = new Set()
+  for (const p of got) for (const s of p.speakers || []) {
+    const k = ((s && s.label) || '').trim()
+    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+  }
+  const cat = (key) => got.flatMap((p) => p[key] || [])
+  const errByKind = {}
+  for (const p of got) for (const er of p.errors || []) {
+    if (!er) continue
+    const k = er.kind || '其他'
+    if (!errByKind[k]) errByKind[k] = { kind: k, examples: [] }
+    for (const ex of er.examples || []) if (!errByKind[k].examples.includes(ex)) errByKind[k].examples.push(ex)
+  }
+  const uniq = (key) => { const out = []; const seen = new Set(); for (const p of got) for (const v of p[key] || []) { const s = String(v).trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s) } } return out }
+  let ending = null
+  for (const p of got) { const a = p.ending_anchor; if (a && typeof a.line === 'number' && (!ending || a.line >= ending.line)) ending = a }
+  const total = (f && f.lines) || 0
+  if (ending && total && ending.line < total * 0.9) ending = null   // last chunk missing → unknown ending; let refine/check read the tail
+  return {
+    speakers,
+    people: cat('people'),
+    brands: cat('brands'),
+    terms: cat('terms'),
+    errors: Object.values(errByKind),
+    themes: uniq('themes'),
+    has_existing_headings: got.some((p) => p.has_existing_headings),
+    ending_anchor: ending || {},
+    special_notes: uniq('special_notes'),
+  }
+}
+const partPath = (outPath, idx) => `${outPath}.part${idx}`
+
+// Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
+// join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
+// testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
+// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
+// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
+function stitchParts(texts) {
+  const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
+  if (!parts.length) return ''
+  let out = parts[0]
+  for (let i = 1; i < parts.length; i += 1) {
+    let next = parts[i]
+    const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
+    const nextFirst = (next.split('\n')[0] || '').trim()
+    if (prevLast.startsWith('## ') && prevLast === nextFirst) {
+      next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
+    }
+    out = `${out}\n\n${next}`
+  }
+  return `${out.replace(/\s+$/, '')}\n`
+}
+
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
 // headingPolicy is still 'none' (the pre-flight check didn't catch it), the user must be asked at wrap-up.
 function findHeadingConflicts(findings, files, policy) {
   if ((policy || 'none') !== 'none') return []
   return files.filter((f, i) => findings[i] && findings[i].has_existing_headings).map((f) => f.label)
+}
+
+// Apply a verified conclusion into an entry — shared by the full render (renderGlossary) and the
+// condensed refine render (renderRefineGlossary). resolvedMap: query→{canonical,identity}; applied/rejected:
+// sets tracking which conclusions landed vs. were blocked by the name guard (for the full render's footnote).
+// Name guard: if an entry already has a real (strong) name and the verifier returns a DIFFERENT strong name
+// not present in the entry, it's likely a misattribution (observed: verify hallucinated 李明→王志远, rewriting
+// the interviewee as the chairman) — don't rewrite; append a ⚠ note. Weak titles (王总 / 董事长) resolving to a
+// real name still apply (that's the point of verification). ownStrong spans ALL names, not just canonical
+// (clustering may elect a weak title as canonical with the real name in variants).
+function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
+  const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
+  if (!hit) return e
+  const names = [e.canonical, ...(e.variants || [])]
+  const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  if (isPerson && hit.canonical && ownStrong.length
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+    rejected.add(hit)
+    const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
+    return Object.assign({}, e, { hint })
+  }
+  applied.add(hit)
+  const variants = Array.from(new Set(names.filter((n) => n && n !== hit.canonical)))
+  // Idempotent: don't re-prepend the identity tag if it's already in the hint (a persisted glossary
+  // is parsed + re-rendered every batch, so a naive prepend would bloat the hint each run).
+  const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
+  const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
+  return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
+}
+
+// Keep a hint short for the condensed refine glossary: the first clause (truncated) plus any ⚠ warnings
+// (the refiner must see ⚠ to skip those rows). Drops the long identity/source prose the refiner doesn't need.
+function trimHint(h) {
+  if (!h) return ''
+  const parts = String(h).split('；')
+  const warn = parts.filter((p) => p.includes('⚠'))
+  const head = (parts.find((p) => !p.includes('⚠')) || '').trim().slice(0, 36)
+  return [head, ...warn].filter(Boolean).join('；')
+}
+
+// Condensed glossary for the chunk-refine agents: only the spelling-unification info a refiner needs —
+// entity tables (canonical ← variants, verified spellings applied, ⚠ marks), 写法统一 directives,
+// 疑似同指 flags, 确认不同指, and compact speaker labels. Drops the archival prose (采访背景, 联网核实结论
+// sources, 转写错误 examples, 各份特别提醒, 跨访谈发言人登记) that bloats the full 校对表. Sent to EACH of the
+// K chunk agents, so trimming it is the main lever on chunked-refine token cost; the full 校对表 is still
+// persisted and used by the single-agent refine path. Verified canonicals are applied exactly as in the
+// full render (same applyVerifiedEntry), so 写法 stay identical.
+function renderRefineGlossary(merged, verified, dedup, a) {
+  const resolvedMap = new Map()
+  for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
+  const applied = new Set(), rejected = new Set()
+  const sec = [`# ${a.topic} 写法对照（精校用·摘自校对表）`]
+  const spk = []
+  for (const s of merged.speakersByFile || []) for (const sp of s.speakers || []) { if (sp && sp.label) spk.push(`${sp.label} → ${sp.role || '?'}${sp.identity ? `（${sp.identity}）` : ''}`) }
+  const uspk = Array.from(new Set(spk))
+  if (uspk.length) { sec.push('', '## 发言人'); for (const x of uspk) sec.push(`- ${x}`) }
+  const block = (title, list, isPerson) => {
+    const rows = []
+    for (const e0 of list) {
+      const e = applyVerifiedEntry(e0, isPerson, resolvedMap, applied, rejected)
+      const hint = trimHint(e.hint)
+      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}`)
+    }
+    if (rows.length) { sec.push('', `## ${title}`); sec.push(...rows) }
+  }
+  block('人名', merged.people, true)
+  block('品牌 / 公司 / 产品', merged.brands)
+  block('术语 / 专名', merged.terms)
+  const { directives, flags } = splitSuspects(dedup)
+  if (directives.length) { sec.push('', '## 写法统一（初次落笔即写对，勿事后回改）'); for (const s of directives) sec.push(`- ${(s.members || []).filter((x) => x !== s.preferred).join(' / ')} → **${s.preferred}**`) }
+  if (flags.length) { sec.push('', '## 疑似同指（勿自动合并）'); for (const s of flags) sec.push(`- ${(s.members || []).join(' ／ ')}（${s.kind}）`) }
+  if (a.doNotMerge && a.doNotMerge.length) { sec.push('', '## 确认不同指（勿合并）'); for (const p of a.doNotMerge) sec.push(`- ${(p || []).join(' ／ ')}`) }
+  return sec.join('\n')
 }
 
 function renderGlossary(merged, verified, dedup, a) {
@@ -346,35 +571,7 @@ function renderGlossary(merged, verified, dedup, a) {
   for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
   const applied = new Set()   // verified conclusions actually applied into the table body
   const rejected = new Set()  // verified conclusions blocked by the person-name guard
-  const applyVerified = (e, isPerson) => {
-    const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
-    if (!hit) return e
-    const names = [e.canonical, ...(e.variants || [])]
-    // Name guard: if this entry already contains a real name (strong name) and the verifier returns a
-    // different strong name not present in this entry, it likely indicates a misattribution
-    // (observed in the wild during network degradation: verify hallucinated 李明→王志远, rewriting the
-    // interviewee as the chairman). Do not rewrite the body; append a warning note instead.
-    // The harm of replacing one person with another far outweighs leaving a name unresolved.
-    // Weak titles (王总 / 董事长) resolving to a real name are still applied normally — that is the
-    // whole point of verification.
-    // Note: the guard checks `ownStrong`, the set of strong names across ALL names in this entry, not
-    // just canonical — clustering may elect a weak title (王总) as canonical while placing the real name
-    // (李明) in variants; checking only canonical would leave the guard blind to those cases.
-    const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
-    if (isPerson && hit.canonical && ownStrong.length
-        && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
-      rejected.add(hit)
-      const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
-      return Object.assign({}, e, { hint })
-    }
-    applied.add(hit)
-    const variants = Array.from(new Set(names.filter((n) => n && n !== hit.canonical)))
-    // Idempotent: don't re-prepend the identity tag if it's already in the hint (a persisted glossary
-    // is parsed + re-rendered every batch, so a naive prepend would bloat the hint each run).
-    const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
-    const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
-    return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
-  }
+  const applyVerified = (e, isPerson) => applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected)
   const sec = []
   sec.push(`# ${a.topic} 统一校对表（采访时间 ${a.date}）`, '', '## 采访背景', a.background, '')
   sec.push('## 发言人统一标注')
@@ -390,7 +587,9 @@ function renderGlossary(merged, verified, dedup, a) {
     sec.push('', `## ${title}（写法 → 统一）`)
     for (const e0 of list) {
       const e = applyVerified(e0, isPerson)
-      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}`)
+      const susp = e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
+        ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
+      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}`)
     }
   }
   block('人名', merged.people, true)
@@ -426,6 +625,23 @@ function renderGlossary(merged, verified, dedup, a) {
     for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
   }
   return sec.join('\n')
+}
+
+// Scout-flagged ASR suspects that verify did not resolve — surfaced into openQuestions so a likely
+// mis-transcribed name is never shipped silently (the failure mode where scout suspected it, verify
+// either skipped it or couldn't confirm, and the ASR spelling went straight into the 成稿).
+function suspectUnverified(merged, verified) {
+  const resolved = new Set()
+  for (const r of (verified && verified.resolved) || []) if (r && r.query) resolved.add(r.query)
+  const out = []
+  for (const list of [merged.people, merged.brands, merged.terms]) {
+    for (const e of list || []) {
+      if (e.suspect_asr && ![e.canonical, ...(e.variants || [])].some((n) => resolved.has(n))) {
+        out.push(`疑似转录误写、未核实：「${e.canonical}」${e.hint ? `（${e.hint}）` : ''}——请人工确认正确写法`)
+      }
+    }
+  }
+  return out
 }
 
 // Defensive filter: drop the model's occasional placeholder/self-negating entries
@@ -684,6 +900,21 @@ function readPlan(f) {
   return `读取计划（共 ${n} 行，照此执行，不要用更小的分页）：\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
 }
 
+// Read plan for one chunk's source span [startLine, endLine], with ~30 lines of lead-in/lead-out so
+// the agent can see the full speaker turns straddling its boundaries (it only EMITS the turns it owns,
+// per the ownership rule in refinePrompt's chunk branch). Same density-aware page sizing as readPlan.
+const CHUNK_MARGIN = 30
+function readPlanRange(f, startLine, endLine) {
+  const lines = f.lines || 0
+  const from = Math.max(1, (startLine || 1) - CHUNK_MARGIN)               // 1-indexed first line to read
+  const to = lines ? Math.min(lines, (endLine || lines) + CHUNK_MARGIN) : (endLine || 0) + CHUNK_MARGIN // 1-indexed last line
+  let page = READ_PAGE
+  if (f.bytes && lines) page = Math.min(READ_PAGE, Math.max(150, Math.floor(lines * READ_BYTES_PER_PAGE / f.bytes)))
+  const steps = []
+  for (let o = from - 1; o < to; o += page) steps.push(`Read(offset=${o}, limit=${Math.min(page, to - o)})`) // o is a 0-based offset
+  return steps
+}
+
 function headingNote(policy) {
   if (policy === 'keep') return '【小标题处理】源文件已带小标题：按用户要求**保留原有小标题**，只做必要的错字修正，不重新分段。'
   if (policy === 'regenerate') return '【小标题处理】源文件已带（记者/速记的）小标题：按用户要求**全部去掉**，根据内容理解重新生成小标题。'
@@ -704,26 +935,42 @@ function knownNote(a) {
 ${ppl ? `人名：${ppl}\n` : ''}${br ? `品牌/公司/产品：${br}\n` : ''}${tm ? `术语：${tm}\n` : ''}${spk ? `已知发言人：${spk}` : ''}`
 }
 
-function scoutPrompt(f, a) {
+function scoutPrompt(f, a, chunk) {
+  const isChunk = !!(chunk && chunk.count > 1)
+  const where = isChunk
+    ? `本份文件：${f.path}——这是它的**第 ${chunk.idx}/${chunk.count} 段**（源文件第 ${chunk.startLine}–${chunk.endLine} 行，全文约 ${f.lines} 行）。这是大文件的分段侦察，各段结果会自动合并；只管**本段**，不必顾及别段。`
+    : `本份文件：${f.path}（约 ${f.lines} 行）`
+  const readBlock = isChunk
+    ? `任务：用 Read **只读本段** [${chunk.startLine}, ${chunk.endLine}] 行（已含前后约 ${CHUNK_MARGIN} 行衔接），**不精校、不联网、不大段摘录原文**；只抽取**本段内**出现的实体与发言人。
+读取计划（照此执行，不要用更小的分页）：
+${readPlanRange(f, chunk.startLine, chunk.endLine).map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+    : `任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
+${readPlan(f)}`
+  const endingBullet = isChunk
+    ? (chunk.isLast
+        ? `- ending_anchor：本段含全文结尾——line=文件总行数（约 ${f.lines}）；text=全文最后一句话**原样照抄**。`
+        : `- ending_anchor：本段不是全文结尾——line=本段最后一行行号（约 ${chunk.endLine}）、text 留空或填该行原文即可（合并时以含结尾的那段为准）。`)
+    : `- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。`
   return `你是访谈转录「侦察」子代理。
 
 采访背景：${a.background}
 
-本份文件：${f.path}（约 ${f.lines} 行）
+${where}
 ${f.speakerHints ? `已知发言人线索：${f.speakerHints}` : ''}
 ${f.notes ? `额外提醒：${f.notes}` : ''}
 ${knownNote(a)}
 
-任务：用 Read 把这份转录**整份读完**（绝不能只读开头），**不精校、不联网、不大段摘录原文**。
-${readPlan(f)}
+${readBlock}
 读完后按 schema 返回结构化侦察结果：
 - speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
+  · **知名实体用你已知的正确写法做 canonical**：若这是你认得的知名公司/产品/机构/公众人物，canonical 一律填**你所知的规范写法**，哪怕转录通篇是另一种听写——把转录里的写法放进 variants。例：转录一直写「苍碧科技」、而你知道这家公司规范写法是「苍璧科技」（碧→璧 同音误写），则 canonical=苍璧科技、variants 含 苍碧科技。别让一个一直被听错的名字、因为转录里写法统一就当成正确写法。
+  · **拿不准就置 suspect_asr=true**：当你怀疑 canonical 可能是转录的同音/听写误写、却又给不出有把握的正确写法时，suspect_asr=true——这会强制对这一条联网核实（哪怕它只出现一处、没有别的变体，正常不会送核的）。一个写法"看着像真名"、却疑似听错的实体，正是最该标的；宁可多标。
 - errors：明显转写错误按类别举例（同音字错/英文听写错/（音）标记/夹行时间戳/乱码/Word 残讯）。
 - themes：这份大致谈了哪些主题。
 - has_existing_headings：源文件是否已带小标题行（#/##/【】式标题）。
-- ending_anchor：line=文件总行数；text=原文最后一句话**原样照抄**。
+${endingBullet}
 - special_notes：该份特别提醒（拒答/敏感语境要保留、收尾离场后的闲聊、称呼混乱重灾区等）。`
 }
 
@@ -745,13 +992,53 @@ ${table}
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 
-function refinePrompt(f, glossary, finding, a) {
+function refinePrompt(f, glossary, finding, a, chunk) {
   // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
+  const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
+  const speakers = (finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'
+
+  // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
+  // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
+  if (chunk && chunk.count > 1) {
+    const outPart = partPath(f.outPath, chunk.idx)
+    const steps = readPlanRange(f, chunk.startLine, chunk.endLine)
+    const headBlock = chunk.isFirst
+      ? `【抬头】你是第 1 块：第一行写 \`# ${f.title}\`，第二行写 \`${f.subtitle}\`，然后从第一个 \`##\` 小标题开始正文。`
+      : `【抬头】你是第 ${chunk.idx} 块（非首块）：**不要写 H1 标题、不要写说明行**，直接从一个 \`##\` 小标题开始正文。`
+    const tailNote = chunk.isLast
+      ? `【收尾】你这一块覆盖到源文件结尾（约第 ${f.lines} 行${anchor.text ? `，最后一句「${anchor.text}」` : ''}）——必须精校到最后，正文绝不能中途断掉（结尾客套可折成一句说明）。`
+      : '【收尾】你不是最后一块，正常精校到你负责的最后一轮发言即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。'
+    return `你是访谈转录「精校」子代理（分块并行：本份共 ${chunk.count} 块，你负责第 ${chunk.idx} 块）。
+
+【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
+${glossary}
+
+【源文件】${f.path}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
+读取计划（首尾各多读约 ${CHUNK_MARGIN} 行邻接内容，好看清边界处的整轮发言；只精校属于你的那些发言轮）：
+${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+【分块边界规则——务必严格，确保各块不重不漏】
+- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
+- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}
+
+【输出】Write 到 ${outPart}
+${headBlock}
+【该份发言人】${speakers}
+${notes ? `【该份特别提醒】\n${notes}` : ''}
+${headingNote(a.headingPolicy)}
+
+${RULES}
+
+${tailNote}
+
+完成后按 schema 返回 path（=${outPart}）、headings（你这一块分的 ## 小标题）、key_fixes、open_questions。`
+  }
+
   const anchorNote = anchor.text
     ? `【收尾锚点】源文件共 ${anchor.line || f.lines} 行，最后一句：「${anchor.text}」。成稿必须覆盖到此处（收尾客套可折成一句说明；正文绝不能中途断掉）。`
     : `【收尾锚点】源文件共约 ${f.lines} 行——先用 Read 看源文件最后约 30 行确认结尾内容，成稿必须覆盖到源文件结尾（收尾客套可折成一句说明；正文绝不能中途断掉）。`
-  const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
   return `你是访谈转录「精校」子代理。
 
 【统一校对表】（「联网核实结论」与「写法统一」两节优先级最高，与前文冲突时以它们为准——但其中**标 ⚠ 的条目未被采纳、勿套用**；「写法统一」里的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
@@ -771,12 +1058,36 @@ ${anchorNote}
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
 }
 
+// Merge the K chunk part-files into the final transcript. The script can't touch the filesystem, so a
+// cheap agent does it — but by CONCATENATION (one tool call), never by retyping the content (which would
+// hit the per-response output cap on a long transcript and risk paraphrase). The post-stitch completeness
+// check + the source-aware audit (charRatio) backstop a bad merge.
+function stitchPrompt(f, chunks) {
+  const parts = chunks.map((c) => partPath(f.outPath, c.idx))
+  const list = parts.map((p, i) => `  ${i + 1}. ${p}`).join('\n')
+  return `你是「分块拼接」子代理。把一份访谈精校稿的 ${chunks.length} 个分块按顺序合并成一份最终成稿——**纯机械拼接、逐字照搬，绝不改写、增删、重述或重新打字录入内容**。
+
+【分块文件（务必按此顺序拼接）】
+${list}
+
+【目标成稿】${f.outPath}
+
+【怎么做——用一次拼接动作，别自己逐字重敲内容】
+- 若你有 \`Concat\` 文件工具：直接调用 \`Concat(file_path="${f.outPath}", sources=[按上面顺序排列的各分块路径])\`，一步到位。
+- 否则若你能跑 shell：用 \`cat "分块1" "分块2" … > "${f.outPath}"\`（**每个路径都用双引号包起来**——路径含空格/中文，不加引号会出错；务必按上面的顺序）。
+- 两者都没有时（最后手段）：Read 第 1 块→Write 到目标成稿；再**逐块** Read→用 Edit 以目标当前结尾为锚点追加（一次只追加一块、绝不整文件重写），直到接完。
+第 1 块已带 \`# ${f.title}\` 抬头、其余块直接是 \`##\` 正文，顺序接上即可；分块之间留一个空行。不要加任何前言、结语、编者注或分隔线。
+
+拼好后用一句话回复：已合并 ${chunks.length} 块到 ${f.outPath}。`
+}
+
 function checkPrompt(f, anchor) {
   const src = (anchor && anchor.text)
     ? `源转录共 ${anchor.line || '?'} 行，原文最后一句是：“${anchor.text}”。`
     : `先用 Read 读源文件 ${f.path} 的最后约 30 行，确定原文结尾内容。`
   return `你是「结尾完整性」核对代理。${src}
 用 Read 读成稿 ${f.outPath} 的最后约 60 行。**判 complete 前先确认成稿倒数若干段的实质内容确实对应到了源文件结尾（上面的锚点附近）**：
+- **注意：精校稿因删口癖、并碎句，行数与字数本就比源文件少约 15-30%——绝不能因为成稿比源文件短、或行数比源文件少就判 complete=false。完整性只看「源文件结尾那句的实质内容有没有出现在成稿结尾」，不做行数/字数比例的推断。**
 - 对应上了 → complete=true。
 - 成稿在**远早于结尾处**就以一句收束注（如“后续为离场闲聊，从略”）收住、中间大段源文件内容缺失 → 这是中途截断，**complete=false**，在 note 写明大约从哪一段起缺。
 - 只有当收束注**前一段已对应到源文件末尾区域**时，该收束注才算正常收尾（complete=true）。
@@ -880,13 +1191,62 @@ ${TYPESET}
 
 
 
+// Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
+// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged by a cheap stitch
+// agent. Returns a REFINE_REPORT-shaped object (path = f.outPath) or null if it
+// could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
+// completeness check + source-aware audit) rather than silently dropped.
+async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
+  const chunks = splitForRefine(f, A.chunkMode)
+  if (chunks.length <= 1) {
+    // Single agent → full glossary (no token multiplication on one agent).
+    return engine.agent(refinePrompt(f, glossary, finding, A),
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  }
+  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
+  // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
+  // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
+  const partReps = await engine.parallel(chunks.map((c) => () =>
+    engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })))
+  const good = partReps.filter(Boolean)
+  if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
+  const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
+  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，结尾核对/审计会进一步标记`)
+  const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+  if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+  return {
+    path: f.outPath,
+    headings: good.flatMap((r) => r.headings || []),
+    key_fixes: good.flatMap((r) => r.key_fixes || []),
+    open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
+    chunked: chunks.length,
+  }
+}
+
+// Scout one file. A normal interview → one agent (unchanged). An oversized merged file (> SCOUT_CHUNK_CHARS
+// 字) → splitForScout parallel chunk agents, merged by mergeScoutChunks — a RESILIENCE measure so a single
+// scout can't stall on a huge file (the failure mode that motivated this). Returns one SCOUT_SCHEMA-shaped
+// finding, or null if every chunk failed (handled downstream exactly like any other null scout → scoutFailed,
+// refine still runs from source). A partial chunk set still yields a usable per-file finding.
+async function scoutFile(engine, f, A, M, labelPrefix = 'scout') {
+  const chunks = splitForScout(f)
+  if (chunks.length === 1) {
+    return engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+  }
+  engine.log(`侦察分块：大文件 ${f.label}（约 ${refineSize(f)} 字）拆 ${chunks.length} 段并行侦察，防单代理卡死`)
+  const parts = await engine.parallel(chunks.map((c) => () =>
+    engine.agent(scoutPrompt(f, A, c), { label: `${labelPrefix}:${f.label}#${c.idx}/${c.count}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
+  return mergeScoutChunks(parts, f)
+}
+
 async function runPipeline(A, engine) {
 const M = Object.assign(
-  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', logic: 'opus', summary: 'opus', timeline: 'opus' },
+  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus' },
   A.models || {}
 )
 const scope = A.scope || ['refine']
-const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null })
+const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null })
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
@@ -908,38 +1268,39 @@ if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人
 
 let glossary = ''
 let netUnverified = []
+let asrSuspects = []   // scout-flagged ASR suspects verify couldn't resolve → folded into openQuestions
 let refined = []
 let failed = []
 let headingConflicts = []
 let scoutSuspect = []
+let scoutFailed = []   // files whose scout returned nothing (stalled) — refined anyway (glossary degraded), surfaced for re-scout
 let dedup = null
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
-if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
-  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify
+if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
+  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
+  // Length judged by 正文字数, not lines.
   const f = A.files[0]
   engine.phase('Refine')
-  engine.log(`单份短文件（${f.lines} 行）：一遍过精校，不建独立校对表`)
-  const rep = await engine.agent(singlePassPrompt(f, A), { label: `refine:${f.label}`, model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  engine.log(`▶ 精校 Refine：单份短文件（约 ${refineSize(f)} 字）一遍过，不建独立校对表`)
+  const rep = await engine.agent(singlePassPrompt(f, A), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
   if (rep) {
-    const chk = await engine.agent(checkPrompt(f, null), { label: `check:${f.label}`, model: 'haiku', schema: CHECK_SCHEMA })
-    refined = [withCheck(rep, chk, f)]
-    refinedPairs = [{ f, rep: refined[0] }]
+    refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '结尾核对待跑' })]
+    refinedPairs = [{ f, rep, anchor: null }]   // completeness check runs in the shared phase below
   } else {
     failed = [f.label]
   }
   glossary = SINGLE_FILE_GLOSSARY
 } else {
   engine.phase('Scout')
-  let findings = await engine.parallel(A.files.map((f) => () =>
-    engine.agent(scoutPrompt(f, A), { label: `scout:${f.label}`, model: M.scout, schema: SCOUT_SCHEMA })))
+  engine.log(`▶ 1/${scope.includes('logic') ? 5 : 4} 侦察 Scout：${A.files.length} 份并行抽取实体（人名 / 品牌 / 术语 / 发言人）`)
+  let findings = await engine.parallel(A.files.map((f) => () => scoutFile(engine, f, A, M)))
   // Garbled-scout self-healing: if a scout result looks garbled, retry it once (a haiku call is cheap); if still garbled, flag it in scoutSuspect and warn at delivery that the glossary entry for that file is unreliable.
   // The refined transcript is unaffected — refine reads the source file directly and does not blindly trust the scout output — but the archived glossary entry for that file will be dirty.
   const retryIdx = A.files.map((f, i) => (findings[i] && scoutLooksGarbled(findings[i])) ? i : -1).filter((i) => i >= 0)
   if (retryIdx.length) {
     engine.log(`侦察疑似损坏（疑网络中途毁坏生成流）：${retryIdx.map((i) => A.files[i].label).join('、')}——各重试一次`)
-    const retries = await engine.parallel(retryIdx.map((i) => () =>
-      engine.agent(scoutPrompt(A.files[i], A), { label: `scout-retry:${A.files[i].label}`, model: M.scout, schema: SCOUT_SCHEMA })))
+    const retries = await engine.parallel(retryIdx.map((i) => () => scoutFile(engine, A.files[i], A, M, 'scout-retry')))
     retryIdx.forEach((i, k) => { if (retries[k] && !scoutLooksGarbled(retries[k])) findings[i] = retries[k] })
   }
   scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)
@@ -953,6 +1314,7 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   if (headingConflicts.length) engine.log(`注意：${headingConflicts.join('、')} 源文件已带小标题但 headingPolicy=none——收尾时需问用户保留还是重做`)
 
   engine.phase('Verify')
+  engine.log(`▶ 2/${scope.includes('logic') ? 5 : 4} 核实 Verify：关键实体联网核实 + 语义同指排查`)
   // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
   // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
@@ -997,23 +1359,31 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
   const allVerified = prior ? mergeVerified(prior.verified, verified) : verified
   const allDedup = prior ? { suspects: mergeDedup(prior.dedupSuspects, (dedup && dedup.suspects) || []) } : dedup
   weakDups = prior ? weakDupFlags(prior, mergedThisBatch) : []
+  asrSuspects = suspectUnverified(mergedThisBatch, allVerified)   // suspects still unresolved after verify → ask the user
+  if (asrSuspects.length) engine.log(`疑似转录误写未核实：${asrSuspects.length} 项——并入 openQuestions 待人工确认正确写法`)
   if (weakDups.length) engine.log(`称呼歧义：${weakDups.length} 个弱称呼跨批次重复（未合并）——并入 openQuestions 待人工辨认`)
   if (prior) engine.log(`累积合并：校对表现含 ${merged.people.length} 人名 / ${merged.brands.length} 品牌 / ${merged.terms.length} 术语`)
   glossary = renderGlossary(merged, allVerified, allDedup, A)
+  // Condensed glossary for chunk-refine agents (full 校对表 still persisted + used by single-agent refine).
+  const refineGlossary = renderRefineGlossary(merged, allVerified, allDedup, A)
 
   let positional = []
   if (scope.includes('refine')) {
     engine.phase('Refine')
+    engine.log(`▶ 3/${scope.includes('logic') ? 5 : 4} 精校 Refine：${A.files.length} 份逐份精校${A.chunkMode === 'speed' ? '（大文件分块并行）' : ''}`)
+    // Refine ONLY — the ending-completeness check is NOT in the critical path here; it runs last (after the
+    // deliverables are written to disk) so a slow / stalled cheap check can't cost the expensive refine or the
+    // deliverables. And refine runs even when scout failed for a file (findings[i] null): refine reads the
+    // source directly and the glossary is only an aid, so a stalled cheap scout degrades the glossary but
+    // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
-      (f, _f, i) => findings[i] && engine.agent(refinePrompt(f, glossary, findings[i], A),
-        { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA }),
-      (rep, f, i) => rep && engine.agent(checkPrompt(f, findings[i].ending_anchor),
-        { label: `check:${f.label}`, phase: 'Refine', model: 'haiku', schema: CHECK_SCHEMA })
-        .then((chk) => withCheck(rep, chk, f)))
+      (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, findings[i] || {}, A, M))
   }
-  failed = A.files.filter((f, i) => !findings[i] || (scope.includes('refine') && !positional[i])).map((f) => f.label)
-  refined = positional.filter(Boolean)
-  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i] })).filter((p) => p.rep)
+  scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
+  if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
+  failed = A.files.filter((f, i) => scope.includes('refine') && !positional[i]).map((f) => f.label)
+  refined = positional.map((rep, i) => rep && Object.assign({}, rep, { outPath: A.files[i].outPath, complete: null, checkNote: '结尾核对待跑' })).filter(Boolean)
+  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: findings[i] && findings[i].ending_anchor })).filter((p) => p.rep)
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
@@ -1022,8 +1392,9 @@ if (A.files.length === 1 && (A.files[0].lines || 9999) < 400) {
 let logic = []
 if (scope.includes('logic') && refinedPairs.length) {
   engine.phase('Logic')
+  engine.log(`▶ 4/5 逻辑顺序 Logic：${refinedPairs.length} 份按主线重排为叙事顺序`)
   const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, model: M.logic, schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, schema: LOGIC_REPORT_SCHEMA })))
   lreps.forEach((lrep, k) => {
     const { f, rep } = refinedPairs[k]
     if (!lrep) { logic.push({ label: f.label, path: null, mainline: '', threads: [], missingSections: [], open_questions: [] }); return }
@@ -1039,14 +1410,34 @@ if (scope.includes('logic') && refinedPairs.length) {
 }
 
 engine.phase('Deliver')
+if (refined.length && (scope.includes('summary') || scope.includes('timeline'))) {
+  engine.log(`▶ 交付 Deliver：${[scope.includes('summary') && '访谈总结', scope.includes('timeline') && '时间线'].filter(Boolean).join(' + ')}`)
+}
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', model: M.summary })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', model: M.timeline })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline })
     : Promise.resolve(null)),
 ])
+
+// Completeness check — runs LAST, off the critical path. The expensive refine and the deliverables are
+// already written to disk, so a slow / failed / stalled haiku check can no longer cost them (the failure mode
+// that bit the 5.25-万字 run, where a stuck 结尾核对 agent held the whole run hostage). The deterministic
+// source-aware audit (run post-pipeline on the files) is the authoritative completeness signal; this agent is
+// a best-effort refinement folded back into `refined`.
+if (refinedPairs.length) {
+  engine.phase('Check')
+  engine.log(`▶ 结尾核对 Check：${refinedPairs.length} 份（不阻塞已落盘的成稿与交付物）`)
+  const chks = await engine.parallel(refinedPairs.map(({ f, anchor }) => () =>
+    engine.agent(checkPrompt(f, anchor), { label: `check:${f.label}`, phase: 'Check', model: 'haiku', schema: CHECK_SCHEMA })))
+  refinedPairs.forEach(({ f, rep }, k) => {
+    const w = withCheck(rep, chks[k], f)
+    const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
+    if (r) { r.complete = w.complete; r.checkNote = w.checkNote }
+  })
+}
 
 return {
   glossary,
@@ -1056,10 +1447,11 @@ return {
   unchecked: refined.filter((r) => r.complete === null).map((r) => r.outPath || r.path),
   headingConflicts,
   scoutSuspect,
+  scoutFailed,
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects),
   summary,
   timeline,
 }

@@ -60,6 +60,39 @@ test('served HTML embeds the per-session API token', async () => {
   }
 })
 
+test('serves a PWA manifest and an SVG icon so the GUI installs as a local app', async () => {
+  const server = createAppServer({ token: 't' })
+  const port = await listen(server)
+  try {
+    const m = await request(port, 'GET', '/manifest.webmanifest')
+    assert.equal(m.status, 200)
+    assert.match(m.headers['content-type'], /manifest\+json/)
+    const mf = JSON.parse(m.body)
+    assert.equal(mf.display, 'standalone')
+    assert.ok(mf.name && mf.icons.length, 'manifest has a name and icons')
+    assert.equal(mf.icons[0].src, '/icon.svg')
+    const i = await request(port, 'GET', '/icon.svg')
+    assert.equal(i.status, 200)
+    assert.match(i.headers['content-type'], /image\/svg\+xml/)
+    assert.match(i.body, /^<svg/)
+  } finally {
+    await close(server)
+  }
+})
+
+test('served HTML links the manifest, icon and theme-color (installable head)', async () => {
+  const server = createAppServer({ token: 't' })
+  const port = await listen(server)
+  try {
+    const res = await request(port, 'GET', '/')
+    assert.match(res.body, /rel="manifest" href="\/manifest\.webmanifest"/)
+    assert.match(res.body, /rel="icon" href="\/icon\.svg"/)
+    assert.match(res.body, /name="theme-color"/)
+  } finally {
+    await close(server)
+  }
+})
+
 test('API rejects untokened, non-JSON, and cross-origin run requests', async () => {
   let called = false
   const token = 'secret-token'
