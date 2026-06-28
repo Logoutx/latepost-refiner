@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>访谈转录精校 · 本地版</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16140f" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="访谈精校">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <style>
   :root {
     --bg: #f6f5f2; --card: #fffefb; --ink: #1c1a17; --muted: #6b6660; --line: #e3ded6;
@@ -173,7 +182,7 @@
   </div>
 
   <div class="card" id="consoleCard" style="display:none">
-    <h2>进度</h2>
+    <h2>进度 <span id="elapsed" class="hint" style="font-variant-numeric:tabular-nums;font-weight:normal"></span></h2>
     <div id="console"></div>
   </div>
 
@@ -413,7 +422,21 @@ function parseModels(s) {
   return Object.keys(m).length ? m : undefined
 }
 
-const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight }
+const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight; return span }
+
+// --- run clock: a live elapsed timer so a slow phase reads as "still running", not hung ---
+let runStart = 0, phaseStart = 0, phaseEl = null, phaseTitle = '', clockTick = null
+const fmtDur = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') }
+function updateClock() {
+  if (!runStart) return
+  const t = Date.now()
+  const el = $('elapsed'); if (el) el.textContent = '总用时 ' + fmtDur(t - runStart)
+  if (phaseEl) phaseEl.textContent = '▸ ' + phaseTitle + '   ' + fmtDur(t - phaseStart)   // active phase counts up in place
+}
+function startClock() { runStart = Date.now(); phaseStart = runStart; phaseEl = null; phaseTitle = ''; clearInterval(clockTick); clockTick = setInterval(updateClock, 1000); updateClock() }
+function freezePhase() { if (phaseEl) phaseEl.textContent = '▸ ' + phaseTitle + '   用时 ' + fmtDur(Date.now() - phaseStart) }   // pin the finished phase's duration
+function markPhase(title) { freezePhase(); phaseTitle = title; phaseStart = Date.now(); phaseEl = log('▸ ' + title, 'ph') }
+function stopClock() { freezePhase(); clearInterval(clockTick); clockTick = null; const el = $('elapsed'); if (el && runStart) el.textContent = '总用时 ' + fmtDur(Date.now() - runStart); runStart = 0; phaseEl = null }
 
 $('run').onclick = run
 { const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置
@@ -443,6 +466,7 @@ async function run() {
   $('run').disabled = true; setStatus('运行中... 大文件可能需要几分钟。')
   $('consoleCard').style.display = 'block'; $('console').innerHTML = ''
   $('resultCard').style.display = 'none'; $('result').innerHTML = ''
+  startClock()
 
   try {
     const resp = await fetch('/api/run', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(params) })
@@ -454,7 +478,7 @@ async function run() {
       while ((idx = buf.indexOf('\n\n')) >= 0) { handleEvent(buf.slice(0, idx)); buf = buf.slice(idx + 2) }
     }
   } catch (e) { log('连接中断：' + e.message, 'er') }
-  finally { $('run').disabled = false; setStatus('') }
+  finally { stopClock(); $('run').disabled = false; setStatus('') }
 }
 
 function handleEvent(raw) {
@@ -464,7 +488,7 @@ function handleEvent(raw) {
     else if (line.startsWith('data: ')) data += line.slice(6)
   }
   let obj = {}; try { obj = JSON.parse(data) } catch {}
-  if (ev === 'phase') log('▸ ' + obj.title, 'ph')
+  if (ev === 'phase') markPhase(obj.title)
   else if (ev === 'log') log('  ' + obj.message)
   else if (ev === 'error') { log('✗ ' + obj.message, 'er'); setStatus(obj.message, true) }
   else if (ev === 'result') renderResult(obj)
