@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, parseSourceTurns, annotateGaps, scanCoverage } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -173,4 +173,78 @@ test('an unparseable source degrades to assessed:false and never gates', () => {
   const s = scanCoverage('无标签文字。', '成稿。')
   assert.equal(s.assessed, false)
   assert.deepEqual(s.gaps, [])
+})
+
+// ---------- source anchors (provenance: quote → source line → recording timestamp) ----------
+
+test('parseSourceTurns attaches the label timestamp as .ts (raw, precision preserved; null when absent)', () => {
+  const ts = parseSourceTurns(covSource())
+  assert.equal(ts[0].ts, '00:05', '名字 MM:SS label')
+  const bold = parseSourceTurns('**发言人 1 00:03:22**\n大家好，我先说两句。\n\n**发言人 2**\n好的您请讲。')
+  assert.equal(bold[0].ts, '00:03:22', 'HH:MM:SS precision preserved')
+  assert.equal(bold[1].ts, null, 'no timestamp → null')
+})
+
+test('annotateAnchors inverts the coverage scan into per-section source ranges + timestamps (load-bearing)', () => {
+  const r = annotateAnchors(covSource(), fixture('coverage-refined-good.md'))
+  assert.equal(r.updated.length, 4, 'all four sections anchored')
+  const by = Object.fromEntries(r.updated.map((u) => [u.title, u]))
+  assert.deepEqual({ s: by['经销商账期与仲裁风波'].startLine, e: by['经销商账期与仲裁风波'].endLine, ts: by['经销商账期与仲裁风波'].ts }, { s: 25, e: 38, ts: '08:00-12:05' })
+  assert.deepEqual({ s: by['公司概况'].startLine, e: by['公司概况'].endLine, ts: by['公司概况'].ts }, { s: 1, e: 11, ts: '00:05-02:31' })
+  // the REORDERED section (moved to the end of the refined file) still gets its true source range —
+  // out-of-source-order and overlapping ranges are allowed by design (anchors follow content)
+  assert.deepEqual({ s: by['与进口品牌的差异'].startLine, e: by['与进口品牌的差异'].endLine, ts: by['与进口品牌的差异'].ts }, { s: 19, e: 23, ts: '05:30-05:45' })
+  assert.match(r.text, /## 经销商账期与仲裁风波\n<!-- 源 L25-L38 · 08:00-12:05 -->/, 'comment glued directly under the heading')
+})
+
+test('a section with zero matched turns gets NO anchor (wrong anchor is worse than none)', () => {
+  const withExtra = fixture('coverage-refined-good.md') + '\n## 现场花絮\n\n（现场花絮与合影，从略。）\n'
+  const r = annotateAnchors(covSource(), withExtra)
+  assert.equal(r.updated.length, 4, 'real sections still anchored')
+  assert.ok(r.skipped.some((s) => s.title === '现场花絮' && s.reason === 'no-matched-turns'))
+  assert.ok(!/## 现场花絮\n<!-- 源/.test(r.text), 'no comment under the empty section')
+})
+
+test('anchors degrade to lines-only when the source has no timestamps, and no-heading files are untouched', () => {
+  // strip label timestamps by converting `名字 MM:SS` label lines to inline `名字：` labels
+  const noTs = covSource().replace(/^([一-龥A-Za-z]{2,7}) \d{1,2}:\d{2}(?::\d{2})?\s*$/gm, '$1：')
+  const r = annotateAnchors(noTs, fixture('coverage-refined-good.md'))
+  assert.ok(r.updated.length >= 3, 'sections still anchored via line ranges')
+  assert.ok(r.updated.every((u) => u.ts === null), 'no timestamps anywhere')
+  assert.match(r.text, /<!-- 源 L\d+-L\d+ -->/, 'lines-only comment format (no ·)')
+  const plain = '没有小标题的成稿正文而已。'
+  assert.deepEqual(annotateAnchors(covSource(), plain), { text: plain, updated: [], skipped: [] })
+})
+
+test('annotateAnchors is idempotent (replace, not duplicate) and coexists with the coverage scan', () => {
+  const src = covSource()
+  const once = annotateAnchors(src, fixture('coverage-refined-good.md'))
+  const twice = annotateAnchors(src, once.text)
+  assert.deepEqual(twice.updated, once.updated, 'ranges identical on re-run (source lines are invariant)')
+  assert.equal((twice.text.match(/<!-- 源/g) || []).length, 4, 'exactly one comment per section')
+  const c1 = scanCoverage(src, fixture('coverage-refined-good.md'))
+  const c2 = scanCoverage(src, twice.text)
+  assert.equal(c1.turnsLost, c2.turnsLost, 'anchored text scans identically')
+  assert.equal(c1.gaps.length, c2.gaps.length)
+  // CRLF preserved
+  const crlf = annotateAnchors(src, fixture('coverage-refined-good.md').replace(/\n/g, '\r\n'))
+  assert.ok(crlf.text.includes('\r\n') && crlf.updated.length === 4)
+  // the anchored output stays invisible to the output-only audit
+  const a = auditText(once.text)
+  assert.equal(a.status, 'ok')
+})
+
+test('normalizeWithMap strips HTML comments without shifting the line map', () => {
+  assert.equal(normalizeWithMap('## 概况\n<!-- 源 L4-L11 · 00:05-02:31 -->\n正文内容').norm.startsWith('概况正文'), true, '源 does not leak into the norm')
+  const multi = normalizeWithMap('<!--\n注释\n-->\n汉字')
+  assert.equal(multi.norm, '汉字')
+  assert.equal(multi.lineOf[0], 4, 'newlines inside the comment preserved → line map intact')
+})
+
+test('sectionRange keeps the largest contiguous source run (outlier bag-matches rejected)', () => {
+  const t = (s, e, n = 30) => ({ startLine: s, endLine: e, norm: '字'.repeat(n) })
+  const withOutlier = sectionRange([t(4, 5), t(10, 11), t(49, 50)])
+  assert.deepEqual({ s: withOutlier.startLine, e: withOutlier.endLine }, { s: 4, e: 11 }, 'stray turn 40 lines away forms its own run and loses')
+  const twoRuns = sectionRange([t(4, 5), t(49, 50)])
+  assert.deepEqual({ s: twoRuns.startLine, e: twoRuns.endLine }, { s: 4, e: 5 }, 'tie → first run kept')
 })

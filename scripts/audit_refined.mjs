@@ -150,18 +150,19 @@ export function parseSourceTurns(sourceText) {
     const lineNo = i + 1
     const line = lines[i].trim()
     if (!line) continue
-    const a = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\s*\*{0,2}$/)
-    const b = a ? null : line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+\d{1,2}:\d{2}(?::\d{2})?\s*\*{0,2}$/)
+    const a = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?\s*\*{0,2}$/)
+    const b = a ? null : line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*\*{0,2}$/)
     if (a || b) {
       if (cur) turns.push(cur)
-      cur = { speaker: a ? '发言人' + a[1] : b[1], startLine: lineNo, endLine: lineNo, text: '' }
+      // ts = the label's raw timestamp verbatim (HH:MM or HH:MM:SS), or null — feeds the source anchors.
+      cur = { speaker: a ? '发言人' + a[1] : b[1], startLine: lineNo, endLine: lineNo, text: '', ts: (a ? a[2] : b[2]) || null }
       continue
     }
     if (/^[#*>|]/.test(line)) continue
     const c = line.match(/^([一-龥A-Za-z][^：:\s]{0,7})[：:]\s*(.*)$/)
     if (c) {
       if (cur) turns.push(cur)
-      cur = { speaker: c[1], startLine: lineNo, endLine: lineNo, text: c[2] || '' }
+      cur = { speaker: c[1], startLine: lineNo, endLine: lineNo, text: c[2] || '', ts: null }
       continue
     }
     if (cur) { cur.text += (cur.text ? '\n' : '') + line; cur.endLine = lineNo }
@@ -173,6 +174,10 @@ export function parseSourceTurns(sourceText) {
 // Normalize to hanzi-only with filler stripped, keeping a norm-index → 1-based raw line map
 // (the map is what lets a detected gap be turned into an insertion point in the raw file).
 export function normalizeWithMap(text) {
+  // Strip HTML comments (source-anchor comments contain the hanzi 源, which would otherwise leak
+  // into the coverage norm). Replaced with same-shape whitespace — NOT deleted — so newlines inside
+  // a multi-line comment can't shift the norm-index → line map.
+  text = String(text || '').replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '))
   const chars = []
   const lineOfAll = []
   let line = 1
@@ -258,15 +263,17 @@ function bagMatch(turnNorm, rarity, refPositions) {
   return null
 }
 
-// The scan: which substantive source turns never surface in the refined text, grouped into gaps.
-export function scanCoverage(sourceText, refinedText) {
+// Shared anchoring pass: parse source turns, normalize both sides, and locate each substantive
+// source turn in the refined text (contiguous shingles first, rare-bigram-bag fallback). Returns
+// { turns, subs } where subs carry .found and .anchor = { normIdx, line (1-based refined line) }.
+// Both scanCoverage (gap detection) and annotateAnchors (source anchors) consume this, so the two
+// features stay in lock-step forever.
+export function anchorTurns(sourceText, refinedText) {
   const turns = parseSourceTurns(sourceText)
-  const empty = { assessed: false, turnsTotal: turns.length, turnsSubstantive: 0, turnsLost: 0, lostChars: 0, lostRatio: 0, modelMarkers: [], gaps: [] }
-  if (!turns.length) return empty
   const subs = turns
     .map((t) => ({ ...t, norm: normalize(t.text) }))
     .filter((t) => t.norm.length >= COVERAGE.MIN_SUBSTANTIVE_CHARS)
-  if (!subs.length) return empty
+  if (!subs.length) return { turns, subs }
   // char rarity over the source's substantive text
   const freq = new Map()
   let total = 0
@@ -274,7 +281,6 @@ export function scanCoverage(sourceText, refinedText) {
   const rarity = new Map()
   for (const [ch, n] of freq) rarity.set(ch, Math.log(total / n))
   const ref = normalizeWithMap(refinedText)
-  const refLines = refinedText.split(/\r?\n/)
   // bigram → sorted positions in the refined norm (for the bag-match fallback)
   const refPositions = new Map()
   for (let i = 0; i + 2 <= ref.norm.length; i += 1) {
@@ -284,7 +290,7 @@ export function scanCoverage(sourceText, refinedText) {
     arr.push(i)
   }
   // per-turn lookup; record an anchor (norm index + raw line) for found turns.
-  // Contiguous shingles first (precise, cheap); rare-char-bag fallback for reworded-but-present turns.
+  // Contiguous shingles first (precise, cheap); rare-bigram-bag fallback for reworded-but-present turns.
   const lineAt = (idx) => ref.lineOf[Math.min(Math.max(idx, 0), ref.lineOf.length - 1)] || 1
   for (const t of subs) {
     t.found = false
@@ -297,6 +303,15 @@ export function scanCoverage(sourceText, refinedText) {
       if (m) { t.found = true; t.anchor = { normIdx: m.normIdx, line: lineAt(m.normIdx) } }
     }
   }
+  return { turns, subs }
+}
+
+// The scan: which substantive source turns never surface in the refined text, grouped into gaps.
+export function scanCoverage(sourceText, refinedText) {
+  const { turns, subs } = anchorTurns(sourceText, refinedText)
+  const empty = { assessed: false, turnsTotal: turns.length, turnsSubstantive: 0, turnsLost: 0, lostChars: 0, lostRatio: 0, modelMarkers: [], gaps: [] }
+  if (!turns.length || !subs.length) return empty
+  const refLines = refinedText.split(/\r?\n/)
   const modelMarkers = []
   refLines.forEach((l, i) => { if (MODEL_MARKER_RE.test(l)) modelMarkers.push({ line: i + 1, text: l.trim().slice(0, 80) }) })
   // group consecutive lost substantive turns into gaps
@@ -387,6 +402,86 @@ export function annotateFile(refinedPath, gaps) {
   const r = annotateGaps(before, gaps)
   if (r.inserted.length) fs.writeFileSync(refinedPath, r.text)
   return { path: path.resolve(refinedPath), inserted: r.inserted, skipped: r.skipped }
+}
+
+// ===== Source anchors (provenance) =====
+// Refining strips timestamps for readability, which severs the chain quote → transcript → audio.
+// These anchors restore it: each ## section gets an invisible HTML comment directly under the
+// heading — `<!-- 源 L25-L38 · 08:00-12:05 -->` — the source line range and (when the source labels
+// carry timestamps) the time range, so a quote can be jumped back to the recording. Deterministic
+// inversion of the coverage scan: a section's anchor is built from the source turns whose matched
+// position falls inside that section. Works retroactively on any existing source/refined pair.
+// Semantics: ranges MAY overlap between sections and appear out of source order (reordering and
+// repeat-merging are legitimate refine operations — anchors follow content). A section with zero
+// matched turns gets NO anchor: a wrong anchor is worse than none for a verification aid.
+export const ANCHOR = {
+  GAP_MAX_LINES: 18, // source-line gap that splits a section's turns into runs (outlier rejection)
+}
+const ANCHOR_HEADING_RE = /^##\s+/
+const ANCHOR_COMMENT_RE = /^\s*<!--\s*源\s+L\d+-L\d+(?:\s*·\s*[\d:]+-[\d:]+)?\s*-->\s*$/
+
+// Robust range for one section's matched turns: sort by source startLine, split into contiguous
+// runs (gap > GAP_MAX_LINES starts a new run), keep the run with the most turns (tie → most chars).
+// Exploits the real signal — a section's turns are contiguous in the SOURCE even when the refined
+// side reorders — so a stray bag-match false positive forms its own 1-turn run and loses.
+export function sectionRange(matched) {
+  const sorted = matched.slice().sort((x, y) => x.startLine - y.startLine)
+  const runs = [[sorted[0]]]
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i].startLine - sorted[i - 1].endLine > ANCHOR.GAP_MAX_LINES) runs.push([])
+    runs[runs.length - 1].push(sorted[i])
+  }
+  const size = (r) => r.reduce((s, t) => s + t.norm.length, 0)
+  let best = runs[0]
+  for (const r of runs) { if (r.length > best.length || (r.length === best.length && size(r) > size(best))) best = r }
+  const first = best.find((t) => t.ts)
+  const last = [...best].reverse().find((t) => t.ts)
+  return {
+    startLine: best[0].startLine,
+    endLine: best[best.length - 1].endLine,
+    ts: first && last ? `${first.ts}-${last.ts}` : null,
+  }
+}
+
+// Pure: compute + write the per-section anchor comments into the refined text. Idempotent —
+// an existing anchor comment directly under a heading is REPLACED, never duplicated (fresh scan
+// each run; source line numbers come from the SOURCE so they are invariant across re-runs).
+export function annotateAnchors(sourceText, refinedText) {
+  const eol = /\r\n/.test(refinedText) ? '\r\n' : '\n'
+  const lines = refinedText.split(/\r?\n/)
+  const headIdx = lines.map((l, i) => (ANCHOR_HEADING_RE.test(l) ? i : -1)).filter((i) => i >= 0)
+  if (!headIdx.length) return { text: refinedText, updated: [], skipped: [] }
+  const { subs } = anchorTurns(sourceText, refinedText)
+  const updated = [], skipped = []
+  // reverse order so insertions never shift earlier heading indices
+  for (let k = headIdx.length - 1; k >= 0; k -= 1) {
+    const h = headIdx[k]
+    const title = lines[h].replace(ANCHOR_HEADING_RE, '').trim()
+    const from = h + 2            // section body spans (1-based) lines h+2 .. next heading
+    const to = k + 1 < headIdx.length ? headIdx[k + 1] : lines.length
+    const matched = subs.filter((t) => t.found && t.anchor.line >= from && t.anchor.line <= to)
+    const existing = h + 1 < lines.length && ANCHOR_COMMENT_RE.test(lines[h + 1])
+    if (!matched.length) {
+      // no evidence → no anchor; also remove a stale one left by an earlier run
+      if (existing) lines.splice(h + 1, 1)
+      skipped.push({ title, reason: 'no-matched-turns' })
+      continue
+    }
+    const r = sectionRange(matched)
+    const comment = `<!-- 源 L${r.startLine}-L${r.endLine}${r.ts ? ` · ${r.ts}` : ''} -->`
+    if (existing) lines[h + 1] = comment
+    else lines.splice(h + 1, 0, comment)
+    updated.push({ title, startLine: r.startLine, endLine: r.endLine, ts: r.ts })
+  }
+  return { text: lines.join(eol), updated: updated.reverse(), skipped: skipped.reverse() }
+}
+
+export function annotateAnchorsFile(sourcePath, refinedPath) {
+  const src = fs.readFileSync(sourcePath, 'utf8')
+  const before = fs.readFileSync(refinedPath, 'utf8')
+  const r = annotateAnchors(src, before)
+  if (r.text !== before) fs.writeFileSync(refinedPath, r.text)
+  return { path: path.resolve(refinedPath), updated: r.updated, skipped: r.skipped }
 }
 
 export function auditText(text, file = '<text>') {
@@ -487,6 +582,8 @@ function usage() {
   node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary]
                                                                   # 对比源文：查压缩/欠精校/内容缺口
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
+  … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
+                                                                  # （渲染不可见；引文可循此跳回源文件行号与录音时间；可与 --annotate 同用）
 
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就 等纯噪音；超约 900 字的对话长段。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
@@ -513,6 +610,16 @@ function main() {
         result.annotation = { dryRun: true, inserted: r.inserted, skipped: r.skipped }
       } else {
         result.annotation = annotateFile(refined, gaps)
+      }
+    }
+    // anchors run AFTER gap annotation (they re-scan the current on-disk/on-hand text, so they see
+    // and coexist with any just-inserted gap markers)
+    if (argv.includes('--anchors')) {
+      if (argv.includes('--dry-run')) {
+        const r = annotateAnchors(fs.readFileSync(source, 'utf8'), fs.readFileSync(refined, 'utf8'))
+        result.anchors = { dryRun: true, updated: r.updated, skipped: r.skipped }
+      } else {
+        result.anchors = annotateAnchorsFile(source, refined)
       }
     }
     console.log(JSON.stringify(result, null, 2))
