@@ -239,6 +239,7 @@ export function buildRunManifest(result = {}, context = {}) {
       files: (result.audit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null, gaps: f.gaps || [], modelMarkers: f.modelMarkers || [] })),
     } : null,
     annotations: (result.annotations || []).map((a) => ({ path: a.path, inserted: (a.inserted || []).map((g) => ({ startLine: g.startLine, endLine: g.endLine, chars: g.chars })) })),
+    anchors: (result.anchors || []).map((a) => ({ path: a.path, sections: (a.updated || []).length })),
     usage,
   }
 }

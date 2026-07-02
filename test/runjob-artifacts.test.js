@@ -97,6 +97,10 @@ test('runJob detects a hard content gap, annotates the 成稿, and records it in
   assert.ok(manifest.audit.files[0].gaps.length >= 1, 'gaps in run.json')
   assert.ok(manifest.annotations.length >= 1, 'annotations in run.json')
   assert.match(fs.readFileSync(result.reviewPath, 'utf8'), /内容缺口/, 'review.md surfaces the gap')
+  // source anchors ran on the same pass: sections carry <!-- 源 … --> comments, manifest records them
+  assert.ok(result.anchors.length >= 1, 'anchors attached to the result')
+  assert.match(fs.readFileSync(result.anchors[0].path, 'utf8'), /<!-- 源 L\d+-L\d+/, 'anchor comment in the 成稿')
+  assert.ok(manifest.anchors.length >= 1 && manifest.anchors[0].sections >= 1, 'anchors in run.json')
 })
 
 test('annotate:false leaves the refined files untouched (still audited and reported)', async () => {
@@ -106,4 +110,28 @@ test('annotate:false leaves the refined files untouched (still audited and repor
   for (const f of result.refined) {
     assert.ok(!fs.readFileSync(f.outPath || f.path, 'utf8').includes('内容缺口'), 'no marker in file')
   }
+})
+
+test('runJob accepts filesystem path entries and records prepared file metadata', async () => {
+  const inputDir = tmpdir()
+  const outputDir = tmpdir()
+  const src = path.join(inputDir, 'path-fixture.md')
+  fs.writeFileSync(src, '采访者：请介绍背景\n受访者：这是虚构样本。\n', 'utf8')
+
+  const result = await runJob({
+    __engine: mockEngine(),
+    files: [{ path: src }],
+    topic: '路径样本',
+    date: '2026-07',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+  })
+
+  assert.equal(result.provider, 'injected')
+  assert.equal(result.refined.length, 1)
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.config.files.length, 1)
+  assert.equal(manifest.config.files[0].path, src)
+  assert.equal(manifest.config.files[0].outPath, path.join(outputDir, 'Transcripts', 'path-fixture.md'))
 })
