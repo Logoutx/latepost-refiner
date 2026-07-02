@@ -98,6 +98,7 @@
           <label>服务商</label>
           <select id="provider"></select>
           <p class="hint" id="providerNote"></p>
+          <p class="hint" id="providerRisk" style="color:var(--warn)"></p>
         </div>
         <div>
           <label>API Key <span class="opt" id="keyHint"></span></label>
@@ -236,6 +237,7 @@ function onProvider() {
   const p = PROVIDERS.find(x => x.name === $('provider').value) || {}
   $('keyHint').textContent = '（' + (p.keyEnv || []).join(' / ') + '）'
   $('providerNote').textContent = p.note || ''
+  $('providerRisk').textContent = p.riskNote || ''   // 信源保护提示（境内运营商）
   $('baseURL').placeholder = p.baseURL || '默认'
   $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
   $('searchNote').textContent = p.nativeSearch
