@@ -90,3 +90,22 @@ test('writeRunArtifacts writes review.md and run.json', () => {
   assert.match(fs.readFileSync(paths.reviewPath, 'utf8'), /Review Queue/)
   assert.equal(JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8')).artifacts.reviewPath, paths.reviewPath)
 })
+
+test('manifest carries content-gap details and annotations; review renders 内容缺口', () => {
+  const gap = { startLine: 25, endLine: 38, turns: 5, chars: 434, severity: 'hard', trace: false }
+  const withGaps = {
+    ...baseResult,
+    audit: { status: 'fail', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'fail', failed: ['content_gap'], metrics: { charRatio: 0.7 }, gaps: [gap], modelMarkers: [] }] },
+    annotations: [{ path: '/tmp/out/Transcripts/A.md', inserted: [gap], skipped: [] }],
+  }
+  const manifest = buildRunManifest(withGaps, { outputDir: '/tmp/out', topic: 'T' })
+  assert.equal(manifest.audit.files[0].gaps.length, 1, 'gaps survive into run.json (not silently dropped)')
+  assert.equal(manifest.audit.files[0].gaps[0].startLine, 25)
+  assert.equal(manifest.annotations.length, 1)
+  assert.deepEqual(manifest.annotations[0].inserted[0], { startLine: 25, endLine: 38, chars: 434 })
+  const sections = reviewSections(withGaps, [])
+  const quality = sections.find((s) => s.title.includes('成稿质量抽查未过'))
+  assert.ok(quality && quality.items[0].includes('内容缺口 第 25-38 行'), 'formatAudit renders the gap with line range')
+  const ann = sections.find((s) => s.title.includes('已在成稿中插入内容缺口标记'))
+  assert.ok(ann && ann.items[0].includes('插入 1 处标记'), 'annotation section present with count')
+})

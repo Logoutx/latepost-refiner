@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { makeOpenAIEngine } from '../engines/openai.js'
-import { PROVIDERS, resolveKey } from '../engines/providers.js'
+import { PROVIDERS, resolveKey, jurisdictionNote } from '../engines/providers.js'
 
 function completion(message, finishReason = 'stop') {
   return {
@@ -65,6 +65,19 @@ test('provider registry preserves known per-provider contracts', () => {
   assert.equal(PROVIDERS.openai.maxTokensParam, 'max_completion_tokens')
   assert.equal(PROVIDERS.openai.forceStructured, true)
   assert.equal(PROVIDERS.openai.nativeSearch, undefined)
+
+  // source-protection surface: jurisdiction must be declared for every provider
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, v.jurisdiction])),
+    { deepseek: 'PRC', glm: 'PRC', kimi: 'PRC', openai: 'US' },
+  )
+})
+
+test('jurisdictionNote warns for PRC operators and stays silent otherwise', () => {
+  assert.match(jurisdictionNote('deepseek'), /信源保护提示/, 'PRC provider gets the notice')
+  assert.match(jurisdictionNote('glm'), /运营方/, 'endpoint choice does not change the operator')
+  assert.equal(jurisdictionNote('openai'), '', 'US provider — no notice')
+  assert.equal(jurisdictionNote('nonexistent'), '', 'unknown provider — no notice, no throw')
 })
 
 test('resolveKey uses provider env var priority order', () => {

@@ -10,8 +10,8 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
-import { auditPairs } from '../scripts/audit_refined.mjs'
-import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
+import { auditPairs, annotateFile, annotateAnchorsFile } from '../scripts/audit_refined.mjs'
+import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
 import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
@@ -19,6 +19,14 @@ import { writeRunArtifacts } from './artifacts.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
+
+export class JobConfigError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'JobConfigError'
+    this.code = 'CONFIG_ERROR'
+  }
+}
 
 export function loadDotEnv(filePath = path.join(REPO_ROOT, '.env'), env = process.env) {
   if (!fs.existsSync(filePath)) return false
@@ -159,11 +167,35 @@ export function persistGlossary(result, glossaryPath) {
   return false
 }
 
-// One-call run used by the web server. `files` are uploads: [{ name, base64 }] (raw bytes,
-// any type — docx/pdf converted via markitdown). onPhase/onLog stream progress.
-export async function runJob(params, { onPhase, onLog } = {}) {
+async function prepareInputFile(f, { topic, date, headingPolicy, outputDir, uploadDir, convertedDir }) {
+  if (f && typeof f.path === 'string' && f.path.trim()) {
+    const src = path.resolve(f.path)
+    if (!fs.existsSync(src)) throw new JobConfigError(`找不到文件 ${src}`)
+    try {
+      return await prepareFile(src, { topic, date, headingPolicy, outputDir, workDir: convertedDir })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  if (f && typeof f.name === 'string' && f.name.trim()) {
+    fs.mkdirSync(uploadDir, { recursive: true })
+    const src = path.join(uploadDir, path.basename(f.name))
+    fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
+    try {
+      return await prepareFile(src, { topic, date, headingPolicy, outputDir, workDir: uploadDir })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  return null
+}
+
+// One-call run used by the web server and CLI. `files` may be filesystem entries
+// [{ path }] or uploads [{ name, base64 }]. onPhase/onLog stream progress.
+export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedMs = Date.now()
   const startedAt = new Date(startedMs).toISOString()
+  const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
     provider = 'anthropic', apiKey, baseURL, tavilyKey,
     files = [], topic = 'untitled', date = '', background = '',
@@ -171,46 +203,76 @@ export async function runJob(params, { onPhase, onLog } = {}) {
     models, outputDir, fresh = false, concurrency,
     skillDir,
   } = params
-  if (!files.length) throw new Error('未提供任何文件')
+  if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
-  const workDir = path.join(outDir, '.uploads')
-  fs.mkdirSync(workDir, { recursive: true })
+  const uploadDir = path.join(outDir, '.uploads')
+  const convertedDir = path.join(outDir, '.converted')
+  const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
+
+  if (!fs.existsSync(path.join(resolvedSkillDir, 'references', 'deliverables.md'))) {
+    notice(`警告：${resolvedSkillDir}/references/deliverables.md 不存在——总结/时间线/逻辑稿的结构模板将读不到。用 --skill-dir 指向含 references/ 的目录。`)
+  }
 
   // 1. materialize uploads to disk, then prepare each
   const fileEntries = []
   const warnings = []
   for (const f of files) {
-    if (!f || !f.name) continue
-    const src = path.join(workDir, path.basename(f.name))
-    fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
-    const { entry, headingWarning } = await prepareFile(src, { topic, date, headingPolicy, outputDir: outDir, workDir })
+    const prepared = await prepareInputFile(f, { topic, date, headingPolicy, outputDir: outDir, uploadDir, convertedDir })
+    if (!prepared) continue
+    const { entry, headingWarning } = prepared
     if (headingWarning) warnings.push(headingWarning)
+    if (headingWarning) notice(`提示：${headingWarning}`)
     fileEntries.push(entry)
   }
 
   // 2. prior glossary (persistent per-company校对表)
   const glossaryPath = path.join(outDir, '校对表.md')
   let priorGlossaryText
-  if (!fresh && fs.existsSync(glossaryPath)) priorGlossaryText = fs.readFileSync(glossaryPath, 'utf8')
+  if (!fresh && fs.existsSync(glossaryPath)) {
+    priorGlossaryText = fs.readFileSync(glossaryPath, 'utf8')
+    notice(`沿用既有校对表：${glossaryPath}`)
+  }
 
   // 3. engine. Three modes: an injected engine (tests), per-category routing (web UI's
   //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
   //    run from the web category's key (or the top-level tavilyKey).
   const categories = params.categories
-  const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
   const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY
   if (webTavily) process.env.TAVILY_API_KEY = webTavily
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
-  else if (categories) sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
-  else sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
+  else if (categories) {
+    try {
+      sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  } else {
+    try {
+      sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  if (sel.provider !== 'anthropic' && sel.provider !== 'injected' && sel.provider !== 'router') {
+    notice(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
+    if (sel.info.note) notice(`注意：${sel.info.note}`)
+    const jn = jurisdictionNote(sel.provider)
+    if (jn) notice(`⚠ ${jn}`)
+    if (!process.env.TAVILY_API_KEY && (scope.includes('timeline') || verifyDepth !== 'none')) {
+      notice('提示：未设 TAVILY_API_KEY——非 anthropic provider 的联网核实/时间线将降级（refine 不受影响）。')
+    }
+  }
+  notice(`
+开始：${fileEntries.length} 份文件 · scope=${scope.join(',')} · verify=${verifyDepth} · 输出 ${outDir}
+`)
 
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, priorGlossaryText, fresh, files: fileEntries,
+    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, priorGlossaryText, fresh, annotate: params.annotate, files: fileEntries,
   }
 
   try {
@@ -220,14 +282,41 @@ export async function runJob(params, { onPhase, onLog } = {}) {
     // source-aware quality audit: compare each refined transcript against its source (refine scope)
     const auditList = r.error ? [] : fileEntries.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
     const audit = auditList.length ? auditPairs(auditList) : null
+    // Content-gap annotation: insert visible 内容缺口 markers into the 成稿 for HARD gaps (a substantial
+    // source stretch the audit found missing with no fold trace — the silent-omission/censorship failure),
+    // so readers of the document can SEE that something was dropped and where to find it in the source.
+    // Default on; params.annotate === false disables. Idempotent (overlap-checked), so re-runs are safe.
+    // Runs necessarily after deliverables (the pipeline sandbox has no fs) — review.md notes they predate markers.
+    const annotations = []
+    if (audit && params.annotate !== false) {
+      audit.files.forEach((f, i) => {
+        if ((f.gaps || []).some((g) => g.severity === 'hard')) {
+          const a = annotateFile(auditList[i].refinedPath, f.gaps)
+          if (a.inserted.length) annotations.push(a)
+        }
+      })
+    }
+    // Source anchors: after gap annotation, each 成稿's ## sections get an invisible
+    // <!-- 源 L…-L… · 时间-时间 --> comment — provenance from any quote back to the source lines
+    // and the recording timestamp. Deterministic + idempotent; params.anchors === false disables.
+    const anchors = []
+    if (params.anchors !== false) {
+      for (const p of auditList) {
+        const a = annotateAnchorsFile(p.sourcePath, p.refinedPath)
+        if (a.updated.length) anchors.push(a)
+      }
+      if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
+    }
     const finishedMs = Date.now()
-    const result = { ...r, audit, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    const finishedAt = new Date(finishedMs).toISOString()
+    const durationMs = finishedMs - startedMs
+    const result = { ...r, audit, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
       startedAt,
-      finishedAt: new Date(finishedMs).toISOString(),
-      durationMs: finishedMs - startedMs,
+      finishedAt,
+      durationMs,
       provider: sel.provider,
       providerInfo: sel.info,
       warnings,

@@ -16,6 +16,7 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { runJob, PROVIDERS, PROVIDER_NAMES } from './jobs.js'
+import { jurisdictionNote } from '../engines/providers.js'
 import { CATEGORIES } from '../engines/router.js'
 import { getIndexHtml } from './assets.js'
 
@@ -138,7 +139,7 @@ function rememberOpenable(openablePaths, result) {
 // suggest tool-capable model ids; `nativeSearch` flags whether the provider can do web
 // search itself — used for the 联网搜索 hint.
 const rawProviderMeta = [
-  { name: 'anthropic', label: 'Anthropic', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '自带联网搜索。', nativeSearch: true, models: ANTHROPIC_MODELS, modelNote: '' },
+  { name: 'anthropic', label: 'Anthropic', keyEnv: ['ANTHROPIC_API_KEY'], baseURL: '', note: '自带联网搜索。', nativeSearch: true, models: ANTHROPIC_MODELS, modelNote: '', jurisdiction: 'US', riskNote: '' },
   ...PROVIDER_NAMES.map((n) => {
     const ui = {
       deepseek: { note: '精校可用；联网核实需 Tavily。', modelNote: '避免 thinking / reasoner 模型，工具调用会受限。' },
@@ -146,7 +147,7 @@ const rawProviderMeta = [
       kimi: { note: '自带联网搜索；.ai / .cn key 不通用。', modelNote: '' },
       openai: { note: '精校可用；联网核实需 Tavily。', modelNote: '' },
     }[n] || {}
-    return { name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: ui.note || PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: ui.modelNote || '' }
+    return { name: n, label: PROVIDERS[n].label, keyEnv: PROVIDERS[n].keyEnv, baseURL: PROVIDERS[n].baseURL, altBaseURL: PROVIDERS[n].altBaseURL || '', note: ui.note || PROVIDERS[n].note || '', nativeSearch: !!PROVIDERS[n].nativeSearch, models: PROVIDERS[n].models, modelNote: ui.modelNote || '', jurisdiction: PROVIDERS[n].jurisdiction || '', riskNote: jurisdictionNote(n) }
   }),
 ]
 
@@ -233,13 +234,24 @@ function pickModel(provider, role, entries, fallback) {
   return (ranked[0] && ranked[0].id) || fallback || (entries[0] && entries[0].id)
 }
 
+// The smart category (精校与总结) must never default to the cheapest tier — cheap models
+// over-compress long transcripts in the refine stage. If the provider registry's `opus`
+// (strong chat tier) id is present in the live/fallback catalog, use it verbatim; that's
+// authoritative over the heuristic score. Otherwise fall back to the heuristic 'smart' pick,
+// which is already biased away from the 'cheap' role's picks.
+function pickSmartModel(provider, entries, fallbackModels, fallbackSmart) {
+  const opusId = fallbackModels.opus
+  if (opusId && entries.some((e) => e.id === opusId)) return opusId
+  return pickModel(provider, 'smart', entries, fallbackSmart)
+}
+
 function costEffectiveDefaults(provider, entries, fallbackModels = {}) {
   const fallbackCheap = fallbackModels.haiku || fallbackModels.sonnet || fallbackModels.opus
   const fallbackBalanced = fallbackModels.sonnet || fallbackCheap
-  const fallbackSmart = fallbackModels.sonnet || fallbackModels.opus || fallbackBalanced
+  const fallbackSmart = fallbackModels.opus || fallbackModels.sonnet || fallbackBalanced
   const cheap = pickModel(provider, 'cheap', entries, fallbackCheap)
   const balanced = pickModel(provider, 'balanced', entries, fallbackBalanced)
-  const smart = pickModel(provider, 'smart', entries, fallbackSmart)
+  const smart = pickSmartModel(provider, entries, fallbackModels, fallbackSmart)
   return {
     stage: {
       scout: cheap,
