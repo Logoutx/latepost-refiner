@@ -233,13 +233,24 @@ function pickModel(provider, role, entries, fallback) {
   return (ranked[0] && ranked[0].id) || fallback || (entries[0] && entries[0].id)
 }
 
+// The smart category (精校与总结) must never default to the cheapest tier — cheap models
+// over-compress long transcripts in the refine stage. If the provider registry's `opus`
+// (strong chat tier) id is present in the live/fallback catalog, use it verbatim; that's
+// authoritative over the heuristic score. Otherwise fall back to the heuristic 'smart' pick,
+// which is already biased away from the 'cheap' role's picks.
+function pickSmartModel(provider, entries, fallbackModels, fallbackSmart) {
+  const opusId = fallbackModels.opus
+  if (opusId && entries.some((e) => e.id === opusId)) return opusId
+  return pickModel(provider, 'smart', entries, fallbackSmart)
+}
+
 function costEffectiveDefaults(provider, entries, fallbackModels = {}) {
   const fallbackCheap = fallbackModels.haiku || fallbackModels.sonnet || fallbackModels.opus
   const fallbackBalanced = fallbackModels.sonnet || fallbackCheap
-  const fallbackSmart = fallbackModels.sonnet || fallbackModels.opus || fallbackBalanced
+  const fallbackSmart = fallbackModels.opus || fallbackModels.sonnet || fallbackBalanced
   const cheap = pickModel(provider, 'cheap', entries, fallbackCheap)
   const balanced = pickModel(provider, 'balanced', entries, fallbackBalanced)
-  const smart = pickModel(provider, 'smart', entries, fallbackSmart)
+  const smart = pickSmartModel(provider, entries, fallbackModels, fallbackSmart)
   return {
     stage: {
       scout: cheap,

@@ -140,8 +140,10 @@ test('fetchProviderModels calls OpenAI-compatible /models and picks cost-effecti
   assert.equal(called.url, 'https://api.openai.com/v1/models')
   assert.equal(called.options.headers.Authorization, 'Bearer sk-test')
   assert.deepEqual(result.models.map((m) => m.id), ['gpt-5.5', 'gpt-5.4-mini'])
-  assert.equal(result.defaults.stage.refine, 'gpt-5.4-mini')
-  assert.equal(result.defaults.category.smart, 'gpt-5.4-mini')
+  // smart (精校与总结) must land on the provider's strong chat tier (opus = gpt-5.5), not the
+  // cheaper gpt-5.4-mini — cheap tiers over-compress long transcripts in the refine stage.
+  assert.equal(result.defaults.stage.refine, 'gpt-5.5')
+  assert.equal(result.defaults.category.smart, 'gpt-5.5')
 })
 
 test('fetchProviderModels uses Anthropic model-list headers', async () => {
@@ -168,7 +170,9 @@ test('fetchProviderModels uses Anthropic model-list headers', async () => {
   assert.equal(called.options.headers['x-api-key'], 'anthropic-key')
   assert.equal(called.options.headers['anthropic-version'], '2023-06-01')
   assert.equal(result.defaults.stage.scout, 'claude-haiku-4-5')
-  assert.equal(result.defaults.stage.refine, 'claude-sonnet-4-6')
+  // smart must be the strong tier (opus = claude-opus-4-8), never the cheaper sonnet pick.
+  assert.equal(result.defaults.stage.refine, 'claude-opus-4-8')
+  assert.equal(result.defaults.category.smart, 'claude-opus-4-8')
 })
 
 test('built-in cost-effective defaults keep cheap GLM flash separate from flashx', async () => {
@@ -176,7 +180,38 @@ test('built-in cost-effective defaults keep cheap GLM flash separate from flashx
 
   assert.equal(result.source, 'fallback')
   assert.equal(result.defaults.stage.scout, 'glm-4.7-flash')
-  assert.equal(result.defaults.stage.refine, 'glm-4.7-flashx')
+  // smart (精校与总结) must never default to the cheapest/flash-class pick when a stronger chat
+  // model (the provider registry's opus tier, glm-5.2) is present in the catalog — this is the
+  // regression this fix targets: 更新默认模型 used to fill smart with the cheapest flash tier.
+  assert.equal(result.defaults.stage.refine, 'glm-5.2')
+  assert.equal(result.defaults.category.smart, 'glm-5.2')
+  assert.notEqual(result.defaults.category.smart, result.defaults.stage.scout)
+})
+
+test('smart-category default picks the stronger chat model over a flash-class model in a live catalog', async () => {
+  // A live/fetched catalog containing both a flash-class model and a stronger chat model: the
+  // smart default must resolve to the stronger one, never the cheapest pick — this is the core
+  // regression check for the 更新默认模型 bug (mixed/按任务分配 mode filled all four categories,
+  // including 精校与总结, with the provider's cheapest flash tier).
+  const result = await fetchProviderModels({
+    provider: 'glm',
+    apiKey: 'test-key',
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        data: [
+          { id: 'glm-4.7-flash', object: 'model' },
+          { id: 'glm-4.7-flashx', object: 'model' },
+          { id: 'glm-5.2', object: 'model' },
+        ],
+      }),
+    }),
+  })
+
+  assert.equal(result.source, 'provider')
+  assert.equal(result.defaults.category.mechanical, 'glm-4.7-flash')
+  assert.equal(result.defaults.category.smart, 'glm-5.2')
+  assert.notEqual(result.defaults.category.smart, result.defaults.category.mechanical)
 })
 
 test('API exposes protected model catalog without leaking keys', async () => {
