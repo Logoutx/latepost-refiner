@@ -17,7 +17,7 @@ import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY } from '../core/spec.js'
 import { selectEngine, prepareFile, buildFilePolicy, cleanupRefineParts } from './jobs.js'
 import { writeRunArtifacts } from './artifacts.js'
-import { auditPairs } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile } from '../scripts/audit_refined.mjs'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -30,7 +30,7 @@ const REPO_ROOT = path.resolve(__dirname, '..')
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
@@ -90,6 +90,7 @@ async function main() {
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
   --fresh                忽略既有 校对表.md，从零重建
+  --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
 
 模型来源:
   --provider <名>        anthropic（默认）| deepseek | glm | kimi | openai
@@ -146,6 +147,7 @@ async function main() {
     chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,   // speed = split big files into parallel chunks; else single agent/file
     priorGlossaryText,
     fresh: !!a.fresh,
+    annotate: a.noAnnotate ? false : undefined,   // default on: hard content gaps get visible in-document markers
     files,
   }
 
@@ -199,6 +201,21 @@ async function main() {
     result.audit = auditPairs(auditList)
     const bad = result.audit.files.filter((f) => f.status === 'fail')
     if (bad.length) console.error(`\n⚠ 成稿质量抽查未过 ${bad.length} 份：` + bad.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
+    // Hard content gaps (a substantial source stretch missing with no fold trace — silent omission,
+    // possibly a model content-policy pass): insert visible 内容缺口 markers so readers can see it.
+    // Default on; --no-annotate disables. Idempotent, safe on re-runs.
+    result.annotations = []
+    if (A.annotate !== false) {
+      result.audit.files.forEach((f, i) => {
+        if ((f.gaps || []).some((g) => g.severity === 'hard')) {
+          const an = annotateFile(auditList[i].refinedPath, f.gaps)
+          if (an.inserted.length) {
+            result.annotations.push(an)
+            console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或换 provider 重精校该段')
+          }
+        }
+      })
+    }
   }
   const artifacts = writeRunArtifacts(result, { A, outputDir, startedAt, finishedAt, durationMs, provider: sel.provider, providerInfo: sel.info, warnings, usage })
 

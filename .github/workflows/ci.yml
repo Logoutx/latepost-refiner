@@ -48,6 +48,10 @@ jobs:
       - name: Check generated workflow drift
         run: git diff --exit-code claude-code-skill/workflow.js
 
+      # audit_refined.mjs is manually copied into the skill bundle (no build step) — fail on drift.
+      - name: Check audit script copies in sync
+        run: cmp scripts/audit_refined.mjs claude-code-skill/audit_refined.mjs
+
   package:
     name: Package skill zip
     needs: verify

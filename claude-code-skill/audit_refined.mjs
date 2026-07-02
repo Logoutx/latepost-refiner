@@ -61,7 +61,7 @@ function emptyCount(text) {
 }
 
 // Ordered speaker identifiers from either format: source "**发言人 1 …**" or
-// refined "老夏：/记者：". Headings/quotes/tables are skipped.
+// refined "李某：/记者：". Headings/quotes/tables are skipped.
 function speakerSeq(text) {
   const ids = []
   for (const raw of text.split(/\r?\n/)) {
@@ -69,6 +69,9 @@ function speakerSeq(text) {
     if (!line) continue
     const src = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)/)
     if (src) { ids.push('S' + src[1]); continue }
+    // bare name+timestamp label line (`李某 15:12`) — the common ASR export format
+    const ts = line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+\d{1,2}:\d{2}(?::\d{2})?\s*\*{0,2}$/)
+    if (ts) { ids.push('T' + ts[1]); continue }
     if (/^[#*>|]/.test(line)) continue
     const ref = line.match(/^([一-龥A-Za-z][^：:\s]{0,7})[：:]/)
     if (ref) { ids.push('R' + ref[1]) }
@@ -95,6 +98,295 @@ function endingCovered(sourceText, refinedText) {
     if (refHan.includes(tail.slice(i, i + 4))) return true
   }
   return false
+}
+
+// ===== Content-gap detection (coverage scan) =====
+// Detects source sections that never made it into the refined output — the silent-omission failure
+// (observed live: a model content-policy pass dropped a contiguous ~1500-字 segment mid-file; the global
+// charRatio said "something is missing" but couldn't say WHERE). Pure JS, zero model calls, position-
+// independent (immune to section reordering), and it does NOT trust the possibly-censoring model to
+// self-report. Legitimate refine operations must not hard-flag: filler deletion, same-speaker merging,
+// 汉字数字→阿拉伯 conversion, global ASR-spelling correction, and noise folded into a stage direction.
+export const COVERAGE = {
+  MIN_SUBSTANTIVE_CHARS: 20, // normalized 汉字 per turn to count as substantive
+  SHINGLE_LEN: 6,            // normalized-hanzi window per anchor
+  SHINGLES_MIN: 3, SHINGLES_MAX: 8, SHINGLE_PER_CHARS: 80, // per-turn count = clamp(3, ceil(len/80), 8)
+  SHINGLE_SPACING: 24,       // min normalized-char distance between a turn's selected shingles
+  GAP_HARD_CHARS: 400, GAP_HARD_TURNS: 3,  // hard requires BOTH, and no fold trace between the anchors
+  GAP_SOFT_CHARS: 150, GAP_SOFT_TURNS: 2,  // soft: run ≥ 2 turns & ≥ 150 字
+  GAP_SINGLE_TURN_SOFT: 300,               // …or a single lost turn ≥ 300 字
+  LOST_RATIO_SOFT: 0.15,                   // global scattered-loss signal
+  // Rare-bigram-bag fallback (see bagMatch), calibrated on real pairs. Contiguous shingles alone
+  // false-flagged known-good outputs whose content survived but was reworded (修语序 / 合并语义重复);
+  // single-CHAR bags then matched even truly censored turns against kept same-topic sections. Bigrams
+  // thread the needle: rewording keeps words intact (within-word bigrams survive a faithful retelling),
+  // while topic-cousin turns share far fewer exact bigrams than characters.
+  BAG_GRAMS: 10, BAG_MIN_FRACTION: 0.6, BAG_WIN_MIN: 80, BAG_WIN_PER_CHAR: 1.5, BAG_WIN_MAX: 400,
+}
+// Stripped from BOTH sides before matching (refine deletes these; symmetric corruption inside real
+// words is harmless because the normalized text is only ever used for substring matching, never shown).
+const FILLER_RE = /嗯|呃|啊|哦|欸|那个|这个|就是|然后/g
+// Shingle windows containing number-ish chars are excluded: RULES 10 converts 汉字数字→阿拉伯 (十六个→16 个),
+// which would break the anchor even though the content survived.
+const NUMBERISH_RE = /[0-9A-Za-z〇一二三四五六七八九十百千万亿两]/
+// Fold trace: a cooperative refine that collapses a stretch leaves a visible residue — a stage-direction
+// line, a 从略-style note, or a marker. Censorship leaves none. Its presence caps a gap's severity at soft.
+const FOLD_TRACE_RE = /^（[^（）]{2,60}）$|从略|寒暄|闲聊|客套/
+// L3 deterministic marker (also parsed back for overlap-idempotency).
+const GAP_MARKER_RE = /【内容缺口：源文件第\s*(\d+)\s*[-–—~至]\s*(\d+)\s*行/
+// L1 model self-report marker — detected leniently (models paraphrase); line numbers inside are NOT trusted.
+const MODEL_MARKER_RE = /[⚠!！]?\s*[【\[]?未精校段/
+
+// Parse the SOURCE transcript into ordered speaker turns with line ranges. Recognizes the three label
+// shapes seen in real transcripts: `**发言人 1 00:03:22**` (bold, optional trailing timestamp, label-only
+// line), `名字 15:12` (bare name+timestamp line, optional bold/trailing spaces), and inline `名字：内容`.
+// Zero turns parsed → caller treats coverage as not assessable (never a gate), same leniency contract as
+// endingCovered.
+export function parseSourceTurns(sourceText) {
+  const turns = []
+  let cur = null
+  const lines = sourceText.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNo = i + 1
+    const line = lines[i].trim()
+    if (!line) continue
+    const a = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\s*\*{0,2}$/)
+    const b = a ? null : line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+\d{1,2}:\d{2}(?::\d{2})?\s*\*{0,2}$/)
+    if (a || b) {
+      if (cur) turns.push(cur)
+      cur = { speaker: a ? '发言人' + a[1] : b[1], startLine: lineNo, endLine: lineNo, text: '' }
+      continue
+    }
+    if (/^[#*>|]/.test(line)) continue
+    const c = line.match(/^([一-龥A-Za-z][^：:\s]{0,7})[：:]\s*(.*)$/)
+    if (c) {
+      if (cur) turns.push(cur)
+      cur = { speaker: c[1], startLine: lineNo, endLine: lineNo, text: c[2] || '' }
+      continue
+    }
+    if (cur) { cur.text += (cur.text ? '\n' : '') + line; cur.endLine = lineNo }
+  }
+  if (cur) turns.push(cur)
+  return turns
+}
+
+// Normalize to hanzi-only with filler stripped, keeping a norm-index → 1-based raw line map
+// (the map is what lets a detected gap be turned into an insertion point in the raw file).
+export function normalizeWithMap(text) {
+  const chars = []
+  const lineOfAll = []
+  let line = 1
+  for (const ch of text) {
+    if (ch === '\n') { line += 1; continue }
+    if (/[一-龥]/.test(ch)) { chars.push(ch); lineOfAll.push(line) }
+  }
+  const joined = chars.join('')
+  const drop = new Array(joined.length).fill(false)
+  for (const m of joined.matchAll(FILLER_RE)) {
+    for (let k = 0; k < m[0].length; k += 1) drop[(m.index ?? 0) + k] = true
+  }
+  let norm = ''
+  const lineOf = []
+  for (let k = 0; k < joined.length; k += 1) {
+    if (!drop[k]) { norm += joined[k]; lineOf.push(lineOfAll[k]) }
+  }
+  return { norm, lineOf }
+}
+const normalize = (text) => normalizeWithMap(text).norm
+
+// Select anchor shingles for one normalized turn. "Rarest 6-gram" degenerates on a long document
+// (almost every 6-gram is unique) and biases toward mis-heard names — the very strings the refine
+// corrects — so instead: score windows by summed per-character rarity, enforce positional spacing so
+// the picks spread across the turn, and exclude number-ish windows (broken by 数字 conversion) unless
+// the turn offers too few alternatives. Any-of-N matching then survives one spelling correction.
+export function pickShingles(normTurn, rarity) {
+  const L = COVERAGE.SHINGLE_LEN
+  if (normTurn.length < L) return []
+  const want = Math.min(COVERAGE.SHINGLES_MAX, Math.max(COVERAGE.SHINGLES_MIN, Math.ceil(normTurn.length / COVERAGE.SHINGLE_PER_CHARS)))
+  const score = (w) => { let s = 0; for (const ch of w) s += rarity.get(ch) || 0; return s }
+  const clean = [], numberish = []
+  for (let i = 0; i + L <= normTurn.length; i += 1) {
+    const w = normTurn.slice(i, i + L)
+    ;(NUMBERISH_RE.test(w) ? numberish : clean).push({ i, w, s: score(w) })
+  }
+  const pick = (cands, picked) => {
+    for (const c of cands.sort((x, y) => y.s - x.s)) {
+      if (picked.length >= want) break
+      if (picked.every((p) => Math.abs(p.i - c.i) >= COVERAGE.SHINGLE_SPACING)) picked.push(c)
+    }
+    return picked
+  }
+  let picked = pick(clean, [])
+  if (picked.length < COVERAGE.SHINGLES_MIN) picked = pick(numberish, picked) // fallback: number-dense turn
+  return picked.sort((x, y) => x.i - y.i).map((p) => p.w)
+}
+
+// Fallback matcher for reworded-but-present turns. A faithful refine 修语序 / merges semantic repeats /
+// corrects spellings — all of which break contiguous 6-char shingles — but WORDS survive a faithful
+// retelling, so the turn's rare within-word BIGRAMS do too. Found when ≥ BAG_MIN_FRACTION of the turn's
+// rarest distinct bigrams co-occur inside one bounded window of the refined text (sliding window over
+// merged position lists, O(k log k)). A truly deleted turn's bigrams may appear scattered in a long
+// document, but not co-located; and unlike single chars, they don't false-match kept same-topic sections.
+function bagMatch(turnNorm, rarity, refPositions) {
+  const cand = new Map() // bigram → rarity score (number-ish grams excluded — 数字 conversion breaks them)
+  for (let i = 0; i + 2 <= turnNorm.length; i += 1) {
+    const g = turnNorm.slice(i, i + 2)
+    if (NUMBERISH_RE.test(g) || cand.has(g)) continue
+    cand.set(g, (rarity.get(g[0]) || 0) + (rarity.get(g[1]) || 0))
+  }
+  const picked = Array.from(cand.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, COVERAGE.BAG_GRAMS)
+    .map(([g]) => g)
+  if (picked.length < 4) return null
+  const need = Math.ceil(picked.length * COVERAGE.BAG_MIN_FRACTION)
+  const W = Math.min(COVERAGE.BAG_WIN_MAX, Math.max(COVERAGE.BAG_WIN_MIN, Math.round(turnNorm.length * COVERAGE.BAG_WIN_PER_CHAR)))
+  const events = []
+  picked.forEach((ch, ci) => { for (const p of refPositions.get(ch) || []) events.push([p, ci]) })
+  if (events.length < need) return null
+  events.sort((a, b) => a[0] - b[0])
+  const count = new Array(picked.length).fill(0)
+  let distinctIn = 0
+  let lo = 0
+  for (let hi = 0; hi < events.length; hi += 1) {
+    const [p, ci] = events[hi]
+    if (count[ci] === 0) distinctIn += 1
+    count[ci] += 1
+    while (events[lo][0] < p - W) { const cj = events[lo][1]; count[cj] -= 1; if (count[cj] === 0) distinctIn -= 1; lo += 1 }
+    if (distinctIn >= need) return { normIdx: events[lo][0] }
+  }
+  return null
+}
+
+// The scan: which substantive source turns never surface in the refined text, grouped into gaps.
+export function scanCoverage(sourceText, refinedText) {
+  const turns = parseSourceTurns(sourceText)
+  const empty = { assessed: false, turnsTotal: turns.length, turnsSubstantive: 0, turnsLost: 0, lostChars: 0, lostRatio: 0, modelMarkers: [], gaps: [] }
+  if (!turns.length) return empty
+  const subs = turns
+    .map((t) => ({ ...t, norm: normalize(t.text) }))
+    .filter((t) => t.norm.length >= COVERAGE.MIN_SUBSTANTIVE_CHARS)
+  if (!subs.length) return empty
+  // char rarity over the source's substantive text
+  const freq = new Map()
+  let total = 0
+  for (const t of subs) for (const ch of t.norm) { freq.set(ch, (freq.get(ch) || 0) + 1); total += 1 }
+  const rarity = new Map()
+  for (const [ch, n] of freq) rarity.set(ch, Math.log(total / n))
+  const ref = normalizeWithMap(refinedText)
+  const refLines = refinedText.split(/\r?\n/)
+  // bigram → sorted positions in the refined norm (for the bag-match fallback)
+  const refPositions = new Map()
+  for (let i = 0; i + 2 <= ref.norm.length; i += 1) {
+    const g = ref.norm.slice(i, i + 2)
+    let arr = refPositions.get(g)
+    if (!arr) { arr = []; refPositions.set(g, arr) }
+    arr.push(i)
+  }
+  // per-turn lookup; record an anchor (norm index + raw line) for found turns.
+  // Contiguous shingles first (precise, cheap); rare-char-bag fallback for reworded-but-present turns.
+  const lineAt = (idx) => ref.lineOf[Math.min(Math.max(idx, 0), ref.lineOf.length - 1)] || 1
+  for (const t of subs) {
+    t.found = false
+    for (const w of pickShingles(t.norm, rarity)) {
+      const idx = ref.norm.indexOf(w)
+      if (idx >= 0) { t.found = true; t.anchor = { normIdx: idx, line: lineAt(idx + w.length - 1) }; break }
+    }
+    if (!t.found) {
+      const m = bagMatch(t.norm, rarity, refPositions)
+      if (m) { t.found = true; t.anchor = { normIdx: m.normIdx, line: lineAt(m.normIdx) } }
+    }
+  }
+  const modelMarkers = []
+  refLines.forEach((l, i) => { if (MODEL_MARKER_RE.test(l)) modelMarkers.push({ line: i + 1, text: l.trim().slice(0, 80) }) })
+  // group consecutive lost substantive turns into gaps
+  const gaps = []
+  let run = []
+  const flush = () => {
+    if (!run.length) return
+    const chars = run.reduce((s, t) => s + t.norm.length, 0)
+    const kFirst = subs.indexOf(run[0]); const kLast = subs.indexOf(run[run.length - 1])
+    const pre = kFirst > 0 ? subs[kFirst - 1].anchor || null : null
+    const post = kLast < subs.length - 1 ? subs[kLast + 1].anchor || null : null
+    // fold trace: any residue line in the refined stretch between the bracketing anchors
+    const lo = pre ? pre.line : 1
+    const hi = post ? Math.max(post.line, lo) : refLines.length
+    let trace = false
+    for (let i = Math.min(lo, hi) - 1; i < Math.max(lo, hi) && i < refLines.length; i += 1) {
+      const l = refLines[i].trim()
+      if (l && (FOLD_TRACE_RE.test(l) || GAP_MARKER_RE.test(l) || MODEL_MARKER_RE.test(l))) { trace = true; break }
+    }
+    const hard = run.length >= COVERAGE.GAP_HARD_TURNS && chars >= COVERAGE.GAP_HARD_CHARS && !trace
+    const soft = (run.length >= COVERAGE.GAP_SOFT_TURNS && chars >= COVERAGE.GAP_SOFT_CHARS)
+      || (run.length === 1 && chars >= COVERAGE.GAP_SINGLE_TURN_SOFT)
+    if (hard || soft) {
+      gaps.push({
+        startLine: run[0].startLine, endLine: run[run.length - 1].endLine,
+        turns: run.length, chars, severity: hard ? 'hard' : 'soft', trace,
+        firstText: run[0].text.replace(/\s+/g, ' ').slice(0, 40), lastText: run[run.length - 1].text.replace(/\s+/g, ' ').slice(0, 40),
+        preAnchor: pre, postAnchor: post,
+      })
+    }
+    run = []
+  }
+  for (const t of subs) { if (t.found) flush(); else run.push(t) }
+  flush()
+  const lostChars = subs.filter((t) => !t.found).reduce((s, t) => s + t.norm.length, 0)
+  const totalChars = subs.reduce((s, t) => s + t.norm.length, 0)
+  return {
+    assessed: true,
+    turnsTotal: turns.length,
+    turnsSubstantive: subs.length,
+    turnsLost: subs.filter((t) => !t.found).length,
+    lostChars,
+    lostRatio: totalChars ? Number((lostChars / totalChars).toFixed(3)) : 0,
+    modelMarkers,
+    gaps,
+  }
+}
+
+// Insert deterministic 内容缺口 markers into the refined text — HARD gaps only (soft = traced folds or
+// small losses; writing markers for those would pollute archive documents — they surface in the report
+// instead). Insertion goes after the END of the paragraph containing the pre-gap anchor (never
+// mid-paragraph); a file-start gap goes after the H1/subtitle block; no anchors at all → append at EOF.
+// Idempotent by range-OVERLAP with existing markers (a re-run detecting 300–425 must not double-mark
+// 301–423). Preserves CRLF. Pure — annotateFile is the fs wrapper.
+export function annotateGaps(refinedText, gaps) {
+  const eol = /\r\n/.test(refinedText) ? '\r\n' : '\n'
+  const lines = refinedText.split(/\r?\n/)
+  const existing = []
+  for (const l of lines) { const m = l.match(GAP_MARKER_RE); if (m) existing.push([Number(m[1]), Number(m[2])]) }
+  const inserted = [], skipped = []
+  const jobs = []
+  for (const g of gaps || []) {
+    if (g.severity !== 'hard') { skipped.push({ gap: g, reason: 'soft' }); continue }
+    if (existing.some(([a, b]) => g.startLine <= b && g.endLine >= a)) { skipped.push({ gap: g, reason: 'already-marked' }); continue }
+    let at // 0-based line index to insert AFTER
+    if (g.preAnchor) {
+      at = g.preAnchor.line - 1
+      while (at + 1 < lines.length && lines[at + 1].trim()) at += 1 // extend to end of paragraph
+    } else {
+      at = -1 // top-of-file: skip the leading H1 / subtitle / blank block
+      while (at + 1 < lines.length && (/^#|^\*[^*].*\*$|^\s*$/.test(lines[at + 1]) || !lines[at + 1].trim())) at += 1
+      if (at >= lines.length - 1) at = lines.length - 1
+    }
+    if (!g.preAnchor && !g.postAnchor) at = lines.length - 1 // nothing to anchor on → EOF
+    const marker = `> ⚠【内容缺口：源文件第 ${g.startLine}-${g.endLine} 行，约 ${g.chars} 字未出现在成稿中——可能为模型内容策略略过或处理遗漏，请对照源文件人工补回】`
+    jobs.push({ at, marker, gap: g })
+  }
+  // apply bottom-up so earlier insertions don't shift later indices
+  for (const j of jobs.sort((x, y) => y.at - x.at)) {
+    lines.splice(j.at + 1, 0, '', j.marker)
+    inserted.push(j.gap)
+  }
+  return { text: lines.join(eol), inserted, skipped }
+}
+
+export function annotateFile(refinedPath, gaps) {
+  const before = fs.readFileSync(refinedPath, 'utf8')
+  const r = annotateGaps(before, gaps)
+  if (r.inserted.length) fs.writeFileSync(refinedPath, r.text)
+  return { path: path.resolve(refinedPath), inserted: r.inserted, skipped: r.skipped }
 }
 
 export function auditText(text, file = '<text>') {
@@ -145,11 +437,14 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   const emptyReduction = sEmptyDensity ? Number((1 - rEmptyDensity / sEmptyDensity).toFixed(3)) : 0
   const ending = endingCovered(sourceText, refinedText)
 
+  const coverage = scanCoverage(sourceText, refinedText)
+
   const metrics = {
     sourceChars: sChars, refinedChars: rChars, charRatio,
     sourceTurns: sTurns, refinedTurns: rTurns, speakerTurnRatio, // turnRatio is confirming-only, never an independent gate
     sourceEmptyDensity: Number(sEmptyDensity.toFixed(4)), refinedEmptyDensity: Number(rEmptyDensity.toFixed(4)), emptyReduction,
     endingCovered: ending,
+    coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
   }
 
   const gates = {
@@ -160,9 +455,19 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     gates.compression_risk = charRatio < REFINE_GATES.CHAR_RATIO_MIN
     gates.under_refined = sEmptyDensity > REFINE_GATES.SOURCE_FILLER_DENSITY && emptyReduction < REFINE_GATES.EMPTY_REDUCTION_MIN
     gates.ending_missing = !ending
+    // content_gap: a substantial contiguous source stretch never surfaced in the refined text and left
+    // no fold trace — the silent-omission (possible censorship) failure. Soft gaps and scattered loss
+    // are reported as findings below, never gates.
+    gates.content_gap = coverage.assessed && coverage.gaps.some((g) => g.severity === 'hard')
   }
   const failed = Object.keys(gates).filter((k) => gates[k])
-  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings: out.findings }
+  const findings = out.findings.concat([
+    { name: 'content_gap_soft', severity: 'soft', count: coverage.gaps.filter((g) => g.severity === 'soft').length, samples: coverage.gaps.filter((g) => g.severity === 'soft').slice(0, 12).map((g) => ({ text: `第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字${g.trace ? '（有折叠痕迹）' : ''}`, line: g.startLine })) },
+    { name: 'model_marker', severity: 'soft', count: coverage.modelMarkers.length, samples: coverage.modelMarkers.slice(0, 12).map((m) => ({ text: m.text, line: m.line })) },
+    ...(coverage.assessed && coverage.lostRatio >= COVERAGE.LOST_RATIO_SOFT
+      ? [{ name: 'scattered_loss', severity: 'soft', count: coverage.turnsLost, samples: [{ text: `实质轮次流失率 ${Math.round(coverage.lostRatio * 100)}%（${coverage.turnsLost}/${coverage.turnsSubstantive} 轮）`, line: 1 }] }] : []),
+  ])
+  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers }
 }
 
 export function auditPairs(pairs) {
@@ -180,11 +485,13 @@ function usage() {
   return `用法:
   node scripts/audit_refined.mjs <精校稿.md> [更多.md...]          # 只查输出干净度
   node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary]
-                                                                  # 对比源文：查压缩/欠精校
+                                                                  # 对比源文：查压缩/欠精校/内容缺口
+  … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
 
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就 等纯噪音；超约 900 字的对话长段。
-对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失。
-soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，以及 那个/这个/就是说 等。`
+对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
+  content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）。
+soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失。`
 }
 
 function getOpt(argv, name) {
@@ -199,6 +506,15 @@ function main() {
   const refined = getOpt(argv, '--refined')
   if (source && refined) {
     const result = auditPairs([{ sourcePath: source, refinedPath: refined, mode: getOpt(argv, '--mode') || 'refine' }])
+    if (argv.includes('--annotate')) {
+      const gaps = result.files[0].gaps || []
+      if (argv.includes('--dry-run')) {
+        const r = annotateGaps(fs.readFileSync(refined, 'utf8'), gaps)
+        result.annotation = { dryRun: true, inserted: r.inserted, skipped: r.skipped }
+      } else {
+        result.annotation = annotateFile(refined, gaps)
+      }
+    }
     console.log(JSON.stringify(result, null, 2))
     return result.status === 'fail' ? 1 : 0
   }

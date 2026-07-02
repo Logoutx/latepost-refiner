@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
-import { auditPairs } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -220,8 +220,22 @@ export async function runJob(params, { onPhase, onLog } = {}) {
     // source-aware quality audit: compare each refined transcript against its source (refine scope)
     const auditList = r.error ? [] : fileEntries.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
     const audit = auditList.length ? auditPairs(auditList) : null
+    // Content-gap annotation: insert visible 内容缺口 markers into the 成稿 for HARD gaps (a substantial
+    // source stretch the audit found missing with no fold trace — the silent-omission/censorship failure),
+    // so readers of the document can SEE that something was dropped and where to find it in the source.
+    // Default on; params.annotate === false disables. Idempotent (overlap-checked), so re-runs are safe.
+    // Runs necessarily after deliverables (the pipeline sandbox has no fs) — review.md notes they predate markers.
+    const annotations = []
+    if (audit && params.annotate !== false) {
+      audit.files.forEach((f, i) => {
+        if ((f.gaps || []).some((g) => g.severity === 'hard')) {
+          const a = annotateFile(auditList[i].refinedPath, f.gaps)
+          if (a.inserted.length) annotations.push(a)
+        }
+      })
+    }
     const finishedMs = Date.now()
-    const result = { ...r, audit, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
+    const result = { ...r, audit, annotations, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage() }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
