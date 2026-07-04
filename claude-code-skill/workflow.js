@@ -1403,7 +1403,7 @@ ${listText}
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
 }
 
-function singlePassPrompt(f, a) {
+function singlePassPrompt(f, a, overrideNote) {
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
@@ -1416,7 +1416,7 @@ ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
 若读全文时发现源文件其实已带（记者/速记的）小标题、而上方又没有【小标题处理】交代——按默认规范精校，但把这一情况写进 open_questions 提醒委托方决定保留还是重做。
-
+${overrideNote ? `\n${overrideNote}\n` : ''}
 ${RULES}
 
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
@@ -1730,10 +1730,35 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   const f = A.files[0]
   engine.phase('Refine')
   engine.log(`▶ 精校 Refine：单份短文件（约 ${refineSize(f)} 字）一遍过，不建独立校对表`)
-  const rep = await engine.agent(singlePassPrompt(f, A), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  // §1 on the one-pass path too: this branch skips scout/merge entirely, so canonicalOverrides has no cluster
+  // list to veto — without this, a user decree was silently dropped (never reached singlePassPrompt, never
+  // reached audit). Route every override through applyOverridesToMerged against an EMPTY bundle: every decree
+  // then hits the documented "matched nothing → still emit a locked cluster" path, so it's guaranteed to
+  // surface here exactly as it would on the multi-file path. Category routing (person/brand/term) is preserved.
+  const lockedClusters = (A.canonicalOverrides && A.canonicalOverrides.length)
+    ? applyOverridesToMerged({ people: [], brands: [], terms: [] }, A.canonicalOverrides)
+    : null
+  const lockedAll = lockedClusters ? [...lockedClusters.people, ...lockedClusters.brands, ...lockedClusters.terms] : []
+  let overrideNote = ''
+  let onePassGlossaryText = null
+  if (lockedAll.length) {
+    engine.log(`用户钦定正名（一遍过分支）：${lockedAll.length} 条已注入 prompt + 最小校对表`)
+    // Prompt injection: same voice as the rest of singlePassPrompt (中文、弯引号、盘古空格).
+    const decreeLines = lockedAll.map((e) => {
+      const variants = (e.variants || []).join(' / ') || '（无变体）'
+      return `- ${variants} 一律写作 **${e.canonical}**`
+    })
+    overrideNote = `【用户钦定正名（必须执行）】以下写法无论源文件里出现哪种口语/变体，精校时一律统一写作钦定正字：\n${decreeLines.join('\n')}`
+    // Minimal glossaryText for the audit gate: hand-rolled `- **正字** ← 变体1 / 变体2` rows in the exact
+    // grammar audit_refined.mjs's parseGlossaryLite recognises (canonical entity line under a 人名/品牌 header),
+    // so ghost_name / missing_yin can catch a decreed variant surviving into the 成稿 on this path too.
+    onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
+      `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
+  }
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '结尾核对待跑' })]
-    refinedPairs = [{ f, rep, anchor: null }]   // completeness check runs in the shared phase below
+    refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]   // completeness check runs in the shared phase below
   } else {
     failed = [f.label]
   }
@@ -1855,7 +1880,11 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
 if (scope.includes('refine') && refinedPairs.length) {
   engine.phase('Audit')
   engine.log(`▶ 审计门禁 Audit：${refinedPairs.length} 份逐份源比对（content_gap / 引号 hard → 自动修复一次 → 复检；仍 hard 记入 auditFailed）`)
-  const results = await engine.parallel(refinedPairs.map(({ f }) => () => runAuditStep(A, engine, f, capabilities, glossary)))
+  // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
+  // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
+  // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
+  // through unchanged.
+  const results = await engine.parallel(refinedPairs.map(({ f, onePassGlossaryText }) => () => runAuditStep(A, engine, f, capabilities, onePassGlossaryText || glossary)))
   refinedPairs.forEach(({ f }, k) => {
     const a = results[k] || { status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0 }
     const r = refined.find((x) => (x.outPath || x.path) === f.outPath)

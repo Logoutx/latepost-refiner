@@ -236,7 +236,7 @@ ${listText}
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
 }
 
-export function singlePassPrompt(f, a) {
+export function singlePassPrompt(f, a, overrideNote) {
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
@@ -249,7 +249,7 @@ ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
 若读全文时发现源文件其实已带（记者/速记的）小标题、而上方又没有【小标题处理】交代——按默认规范精校，但把这一情况写进 open_questions 提醒委托方决定保留还是重做。
-
+${overrideNote ? `\n${overrideNote}\n` : ''}
 ${RULES}
 
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`

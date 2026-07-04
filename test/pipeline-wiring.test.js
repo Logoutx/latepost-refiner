@@ -82,6 +82,60 @@ test('override: excludeVerified via prior confidence coexists with a fresh decre
   assert.ok(/新人/.test(verifyPrompts), 'a genuinely new entity still gets verified')
 })
 
+// ---------- one-pass branch: canonicalOverrides must not be silently dropped ----------
+// The one-pass branch (single short file, refineSize < ONE_PASS_CHARS) skips scout/merge entirely — before this
+// fix, A.canonicalOverrides had no cluster list to attach to and was dropped: singlePassPrompt never mentioned
+// the decree, and the audit gate got no glossaryText (so ghost_name/missing_yin couldn't watch for a variant
+// leaking into the 成稿). Both effects are now covered.
+
+test('one-pass: canonicalOverrides is injected into singlePassPrompt as a 用户钦定 note', async () => {
+  const labels = [], prompts = []
+  const eng = engine(labels, {}, prompts)
+  await runPipeline(A({
+    files: [F({ chars: 1000 })],
+    canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘', '陈涛（同音）'] }],
+  }), eng)
+  const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
+  assert.ok(/用户钦定正名/.test(refinePrompt), 'the prompt carries a 用户钦定 section on the one-pass path')
+  assert.ok(refinePrompt.includes('陈涛') && refinePrompt.includes('陈焘'), 'both canonical and variant are named')
+})
+
+test('one-pass: canonicalOverrides absent leaves singlePassPrompt unchanged (no stray section)', async () => {
+  const labels = [], prompts = []
+  const eng = engine(labels, {}, prompts)
+  await runPipeline(A({ files: [F({ chars: 1000 })] }), eng)
+  const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
+  assert.ok(!/用户钦定正名/.test(refinePrompt), 'no decree section appears when there is no override')
+})
+
+test('one-pass: canonicalOverrides is handed to the audit gate as glossaryText (canonical + variants present)', async () => {
+  const labels = []
+  let seenGlossary = 'unset'
+  const capabilities = {
+    runAudit: (f, opts = {}) => { seenGlossary = opts.glossaryText; return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  await runPipeline(A({
+    files: [F({ chars: 1000 })],
+    capabilities,
+    canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘'] }],
+  }), engine(labels))
+  assert.ok(seenGlossary && typeof seenGlossary === 'string', 'the audit capability received a glossaryText string')
+  assert.ok(seenGlossary.includes('陈涛'), 'the decreed canonical is present')
+  assert.ok(seenGlossary.includes('陈焘'), 'the decreed variant is present (so ghost_name can catch it surviving in prose)')
+})
+
+test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary (unchanged prior behaviour)', async () => {
+  const labels = []
+  let seenGlossary = 'unset'
+  const capabilities = {
+    runAudit: (f, opts = {}) => { seenGlossary = opts.glossaryText; return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  await runPipeline(A({ files: [F({ chars: 1000 })], capabilities }), engine(labels))
+  assert.equal(seenGlossary, null, 'no fake glossary is handed to the audit when there is no override (SINGLE_FILE_GLOSSARY placeholder is never leaked)')
+})
+
 // ---------- §2 in-pipeline audit gate (capability injection) ----------
 
 test('audit gate: content_gap hard → auto-repair → re-audit passes → not auditFailed', async () => {
