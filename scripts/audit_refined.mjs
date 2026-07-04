@@ -60,6 +60,217 @@ function emptyCount(text) {
   return (text.match(EMPTY_PHRASE) || []).length
 }
 
+// ===== Editorial deterministic checks (typesetting / glossary residue) =====
+// These live in the SOURCE-AWARE path (auditPair / auditLogicPair): they enforce editing rules that a
+// prose skill was previously trusted to self-apply — the very rules that produced three different failure
+// pictures across three engines. All soft by default (first version under-reports rather than mis-fires),
+// except the two typesetting rules the spec bans outright (ASCII quotes hugging CJK, 直角引号), which are hard.
+
+const CJK_CHAR = /[一-龥]/                       // same Han range the rest of the file uses ([一-龥])
+const CORNER_QUOTES_RE = /[「」『』]/g              // 直角引号 — banned by the typesetting spec
+const CURLY_QUOTE_RE = /[“”]/                     // full-width curly quote (the ONLY sanctioned form)
+
+// Iterate the refined text as body lines with true 1-based line numbers, skipping regions where a stray
+// quote / colon / label is not prose: YAML front matter, fenced code blocks, HTML comments (可跨行),
+// heading lines, and blockquote/table/list-marker lines. Within each surviving line, inline `code` spans
+// and URLs are blanked to spaces (length-preserving) so their ASCII quotes/colons never trip a check.
+// Returns [{ no, raw, text }] where `text` is the sanitized content (same length as raw).
+function bodyLines(text) {
+  const out = []
+  const lines = String(text || '').split(/\r?\n/)
+  let inFence = false, inComment = false, inFront = false
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i]
+    const trimmed = raw.trim()
+    // YAML front matter: only when the very first line is a lone `---`, until the closing `---`.
+    if (i === 0 && trimmed === '---') { inFront = true; continue }
+    if (inFront) { if (trimmed === '---') inFront = false; continue }
+    // fenced code block toggles on a line whose first non-space token is ``` or ~~~
+    const fence = trimmed.match(/^(```+|~~~+)/)
+    if (fence) { inFence = !inFence; continue }
+    if (inFence) continue
+    // HTML comment regions (may span multiple lines); a line that both opens and closes stays inspectable
+    // for its non-comment remainder.
+    let line = raw
+    if (inComment) {
+      const end = line.indexOf('-->')
+      if (end < 0) continue
+      line = ' '.repeat(end + 3) + line.slice(end + 3)
+      inComment = false
+    }
+    // blank out any complete <!-- ... --> on this line, then detect an unterminated opener
+    line = line.replace(/<!--[\s\S]*?-->/g, (m) => ' '.repeat(m.length))
+    const open = line.indexOf('<!--')
+    if (open >= 0) { inComment = true; line = line.slice(0, open) + ' '.repeat(line.length - open) }
+    if (!line.trim()) continue
+    if (/^\s*[#>|]/.test(line)) continue                 // heading / blockquote / table row → not prose
+    if (/^\s*(?:[-*+]|\d+[.)])\s/.test(line)) continue    // list item marker line (glossary-style rows等)
+    // blank inline code spans, markdown-link target+title segments, and URLs so their inner ASCII quotes/colons
+    // don't fire. SF-4: a link title `[文字](url "中文")` puts ASCII quotes hugging CJK — mask the whole `](...)`
+    // segment (the visible `[文字]` label stays prose). Done before URL masking so the title inside is covered too.
+    line = line.replace(/`[^`]*`/g, (m) => ' '.repeat(m.length))
+    line = line.replace(/\]\([^)]*\)/g, (m) => ' '.repeat(m.length))
+    line = line.replace(/https?:\/\/[^\s]+/g, (m) => ' '.repeat(m.length))
+    out.push({ no: i + 1, raw, text: line })
+  }
+  return out
+}
+
+// quote_style: ASCII "/' hugging a CJK char (hard), 直角引号 (hard), and a low-curly-quote density hint.
+export function checkQuoteStyle(refinedText) {
+  const body = bodyLines(refinedText)
+  const straight = [], corner = []
+  let curly = 0
+  for (const { no, text } of body) {
+    for (let k = 0; k < text.length; k += 1) {
+      const ch = text[k]
+      if (ch === '"' || ch === "'") {
+        const prev = text[k - 1] || '', next = text[k + 1] || ''
+        if (CJK_CHAR.test(prev) || CJK_CHAR.test(next)) straight.push({ text: text.trim().slice(0, 60), line: no })
+      }
+    }
+    for (const _ of text.matchAll(CORNER_QUOTES_RE)) corner.push({ text: text.trim().slice(0, 60), line: no })
+    if (CURLY_QUOTE_RE.test(text)) curly += 1
+  }
+  const findings = [
+    { name: 'quote_style', severity: 'hard', count: straight.length + corner.length,
+      samples: straight.concat(corner).slice(0, 12) },
+  ]
+  // Only when the body is substantial and carries ZERO sanctioned curly quotes do we hint that quoting /
+  // term-marking may have been dropped — a soft nudge, never a gate.
+  if (curly === 0 && body.length >= 200) {
+    findings.push({ name: 'quote_density_low', severity: 'soft', count: 1,
+      samples: [{ text: `成稿 ${body.length} 行正文无一处弯引号 “”——引语/术语可能未标注`, line: body[0].no }] })
+  }
+  return findings
+}
+
+// speaker_label_style: two label shapes — `名字 12:34` (timestamp) and `名字：` (colon). If BOTH shapes
+// each occur ≥3 times, the file mixes label styles → soft, with 2 samples of each shape.
+const LABEL_TS_RE = /^\s*([^\s：:]{1,12})\s+\d{1,2}:\d{2}(?::\d{2})?\s*$/   // name (≤12, no space) + HH:MM(:SS)
+const LABEL_COLON_RE = /^\s*([一-龥A-Za-z0-9·]{1,12})[：:]/                 // name-like token + colon
+export function checkSpeakerLabelStyle(refinedText) {
+  const ts = [], colon = []
+  for (const { no, text } of bodyLines(refinedText)) {
+    if (LABEL_TS_RE.test(text)) { ts.push({ text: text.trim().slice(0, 40), line: no }); continue }
+    if (LABEL_COLON_RE.test(text)) colon.push({ text: text.trim().slice(0, 40), line: no })
+  }
+  if (ts.length >= 3 && colon.length >= 3) {
+    return [{ name: 'speaker_label_style', severity: 'soft', count: ts.length + colon.length,
+      samples: ts.slice(0, 2).concat(colon.slice(0, 2)) }]
+  }
+  return [{ name: 'speaker_label_style', severity: 'soft', count: 0, samples: [] }]
+}
+
+// ---- lightweight glossary parsing (in-file; the real parser in core/spec.js must not be imported) ----
+// Recognizes the 人名 / 品牌 entity rows this repo renders — `- **正字** ← 变体1 / 变体2 ｜ …hint…` — under a
+// section header matching 人名 or 品牌/公司/产品. Also collects names marked unverified: a row whose text
+// carries ⚠ or 未能核实, plus `- query：未能核实，保留（音）` lines from the 联网核实结论 section.
+// Returns { entries: [{ canonical, variants[], section }], unverified: [names] }.
+export function parseGlossaryLite(glossaryText) {
+  const entries = [], unverified = new Set()
+  if (!glossaryText) return { entries, unverified: [] }
+  let inNameOrBrand = false
+  for (const raw of String(glossaryText).split(/\r?\n/)) {
+    const line = raw.trim()
+    const h = line.match(/^#{1,6}\s+(.*)$/)
+    if (h) { inNameOrBrand = /人名|品牌|公司|产品/.test(h[1]); continue }
+    // unverified-by-web line: `- query：未能核实，保留（音）…`
+    const un = line.match(/^-\s*(.+?)：未能核实/)
+    if (un) { const q = un[1].trim(); if (CJK_CHAR.test(q)) unverified.add(q.replace(/\*/g, '')); continue }
+    if (!inNameOrBrand) continue
+    const m = line.match(/^-\s*\*\*(.+?)\*\*\s*←\s*(.*)$/)
+    if (!m) continue
+    const canonical = m[1].trim()
+    const rest = m[2]
+    const fields = rest.split('｜')
+    const varsRaw = (fields.shift() || '').trim()
+    const variants = (varsRaw === '—' || varsRaw === '（无变体）') ? []
+      : varsRaw.split('/').map((x) => x.trim()).filter(Boolean)
+    entries.push({ canonical, variants, section: 'nameOrBrand' })
+    // a suspect/unverified entry (⚠ or 未能核实 anywhere in the row) → its canonical needs a （音） in prose
+    if (/⚠|未能核实/.test(rest)) if (CJK_CHAR.test(canonical)) unverified.add(canonical)
+  }
+  return { entries, unverified: [...unverified] }
+}
+
+const cjkLen = (s) => (String(s).match(CJK_CHAR) ? (s.match(/[一-龥]/g) || []).length : 0)
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// ghost_name: a corrected-away variant (≠ canonical, CJK length ≥2) still present in the refined prose.
+// Overlap guard: when a variant is a substring of its canonical, blank canonical occurrences on the line
+// before searching, so a correct 张伟明 doesn't count as a stray 张伟.
+export function checkGhostName(refinedText, glossary) {
+  const { entries } = glossary || {}
+  const findings = { name: 'ghost_name', severity: 'soft', count: 0, samples: [] }
+  if (!entries || !entries.length) return findings
+  const body = bodyLines(refinedText)
+  const hits = []
+  for (const e of entries) {
+    for (const v of e.variants) {
+      if (v === e.canonical || cjkLen(v) < 2) continue
+      const re = new RegExp(escapeRe(v), 'g')
+      const canonHasV = e.canonical.includes(v)
+      const canonRe = canonHasV ? new RegExp(escapeRe(e.canonical), 'g') : null
+      for (const { no, text } of body) {
+        const scan = canonRe ? text.replace(canonRe, (m) => ' '.repeat(m.length)) : text
+        if (re.test(scan)) { re.lastIndex = 0; hits.push({ text: `${v}（应为 ${e.canonical}）：${text.trim().slice(0, 40)}`, line: no }) }
+        else re.lastIndex = 0
+      }
+    }
+  }
+  findings.count = hits.length
+  findings.samples = hits.slice(0, 12)
+  return findings
+}
+
+// missing_yin: a glossary name flagged ⚠ / 未能核实 appears in prose on a line lacking a （音 annotation.
+export function checkMissingYin(refinedText, glossary) {
+  const names = (glossary && glossary.unverified) || []
+  const findings = { name: 'missing_yin', severity: 'soft', count: 0, samples: [] }
+  if (!names.length) return findings
+  const body = bodyLines(refinedText)
+  const hits = []
+  for (const nm of names) {
+    if (cjkLen(nm) < 2) continue
+    const re = new RegExp(escapeRe(nm), 'g')
+    for (const { no, text } of body) {
+      if (re.test(text) && !/（音/.test(text)) hits.push({ text: `${nm}（未核实、缺（音）标注）：${text.trim().slice(0, 40)}`, line: no })
+      re.lastIndex = 0
+    }
+  }
+  findings.count = hits.length
+  findings.samples = hits.slice(0, 12)
+  return findings
+}
+
+// logic_size_sanity: the logic-ordered draft (逻辑稿) must not balloon past the refined 成稿 (~5-8% 脚手架
+// tolerance → 1.10 cap), and it must not carry duplicated long paragraphs (a reorder-gone-wrong signal).
+export function checkLogicSize(refinedText, logicText) {
+  const rChars = hanzi(refinedText)
+  const lChars = hanzi(logicText)
+  const ratio = rChars ? Number((lChars / rChars).toFixed(3)) : 1
+  const findings = []
+  if (rChars > 0 && lChars > rChars * 1.10) {
+    findings.push({ name: 'logic_size_sanity', severity: 'soft', count: 1,
+      samples: [{ text: `逻辑稿 ${lChars} 字 / 成稿 ${rChars} 字 = ${ratio}×，超 1.10——疑非保序重排而是扩写`, line: 1 }] })
+  } else {
+    findings.push({ name: 'logic_size_sanity', severity: 'soft', count: 0, samples: [] })
+  }
+  // duplicated long lines (≥25 CJK chars, identical trimmed text appearing ≥2 times)
+  const seen = new Map()
+  for (const { no, raw } of bodyLines(logicText)) {
+    const key = raw.trim()
+    if (cjkLen(key) < 25) continue
+    if (!seen.has(key)) seen.set(key, [])
+    seen.get(key).push(no)
+  }
+  const dups = []
+  for (const [key, nos] of seen) if (nos.length >= 2) dups.push({ text: `重复长行（${nos.join(' / ')} 行）：${key.slice(0, 40)}`, line: nos[0] })
+  findings.push({ name: 'logic_duplicate_para', severity: 'soft', count: dups.length, samples: dups.slice(0, 12) })
+  return findings
+}
+
 // Ordered speaker identifiers from either format: source "**发言人 1 …**" or
 // refined "李某：/记者：". Headings/quotes/tables are skipped.
 function speakerSeq(text) {
@@ -386,7 +597,7 @@ export function annotateGaps(refinedText, gaps) {
       if (at >= lines.length - 1) at = lines.length - 1
     }
     if (!g.preAnchor && !g.postAnchor) at = lines.length - 1 // nothing to anchor on → EOF
-    const marker = `> ⚠【内容缺口：源文件第 ${g.startLine}-${g.endLine} 行，约 ${g.chars} 字未出现在成稿中——可能为模型内容策略略过或处理遗漏，请对照源文件人工补回】`
+    const marker = `> ⚠【内容缺口：源文件第 ${g.startLine}-${g.endLine} 行，约 ${g.chars} 字没能出现在成稿里——这段可能在整理时被漏掉了，也可能因内容较敏感被跳过；请对照源文件人工补回这一段。】`
     jobs.push({ at, marker, gap: g })
   }
   // apply bottom-up so earlier insertions don't shift later indices
@@ -518,7 +729,9 @@ export function auditFiles(paths) {
 }
 
 // Source-aware audit: compare refined output against its source transcript.
-export function auditPair({ sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine' }) {
+// glossaryText (optional): a rendered 校对表.md — enables ghost_name / missing_yin. When absent, those
+// two checks are silently skipped (count 0), same leniency contract as the coverage scan.
+export function auditPair({ sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine', glossaryText = null }) {
   const out = auditText(refinedText, refinedFile) // output-only cleanliness (residual noise / long paras)
 
   const sChars = hanzi(sourceText)
@@ -542,9 +755,19 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
   }
 
+  // Editorial deterministic checks (typesetting + glossary residue). quote_style is HARD → it opens its own
+  // gate; the rest are soft findings only. ghost_name/missing_yin need a glossary — parsed leniently here.
+  const glossary = parseGlossaryLite(glossaryText)
+  const quoteFindings = checkQuoteStyle(refinedText)
+  const speakerFindings = checkSpeakerLabelStyle(refinedText)
+  const ghostFinding = checkGhostName(refinedText, glossary)
+  const yinFinding = checkMissingYin(refinedText, glossary)
+  const quoteHard = quoteFindings.find((f) => f.name === 'quote_style')
+
   const gates = {
     residual_noise: out.hard_issues > 0,
     long_paragraphs: (out.long_paragraphs || []).length > 0,
+    quote_style: (quoteHard ? quoteHard.count : 0) > 0,
   }
   if (mode === 'refine') {
     gates.compression_risk = charRatio < REFINE_GATES.CHAR_RATIO_MIN
@@ -561,8 +784,32 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     { name: 'model_marker', severity: 'soft', count: coverage.modelMarkers.length, samples: coverage.modelMarkers.slice(0, 12).map((m) => ({ text: m.text, line: m.line })) },
     ...(coverage.assessed && coverage.lostRatio >= COVERAGE.LOST_RATIO_SOFT
       ? [{ name: 'scattered_loss', severity: 'soft', count: coverage.turnsLost, samples: [{ text: `实质轮次流失率 ${Math.round(coverage.lostRatio * 100)}%（${coverage.turnsLost}/${coverage.turnsSubstantive} 轮）`, line: 1 }] }] : []),
+    ...quoteFindings,      // quote_style (hard) + optional quote_density_low (soft)
+    ...speakerFindings,    // speaker_label_style (soft)
+    ghostFinding,          // ghost_name (soft; empty when no glossary)
+    yinFinding,            // missing_yin (soft; empty when no glossary)
   ])
   return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers }
+}
+
+// Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay ≤ 1.10× the 成稿 in 汉字
+// count (导读/出处 scaffold tolerance) and carry no duplicated long paragraphs. Both findings soft — a
+// reorder deliverable is judged on preservation, not gated like a refine. Standalone entry (its own CLI
+// flag --logic); returns the same finding shape so downstream wiring is uniform.
+export function auditLogicPair(refinedText, logicText, { refinedFile = '<refined>', logicFile = '<logic>' } = {}) {
+  const rChars = hanzi(refinedText)
+  const lChars = hanzi(logicText)
+  const findings = checkLogicSize(refinedText, logicText)
+  const failed = [] // both findings are soft → never fails
+  return {
+    file: logicFile, mode: 'logic', status: 'ok', failed,
+    metrics: { refinedFile, refinedChars: rChars, logicChars: lChars, sizeRatio: rChars ? Number((lChars / rChars).toFixed(3)) : 1 },
+    findings,
+  }
+}
+
+export function auditLogicFile(refinedPath, logicPath) {
+  return auditLogicPair(fs.readFileSync(refinedPath, 'utf8'), fs.readFileSync(logicPath, 'utf8'), { refinedFile: path.resolve(refinedPath), logicFile: path.resolve(logicPath) })
 }
 
 export function auditPairs(pairs) {
@@ -572,6 +819,8 @@ export function auditPairs(pairs) {
     sourceFile: p.sourcePath || p.sourceFile,
     refinedFile: p.refinedPath || p.refinedFile,
     mode: p.mode || 'refine',
+    // glossaryText (inline) wins; else glossaryPath is read; else the two glossary checks stay dormant.
+    glossaryText: p.glossaryText != null ? p.glossaryText : (p.glossaryPath ? fs.readFileSync(p.glossaryPath, 'utf8') : null),
   }))
   return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
 }
@@ -579,16 +828,20 @@ export function auditPairs(pairs) {
 function usage() {
   return `用法:
   node scripts/audit_refined.mjs <精校稿.md> [更多.md...]          # 只查输出干净度
-  node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary]
-                                                                  # 对比源文：查压缩/欠精校/内容缺口
+  node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary] [--glossary <校对表.md>]
+                                                                  # 对比源文：查压缩/欠精校/内容缺口；给 --glossary 时另查残留变体/裸写未核实名
+  node scripts/audit_refined.mjs --logic <逻辑稿.md> --refined <成稿.md>   # 逻辑稿膨胀/重复段体检（独立入口，soft）
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
   … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
                                                                   # （渲染不可见；引文可循此跳回源文件行号与录音时间；可与 --annotate 同用）
 
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就 等纯噪音；超约 900 字的对话长段。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
-  content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）。
-soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失。`
+  content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）、
+  quote_style（ASCII 直引号紧贴中文，或出现「」『』——排版规范明令禁止）。
+soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失；
+  quote_density_low（长正文无弯引号）、speaker_label_style（标签风格混用）、ghost_name（残留错写变体）、
+  missing_yin（未核实名裸写缺（音））、logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）。`
 }
 
 function getOpt(argv, name) {
@@ -601,8 +854,16 @@ function main() {
   if (!argv.length || argv.includes('-h') || argv.includes('--help')) { console.log(usage()); return 0 }
   const source = getOpt(argv, '--source')
   const refined = getOpt(argv, '--refined')
+  const logic = getOpt(argv, '--logic')
+  // --logic pairs the 逻辑稿 against the 成稿 (--refined); it is a standalone entry, no --source needed.
+  if (logic && refined) {
+    const result = { status: 'ok', files: [auditLogicFile(refined, logic)] }
+    console.log(JSON.stringify(result, null, 2))
+    return 0
+  }
   if (source && refined) {
-    const result = auditPairs([{ sourcePath: source, refinedPath: refined, mode: getOpt(argv, '--mode') || 'refine' }])
+    const glossary = getOpt(argv, '--glossary')
+    const result = auditPairs([{ sourcePath: source, refinedPath: refined, mode: getOpt(argv, '--mode') || 'refine', glossaryPath: glossary }])
     if (argv.includes('--annotate')) {
       const gaps = result.files[0].gaps || []
       if (argv.includes('--dry-run')) {
@@ -631,6 +892,20 @@ function main() {
   return result.status === 'fail' ? 1 : 0
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Main-module detection. A plain path.resolve compare breaks when argv[1] and import.meta.url resolve
+// through different symlink aliases for the same file (e.g. macOS /tmp → /private/tmp, or a symlinked
+// launcher) — the CLI then silently produces no output. Compare fully-resolved real paths, falling back
+// to the non-realpath compare if realpathSync throws (e.g. the entry path no longer exists).
+function isMainModule() {
+  const argv1 = process.argv[1]
+  if (!argv1) return false
+  const self = fileURLToPath(import.meta.url)
+  try {
+    return fs.realpathSync(argv1) === fs.realpathSync(self)
+  } catch {
+    return path.resolve(argv1) === self
+  }
+}
+if (isMainModule()) {
   process.exitCode = main()
 }

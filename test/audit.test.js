@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -247,4 +247,176 @@ test('sectionRange keeps the largest contiguous source run (outlier bag-matches 
   assert.deepEqual({ s: withOutlier.startLine, e: withOutlier.endLine }, { s: 4, e: 11 }, 'stray turn 40 lines away forms its own run and loses')
   const twoRuns = sectionRange([t(4, 5), t(49, 50)])
   assert.deepEqual({ s: twoRuns.startLine, e: twoRuns.endLine }, { s: 4, e: 5 }, 'tie → first run kept')
+})
+
+// ---------- editorial deterministic checks (typesetting + glossary residue) ----------
+// Rules a prose skill used to self-apply — now hard-coded so they cannot drift per engine. All fixtures
+// use fictional names; the ghost-name homophone pair is 陈涛/陈焘 (虚构同音对), per the repo red line.
+
+const covSrc = () => fixture('coverage-source.md')
+
+// A rendered 校对表 in this repo's exact format (- **正字** ← 变体 / 变体 ｜ …), with a ⚠ suspect row and a
+// 未能核实 web-verify line. Fictional entities only.
+const glossaryText = [
+  '# 示例项目 统一校对表（采访时间 2025-05）',
+  '',
+  '## 人名（写法 → 统一）',
+  '- **陈焘** ← 陈涛 / 陈韬 ｜ 示例公司创始人',
+  '- **周砚** ← — ｜ 受访者 ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法',
+  '',
+  '## 品牌 / 公司 / 产品（写法 → 统一）',
+  '- **云洲仪器** ← 云舟仪器 / 云舟',
+  '',
+  '## 联网核实结论（已采纳的已应用到上表正文；标 ⚠ 的与正文强名冲突、未采纳，待人工确认）',
+  '- 蓝湖科技：未能核实，保留（音） ｜ 无公开信息',
+].join('\n')
+
+test('quote_style: ASCII 直引号紧贴 CJK hard-fails, pure-English quotes do NOT, and 「」『』 hard-fails', () => {
+  // CJK-adjacent ASCII quote → hard
+  const bad = '## 标题\n\n周砚：他说"这个太贵"，我不认同。'
+  const qf = checkQuoteStyle(bad).find((f) => f.name === 'quote_style')
+  assert.equal(qf.severity, 'hard')
+  assert.ok(qf.count >= 1, 'CJK-adjacent straight quote fires')
+  assert.equal(qf.samples[0].line, 3, 'sample carries the body line number')
+  // via auditPair the hard finding opens the quote_style gate → status fail
+  const src = '记者 00:05\n你好。\n\n周砚 00:12\n我们的检测设备卖给电子厂客户很多在苏州团队规模一百多人营收八千万。'
+  const paired = auditPair({ sourceText: src, refinedText: bad, mode: 'refine' })
+  assert.ok(paired.failed.includes('quote_style'), 'quote_style is a gate')
+  assert.equal(paired.status, 'fail')
+
+  // pure-English quotes with non-CJK neighbours → NOT reported (it's fine / "ok" surrounded by spaces)
+  const ok = '## 标题\n\n周砚：产品线叫 "Aurora" 系列，我们觉得 it\'s fine 就行。'
+  assert.equal(checkQuoteStyle(ok).find((f) => f.name === 'quote_style').count, 0, 'English-internal quotes ignored')
+
+  // 直角引号 → hard
+  const corner = '## 标题\n\n周砚：他说「这个太贵」也说『再等等』。'
+  const cf = checkQuoteStyle(corner).find((f) => f.name === 'quote_style')
+  assert.equal(cf.severity, 'hard')
+  assert.ok(cf.count >= 2, '「」『』 all flagged')
+})
+
+test('quote_style: inline code / URLs / code fences do not trip the straight-quote check', () => {
+  const doc = [
+    '## 代码',
+    '',
+    '```',
+    '周砚："这段在围栏里不算正文"',
+    '```',
+    '',
+    '周砚：命令是 `grep "x" file` 参见 https://example.com/a?q="b" 就好。',
+  ].join('\n')
+  assert.equal(checkQuoteStyle(doc).find((f) => f.name === 'quote_style').count, 0, 'fenced code, inline code and URL quotes all skipped')
+})
+
+test('quote_style (SF-4): a markdown-link title with CJK-adjacent ASCII quotes does NOT fire; a real body straight quote still does', () => {
+  // The link title "行业惯例" puts ASCII quotes hugging CJK — but it is inside the ](...) target+title segment,
+  // which is masked before scanning, so it must NOT be flagged.
+  const link = '## 出处\n\n周砚：详见 [报告](https://example.com/a "行业惯例") 里的口径说明。'
+  assert.equal(checkQuoteStyle(link).find((f) => f.name === 'quote_style').count, 0, 'a CJK link title is masked, not flagged')
+  // A genuine straight quote in the prose still fires (the masking is scoped to the link segment only).
+  const real = '## 出处\n\n周砚：他说"这个太贵"，详见 [报告](https://example.com/a "行业惯例")。'
+  assert.ok(checkQuoteStyle(real).find((f) => f.name === 'quote_style').count >= 1, 'a real prose straight quote still fires alongside a masked link title')
+})
+
+test('quote_density_low: a long body with zero 弯引号 emits a soft hint (never a gate)', () => {
+  const many = Array.from({ length: 205 }, (_, i) => `周砚：这是第 ${i} 段正文没有任何引号内容。`).join('\n\n')
+  const f = checkQuoteStyle(many).find((x) => x.name === 'quote_density_low')
+  assert.ok(f && f.severity === 'soft' && f.count === 1, 'soft density hint present past 200 body lines')
+  // short docs never emit it
+  assert.ok(!checkQuoteStyle('周砚：短稿一句话。').some((x) => x.name === 'quote_density_low'), 'short body: no density hint')
+})
+
+test('parseGlossaryLite reads canonical/variants and unverified names from the repo glossary format', () => {
+  const g = parseGlossaryLite(glossaryText)
+  const by = Object.fromEntries(g.entries.map((e) => [e.canonical, e.variants]))
+  assert.deepEqual(by['陈焘'], ['陈涛', '陈韬'], 'variants split on / under 人名')
+  assert.deepEqual(by['云洲仪器'], ['云舟仪器', '云舟'], 'brand section parsed too')
+  assert.deepEqual(by['周砚'], [], '— means no variants')
+  assert.ok(g.unverified.includes('周砚'), '⚠ suspect canonical marked unverified')
+  assert.ok(g.unverified.includes('蓝湖科技'), '未能核实 web line marked unverified')
+  assert.deepEqual(parseGlossaryLite(null), { entries: [], unverified: [] }, 'no glossary → empty')
+})
+
+test('ghost_name: a corrected-away variant left in the prose fires soft; canonical use does not; no glossary skips', () => {
+  const g = parseGlossaryLite(glossaryText)
+  const withGhost = '## 概况\n\n记者：你和陈涛是怎么认识的？\n\n周砚：我们把名字写成云舟了。'
+  const f = checkGhostName(withGhost, g)
+  assert.equal(f.severity, 'soft')
+  assert.equal(f.count, 2, '陈涛 variant + 云舟 variant both caught')
+  assert.ok(f.samples.some((s) => s.text.includes('陈焘')), 'sample names the canonical it should have been')
+  // canonical spellings only → clean
+  const clean = '## 概况\n\n记者：你和陈焘是怎么认识的？\n\n周砚：正确写法是云洲仪器。'
+  assert.equal(checkGhostName(clean, g).count, 0, 'canonical use is not a ghost')
+  // overlap guard: a variant that is a substring of its canonical must not fire on the canonical
+  const g2 = parseGlossaryLite('## 人名（写法 → 统一）\n- **陈焘明** ← 陈焘')
+  assert.equal(checkGhostName('周砚：这位是陈焘明先生。', g2).count, 0, 'canonical 陈焘明 does not count as stray 陈焘')
+  assert.equal(checkGhostName('周砚：另一位叫陈焘，不是陈焘明。', g2).count, 1, 'a bare 陈焘 still fires despite the substring guard')
+  // no glossary → silently skipped
+  assert.equal(checkGhostName(withGhost, parseGlossaryLite(null)).count, 0, 'no glossary → no ghost check')
+})
+
+test('missing_yin: a ⚠/未能核实 name written bare fires soft; with （音） it does not; no glossary skips', () => {
+  const g = parseGlossaryLite(glossaryText)
+  const bare = '## 概况\n\n记者：周砚您好，请介绍一下蓝湖科技。'
+  const f = checkMissingYin(bare, g)
+  assert.equal(f.severity, 'soft')
+  assert.equal(f.count, 2, 'both 周砚 and 蓝湖科技 bare on the line')
+  const annotated = '## 概况\n\n记者：周砚（音）您好，请介绍一下蓝湖科技（音）。'
+  assert.equal(checkMissingYin(annotated, g).count, 0, '（音 on the line clears it')
+  assert.equal(checkMissingYin(bare, parseGlossaryLite(null)).count, 0, 'no glossary → skipped')
+})
+
+test('speaker_label_style: mixing 名字 12:34 and 名字： each ≥3 times fires soft; a uniform file does not', () => {
+  const mixed = [
+    '周砚 00:12', '这是带时间戳的第一段内容。',
+    '记者 00:20', '这是带时间戳的第二段内容。',
+    '周砚 00:35', '这是带时间戳的第三段内容。',
+    '记者：换成冒号风格的第一句。',
+    '周砚：换成冒号风格的第二句。',
+    '记者：换成冒号风格的第三句。',
+  ].join('\n')
+  const f = checkSpeakerLabelStyle(mixed)[0]
+  assert.equal(f.severity, 'soft')
+  assert.ok(f.count >= 6, 'both styles counted')
+  assert.equal(f.samples.length, 4, 'two samples of each shape')
+  // uniform colon-only file → no mix
+  const uniform = ['周砚：一。', '记者：二。', '周砚：三。', '记者：四。', '周砚：五。'].join('\n')
+  assert.equal(checkSpeakerLabelStyle(uniform)[0].count, 0, 'single style → not flagged')
+})
+
+test('logic_size_sanity: 逻辑稿 > 成稿×1.10 fires; a duplicated long line fires; a normal draft passes', () => {
+  const refined = '正文内容' .repeat(60)            // 240 汉字
+  // bloat: 逻辑稿 well past 1.10×
+  const bloated = '正文内容'.repeat(80)              // 320 汉字 → 1.33×
+  const r1 = auditLogicPair(refined, bloated)
+  assert.equal(r1.mode, 'logic')
+  assert.equal(r1.status, 'ok', 'logic findings are soft — never a fail')
+  const sz = r1.findings.find((f) => f.name === 'logic_size_sanity')
+  assert.ok(sz.severity === 'soft' && sz.count === 1, 'size gate fires soft')
+  assert.ok(r1.metrics.sizeRatio > 1.10, `ratio ${r1.metrics.sizeRatio}`)
+  // duplicated long paragraph (≥25 CJK chars, identical, twice)
+  const line = '这是一段用于测试重复段检测的足够长的完全相同的句子内容确保超过二十五个汉字。'
+  const dupLogic = `## 导读\n\n${line}\n\n中间隔一段短的。\n\n${line}`
+  const dupF = auditLogicPair('正文内容'.repeat(200), dupLogic).findings.find((f) => f.name === 'logic_duplicate_para')
+  assert.ok(dupF.count === 1 && dupF.samples[0].text.includes('重复长行'), 'duplicate long line reported with line numbers')
+  // normal: small growth, no dups → both clean
+  const normal = '正文内容'.repeat(63)              // 252 → 1.05×
+  const r2 = auditLogicPair(refined, `## 导读\n\n${normal}`)
+  assert.equal(r2.findings.find((f) => f.name === 'logic_size_sanity').count, 0, 'within tolerance')
+  assert.equal(r2.findings.find((f) => f.name === 'logic_duplicate_para').count, 0, 'no duplicates')
+})
+
+test('auditPair threads a glossary into ghost_name / missing_yin and stays silent without one', () => {
+  const src = covSrc()
+  const refined = fixture('coverage-refined-good.md')
+  // no glossary passed → both checks present but zero
+  const bare = auditPair({ sourceText: src, refinedText: refined, mode: 'refine' })
+  assert.ok(bare.findings.some((f) => f.name === 'ghost_name' && f.count === 0), 'ghost_name dormant without glossary')
+  assert.ok(bare.findings.some((f) => f.name === 'missing_yin' && f.count === 0), 'missing_yin dormant without glossary')
+  // inject a variant (云舟) into the refined text and pass the glossary → ghost_name lights up
+  const dirtied = refined.replace('云洲仪器是 2019', '云舟仪器是 2019')
+  const withG = auditPair({ sourceText: src, refinedText: dirtied, mode: 'refine', glossaryText })
+  const gf = withG.findings.find((f) => f.name === 'ghost_name')
+  assert.ok(gf.count >= 1, 'variant residue caught when glossary supplied')
+  assert.equal(gf.severity, 'soft', 'ghost_name is soft — does not fail the pair')
 })
