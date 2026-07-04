@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -419,4 +419,111 @@ test('auditPair threads a glossary into ghost_name / missing_yin and stays silen
   const gf = withG.findings.find((f) => f.name === 'ghost_name')
   assert.ok(gf.count >= 1, 'variant residue caught when glossary supplied')
   assert.equal(gf.severity, 'soft', 'ghost_name is soft — does not fail the pair')
+})
+
+// ---------- 校对表 structural lint (E13) ----------
+
+// A healthy glossary: ≥3 人名/品牌 rows, all with an identity hint, most with variants.
+const healthyGlossary = [
+  '# 示例项目 统一校对表（采访时间 2025-05）',
+  '',
+  '## 人名（写法 → 统一）',
+  '- **陈焘** ← 陈涛 / 陈韬 ｜ 示例公司创始人 ｜ 多份互证',
+  '- **周砚** ← 周研 ｜ 产品负责人 ｜ 〔核实·2025-05〕',
+  '- **林越** ← 林悦 ｜ 早期投资人',
+  '',
+  '## 品牌 / 公司 / 产品（写法 → 统一）',
+  '- **云洲仪器** ← 云舟仪器 / 云舟 ｜ 自家公司',
+  '- **青萍资本** ← 青苹资本 ｜ A 轮领投方',
+  '',
+  '## 术语 / 专名（写法 → 统一）',
+  '- **边缘计算** ← — ｜ 技术方向',   // term row: must NOT be counted by the lint
+].join('\n')
+
+const grep = (r, name) => r.findings.find((f) => f.name === name)
+
+test('parseGlossaryEntities reads 人名/品牌 rows, splits hint from markers, and excludes 术语', () => {
+  const es = parseGlossaryEntities(healthyGlossary)
+  assert.equal(es.length, 5, '3 people + 2 brands; the 术语 row is excluded')
+  assert.equal(es.filter((e) => e.section === 'person').length, 3)
+  assert.equal(es.filter((e) => e.section === 'brand').length, 2)
+  const chen = es.find((e) => e.canonical === '陈焘')
+  assert.ok(chen.hasVariants && chen.hasHint, '陈焘: variants + hint (多份互证 is not the hint)')
+  // 多份互证 / 〔核实〕 must not be mistaken for an identity hint
+  const withOnlyMarkers = parseGlossaryEntities('## 人名（写法 → 统一）\n- **甲** ← 乙 ｜ 多份互证 ｜ 〔核实·2025-05〕')
+  assert.equal(withOnlyMarkers[0].hasHint, false, 'cross-file/confidence markers are not hints')
+  assert.equal(withOnlyMarkers[0].hasVariants, true, 'but the variant is still recorded')
+  // — / （无变体） / empty all mean "no variant"
+  assert.equal(parseGlossaryEntities('## 人名（写法 → 统一）\n- **丙** ← — ｜ 某身份')[0].hasVariants, false)
+  assert.deepEqual(parseGlossaryEntities(null), [], 'null → empty')
+  // renderGlossary appends the 〔核实〕 confidence marker onto the LAST segment, so a crossFile-but-hintless
+  // row reads `← v ｜ 多份互证 〔核实·2025-05〕` — the marker must be peeled so this counts as NO hint.
+  const crossOnly = parseGlossaryEntities('## 人名（写法 → 统一）\n- **甲** ← 乙 ｜ 多份互证 〔核实·2025-05〕')
+  assert.equal(crossOnly[0].hasHint, false, '多份互证 + confidence marker is not an identity hint')
+  // …but a real hint that happens to carry a trailing confidence marker still counts as a hint
+  const hintPlusMark = parseGlossaryEntities('## 人名（写法 → 统一）\n- **甲** ← 乙 ｜ 创始人 〔核实·2025-05〕')
+  assert.equal(hintPlusMark[0].hasHint, true, 'a real hint with a trailing marker is still a hint')
+})
+
+test('auditGlossary: a healthy table fires no warnings and reports the right metrics', () => {
+  const r = auditGlossary(healthyGlossary)
+  assert.equal(r.status, 'ok', 'all soft → status stays ok')
+  assert.equal(r.metrics.entities, 5)
+  assert.equal(r.metrics.people, 3)
+  assert.equal(r.metrics.brands, 2)
+  assert.equal(r.metrics.hintRatio, 1, 'every counted row has a hint')
+  assert.equal(grep(r, 'glossary_thin').count, 0)
+  assert.equal(grep(r, 'glossary_hints_sparse').count, 0)
+  assert.equal(grep(r, 'glossary_variants_sparse').count, 0)
+})
+
+test('auditGlossary: a thin table (<3 entities) fires glossary_thin and skips the ratio warnings', () => {
+  const thin = '## 人名（写法 → 统一）\n- **陈焘** ← 陈涛 ｜ 创始人\n- **周砚** ← 周研 ｜ 负责人'
+  const r = auditGlossary(thin)
+  assert.equal(grep(r, 'glossary_thin').count, 1, '2 < MIN_ENTITIES(3)')
+  assert.ok(grep(r, 'glossary_thin').samples[0].text.includes('2 条'), 'sample states the count')
+  // ratio warnings are not even emitted below the entity floor (a proportion over <3 rows is meaningless)
+  assert.equal(grep(r, 'glossary_hints_sparse'), undefined, 'no hint-ratio warning below the floor')
+  assert.equal(grep(r, 'glossary_variants_sparse'), undefined, 'no variant-ratio warning below the floor')
+})
+
+test('auditGlossary: enough rows but few identity clues → glossary_hints_sparse (only)', () => {
+  // 4 people, only 1 with a hint (25% < 50%); all have variants so the variant warning stays quiet
+  const g = [
+    '## 人名（写法 → 统一）',
+    '- **陈焘** ← 陈涛 ｜ 创始人',   // hint
+    '- **周砚** ← 周研',            // no hint
+    '- **林越** ← 林悦',            // no hint
+    '- **顾岚** ← 顾兰',            // no hint
+  ].join('\n')
+  const r = auditGlossary(g)
+  assert.equal(grep(r, 'glossary_thin').count, 0, '4 ≥ floor')
+  assert.equal(grep(r, 'glossary_hints_sparse').count, 1, '25% < HINT_RATIO_MIN')
+  assert.equal(grep(r, 'glossary_variants_sparse').count, 0, 'all four have variants')
+  assert.equal(r.metrics.hintRatio, 0.25)
+})
+
+test('auditGlossary: enough rows but almost no variants → glossary_variants_sparse (only)', () => {
+  // 4 rows, all with hints, none with variants (0% < 30%)
+  const g = [
+    '## 人名（写法 → 统一）',
+    '- **陈焘** ← — ｜ 创始人',
+    '- **周砚** ← — ｜ 负责人',
+    '- **林越** ← — ｜ 投资人',
+    '- **顾岚** ← — ｜ 顾问',
+  ].join('\n')
+  const r = auditGlossary(g)
+  assert.equal(grep(r, 'glossary_hints_sparse').count, 0, 'all have hints')
+  assert.equal(grep(r, 'glossary_variants_sparse').count, 1, '0% < VARIANT_RATIO_MIN')
+  assert.equal(r.metrics.variantRatio, 0)
+})
+
+test('auditGlossary: empty / entity-less input reports 0 entities and only glossary_thin', () => {
+  for (const empty of ['', null, undefined, '# 校对表\n\n## 采访背景\n- 时间：2025-05']) {
+    const r = auditGlossary(empty)
+    assert.equal(r.metrics.entities, 0, 'no entities parsed')
+    assert.equal(grep(r, 'glossary_thin').count, 1, 'empty table is thin')
+    assert.equal(r.status, 'ok', 'still never fails')
+    assert.equal(grep(r, 'glossary_hints_sparse'), undefined, 'no ratio warning with zero rows')
+  }
 })

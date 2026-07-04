@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -324,13 +324,17 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const r = await runPipeline(A, sel.engine)
     cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
+    // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
+    // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
+    // review.md via reviewSections. All soft — never affects the exit code.
+    const glossaryLint = (wroteGlossary && r.glossary) ? auditGlossary(r.glossary) : null
     // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
     const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
     if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
-    const result = { ...r, audit, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, glossaryLint, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

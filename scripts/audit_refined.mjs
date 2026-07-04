@@ -244,6 +244,100 @@ export function checkMissingYin(refinedText, glossary) {
   return findings
 }
 
+// ===== 校对表 structural lint (E13) =====
+// The 校对表 is the pipeline's cross-file归一 + 身份/依据 record. A *thin* one — very few named entities, most
+// without any identity clue, or barely any variant写法 recorded — usually means scout under-extracted, verify
+// was skipped, or the table was hand-stubbed. All findings here are SOFT (a warning to review, never a gate):
+// small, tightly-scoped interviews legitimately produce short tables, so this must under-report rather than
+// mis-fire. It reads the glossary TEXT alone (no source/refined), so it also drives the standalone
+// --glossary-only CLI. Thresholds are intentionally lenient; tune from real 校对表 corpora, not from one file.
+export const GLOSSARY_LINT = {
+  MIN_ENTITIES: 3,        // fewer than this many 人名+品牌 rows total → the whole table is suspiciously sparse
+  HINT_RATIO_MIN: 0.5,    // < half the rows carry a 身份/依据 clue → weak for verification & speaker-mapping
+  VARIANT_RATIO_MIN: 0.3, // < this fraction records any ASR 写法 variant → cross-file 归一 likely incomplete
+}
+
+// A renderGlossary row segment counts as a NON-hint (not an identity clue) when — after peeling any trailing
+// 〔核实/用户钦定/待复核〕 confidence marker (renderGlossary appends it to the LAST segment, e.g. the crossFile
+// tag `多份互证 〔核实·2025-05〕`) — what remains is empty or a pure marker: the 多份互证 cross-file tag, a
+// 公众人物 tag, a ⚠ suspect note, or a 出处/依据 provenance tail. Anything else is the hint (身份/title/语境).
+const GLOSSARY_MARKER_ONLY = /^多份互证$|^公众人物$|^⚠|^出处：|^依据：/
+const CONFIDENCE_TAIL = /\s*〔[^〕]*〕\s*$/
+function glossarySegIsHint(seg) {
+  const s = seg.replace(CONFIDENCE_TAIL, '').trim()
+  return !!s && !GLOSSARY_MARKER_ONLY.test(s)
+}
+
+// Parse renderGlossary's 人名 / 品牌 rows into { canonical, hasVariants, hasHint }. Self-contained (the real
+// parser in core/spec.js must not be imported here). A row: `- **正字** ← 变体 / … ｜ hint ｜ …markers…`.
+// 术语 rows are intentionally excluded — 身份 clues don't apply to terms, so counting them would depress the
+// hint ratio unfairly; the lint judges people/brands, where an identity clue is meaningful.
+export function parseGlossaryEntities(glossaryText) {
+  const entities = []
+  if (!glossaryText) return entities
+  let section = null   // 'person' | 'brand' | null
+  for (const raw of String(glossaryText).split(/\r?\n/)) {
+    const line = raw.trim()
+    const h = line.match(/^#{1,6}\s+(.*)$/)
+    if (h) {
+      const t = h[1]
+      section = /人名/.test(t) ? 'person' : (/品牌|公司|产品/.test(t) ? 'brand' : null)
+      continue
+    }
+    if (!section) continue
+    const m = line.match(/^-\s*\*\*(.+?)\*\*\s*←\s*(.*)$/)
+    if (!m) continue
+    const canonical = m[1].trim()
+    const segs = m[2].split('｜').map((s) => s.trim())
+    const varsRaw = (segs.shift() || '').trim()
+    const hasVariants = !(varsRaw === '' || varsRaw === '—' || varsRaw === '（无变体）')
+    const hasHint = segs.some(glossarySegIsHint)
+    entities.push({ canonical, section, hasVariants, hasHint })
+  }
+  return entities
+}
+
+// auditGlossary: soft structural warnings on a rendered 校对表. Returns { entities, people, brands, findings }
+// where findings is an array of the standard { name, severity, count, samples } shape. count>0 means the
+// warning fired. An empty / entity-less table reports 0 entities and fires glossary_thin only (no ratio
+// warnings — a ratio over zero rows is meaningless). Never throws; a non-string / empty input → empty report.
+export function auditGlossary(glossaryText) {
+  const entities = parseGlossaryEntities(glossaryText)
+  const people = entities.filter((e) => e.section === 'person').length
+  const brands = entities.filter((e) => e.section === 'brand').length
+  const total = entities.length
+  const withHint = entities.filter((e) => e.hasHint).length
+  const withVar = entities.filter((e) => e.hasVariants).length
+  const hintRatio = total ? Number((withHint / total).toFixed(3)) : 0
+  const variantRatio = total ? Number((withVar / total).toFixed(3)) : 0
+
+  const findings = []
+  const thin = total < GLOSSARY_LINT.MIN_ENTITIES
+  findings.push({ name: 'glossary_thin', severity: 'soft', count: thin ? 1 : 0,
+    samples: thin ? [{ text: `校对表仅 ${total} 条人名/品牌（人名 ${people}、品牌 ${brands}）——疑侦察抽取过少或核实被跳过`, line: 1 }] : [] })
+  // Ratio warnings only make sense once there are enough rows to judge a proportion.
+  if (total >= GLOSSARY_LINT.MIN_ENTITIES) {
+    const hintThin = hintRatio < GLOSSARY_LINT.HINT_RATIO_MIN
+    findings.push({ name: 'glossary_hints_sparse', severity: 'soft', count: hintThin ? 1 : 0,
+      samples: hintThin ? [{ text: `仅 ${withHint}/${total}（${Math.round(hintRatio * 100)}%）条带身份/依据线索——多数人名/品牌缺当时 title 或核实依据`, line: 1 }] : [] })
+    const varThin = variantRatio < GLOSSARY_LINT.VARIANT_RATIO_MIN
+    findings.push({ name: 'glossary_variants_sparse', severity: 'soft', count: varThin ? 1 : 0,
+      samples: varThin ? [{ text: `仅 ${withVar}/${total}（${Math.round(variantRatio * 100)}%）条记录了转写变体——跨文件写法归一可能不完整`, line: 1 }] : [] })
+  }
+  return {
+    file: '<glossary>', mode: 'glossary',
+    status: 'ok',   // all soft — a thin glossary never fails the audit, only warns
+    entities: total, people, brands,
+    metrics: { entities: total, people, brands, withHint, withVariants: withVar, hintRatio, variantRatio },
+    findings,
+  }
+}
+
+export function auditGlossaryFile(glossaryPath) {
+  const r = auditGlossary(fs.readFileSync(glossaryPath, 'utf8'))
+  return { ...r, file: path.resolve(glossaryPath) }
+}
+
 // logic_size_sanity: the logic-ordered draft (逻辑稿) must not balloon past the refined 成稿 (~5-8% 脚手架
 // tolerance → 1.10 cap), and it must not carry duplicated long paragraphs (a reorder-gone-wrong signal).
 export function checkLogicSize(refinedText, logicText) {
@@ -831,6 +925,7 @@ function usage() {
   node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary] [--glossary <校对表.md>]
                                                                   # 对比源文：查压缩/欠精校/内容缺口；给 --glossary 时另查残留变体/裸写未核实名
   node scripts/audit_refined.mjs --logic <逻辑稿.md> --refined <成稿.md>   # 逻辑稿膨胀/重复段体检（独立入口，soft）
+  node scripts/audit_refined.mjs --glossary-only <校对表.md>       # 校对表结构体检（条目数/身份线索/变体比例，独立入口，全 soft）
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
   … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
                                                                   # （渲染不可见；引文可循此跳回源文件行号与录音时间；可与 --annotate 同用）
@@ -841,7 +936,8 @@ function usage() {
   quote_style（ASCII 直引号紧贴中文，或出现「」『』——排版规范明令禁止）。
 soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失；
   quote_density_low（长正文无弯引号）、speaker_label_style（标签风格混用）、ghost_name（残留错写变体）、
-  missing_yin（未核实名裸写缺（音））、logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）。`
+  missing_yin（未核实名裸写缺（音））、logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）、
+  glossary_thin / glossary_hints_sparse / glossary_variants_sparse（校对表偏薄，见 --glossary-only）。`
 }
 
 function getOpt(argv, name) {
@@ -855,6 +951,14 @@ function main() {
   const source = getOpt(argv, '--source')
   const refined = getOpt(argv, '--refined')
   const logic = getOpt(argv, '--logic')
+  const glossaryOnly = getOpt(argv, '--glossary-only')
+  // --glossary-only lints a rendered 校对表 on its own (条目数/身份线索/变体比例). Standalone entry, all soft →
+  // always exit 0; a caller reads findings[*].count>0 to see which warnings fired.
+  if (glossaryOnly) {
+    const result = { status: 'ok', files: [auditGlossaryFile(glossaryOnly)] }
+    console.log(JSON.stringify(result, null, 2))
+    return 0
+  }
   // --logic pairs the 逻辑稿 against the 成稿 (--refined); it is a standalone entry, no --source needed.
   if (logic && refined) {
     const result = { status: 'ok', files: [auditLogicFile(refined, logic)] }
