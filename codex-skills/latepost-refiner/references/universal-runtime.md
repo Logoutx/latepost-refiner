@@ -102,6 +102,12 @@ Read `review.md` before reporting completion. It consolidates failed files, inco
 
 Read `run.json` when auditing a run, resuming a run, or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
 
+## Exit Code And `auditFailed`
+
+The in-pipeline audit gate runs per file after refine. When a file is still **hard** (`content_gap` / `quote_style`) after one auto-repair, it is recorded in the run's top-level **`auditFailed`** (`[{ path, findings }]`, mirrored in `review.md` and `run.json`). By default the CLI then **exits 1** — but the 成稿 and every other product are **already written to disk**; the non-zero code flags "one or more files need a manual look", not "the run failed". A calling script must therefore check the **`auditFailed` field in `run.json` / `review.md`** to decide per-file follow-up, rather than treating a non-zero exit as a whole-run failure and discarding the output.
+
+Pass **`--allow-audit-fail`** to make the CLI exit **0** when products were generated and the only problem is `auditFailed` (a pipeline error still exits 1). Use it in CI/batch drivers that want to consume the produced transcripts and act on `auditFailed` out-of-band instead of gating on the exit code.
+
 ## Return And Handoff
 
 In the final response to the user:
