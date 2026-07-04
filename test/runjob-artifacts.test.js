@@ -112,6 +112,87 @@ test('annotate:false leaves the refined files untouched (still audited and repor
   }
 })
 
+// §2: with fs (Universal), jobs.js injects runAudit/annotate/annotateAnchors but NOT repair — so a hard
+// content_gap that jobs can't auto-fix surfaces as result.auditFailed (→ non-zero CLI exit) and each refined
+// entry carries an audit summary. This is the in-pipeline gate replacing the old post-run wrapper.
+test('runJob surfaces an un-repairable hard gap as auditFailed and attaches a per-file audit summary', async () => {
+  const result = await runGapJob()
+  assert.ok((result.auditFailed || []).length >= 1, 'a still-hard gap is recorded in auditFailed')
+  assert.ok(result.auditFailed.every((x) => x.findings.includes('content_gap')), 'the finding is content_gap')
+  const r0 = result.refined.find((r) => (result.auditFailed[0].path === (r.outPath || r.path)))
+  assert.ok(r0 && r0.audit && r0.audit.status === 'fail', 'the refined entry carries audit.status=fail')
+  assert.equal(r0.audit.repaired, false, 'no repair capability injected in the Universal path → not repaired')
+})
+
+// A clean refine (no gap) must not populate auditFailed, and each refined entry gets audit.status='ok'.
+function cleanEngine() {
+  const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  return {
+    phase() {}, log() {}, usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((t) => t().catch(() => null))),
+    pipeline: async (items) => items.map((f) => {
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, covFixture('coverage-refined-good.md'))
+      return { path: f.outPath, headings: ['## 公司概况'], key_fixes: [], open_questions: [] }
+    }),
+    agent: async () => { usage.agents++; return null },
+  }
+}
+
+test('runJob: a faithful refine leaves auditFailed empty and marks each entry audit ok', async () => {
+  const outputDir = tmpdir()
+  const src64 = Buffer.from(covFixture('coverage-source.md')).toString('base64')
+  const result = await runJob({
+    __engine: cleanEngine(),
+    files: [{ name: '甲.md', base64: src64 }, { name: '乙.md', base64: src64 }],
+    topic: '干净测试', date: '2026-07', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+  assert.deepEqual(result.auditFailed, [], 'no hard findings → auditFailed empty')
+  assert.ok(result.refined.every((r) => r.audit && r.audit.status === 'ok'), 'every refined entry audited ok')
+  assert.ok((result.anchors || []).length >= 1, 'anchors still ran on the clean 成稿')
+})
+
+// §1 + §4 through runJob: canonicalOverrides reach the pipeline (glossary carries 〔用户钦定〕) and an explicit
+// priorGlossaryPath seeds the cumulative glossary. The engine's scout reports 王总; the decree forces 王志远.
+function overrideEngine() {
+  return {
+    phase() {}, log() {}, usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }),
+    parallel: async (thunks) => Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null))),
+    // The refine stage writes a small clean 成稿 so the in-pipeline audit passes.
+    pipeline: async (items) => items.map((f) => {
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, `# ${f.title}\n${f.subtitle}\n\n## 某节\n记者：请介绍一下。\n\n王志远：我们做工业检测，这是虚构样本。\n`)
+      return { path: f.outPath, headings: ['某节'], key_fixes: [], open_questions: [] }
+    }),
+    agent: async (_p, o) => {
+      if (/^scout/.test(o.label)) return { speakers: [{ label: '记者', role: '记者' }], people: [{ canonical: '王总', variants: [], hint: '受访者' }], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 2, text: '虚构样本。' }, special_notes: [] }
+      if (/^check/.test(o.label)) return { complete: true, note: '' }
+      return null // dedup/verify/audit-agent → null (audit uses the injected capability, not an agent)
+    },
+  }
+}
+
+test('runJob threads canonicalOverrides + an explicit priorGlossaryPath into the pipeline', async () => {
+  const inputDir = tmpdir()
+  const outputDir = tmpdir()
+  const src = path.join(inputDir, '访谈.md')
+  const src2 = path.join(inputDir, '访谈2.md')
+  fs.writeFileSync(src, '记者：请介绍一下。\n王总：我们做工业检测。虚构样本，内容足够长以走多份分支。\n', 'utf8')
+  fs.writeFileSync(src2, '记者：再聊聊渠道。\n王总：渠道这块也在铺。虚构样本第二份。\n', 'utf8')
+  const priorPath = path.join(inputDir, '外部校对表.md')
+  fs.writeFileSync(priorPath, ['# 示例公司 统一校对表（采访时间 2025-01）', '', '## 人名（写法 → 统一）', '- **沈其安** ← 沈总 ｜ 创始人 〔核实·2025-01〕'].join('\n'), 'utf8')
+
+  const result = await runJob({
+    __engine: overrideEngine(),
+    files: [{ path: src }, { path: src2 }], // 2 files → multi-file (scout/verify/refine) branch
+    topic: '示例公司', date: '2026-07', outputDir, scope: ['refine'], verifyDepth: 'none',
+    priorGlossaryPath: priorPath,
+    canonicalOverrides: [{ canonical: '王志远', variants: ['王总'] }],
+  })
+  assert.ok(result.glossary.includes('王志远') && result.glossary.includes('用户钦定'), 'the decree landed as 〔用户钦定〕')
+  assert.ok(result.glossary.includes('沈其安'), 'the explicit priorGlossaryPath seeded the cumulative glossary')
+})
+
 test('runJob accepts filesystem path entries and records prepared file metadata', async () => {
   const inputDir = tmpdir()
   const outputDir = tmpdir()

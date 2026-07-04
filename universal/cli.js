@@ -33,11 +33,14 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
   --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
+  --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
   --fresh                忽略既有 校对表.md，从零重建
   --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
   --no-anchors           不往成稿各小节插源锚点注释（默认会插：<!-- 源 L25-L38 · 08:00-12:05 -->，
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
+  --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
+                         （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
 
 模型来源:
   --provider <名>        anthropic（默认）| deepseek | glm | kimi | openai
@@ -52,13 +55,13 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
-    '--chunk': 'chunkMode',
+    '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
   }
   let i = 0
   while (i < argv.length) {
@@ -115,6 +118,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors
+    priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     provider: a.provider,
     baseURL: a.baseURL,
@@ -123,6 +127,21 @@ export function buildRunParams(a, { env = process.env } = {}) {
 }
 
 const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.stringify(x)))).join('、')
+
+// SF-6 — the process exit code, factored out so it is unit-testable without spawning the CLI.
+//   · a pipeline error → always 1
+//   · audit gate left a file still-hard after auto-repair → 1 by default; with allowAuditFail AND ≥1 成稿 produced
+//     (so the ONLY failure is auditFailed and the run otherwise succeeded) → 0
+//   · otherwise → 0
+// The products are written to disk regardless of the exit code; callers should inspect run.json / review.md's
+// auditFailed field, not the exit code, to decide per-file follow-up.
+export function computeExitCode(result, { allowAuditFail = false } = {}) {
+  if (result.error) return 1
+  const auditFailed = (result.auditFailed || []).length > 0
+  if (!auditFailed) return 0
+  const producedOutput = (result.refined || []).length > 0
+  return (allowAuditFail && producedOutput) ? 0 : 1
+}
 
 export function printRunSummary(r) {
   if (r.error) {
@@ -138,6 +157,7 @@ export function printRunSummary(r) {
     const bad = r.audit.files.filter((f) => f.status === 'fail')
     if (bad.length) console.error(`\n⚠ 成稿质量抽查未过 ${bad.length} 份：` + bad.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
   }
+  if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {
       console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或换 provider 重精校该段')
@@ -210,7 +230,7 @@ async function main() {
   }
 
   printRunSummary(result)
-  process.exit(result.error ? 1 : 0)
+  process.exit(computeExitCode(result, { allowAuditFail: !!a.allowAuditFail }))
 }
 
 // Run only when invoked as the entry script (so tests can import the helpers above).
