@@ -12,15 +12,19 @@ import {
   summaryPrompt,
   timelinePrompt,
   logicWritePrompt,
-} from '../../../core/prompts.js'
+} from '../core/prompts.js'
 import {
   DEDUP_SCHEMA,
+  ONE_PASS_CHARS,
   REFINE_REPORT_SCHEMA,
   SCOUT_SCHEMA,
   VERIFY_SCHEMA,
+  applyOverridesToMerged,
   cleanSuspects,
+  contentLength,
   dedupListText,
   dedupQuestions,
+  dropLocked,
   excludeVerified,
   findHeadingConflicts,
   glossaryConflicts,
@@ -34,8 +38,9 @@ import {
   scoutLooksGarbled,
   verifyChunks,
   weakDupFlags,
-} from '../../../core/spec.js'
-import { writeRunArtifacts } from '../../../universal/artifacts.js'
+} from '../core/spec.js'
+import { writeRunArtifacts } from '../universal/artifacts.js'
+import { auditGlossary, auditPairs } from './audit_refined.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -47,6 +52,7 @@ function usage() {
   node codex-skills/latepost-refiner/scripts/codex-native.mjs after-scout --args <out>/_codex-native/args.json --findings findings.json
   node codex-skills/latepost-refiner/scripts/codex-native.mjs after-verify --args <out>/_codex-native/args.json --state <out>/_codex-native/state-after-scout.json --verified verified.json [--dedup dedup.json]
   node codex-skills/latepost-refiner/scripts/codex-native.mjs deliver-prompts --args <out>/_codex-native/args.json --state <out>/_codex-native/state-after-verify.json
+  node codex-skills/latepost-refiner/scripts/codex-native.mjs audit --args <out>/_codex-native/args.json --result result.json
   node codex-skills/latepost-refiner/scripts/codex-native.mjs artifacts --args <out>/_codex-native/args.json --result result.json
 
 This helper is deterministic glue for the Codex subscription-native workflow. It never calls model APIs and never
@@ -118,6 +124,14 @@ function byteCount(filePath) {
   }
 }
 
+function contentChars(filePath) {
+  try {
+    return contentLength(fs.readFileSync(filePath, 'utf8'))
+  } catch {
+    return 0
+  }
+}
+
 function defaultSubtitle(A) {
   const prefix = [A.date, A.topic].filter(Boolean).join(' · ')
   return `*${prefix ? `${prefix} · ` : ''}访谈精校稿*`
@@ -158,6 +172,7 @@ export function normalizeArgs(input) {
     f.label = f.label || titleFromPath(f.path) || `file-${index + 1}`
     f.lines = Number.isFinite(Number(f.lines)) && Number(f.lines) > 0 ? Number(f.lines) : lineCount(f.path)
     f.bytes = Number.isFinite(Number(f.bytes)) && Number(f.bytes) > 0 ? Number(f.bytes) : byteCount(f.path)
+    f.chars = Number.isFinite(Number(f.chars)) && Number(f.chars) > 0 ? Number(f.chars) : contentChars(f.path)
     f.title = f.title || titleFromPath(f.path) || f.label
     f.subtitle = f.subtitle || defaultSubtitle(A)
     f.outPath = f.outPath ? path.resolve(f.outPath) : path.join(A.outputDir, 'Transcripts', `${f.title}.md`)
@@ -179,14 +194,25 @@ export function prepareNativeRun(args) {
 
   const normalizedArgsPath = writeJson(path.join(dir, 'args.json'), A)
   const prompts = []
-  const shortSinglePass = A.files.length === 1 && (A.files[0].lines || 9999) < 400
+  const shortSinglePass = A.files.length === 1 && (A.files[0].chars || 0) < ONE_PASS_CHARS
   if (shortSinglePass) {
     const f = A.files[0]
+    const lockedClusters = (A.canonicalOverrides && A.canonicalOverrides.length)
+      ? applyOverridesToMerged({ people: [], brands: [], terms: [] }, A.canonicalOverrides)
+      : null
+    const lockedAll = lockedClusters ? [...lockedClusters.people, ...lockedClusters.brands, ...lockedClusters.terms] : []
+    const overrideNote = lockedAll.length
+      ? `【用户钦定正名（必须执行）】以下写法无论源文件里出现哪种口语/变体，精校时一律统一写作钦定正字：\n${lockedAll.map((e) => `- ${(e.variants || []).join(' / ') || '（无变体）'} 一律写作 **${e.canonical}**`).join('\n')}`
+      : ''
+    const onePassGlossaryText = lockedAll.length
+      ? ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) => `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
+      : null
+    if (onePassGlossaryText) writeText(path.join(dir, 'one-pass-glossary.md'), onePassGlossaryText)
     prompts.push({
       stage: 'single-pass',
       label: f.label,
       schema: REFINE_REPORT_SCHEMA,
-      path: writeText(path.join(dir, 'prompts', promptName('single-pass', 0, f.label)), singlePassPrompt(f, A)),
+      path: writeText(path.join(dir, 'prompts', promptName('single-pass', 0, f.label)), singlePassPrompt(f, A, overrideNote)),
     })
   } else {
     A.files.forEach((f, index) => {
@@ -220,9 +246,12 @@ export function afterScout(args, findingsRaw) {
   const findings = normalizeFindings(findingsRaw, A.files)
   const scoutSuspect = A.files.filter((f, i) => findings[i] && scoutLooksGarbled(findings[i])).map((f) => f.label)
   const cleanFindings = findings.map((fd) => (fd && scoutLooksGarbled(fd)) ? null : fd)
-  const mergedThisBatch = mergeFindings(cleanFindings, A.files)
+  const mergedThisBatch = applyOverridesToMerged(mergeFindings(cleanFindings, A.files), A.canonicalOverrides)
+  const overrideQuestions = []
+  for (const c of mergedThisBatch.overrideConflicts || []) overrideQuestions.push(`钦定正名冲突：同一对象被多条 decree 命名为「${c.canonicals.join('」「')}」——已按首条统一为「${c.resolvedTo}」，请确认是否正确。`)
+  for (const w of mergedThisBatch.categoryWarnings || []) overrideQuestions.push(`钦定正名类别疑误标：「${w.canonical}」声明为${w.declared}，但其写法在${w.foundIn}里出现——已按声明的${w.declared}锁定，请确认类别。`)
   const headingConflicts = findHeadingConflicts(cleanFindings, A.files, A.headingPolicy)
-  const verifyTarget = excludeVerified(mergedThisBatch, prior)
+  const verifyTarget = excludeVerified(dropLocked(mergedThisBatch), prior)
   const doVerify = A.verifyDepth !== 'none' && (verifyTarget.people.length || verifyTarget.brands.length || verifyTarget.terms.length)
   const vc = doVerify ? verifyChunks(verifyTarget, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
   const dedupList = dedupListText(mergedThisBatch)
@@ -242,6 +271,7 @@ export function afterScout(args, findingsRaw) {
     findings,
     cleanFindings,
     mergedThisBatch,
+    overrideQuestions,
     headingConflicts,
     scoutSuspect,
     verify: { eligible: vc.eligible, excluded: vc.excluded, overflow: vc.overflow, chunks: vc.chunks.length },
@@ -319,7 +349,7 @@ export function afterVerify(args, state, verifiedRaw, dedupRaw) {
     suspectedDuplicates: (dedup && dedup.suspects) || [],
     networkUnverified,
     logic: [],
-    openQuestions: dedupQuestions(dedup).concat(conflicts).concat(weakDups),
+    openQuestions: dedupQuestions(dedup).concat(conflicts).concat(weakDups).concat(state.overrideQuestions || []),
     summary: null,
     timeline: null,
   }
@@ -373,6 +403,54 @@ export function deliverPrompts(args, state) {
   return { manifestPath, prompts }
 }
 
+function refinedPathOf(entry) {
+  return entry && (entry.outPath || entry.path || entry.refinedPath)
+}
+
+function glossaryTextForAudit(A) {
+  const primary = path.join(A.outputDir, '校对表.md')
+  const onePass = path.join(stateDir(A), 'one-pass-glossary.md')
+  for (const p of [primary, onePass]) {
+    try {
+      if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8')
+    } catch {
+      // best effort
+    }
+  }
+  return null
+}
+
+export function auditNativeResult(args, result) {
+  const A = normalizeArgs(args)
+  const refined = Array.isArray(result && result.refined) ? result.refined : []
+  const refinedByPath = new Map(refined.map((r) => {
+    const p = refinedPathOf(r)
+    return p ? [path.resolve(p), r] : null
+  }).filter(Boolean))
+  const pairs = A.files
+    .map((f) => {
+      const outPath = path.resolve(f.outPath)
+      if (!refinedByPath.has(outPath) || !fs.existsSync(outPath)) return null
+      return { sourcePath: f.path, refinedPath: outPath, mode: 'refine', glossaryText: glossaryTextForAudit(A) }
+    })
+    .filter(Boolean)
+  const audit = pairs.length ? auditPairs(pairs) : null
+  const auditFailed = audit
+    ? audit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file || f.refinedFile, findings: f.failed || [] }))
+    : []
+  const glossaryText = glossaryTextForAudit(A)
+  const glossaryLint = glossaryText ? auditGlossary(glossaryText) : null
+  const audited = {
+    ...result,
+    outputDir: A.outputDir,
+    audit,
+    auditFailed,
+    glossaryLint,
+  }
+  const resultPath = writeJson(path.join(stateDir(A), 'result-audited.json'), audited)
+  return { resultPath, audit, auditFailed, glossaryLint }
+}
+
 export function writeNativeArtifacts(args, result) {
   const A = normalizeArgs(args)
   const fullResult = { ...result, outputDir: A.outputDir }
@@ -406,6 +484,9 @@ async function main() {
   } else if (command === 'deliver-prompts') {
     if (!opts.state) throw new Error('--state is required')
     out = deliverPrompts(args, readJson(opts.state))
+  } else if (command === 'audit') {
+    if (!opts.result) throw new Error('--result is required')
+    out = auditNativeResult(args, readJson(opts.result))
   } else if (command === 'artifacts') {
     if (!opts.result) throw new Error('--result is required')
     out = writeNativeArtifacts(args, readJson(opts.result))

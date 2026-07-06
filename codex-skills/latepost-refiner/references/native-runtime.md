@@ -246,15 +246,27 @@ node codex-skills/latepost-refiner/scripts/codex-native.mjs deliver-prompts \
 Spawn native subagents for `logic`, `summary`, and `timeline` prompts as requested. Use built-in browsing for timeline
 public-source checks. Save compact reports and paths in `result.json`.
 
-## Review Queue And Run Manifest
+## Audit, Review Queue, And Run Manifest
 
 Assemble the final result object. Start from `state-after-verify.json`'s `resultSeed`, then fill in `refined`, `logic`,
 `summary`, `timeline`, `failed`, `incomplete`, and `unchecked`.
 
+Run the deterministic quality audit before writing `review.md` / `run.json`, so hard findings are captured in the
+same handoff artifacts. The helper pairs each source file with its refined output, passes the current `校对表.md`
+or one-pass glossary to the audit, and writes `<out>/_codex-native/result-audited.json`.
+
+```bash
+node codex-skills/latepost-refiner/scripts/codex-native.mjs audit \
+  --args <out>/_codex-native/args.json \
+  --result result.json
+```
+
+Then write the review queue and manifest from the audited result:
+
 ```bash
 node codex-skills/latepost-refiner/scripts/codex-native.mjs artifacts \
   --args <out>/_codex-native/args.json \
-  --result result.json
+  --result <out>/_codex-native/result-audited.json
 ```
 
 This writes:
@@ -264,10 +276,12 @@ This writes:
 <out>/run.json
 ```
 
-Run the deterministic quality audit on the refined transcripts before handoff. The audit script is bundled inside this skill at `codex-skills/latepost-refiner/scripts/audit_refined.mjs`, so a standalone install can run it without the repo worktree. **Use the source-aware form** (one per file — pair each refined output with its source) so it catches compression, not just leftover filler:
+The audit script is bundled inside this skill at `codex-skills/latepost-refiner/scripts/audit_refined.mjs`, so a
+standalone install can run it without the repo worktree. For spot checks, use the source-aware form (one per file —
+pair each refined output with its source) so it catches compression, not just leftover filler:
 
 ```bash
-node codex-skills/latepost-refiner/scripts/audit_refined.mjs --source <源稿.md> --refined <out>/Transcripts/<title>.md
+node codex-skills/latepost-refiner/scripts/audit_refined.mjs --source <源稿.md> --refined <out>/Transcripts/<title>.md --glossary <out>/校对表.md
 ```
 
 `status: fail` flags a hard issue:

@@ -34,6 +34,7 @@ Collect:
 - Output folder — ask, with a default the user can change. Default to `~/Downloads`, or to the last-used folder if you remember one: read `~/.config/latepost-refiner/last-output` first and offer that. After the user settles on a folder, remember it: `mkdir -p ~/.config/latepost-refiner && printf '%s' '<chosen folder>' > ~/.config/latepost-refiner/last-output`.
 - Topic/company/person and interview date.
 - Speaker list, reporter/host names, interviewee roles, and any known aliases.
+- User-decreed canonical names: if the user says "口语 X/Y 一律写作 Z", record it in `canonicalOverrides` (`[{ canonical, variants, category: 'person'|'brand'|'term', note? }]`) instead of leaving it only in background prose.
 - Background: industry, companies, people, products, and events discussed.
 - Scope: `refine`, optionally `logic`, `summary`, `timeline`.
 - Web verification depth: `key`, `deep`, or `none`.
@@ -50,15 +51,13 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
    - scout/refine/check: one subagent per source file.
    - verify/timeline: use built-in Codex browsing; never require Tavily on the primary path.
    - dedup/logic/summary: native model subagents.
-5. Use the helper after each model-heavy stage to merge compact JSON reports, render `校对表.md`, and write artifacts.
+5. Use the helper after each model-heavy stage to merge compact JSON reports and render `校对表.md`.
 6. Inspect generated artifacts:
    - `<out>/Transcripts/*.md`
    - `<out>/校对表.md`
-   - `<out>/review.md`
-   - `<out>/run.json`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-7. Run the quality audit before handoff — source-aware, one per file: `node codex-skills/latepost-refiner/scripts/audit_refined.mjs --source <源稿.md> --refined <out>/Transcripts/<title>.md` (the script is bundled inside this skill). Fix or surface any `status: fail`: `compression_risk` (refine became a summary — rerun from source), `under_refined`, `ending_missing`, leftover pure filler (嗯/呃/对对对), or paragraphs over ~900 字. See [references/native-runtime.md](references/native-runtime.md).
-8. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
+7. Run the deterministic audit stage before writing the final handoff artifacts: `node codex-skills/latepost-refiner/scripts/codex-native.mjs audit --args <out>/_codex-native/args.json --result result.json`, then pass the returned `result-audited.json` to `artifacts`.
+8. Read `<out>/review.md` first for unresolved issues; do not dump full transcripts into the main context.
 9. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
 ## Manual Fallback

@@ -6,6 +6,7 @@ import test from 'node:test'
 import {
   afterScout,
   afterVerify,
+  auditNativeResult,
   prepareNativeRun,
   writeNativeArtifacts,
 } from '../codex-skills/latepost-refiner/scripts/codex-native.mjs'
@@ -117,4 +118,79 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     if (savedTavilyKey === undefined) delete process.env.TAVILY_API_KEY
     else process.env.TAVILY_API_KEY = savedTavilyKey
   }
+})
+
+test('Codex native helper applies canonicalOverrides before verify and glossary render', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'latepost-codex-override-'))
+  const sourceA = path.join(tmp, 'interview-a.md')
+  const sourceB = path.join(tmp, 'interview-b.md')
+  fs.writeFileSync(sourceA, '记者：王总怎么判断这个市场？\n受访者：王总说要先做供应链。\n', 'utf8')
+  fs.writeFileSync(sourceB, '记者：后来王总怎么投？\n受访者：投了 500 万。\n', 'utf8')
+
+  const args = {
+    topic: '测试公司',
+    outputDir: path.join(tmp, 'out'),
+    scope: ['refine'],
+    verifyDepth: 'key',
+    files: [{ path: sourceA, label: 'A' }, { path: sourceB, label: 'B' }],
+    canonicalOverrides: [{ canonical: '王志远', variants: ['王总'], category: 'person', note: '用户确认' }],
+  }
+
+  const prepared = prepareNativeRun(args)
+  const normalized = readJson(prepared.argsPath)
+  const findings = {
+    A: { people: [{ canonical: '王总', variants: [], hint: '受访者称呼' }], brands: [], terms: [], themes: [], errors: [], has_existing_headings: false },
+    B: { people: [{ canonical: '王总', variants: [], hint: '投资人称呼' }], brands: [], terms: [], themes: [], errors: [], has_existing_headings: false },
+  }
+  const scout = afterScout(normalized, findings)
+  const state = readJson(scout.statePath)
+  assert.equal(state.verifyPrompts.length, 0, 'locked user-decreed names skip web verification')
+  assert.equal(state.mergedThisBatch.people[0].canonical, '王志远')
+  assert.equal(state.mergedThisBatch.people[0].locked, true)
+
+  const verifiedState = afterVerify(normalized, state, { resolved: [], unresolved: [] }, { suspects: [] })
+  const glossary = fs.readFileSync(verifiedState.glossaryPath, 'utf8')
+  assert.match(glossary, /王志远/)
+  assert.match(glossary, /王总/)
+  assert.match(glossary, /用户钦定/)
+})
+
+test('Codex native one-pass prompt carries canonicalOverrides and an audit glossary', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'latepost-codex-onepass-'))
+  const source = path.join(tmp, 'short.md')
+  fs.writeFileSync(source, '记者：王总怎么看？\n受访者：王总说先验证需求。\n', 'utf8')
+  const args = {
+    topic: '测试公司',
+    outputDir: path.join(tmp, 'out'),
+    files: [{ path: source, label: '短访谈' }],
+    canonicalOverrides: [{ canonical: '王志远', variants: ['王总'] }],
+  }
+  const prepared = prepareNativeRun(args)
+  assert.equal(prepared.prompts.length, 1)
+  const prompt = fs.readFileSync(prepared.prompts[0].path, 'utf8')
+  assert.match(prompt, /用户钦定正名/)
+  assert.match(prompt, /王志远/)
+  const glossary = fs.readFileSync(path.join(args.outputDir, '_codex-native', 'one-pass-glossary.md'), 'utf8')
+  assert.match(glossary, /王志远/)
+  assert.match(glossary, /王总/)
+})
+
+test('Codex native audit stage records auditFailed for compressed outputs', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'latepost-codex-audit-'))
+  const source = path.join(tmp, 'interview.md')
+  const sourceText = Array.from({ length: 30 }, (_, i) => `记者：第 ${i + 1} 个问题。\n受访者：这是第 ${i + 1} 段关于产品、渠道、供应链和组织变化的具体细节。`).join('\n')
+  fs.writeFileSync(source, sourceText, 'utf8')
+  const outDir = path.join(tmp, 'out')
+  const args = { topic: '测试公司', outputDir: outDir, files: [{ path: source, label: '访谈' }] }
+  const prepared = prepareNativeRun(args)
+  const normalized = readJson(prepared.argsPath)
+  const outPath = normalized.files[0].outPath
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, '# 访谈\n\n受访者：内容很多，略。\n', 'utf8')
+  const result = { refined: [{ outPath, complete: true, checkNote: '', headings: [], key_fixes: [], open_questions: [] }] }
+
+  const audited = auditNativeResult(normalized, result)
+  assert.ok(fs.existsSync(audited.resultPath))
+  assert.ok(audited.auditFailed.length >= 1)
+  assert.ok(audited.auditFailed[0].findings.includes('compression_risk'))
 })

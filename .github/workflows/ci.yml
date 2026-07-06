@@ -51,7 +51,17 @@ jobs:
       # audit_refined.mjs is copied into the skill bundle by build:cc (build/build-cc.mjs). The build step
       # above regenerates it; this cmp is a backstop that also catches a hand-edited bundle copy.
       - name: Check audit script copies in sync
-        run: cmp scripts/audit_refined.mjs claude-code-skill/audit_refined.mjs
+        run: |
+          cmp scripts/audit_refined.mjs claude-code-skill/audit_refined.mjs
+          cmp scripts/audit_refined.mjs codex-skills/latepost-refiner/scripts/audit_refined.mjs
+
+      # Codex native installs can be zipped as a standalone skill, so its helper carries the small shared
+      # runtime files it imports. Keep those copies byte-identical with the repo sources.
+      - name: Check Codex native bundled runtime in sync
+        run: |
+          cmp core/spec.js codex-skills/latepost-refiner/core/spec.js
+          cmp core/prompts.js codex-skills/latepost-refiner/core/prompts.js
+          cmp universal/artifacts.js codex-skills/latepost-refiner/universal/artifacts.js
 
       # editorial-spec.md is the one references/ file the two editions share verbatim (deliverables.md and
       # glossary-template.md are intentionally different per-edition adaptations — do NOT cmp those). Fail on
