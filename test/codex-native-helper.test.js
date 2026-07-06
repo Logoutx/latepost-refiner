@@ -9,6 +9,7 @@ import {
   afterScout,
   afterVerify,
   auditNativeResult,
+  CODEX_MODEL_PROFILE,
   prepareNativeRun,
   writeNativeArtifacts,
 } from '../codex-skills/latepost-refiner/scripts/codex-native.mjs'
@@ -47,6 +48,7 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     const prepared = prepareNativeRun(args)
     assert.equal(prepared.prompts.length, 2)
     assert.ok(prepared.prompts.every((p) => p.stage === 'scout' && fs.existsSync(p.path)))
+    assert.ok(prepared.prompts.every((p) => p.model === CODEX_MODEL_PROFILE.scout.model && p.reasoning_effort === CODEX_MODEL_PROFILE.scout.reasoning_effort))
 
     const normalized = readJson(prepared.argsPath)
     const findings = {
@@ -90,6 +92,8 @@ test('Codex native helper prepares prompts, renders glossary, and writes artifac
     assert.match(fs.readFileSync(verifiedState.glossaryPath, 'utf8'), /王志远/)
     assert.equal(verifiedState.refinePrompts.length, 2)
     assert.equal(verifiedState.checkPrompts.length, 2)
+    assert.ok(verifiedState.refinePrompts.every((p) => p.model === CODEX_MODEL_PROFILE.refine.model && p.reasoning_effort === CODEX_MODEL_PROFILE.refine.reasoning_effort))
+    assert.ok(verifiedState.checkPrompts.every((p) => p.model === CODEX_MODEL_PROFILE.check.model && p.reasoning_effort === CODEX_MODEL_PROFILE.check.reasoning_effort))
 
     const resultSeed = readJson(verifiedState.statePath).resultSeed
     for (const f of normalized.files) {
@@ -169,6 +173,8 @@ test('Codex native one-pass prompt carries canonicalOverrides and an audit gloss
   }
   const prepared = prepareNativeRun(args)
   assert.equal(prepared.prompts.length, 1)
+  assert.equal(prepared.prompts[0].model, CODEX_MODEL_PROFILE['single-pass'].model)
+  assert.equal(prepared.prompts[0].reasoning_effort, CODEX_MODEL_PROFILE['single-pass'].reasoning_effort)
   const prompt = fs.readFileSync(prepared.prompts[0].path, 'utf8')
   assert.match(prompt, /用户钦定正名/)
   assert.match(prompt, /王志远/)
@@ -195,6 +201,32 @@ test('Codex native audit stage records auditFailed for compressed outputs', () =
   assert.ok(fs.existsSync(audited.resultPath))
   assert.ok(audited.auditFailed.length >= 1)
   assert.ok(audited.auditFailed[0].findings.includes('compression_risk'))
+})
+
+test('Codex native audit stage records logicFailed for copied same-order logic drafts', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'latepost-codex-logic-audit-'))
+  const source = path.join(tmp, 'interview.md')
+  const turns = Array.from({ length: 28 }, (_, i) => `记者：第 ${i + 1} 个问题。\n受访者：这是第 ${i + 1} 段足够长的虚构内容，用来模拟完整问答和事实细节。`).join('\n')
+  fs.writeFileSync(source, turns, 'utf8')
+  const outDir = path.join(tmp, 'out')
+  const args = { topic: '测试公司', outputDir: outDir, scope: ['refine', 'logic'], files: [{ path: source, label: '访谈', title: '访谈' }] }
+  const prepared = prepareNativeRun(args)
+  const normalized = readJson(prepared.argsPath)
+  const refinedPath = normalized.files[0].outPath
+  const logicPath = path.join(outDir, '逻辑顺序', '访谈.md')
+  fs.mkdirSync(path.dirname(refinedPath), { recursive: true })
+  fs.mkdirSync(path.dirname(logicPath), { recursive: true })
+  const bodyLines = Array.from({ length: 28 }, (_, i) => `受访者：这是第 ${i + 1} 段足够长的虚构内容，用来模拟完整问答和事实细节。`)
+  fs.writeFileSync(refinedPath, `# 访谈\n\n## 原顺序\n\n${bodyLines.join('\n\n')}`, 'utf8')
+  fs.writeFileSync(logicPath, `# 访谈 · 逻辑顺序稿\n\n## 主线脉络（导读）\n\n导读。\n\n## 原顺序\n\n${bodyLines.join('\n\n')}`, 'utf8')
+  const result = {
+    refined: [{ outPath: refinedPath, complete: true, checkNote: '', headings: ['原顺序'], key_fixes: [], open_questions: [] }],
+    logic: [{ label: '访谈', path: logicPath, missingSections: [], open_questions: [] }],
+  }
+
+  const audited = auditNativeResult(normalized, result)
+  assert.equal(audited.logicAudit.status, 'fail')
+  assert.ok(audited.logicFailed[0].findings.includes('logic_order_unchanged'))
 })
 
 test('universal skill Codex helper runs from installed folder layout without API keys', () => {

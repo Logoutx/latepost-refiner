@@ -174,12 +174,12 @@ test('audit gate: still hard after one repair → auditFailed + visible marker (
   assert.equal(r.refined[0].audit.status, 'fail')
 })
 
-test('audit gate: soft-only findings never fail the gate', async () => {
+test('audit gate: any audit failed[] entry is a hard gate', async () => {
   const labels = []
   const capabilities = { runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.deepEqual(r.auditFailed, [], 'under_refined (not content_gap/quote_style) is not a hard gate here')
-  assert.deepEqual(r.refined[0].audit.softFindings, ['under_refined'])
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['under_refined'] }])
+  assert.deepEqual(r.refined[0].audit.hardFindings, ['under_refined'])
 })
 
 test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a parseable pass → ok', async () => {

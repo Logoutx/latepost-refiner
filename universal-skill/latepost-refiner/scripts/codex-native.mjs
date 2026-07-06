@@ -35,16 +35,41 @@ import {
   parseGlossary,
   pickNetworkUnverified,
   renderGlossary,
+  safeName,
   scoutLooksGarbled,
   verifyChunks,
   weakDupFlags,
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
-import { auditGlossary, auditPairs } from './audit_refined.mjs'
+import { auditGlossary, auditLogicFile, auditPairs } from './audit_refined.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..')
+
+export const CODEX_MODEL_PROFILE = {
+  scout: { model: 'gpt-5.4-mini', reasoning_effort: 'low' },
+  check: { model: 'gpt-5.4-mini', reasoning_effort: 'low' },
+  verify: { model: 'gpt-5.4', reasoning_effort: 'medium' },
+  dedup: { model: 'gpt-5.4', reasoning_effort: 'medium' },
+  summary: { model: 'gpt-5.4', reasoning_effort: 'medium' },
+  timeline: { model: 'gpt-5.4', reasoning_effort: 'high' },
+  refine: { model: 'gpt-5.5', reasoning_effort: 'high' },
+  'single-pass': { model: 'gpt-5.5', reasoning_effort: 'high' },
+  logic: { model: 'gpt-5.5', reasoning_effort: 'high' },
+}
+
+function stageProfile(A, stage) {
+  const base = CODEX_MODEL_PROFILE[stage] || { model: 'gpt-5.4', reasoning_effort: 'medium' }
+  const override = A && A.codexModels && A.codexModels[stage]
+  if (typeof override === 'string') return { ...base, model: override }
+  if (override && typeof override === 'object') return { ...base, ...override }
+  return { ...base }
+}
+
+function promptEntry(A, stage, rest) {
+  return { stage, ...stageProfile(A, stage), ...rest }
+}
 
 function usage() {
   return `Usage:
@@ -162,6 +187,7 @@ export function normalizeArgs(input) {
   A.background = A.background || ''
   A.topic = A.topic || 'untitled'
   A.date = A.date || ''
+  A.codexModels = (A.codexModels && typeof A.codexModels === 'object') ? A.codexModels : {}
 
   const files = Array.isArray(A.files) ? A.files : []
   if (!files.length) throw new Error('args.files must contain at least one source file')
@@ -208,20 +234,18 @@ export function prepareNativeRun(args) {
       ? ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) => `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
       : null
     if (onePassGlossaryText) writeText(path.join(dir, 'one-pass-glossary.md'), onePassGlossaryText)
-    prompts.push({
-      stage: 'single-pass',
+    prompts.push(promptEntry(A, 'single-pass', {
       label: f.label,
       schema: REFINE_REPORT_SCHEMA,
       path: writeText(path.join(dir, 'prompts', promptName('single-pass', 0, f.label)), singlePassPrompt(f, A, overrideNote)),
-    })
+    }))
   } else {
     A.files.forEach((f, index) => {
-      prompts.push({
-        stage: 'scout',
+      prompts.push(promptEntry(A, 'scout', {
         label: f.label,
         schema: SCOUT_SCHEMA,
         path: writeText(path.join(dir, 'prompts', promptName('scout', index, f.label)), scoutPrompt(f, A)),
-      })
+      }))
     })
   }
 
@@ -257,8 +281,7 @@ export function afterScout(args, findingsRaw) {
   const dedupList = dedupListText(mergedThisBatch)
   const dir = stateDir(A)
 
-  const verifyPrompts = vc.chunks.map((chunk, index) => ({
-    stage: 'verify',
+  const verifyPrompts = vc.chunks.map((chunk, index) => promptEntry(A, 'verify', {
     label: `verify:${index + 1}/${vc.chunks.length}`,
     schema: VERIFY_SCHEMA,
     path: writeText(path.join(dir, 'prompts', promptName('verify', index, `chunk-${index + 1}`)), verifyPrompt(chunk, A)),
@@ -276,7 +299,7 @@ export function afterScout(args, findingsRaw) {
     scoutSuspect,
     verify: { eligible: vc.eligible, excluded: vc.excluded, overflow: vc.overflow, chunks: vc.chunks.length },
     verifyPrompts,
-    dedupPrompt: dedupPromptPath ? { stage: 'dedup', label: 'dedup:semantic', schema: DEDUP_SCHEMA, path: dedupPromptPath } : null,
+    dedupPrompt: dedupPromptPath ? promptEntry(A, 'dedup', { label: 'dedup:semantic', schema: DEDUP_SCHEMA, path: dedupPromptPath }) : null,
   }
   const statePath = writeJson(path.join(dir, 'state-after-scout.json'), state)
   return { statePath, verifyPrompts, dedupPromptPath }
@@ -321,20 +344,18 @@ export function afterVerify(args, state, verifiedRaw, dedupRaw) {
 
   const refinePrompts = A.files.map((f, index) => {
     const finding = state.findings[index] || {}
-    return {
-      stage: 'refine',
+    return promptEntry(A, 'refine', {
       label: f.label,
       schema: REFINE_REPORT_SCHEMA,
       path: writeText(path.join(dir, 'prompts', promptName('refine', index, f.label)), refinePrompt(f, glossary, finding, A)),
-    }
+    })
   })
   const checkPrompts = A.files.map((f, index) => {
     const finding = state.findings[index] || {}
-    return {
-      stage: 'check',
+    return promptEntry(A, 'check', {
       label: f.label,
       path: writeText(path.join(dir, 'prompts', promptName('check', index, f.label)), checkPrompt(f, finding.ending_anchor || null)),
-    }
+    })
   })
 
   const resultSeed = {
@@ -378,26 +399,23 @@ export function deliverPrompts(args, state) {
   const prompts = []
   if (A.scope.includes('logic')) {
     A.files.forEach((f, index) => {
-      prompts.push({
-        stage: 'logic',
+      prompts.push(promptEntry(A, 'logic', {
         label: f.label,
         path: writeText(path.join(dir, 'prompts', promptName('logic', index, f.label)), logicWritePrompt(f, A)),
-      })
+      }))
     })
   }
   if (A.scope.includes('summary') && refined.length) {
-    prompts.push({
-      stage: 'summary',
+    prompts.push(promptEntry(A, 'summary', {
       label: 'summary',
       path: writeText(path.join(dir, 'prompts', 'summary.txt'), summaryPrompt(A, refined)),
-    })
+    }))
   }
   if (A.scope.includes('timeline') && refined.length) {
-    prompts.push({
-      stage: 'timeline',
+    prompts.push(promptEntry(A, 'timeline', {
       label: 'timeline',
       path: writeText(path.join(dir, 'prompts', 'timeline.txt'), timelinePrompt(A, state.glossary || '', refined)),
-    })
+    }))
   }
   const manifestPath = writeJson(path.join(dir, 'deliver-prompt-manifest.json'), { prompts })
   return { manifestPath, prompts }
@@ -420,6 +438,26 @@ function glossaryTextForAudit(A) {
   return null
 }
 
+function logicPathOf(A, f, entry) {
+  const p = entry && entry.path
+  return path.resolve(p || path.join(A.outputDir, '逻辑顺序', `${safeName(f.title)}.md`))
+}
+
+function auditLogicOutputs(A, result) {
+  const entries = Array.isArray(result && result.logic) ? result.logic : []
+  if (!A.scope.includes('logic') && !entries.length) return null
+  const files = A.files
+    .map((f, index) => {
+      const refinedPath = path.resolve(f.outPath)
+      const logicPath = logicPathOf(A, f, entries[index])
+      if (!fs.existsSync(refinedPath) || !fs.existsSync(logicPath)) return null
+      return auditLogicFile(refinedPath, logicPath)
+    })
+    .filter(Boolean)
+  if (!files.length) return null
+  return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
+}
+
 export function auditNativeResult(args, result) {
   const A = normalizeArgs(args)
   const refined = Array.isArray(result && result.refined) ? result.refined : []
@@ -440,15 +478,21 @@ export function auditNativeResult(args, result) {
     : []
   const glossaryText = glossaryTextForAudit(A)
   const glossaryLint = glossaryText ? auditGlossary(glossaryText) : null
+  const logicAudit = auditLogicOutputs(A, result)
+  const logicFailed = logicAudit
+    ? logicAudit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file || f.logicFile, findings: f.failed || [] }))
+    : []
   const audited = {
     ...result,
     outputDir: A.outputDir,
     audit,
     auditFailed,
     glossaryLint,
+    logicAudit,
+    logicFailed,
   }
   const resultPath = writeJson(path.join(stateDir(A), 'result-audited.json'), audited)
-  return { resultPath, audit, auditFailed, glossaryLint }
+  return { resultPath, audit, auditFailed, glossaryLint, logicAudit, logicFailed }
 }
 
 export function writeNativeArtifacts(args, result) {

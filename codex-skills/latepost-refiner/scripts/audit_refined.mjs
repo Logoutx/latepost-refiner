@@ -16,7 +16,10 @@
 // Source-aware gates (mode: 'refine'):
 //   - compression_risk: charRatio < 0.55  (PRIMARY gate; faithful ~0.83, summary ~0.21)
 //   - under_refined:     source filler-heavy AND emptyReduction < 0.25
+//   - under_refined_high_ratio: source filler-heavy, charRatio > 0.92, and emptyReduction < 0.35
 //   - ending_missing:    source's last sentence not found in the refined output
+//   - glossary_variant_residue / glued_entity_replacement: 校对表变体 or broken English entity replacements survived
+//   - move_marker_residue / strikethrough_leak: source edit markup leaked into the final prose
 //   - residual_noise / long_paragraphs: from the output-only checks
 //   speakerTurnRatio is reported as a CONFIRMING signal only (consolidated
 //   alternations, so rule-4a same-speaker merging doesn't lower it) — it never
@@ -33,7 +36,9 @@ export const HARD_LONG_CHARS = 900
 
 export const REFINE_GATES = {
   CHAR_RATIO_MIN: 0.55,         // refined/source 汉字 below this → probable compression
+  CHAR_RATIO_MAX: 0.92,         // above this + weak cleanup → probable not-refined copy
   EMPTY_REDUCTION_MIN: 0.25,    // filler density must drop at least this much
+  HIGH_RATIO_EMPTY_REDUCTION_MIN: 0.35,
   SOURCE_FILLER_DENSITY: 0.02,  // only apply the under-refine check when source is filler-heavy
 }
 
@@ -170,15 +175,22 @@ export function checkSpeakerLabelStyle(refinedText) {
 export function parseGlossaryLite(glossaryText) {
   const entries = [], unverified = new Set()
   if (!glossaryText) return { entries, unverified: [] }
-  let inNameOrBrand = false
+  let section = null
   for (const raw of String(glossaryText).split(/\r?\n/)) {
     const line = raw.trim()
     const h = line.match(/^#{1,6}\s+(.*)$/)
-    if (h) { inNameOrBrand = /人名|品牌|公司|产品/.test(h[1]); continue }
+    if (h) {
+      const title = h[1]
+      section = /人名/.test(title) ? 'person'
+        : /品牌|公司|产品/.test(title) ? 'brand'
+          : /术语|专名|写法统一/.test(title) ? 'term'
+            : null
+      continue
+    }
     // unverified-by-web line: `- query：未能核实，保留（音）…`
     const un = line.match(/^-\s*(.+?)：未能核实/)
     if (un) { const q = un[1].trim(); if (CJK_CHAR.test(q)) unverified.add(q.replace(/\*/g, '')); continue }
-    if (!inNameOrBrand) continue
+    if (!section) continue
     const m = line.match(/^-\s*\*\*(.+?)\*\*\s*←\s*(.*)$/)
     if (!m) continue
     const canonical = m[1].trim()
@@ -187,7 +199,7 @@ export function parseGlossaryLite(glossaryText) {
     const varsRaw = (fields.shift() || '').trim()
     const variants = (varsRaw === '—' || varsRaw === '（无变体）') ? []
       : varsRaw.split('/').map((x) => x.trim()).filter(Boolean)
-    entries.push({ canonical, variants, section: 'nameOrBrand' })
+    entries.push({ canonical, variants, section })
     // a suspect/unverified entry (⚠ or 未能核实 anywhere in the row) → its canonical needs a （音） in prose
     if (/⚠|未能核实/.test(rest)) if (CJK_CHAR.test(canonical)) unverified.add(canonical)
   }
@@ -227,7 +239,7 @@ export function checkGhostName(refinedText, glossary) {
 // missing_yin: a glossary name flagged ⚠ / 未能核实 appears in prose on a line lacking a （音 annotation.
 export function checkMissingYin(refinedText, glossary) {
   const names = (glossary && glossary.unverified) || []
-  const findings = { name: 'missing_yin', severity: 'soft', count: 0, samples: [] }
+  const findings = { name: 'missing_yin', severity: 'hard', count: 0, samples: [] }
   if (!names.length) return findings
   const body = bodyLines(refinedText)
   const hits = []
@@ -241,6 +253,104 @@ export function checkMissingYin(refinedText, glossary) {
   }
   findings.count = hits.length
   findings.samples = hits.slice(0, 12)
+  return findings
+}
+
+function isLatinish(s) {
+  return /^[A-Za-z0-9][A-Za-z0-9 ._'’/-]*$/.test(String(s || '').trim())
+}
+
+function variantResidueMatch(line, variant, canonical) {
+  if (!variant || variant === canonical) return false
+  if (CJK_CHAR.test(variant)) {
+    if (cjkLen(variant) < 2) return false
+    const canonHasV = canonical && canonical.includes(variant)
+    const scan = canonHasV ? line.replace(new RegExp(escapeRe(canonical), 'g'), (m) => ' '.repeat(m.length)) : line
+    return new RegExp(escapeRe(variant), 'g').test(scan)
+  }
+  if (!isLatinish(variant) || String(variant).trim().length < 3) return false
+  const re = new RegExp(`(^|[^A-Za-z0-9])${escapeRe(variant)}(?=$|[^A-Za-z0-9])`, 'i')
+  return re.test(line)
+}
+
+// glossary_variant_residue: a glossary variant that should have been normalized still appears in prose.
+// glued_entity_replacement: a canonical Latin entity appears with letters/numbers glued to either side
+// (the typical blind-replacement bug: "FooAI" → "FooAII" / "XFooAI").
+export function checkGlossaryApplication(refinedText, glossary) {
+  const entries = (glossary && glossary.entries) || []
+  const variantHits = []
+  const gluedHits = []
+  if (!entries.length) {
+    return [
+      { name: 'glossary_variant_residue', severity: 'hard', count: 0, samples: [] },
+      { name: 'glued_entity_replacement', severity: 'hard', count: 0, samples: [] },
+    ]
+  }
+  for (const e of entries) {
+    for (const { no, text } of bodyLines(refinedText)) {
+      for (const v of e.variants || []) {
+        if (variantResidueMatch(text, v, e.canonical)) {
+          variantHits.push({ text: `${v}（应统一为 ${e.canonical}）：${text.trim().slice(0, 48)}`, line: no })
+        }
+      }
+      if (isLatinish(e.canonical) && String(e.canonical).trim().length >= 3) {
+        const c = escapeRe(e.canonical.trim())
+        const re = new RegExp(`[A-Za-z0-9]+${c}|${c}[A-Za-z0-9]+`, 'ig')
+        for (const m of text.matchAll(re)) {
+          const token = m[0]
+          if (token.toLowerCase() !== e.canonical.toLowerCase()) {
+            gluedHits.push({ text: `${token}（疑似 ${e.canonical} 盲替换粘连）：${text.trim().slice(0, 48)}`, line: no })
+          }
+        }
+      }
+    }
+  }
+  return [
+    { name: 'glossary_variant_residue', severity: 'hard', count: variantHits.length, samples: variantHits.slice(0, 12) },
+    { name: 'glued_entity_replacement', severity: 'hard', count: gluedHits.length, samples: gluedHits.slice(0, 12) },
+  ]
+}
+
+const MOVE_MARKER_RE = /【?\s*换位\s*[0-9一二三四五六七八九十]*(?:\s*[-—－]\s*[前后])?\s*】?/g
+
+function strikethroughSpans(sourceText) {
+  const spans = []
+  for (const m of String(sourceText || '').matchAll(/~~([\s\S]{4,280}?)~~/g)) {
+    const raw = (m[1] || '').replace(/\s+/g, ' ').trim()
+    const norm = normalize(raw)
+    if (norm.length >= 20) spans.push({ raw, norm, line: lineFor(sourceText, m.index || 0) })
+  }
+  return spans
+}
+
+function normWindowPresent(refNorm, spanNorm) {
+  if (!spanNorm) return false
+  if (spanNorm.length < 30) return refNorm.includes(spanNorm)
+  for (let i = 0; i + 30 <= spanNorm.length; i += 15) {
+    if (refNorm.includes(spanNorm.slice(i, i + 30))) return true
+  }
+  return false
+}
+
+// Source edit-markup policy: deletion marks and move marks are instructions, not transcript content.
+export function checkMarkupHandling(sourceText, refinedText) {
+  const findings = []
+  const moveHits = []
+  if (/换位/.test(sourceText || '')) {
+    for (const { no, text } of bodyLines(refinedText)) {
+      for (const m of text.matchAll(MOVE_MARKER_RE)) {
+        moveHits.push({ text: `${m[0]}：${text.trim().slice(0, 56)}`, line: no })
+      }
+    }
+  }
+  findings.push({ name: 'move_marker_residue', severity: 'hard', count: moveHits.length, samples: moveHits.slice(0, 12) })
+
+  const refNorm = normalize(refinedText)
+  const leaks = []
+  for (const s of strikethroughSpans(sourceText)) {
+    if (normWindowPresent(refNorm, s.norm)) leaks.push({ text: `删除线内容疑似进入成稿：${s.raw.slice(0, 48)}`, line: s.line })
+  }
+  findings.push({ name: 'strikethrough_leak', severity: 'hard', count: leaks.length, samples: leaks.slice(0, 12) })
   return findings
 }
 
@@ -365,6 +475,53 @@ export function checkLogicSize(refinedText, logicText) {
   return findings
 }
 
+function logicComparableLines(text) {
+  return bodyLines(text)
+    .map(({ raw, text: sanitized }) => (sanitized || raw || '').trim())
+    .filter(Boolean)
+    .filter((line) => !/^\*.*\*$/.test(line))
+    .filter((line) => !/^〔取自精校稿[:：]/.test(line))
+    .filter((line) => !/^基于精校稿重排/.test(line))
+    .filter((line) => !/^\[?编者\]?/.test(line))
+    .filter((line) => cjkLen(line) >= 8)
+}
+
+function lcsLength(a, b) {
+  if (!a.length || !b.length) return 0
+  let prev = new Array(b.length + 1).fill(0)
+  let cur = new Array(b.length + 1).fill(0)
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1])
+    }
+    ;[prev, cur] = [cur, prev]
+    cur.fill(0)
+  }
+  return prev[b.length]
+}
+
+// logic_order_unchanged: a "逻辑顺序" output that is essentially the refined transcript in the same order.
+// Hard only for substantial files, with a very high threshold so legitimate light reorders don't false-fail.
+export function checkLogicOrder(refinedText, logicText) {
+  const refinedLines = logicComparableLines(refinedText)
+  const logicLines = logicComparableLines(logicText)
+  const minLen = Math.min(refinedLines.length, logicLines.length)
+  const maxLen = Math.max(refinedLines.length, logicLines.length)
+  const lcs = lcsLength(refinedLines, logicLines)
+  const sameOrderRatio = minLen ? Number((lcs / minLen).toFixed(3)) : 0
+  const lineCountRatio = minLen ? Number((maxLen / minLen).toFixed(3)) : 1
+  const unchanged = minLen >= 20 && sameOrderRatio >= 0.985 && lineCountRatio <= 1.08
+  return {
+    metrics: { refinedComparableLines: refinedLines.length, logicComparableLines: logicLines.length, sameOrderRatio, lineCountRatio },
+    finding: {
+      name: 'logic_order_unchanged',
+      severity: 'hard',
+      count: unchanged ? 1 : 0,
+      samples: unchanged ? [{ text: `逻辑稿与精校稿行级同序率 ${sameOrderRatio}，疑只是复制原顺序；需按主线实质重排`, line: 1 }] : [],
+    },
+  }
+}
+
 // Ordered speaker identifiers from either format: source "**发言人 1 …**" or
 // refined "李某：/记者：". Headings/quotes/tables are skipped.
 function speakerSeq(text) {
@@ -402,6 +559,10 @@ function endingCovered(sourceText, refinedText) {
   for (let i = 0; i + 4 <= tail.length; i += 1) {
     if (refHan.includes(tail.slice(i, i + 4))) return true
   }
+  const sourceTail = srcLines.slice(-6).join(' ')
+  const refinedTail = refinedText.split(/\r?\n/).slice(-12).join('\n')
+  if (/谢谢|麻烦|过目|辛苦|欢迎|再来|回头|一定|吃饭|面馆|今天聊/.test(sourceTail)
+    && /收尾|致谢|寒暄|闲聊|客套|约饭|从略/.test(refinedTail)) return true
   return false
 }
 
@@ -856,16 +1017,30 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   const speakerFindings = checkSpeakerLabelStyle(refinedText)
   const ghostFinding = checkGhostName(refinedText, glossary)
   const yinFinding = checkMissingYin(refinedText, glossary)
+  const glossaryFindings = checkGlossaryApplication(refinedText, glossary)
+  const markupFindings = checkMarkupHandling(sourceText, refinedText)
   const quoteHard = quoteFindings.find((f) => f.name === 'quote_style')
+  const glossaryVariant = glossaryFindings.find((f) => f.name === 'glossary_variant_residue')
+  const gluedEntity = glossaryFindings.find((f) => f.name === 'glued_entity_replacement')
+  const moveMarker = markupFindings.find((f) => f.name === 'move_marker_residue')
+  const strikeLeak = markupFindings.find((f) => f.name === 'strikethrough_leak')
 
   const gates = {
     residual_noise: out.hard_issues > 0,
     long_paragraphs: (out.long_paragraphs || []).length > 0,
     quote_style: (quoteHard ? quoteHard.count : 0) > 0,
+    glossary_variant_residue: (glossaryVariant ? glossaryVariant.count : 0) > 0,
+    glued_entity_replacement: (gluedEntity ? gluedEntity.count : 0) > 0,
+    missing_yin: yinFinding.count > 0,
+    move_marker_residue: (moveMarker ? moveMarker.count : 0) > 0,
+    strikethrough_leak: (strikeLeak ? strikeLeak.count : 0) > 0,
   }
   if (mode === 'refine') {
     gates.compression_risk = charRatio < REFINE_GATES.CHAR_RATIO_MIN
     gates.under_refined = sEmptyDensity > REFINE_GATES.SOURCE_FILLER_DENSITY && emptyReduction < REFINE_GATES.EMPTY_REDUCTION_MIN
+    gates.under_refined_high_ratio = sEmptyDensity > REFINE_GATES.SOURCE_FILLER_DENSITY
+      && charRatio > REFINE_GATES.CHAR_RATIO_MAX
+      && emptyReduction < REFINE_GATES.HIGH_RATIO_EMPTY_REDUCTION_MIN
     gates.ending_missing = !ending
     // content_gap: a substantial contiguous source stretch never surfaced in the refined text and left
     // no fold trace — the silent-omission (possible censorship) failure. Soft gaps and scattered loss
@@ -881,23 +1056,26 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...quoteFindings,      // quote_style (hard) + optional quote_density_low (soft)
     ...speakerFindings,    // speaker_label_style (soft)
     ghostFinding,          // ghost_name (soft; empty when no glossary)
-    yinFinding,            // missing_yin (soft; empty when no glossary)
+    yinFinding,            // missing_yin (hard gate when glossary marks a name unverified)
+    ...glossaryFindings,   // glossary_variant_residue / glued_entity_replacement (hard gates)
+    ...markupFindings,     // source edit markup residue (hard gates)
   ])
   return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers }
 }
 
 // Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay ≤ 1.10× the 成稿 in 汉字
-// count (导读/出处 scaffold tolerance) and carry no duplicated long paragraphs. Both findings soft — a
-// reorder deliverable is judged on preservation, not gated like a refine. Standalone entry (its own CLI
-// flag --logic); returns the same finding shape so downstream wiring is uniform.
+// count (导读/出处 scaffold tolerance), carry no duplicated long paragraphs, and show real order movement.
+// The size/duplicate checks are soft; logic_order_unchanged is hard because it means the deliverable wasn't
+// actually produced. Standalone entry (its own CLI flag --logic); returns the same finding shape as auditPair.
 export function auditLogicPair(refinedText, logicText, { refinedFile = '<refined>', logicFile = '<logic>' } = {}) {
   const rChars = hanzi(refinedText)
   const lChars = hanzi(logicText)
-  const findings = checkLogicSize(refinedText, logicText)
-  const failed = [] // both findings are soft → never fails
+  const order = checkLogicOrder(refinedText, logicText)
+  const findings = checkLogicSize(refinedText, logicText).concat(order.finding)
+  const failed = findings.filter((f) => f.severity === 'hard' && f.count).map((f) => f.name)
   return {
-    file: logicFile, mode: 'logic', status: 'ok', failed,
-    metrics: { refinedFile, refinedChars: rChars, logicChars: lChars, sizeRatio: rChars ? Number((lChars / rChars).toFixed(3)) : 1 },
+    file: logicFile, mode: 'logic', status: failed.length ? 'fail' : 'ok', failed,
+    metrics: { refinedFile, refinedChars: rChars, logicChars: lChars, sizeRatio: rChars ? Number((lChars / rChars).toFixed(3)) : 1, ...order.metrics },
     findings,
   }
 }
@@ -933,10 +1111,11 @@ function usage() {
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就 等纯噪音；超约 900 字的对话长段。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
   content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）、
-  quote_style（ASCII 直引号紧贴中文，或出现「」『』——排版规范明令禁止）。
+  quote_style（ASCII 直引号紧贴中文，或出现「」『』——排版规范明令禁止）、校对表变体残留、
+  未核实名裸写、英文实体粘连、删除线/换位标记漏入正文。
 soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失；
   quote_density_low（长正文无弯引号）、speaker_label_style（标签风格混用）、ghost_name（残留错写变体）、
-  missing_yin（未核实名裸写缺（音））、logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）、
+  logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）、
   glossary_thin / glossary_hints_sparse / glossary_variants_sparse（校对表偏薄，见 --glossary-only）。`
 }
 
@@ -961,9 +1140,10 @@ function main() {
   }
   // --logic pairs the 逻辑稿 against the 成稿 (--refined); it is a standalone entry, no --source needed.
   if (logic && refined) {
-    const result = { status: 'ok', files: [auditLogicFile(refined, logic)] }
+    const file = auditLogicFile(refined, logic)
+    const result = { status: file.status, files: [file] }
     console.log(JSON.stringify(result, null, 2))
-    return 0
+    return file.status === 'fail' ? 1 : 0
   }
   if (source && refined) {
     const glossary = getOpt(argv, '--glossary')

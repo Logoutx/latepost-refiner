@@ -98,10 +98,11 @@ export function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/scripts/audit_refined.mjs` and echoes the
-// JSON. content_gap(hard) or quote_style(hard) → optionally auto-repair once (capabilities.repair, or a refine
-// subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
-// 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
-// an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
+// JSON. Any audit `failed[]` entry is a hard gate. Repairable items get one auto-repair attempt
+// (capabilities.repair, or a refine subagent with Read/Edit in CC), re-audit ONCE, and if still hard the file is
+// recorded in auditFailed. A visible 缺口 marker is inserted only for content_gap, because other failures are
+// better handled in review.md/run.json than by polluting the transcript body. Then run source anchors.
+// Never throws: an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
 async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const src = f.path, out = f.outPath
   const skillDir = A.skillDir || '.'
@@ -142,13 +143,16 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const first = await audit()
   if (!first) { engine.log(`审计不可用：${f.label}（子代理未能返回可解析 JSON，降级为仅记录，不阻断）`); return { status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0 } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
-  const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
+  const hardOf = (r) => (r && Array.isArray(r.failed)) ? r.failed.slice() : []
+  const repairableOf = hardOf
+  const softOf = (r) => ((r && r.findings) || [])
+    .filter((x) => x && x.severity === 'soft' && x.count)
+    .map((x) => x.name)
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
 
-  if (hard.length) {
+  if (repairableOf(cur).length) {
     engine.log(`审计 hard：${f.label} → ${hard.join('、')}——尝试自动修复一次`)
     const gaps = (cur.gaps || []).filter((g) => g.severity === 'hard')
     const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
@@ -159,7 +163,15 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       // CC path: a refine-tier subagent with Read/Edit patches ONLY the flagged spots in the on-disk 成稿.
       const parts = []
       if (hard.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
+      if (hard.includes('compression_risk')) parts.push('· 疑似压缩成摘要：不要从当前摘要里“扩写”；必须重新 Read 源稿，把缺失的事实和问答从源稿补回成稿。')
+      if (hard.includes('ending_missing')) parts.push('· 结尾缺失：Read 源稿末尾和成稿末尾，把源稿结尾处的实质内容补进成稿；纯离场客套可折成一句说明。')
       if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
+      if (hard.includes('glossary_variant_residue')) parts.push('· 术语/人名/品牌残留：按校对表把正文里还残留的变体统一为正字，逐处核对语境，禁止盲替换。')
+      if (hard.includes('glued_entity_replacement')) parts.push('· 英文实体粘连：修正英文专名边界错误（例如把多粘的字母/词拆开或还原），不得机械全局替换。')
+      if (hard.includes('missing_yin')) parts.push('· 未核实名裸写：校对表标 ⚠ / 未能核实的名字必须写成 “（音）/（音，存疑）”。')
+      if (hard.includes('move_marker_residue')) parts.push('· “换位”标记：按标记意图调顺段落，删除标记本身，不能把标记当正文。')
+      if (hard.includes('strikethrough_leak')) parts.push('· 删除线内容：源稿删除线默认表示删稿指令；把误入正文的删除线内容移除，除非它承载必须保留的事实并需要显式说明。')
+      if (hard.includes('residual_noise') || hard.includes('under_refined') || hard.includes('under_refined_high_ratio') || hard.includes('long_paragraphs')) parts.push('· 欠精校：对照源稿删净纯口癖、重复和 ASR 胶水，重切超长段；保留事实，不压成摘要。')
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
         { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
@@ -172,7 +184,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   }
 
   const auditFailed = hard.length ? hard.slice() : []
-  // Still hard after (at most one) repair → drop a visible 内容缺口/引号 marker so the document shows the defect.
+  // Still hard after (at most one) repair → drop a visible 内容缺口 marker only for true source omissions.
   // Risk (b): fall back to the agent whenever the annotate CAPABILITY specifically is missing — not only in the
   // all-agent CC path. A host that injects runAudit but not annotate still gets the marker via the agent.
   if (auditFailed.length && (cur.gaps || []).some((g) => g.severity === 'hard')) {

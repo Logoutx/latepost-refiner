@@ -94,11 +94,24 @@ function formatAudit(f) {
   if (failed.includes('content_gap')) parts.push((f.gaps || []).filter((g) => g.severity === 'hard').map((g) => `内容缺口 第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字（疑被无声略过）`).join('、'))
   if (failed.includes('compression_risk')) parts.push(`疑似压缩成摘要（charRatio ${f.metrics ? f.metrics.charRatio : '?'}）`)
   if (failed.includes('under_refined')) parts.push('欠精校（口癖未删净）')
+  if (failed.includes('under_refined_high_ratio')) parts.push(`疑似原样润色（charRatio ${f.metrics ? f.metrics.charRatio : '?'}，emptyReduction ${f.metrics ? f.metrics.emptyReduction : '?'}）`)
   if (failed.includes('ending_missing')) parts.push('结尾缺失')
+  if (failed.includes('glossary_variant_residue')) parts.push('校对表变体仍残留')
+  if (failed.includes('glued_entity_replacement')) parts.push('英文实体疑似盲替换粘连')
+  if (failed.includes('missing_yin')) parts.push('未核实名裸写，缺（音）/（音，存疑）')
+  if (failed.includes('move_marker_residue')) parts.push('“换位”剪辑标记漏进正文')
+  if (failed.includes('strikethrough_leak')) parts.push('删除线内容疑似漏进正文')
   const hard = (f.findings || []).filter((x) => x.severity === 'hard' && x.count).map((x) => `${x.name}×${x.count}`)
   if (hard.length) parts.push(hard.join('、'))
   if (f.long_paragraphs && f.long_paragraphs.length) parts.push(`超 900 字段×${f.long_paragraphs.length}`)
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
+}
+
+function formatLogicAudit(f) {
+  const m = f.metrics || {}
+  const failed = (f.failed || []).join('/')
+  const ratio = m.sameOrderRatio != null ? `同序率 ${m.sameOrderRatio}` : failed
+  return `${path.basename(f.file || '')} — 疑似未按主线重排（${ratio}）`
 }
 
 // E13: fired 校对表 lint warnings → one review line each (each finding's sample text carries the counts).
@@ -125,6 +138,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '因网络故障未核实，可网络恢复后补查', items: (result.networkUnverified || []).map(formatNetworkItem), priority: 'medium' },
     { title: '逻辑顺序稿失败', items: logic.filter((l) => !l.path).map((l) => l.label || jsonLine(l)), priority: 'medium' },
     { title: '逻辑顺序稿疑漏小标题', items: logic.filter((l) => l.missingSections && l.missingSections.length).map(formatLogicGap), priority: 'medium' },
+    { title: '逻辑顺序稿疑似未重排', items: ((result.logicAudit && result.logicAudit.files) || []).filter((f) => f.status === 'fail').map(formatLogicAudit), priority: 'high' },
     { title: '收尾待问', items: (result.openQuestions || []).map(jsonLine), priority: 'medium' },
     { title: '预检提示', items: warnings, priority: 'low' },
   ]
@@ -242,11 +256,16 @@ export function buildRunManifest(result = {}, context = {}) {
       scoutSuspect: result.scoutSuspect || [],
       suspectedDuplicates: result.suspectedDuplicates || [],
       networkUnverified: result.networkUnverified || [],
+      logicFailed: result.logicFailed || [],
       openQuestions: result.openQuestions || [],
     },
     audit: result.audit ? {
       status: result.audit.status,
       files: (result.audit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null, gaps: f.gaps || [], modelMarkers: f.modelMarkers || [] })),
+    } : null,
+    logicAudit: result.logicAudit ? {
+      status: result.logicAudit.status,
+      files: (result.logicAudit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null })),
     } : null,
     // E13: 校对表 structural lint (all soft) — metrics + only the warnings that fired.
     glossaryLint: result.glossaryLint ? {

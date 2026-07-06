@@ -139,7 +139,8 @@ const RULES = `精校规范（务必全部遵守）：
 3. 理顺破碎口语、修语序与冗余助词；有信息量/有个性的金句照留，不要抹平。
 4. 按主题加 ## 小标题：准确概括、不篡改原意、不加原文没有的结论；一律不编号；一份通常 6–20 个。
 4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字），必要时每段重复发言人标签；单个对话段超过约 900 字视为需要重切。
-5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。**凡校对表中标 ⚠ 或注明「保留（音）／未能核实／疑为转录误写」的名字：正文每处都写作「名字（音，存疑）」或「名字（音）」，不得裸写**（这些是尚未核实的写法，裸写会被误当成已确认）。
+5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。**凡校对表中标 ⚠ 或注明「保留（音）／未能核实／疑为转录误写」的名字：正文每处都写作「名字（音，存疑）」或「名字（音）」，不得裸写**（这些是尚未核实的写法，裸写会被误当成已确认）。校对表不是机械全局 find/replace：英文实体和拼音/缩写必须看词边界，禁止把相邻字母粘成新怪词；同音实体必须逐处按上下文判断，不可把不同对象硬并。
+5a. 源稿编辑标记要执行，不能漏进正文：Markdown 删除线 \`~~...~~\` 默认表示删稿指令，除非其中有必须保留的事实且你明确改写说明，否则不要写入成稿；\`【换位…】\` 表示段落移动指令，按其意图调顺内容并删除标记本身。遇到不确定的剪辑标记，写进 open_questions，不能把标记原样当作采访内容。
 6. 保留全部事实细节（数字/金额/时间/产品/工艺/渠道/观点）——精校不是摘要。
 7. 发言人规范：采访方追问归对应记者名；被访方旁白/补充按校对表标注；拒答/「以招股书为准」等语境务必原样保留，勿替受访者补数字。
 8. 文件抬头：首行 H1 标题，第二行斜体说明行。
@@ -1166,7 +1167,6 @@ function safeName(s, max = 80, maxBytes = 255) {
 
 
 
-
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
 // (Haiku tends to take 8–9 small 100–200-line bites; Opus reads large chunks —
@@ -1430,6 +1430,7 @@ ${list}
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
 三部分：分类要点（### 按主题小节，每条带具体事实或数字）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
+**事实边界**：访谈总结默认只使用精校成稿里的事实。若为解释背景补入公开资料，必须显式写明〔公开资料，需复核〕或给出来源名；不得把模型记忆当成已核实事实，也不得把公开资料反写成受访者说过。
 
 ${TYPESET}
 
@@ -1448,6 +1449,7 @@ function timelinePrompt(a, glossary, refined) {
 步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
 ${list}
 抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一；逐条标【访谈】/【公开】/【公开+访谈】；**源头可溯**：凡【访谈】或【公开+访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
+**公开事实纪律**：每条【公开】或【公开+访谈】事件都要在条末注明公开来源名（媒体/公司官网/公告/数据库名即可），查不到来源就降级为【访谈】或写“公开来源未核到”，不能靠记忆补年份、金额、人物关系。
 
 ${TYPESET}
 
@@ -1480,7 +1482,6 @@ ${TYPESET}
 
 完成后按 schema 返回：path、mainline（导读那段）、threads（每条线索的 title、logic、以及它取自精校稿的哪些小标题 source_sections——**source_sections 必须原样照抄精校稿里的 \`##\` 小标题文字**，供完整性核对）、open_questions。`
 }
-
 
 
 
@@ -1581,10 +1582,11 @@ function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/scripts/audit_refined.mjs` and echoes the
-// JSON. content_gap(hard) or quote_style(hard) → optionally auto-repair once (capabilities.repair, or a refine
-// subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
-// 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
-// an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
+// JSON. Any audit `failed[]` entry is a hard gate. Repairable items get one auto-repair attempt
+// (capabilities.repair, or a refine subagent with Read/Edit in CC), re-audit ONCE, and if still hard the file is
+// recorded in auditFailed. A visible 缺口 marker is inserted only for content_gap, because other failures are
+// better handled in review.md/run.json than by polluting the transcript body. Then run source anchors.
+// Never throws: an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
 async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const src = f.path, out = f.outPath
   const skillDir = A.skillDir || '.'
@@ -1625,13 +1627,16 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const first = await audit()
   if (!first) { engine.log(`审计不可用：${f.label}（子代理未能返回可解析 JSON，降级为仅记录，不阻断）`); return { status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0 } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
-  const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
+  const hardOf = (r) => (r && Array.isArray(r.failed)) ? r.failed.slice() : []
+  const repairableOf = hardOf
+  const softOf = (r) => ((r && r.findings) || [])
+    .filter((x) => x && x.severity === 'soft' && x.count)
+    .map((x) => x.name)
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
 
-  if (hard.length) {
+  if (repairableOf(cur).length) {
     engine.log(`审计 hard：${f.label} → ${hard.join('、')}——尝试自动修复一次`)
     const gaps = (cur.gaps || []).filter((g) => g.severity === 'hard')
     const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
@@ -1642,7 +1647,15 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       // CC path: a refine-tier subagent with Read/Edit patches ONLY the flagged spots in the on-disk 成稿.
       const parts = []
       if (hard.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
+      if (hard.includes('compression_risk')) parts.push('· 疑似压缩成摘要：不要从当前摘要里“扩写”；必须重新 Read 源稿，把缺失的事实和问答从源稿补回成稿。')
+      if (hard.includes('ending_missing')) parts.push('· 结尾缺失：Read 源稿末尾和成稿末尾，把源稿结尾处的实质内容补进成稿；纯离场客套可折成一句说明。')
       if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
+      if (hard.includes('glossary_variant_residue')) parts.push('· 术语/人名/品牌残留：按校对表把正文里还残留的变体统一为正字，逐处核对语境，禁止盲替换。')
+      if (hard.includes('glued_entity_replacement')) parts.push('· 英文实体粘连：修正英文专名边界错误（例如把多粘的字母/词拆开或还原），不得机械全局替换。')
+      if (hard.includes('missing_yin')) parts.push('· 未核实名裸写：校对表标 ⚠ / 未能核实的名字必须写成 “（音）/（音，存疑）”。')
+      if (hard.includes('move_marker_residue')) parts.push('· “换位”标记：按标记意图调顺段落，删除标记本身，不能把标记当正文。')
+      if (hard.includes('strikethrough_leak')) parts.push('· 删除线内容：源稿删除线默认表示删稿指令；把误入正文的删除线内容移除，除非它承载必须保留的事实并需要显式说明。')
+      if (hard.includes('residual_noise') || hard.includes('under_refined') || hard.includes('under_refined_high_ratio') || hard.includes('long_paragraphs')) parts.push('· 欠精校：对照源稿删净纯口癖、重复和 ASR 胶水，重切超长段；保留事实，不压成摘要。')
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
         { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
@@ -1655,7 +1668,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   }
 
   const auditFailed = hard.length ? hard.slice() : []
-  // Still hard after (at most one) repair → drop a visible 内容缺口/引号 marker so the document shows the defect.
+  // Still hard after (at most one) repair → drop a visible 内容缺口 marker only for true source omissions.
   // Risk (b): fall back to the agent whenever the annotate CAPABILITY specifically is missing — not only in the
   // all-agent CC path. A host that injects runAudit but not annotate still gets the marker via the agent.
   if (auditFailed.length && (cur.gaps || []).some((g) => g.severity === 'hard')) {

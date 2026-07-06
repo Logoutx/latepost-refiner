@@ -65,7 +65,7 @@ node "<this skill dir>/scripts/codex-native.mjs" audit --args <out>/_codex-nativ
 node "<this skill dir>/scripts/codex-native.mjs" artifacts --args <out>/_codex-native/args.json --result <out>/_codex-native/result-audited.json
 ```
 
-Use native Codex subagents for scout, verify, dedup, refine, logic, summary, and timeline. Keep raw transcripts and full web pages out of the main context; subagents return compact JSON reports and write outputs by path.
+Use native Codex subagents for scout, verify, dedup, refine, logic, summary, and timeline. Use each prompt entry's `model` and `reasoning_effort` fields when the subagent tool allows it. Keep raw transcripts and full web pages out of the main context; subagents return compact JSON reports and write outputs by path.
 
 ## Claude Code Native Summary
 

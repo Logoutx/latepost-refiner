@@ -109,3 +109,37 @@ test('manifest carries content-gap details and annotations; review renders 内�
   const ann = sections.find((s) => s.title.includes('已在成稿中插入内容缺口标记'))
   assert.ok(ann && ann.items[0].includes('插入 1 处标记'), 'annotation section present with count')
 })
+
+test('review and manifest surface high-ratio refine failures and logic-order audit failures', () => {
+  const withQualityFailures = {
+    ...baseResult,
+    audit: {
+      status: 'fail',
+      files: [{
+        file: '/tmp/out/Transcripts/A.md',
+        status: 'fail',
+        failed: ['under_refined_high_ratio', 'glossary_variant_residue', 'move_marker_residue'],
+        metrics: { charRatio: 0.96, emptyReduction: 0.12 },
+        gaps: [],
+        modelMarkers: [],
+      }],
+    },
+    logicAudit: {
+      status: 'fail',
+      files: [{
+        file: '/tmp/out/逻辑顺序/A.md',
+        status: 'fail',
+        failed: ['logic_order_unchanged'],
+        metrics: { sameOrderRatio: 0.999, refinedComparableLines: 100, logicComparableLines: 101 },
+      }],
+    },
+  }
+  const sections = reviewSections(withQualityFailures, [])
+  const quality = sections.find((s) => s.title.includes('成稿质量抽查未过'))
+  assert.ok(quality && /疑似原样润色/.test(quality.items[0]) && /校对表变体仍残留/.test(quality.items[0]))
+  const logic = sections.find((s) => s.title.includes('逻辑顺序稿疑似未重排'))
+  assert.ok(logic && logic.items[0].includes('同序率 0.999'))
+  const manifest = buildRunManifest(withQualityFailures, { outputDir: '/tmp/out', topic: 'T' })
+  assert.equal(manifest.audit.files[0].failed.includes('under_refined_high_ratio'), true)
+  assert.equal(manifest.logicAudit.files[0].failed[0], 'logic_order_unchanged')
+})

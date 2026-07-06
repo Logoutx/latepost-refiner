@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, checkGlossaryApplication, checkMarkupHandling, auditGlossary, parseGlossaryEntities } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -51,6 +51,16 @@ test('refine mode fails an under-refined output (coverage kept, filler not remov
   assert.ok(r.failed.includes('under_refined'), 'under_refined fires')
   assert.ok(!r.failed.includes('compression_risk'), 'charRatio is high — not compression')
   assert.ok(r.metrics.charRatio >= 0.55, `charRatio ${r.metrics.charRatio} stays high`)
+})
+
+test('refine mode fails a high-char-ratio output that is still mostly raw ASR filler', () => {
+  const source = Array.from({ length: 36 }, (_, i) => `记者：那个这个就是说第 ${i + 1} 个问题。\n受访者：那个我们这个阶段就是说先做渠道，再看供应链和组织节奏。`).join('\n')
+  const refined = source.replace(/那个/g, (m, offset) => (offset % 3 === 0 ? '' : m))
+  const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  assert.equal(r.status, 'fail')
+  assert.ok(r.failed.includes('under_refined_high_ratio'), `failed=${r.failed.join(',')}`)
+  assert.ok(r.metrics.charRatio > 0.92, `charRatio ${r.metrics.charRatio}`)
+  assert.ok(r.metrics.emptyReduction < 0.35, `emptyReduction ${r.metrics.emptyReduction}`)
 })
 
 test('refine mode passes a faithful, properly-cleaned refine', () => {
@@ -267,6 +277,10 @@ const glossaryText = [
   '## 品牌 / 公司 / 产品（写法 → 统一）',
   '- **云洲仪器** ← 云舟仪器 / 云舟',
   '',
+  '## 术语 / 专名（写法 → 统一）',
+  '- **现场制** ← 现厂制 / 现场值',
+  '- **OpenCue** ← OpenQ',
+  '',
   '## 联网核实结论（已采纳的已应用到上表正文；标 ⚠ 的与正文强名冲突、未采纳，待人工确认）',
   '- 蓝湖科技：未能核实，保留（音） ｜ 无公开信息',
 ].join('\n')
@@ -331,6 +345,7 @@ test('parseGlossaryLite reads canonical/variants and unverified names from the r
   const by = Object.fromEntries(g.entries.map((e) => [e.canonical, e.variants]))
   assert.deepEqual(by['陈焘'], ['陈涛', '陈韬'], 'variants split on / under 人名')
   assert.deepEqual(by['云洲仪器'], ['云舟仪器', '云舟'], 'brand section parsed too')
+  assert.deepEqual(by['现场制'], ['现厂制', '现场值'], 'term section parsed too')
   assert.deepEqual(by['周砚'], [], '— means no variants')
   assert.ok(g.unverified.includes('周砚'), '⚠ suspect canonical marked unverified')
   assert.ok(g.unverified.includes('蓝湖科技'), '未能核实 web line marked unverified')
@@ -355,15 +370,55 @@ test('ghost_name: a corrected-away variant left in the prose fires soft; canonic
   assert.equal(checkGhostName(withGhost, parseGlossaryLite(null)).count, 0, 'no glossary → no ghost check')
 })
 
-test('missing_yin: a ⚠/未能核实 name written bare fires soft; with （音） it does not; no glossary skips', () => {
+test('missing_yin: a ⚠/未能核实 name written bare hard-fails; with （音） it does not; no glossary skips', () => {
   const g = parseGlossaryLite(glossaryText)
   const bare = '## 概况\n\n记者：周砚您好，请介绍一下蓝湖科技。'
   const f = checkMissingYin(bare, g)
-  assert.equal(f.severity, 'soft')
+  assert.equal(f.severity, 'hard')
   assert.equal(f.count, 2, 'both 周砚 and 蓝湖科技 bare on the line')
   const annotated = '## 概况\n\n记者：周砚（音）您好，请介绍一下蓝湖科技（音）。'
   assert.equal(checkMissingYin(annotated, g).count, 0, '（音 on the line clears it')
   assert.equal(checkMissingYin(bare, parseGlossaryLite(null)).count, 0, 'no glossary → skipped')
+})
+
+test('glossary application hard-fails residual variants and glued Latin entity replacements', () => {
+  const g = parseGlossaryLite(glossaryText)
+  const dirty = '## 产品\n\n周砚：我们把现厂制写进方案，还接了 OpenCueX 的测试接口。'
+  const findings = checkGlossaryApplication(dirty, g)
+  assert.equal(findings.find((f) => f.name === 'glossary_variant_residue').count, 1)
+  assert.equal(findings.find((f) => f.name === 'glued_entity_replacement').count, 1)
+  const r = auditPair({
+    sourceText: '周砚：那个我们说现厂制和 OpenQ 接口，后面都要统一。\n',
+    refinedText: dirty,
+    mode: 'refine',
+    glossaryText,
+  })
+  assert.ok(r.failed.includes('glossary_variant_residue'))
+  assert.ok(r.failed.includes('glued_entity_replacement'))
+})
+
+test('source edit markup hard-fails leaked 换位 markers and deleted spans', () => {
+  const source = [
+    '记者：先讲渠道。',
+    '受访者：这段保留，讲渠道节奏和组织变化。',
+    '【换位1-后】',
+    '受访者：~~这段内部备忘应该删除，不进入最终采访稿，包含很多具体细节。~~',
+    '受访者：最后讲产品线。',
+  ].join('\n')
+  const refined = [
+    '# 访谈',
+    '',
+    '受访者：这段保留，讲渠道节奏和组织变化。',
+    '【换位1-后】',
+    '受访者：这段内部备忘应该删除，不进入最终采访稿，包含很多具体细节。',
+    '受访者：最后讲产品线。',
+  ].join('\n')
+  const findings = checkMarkupHandling(source, refined)
+  assert.equal(findings.find((f) => f.name === 'move_marker_residue').count, 1)
+  assert.equal(findings.find((f) => f.name === 'strikethrough_leak').count, 1)
+  const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  assert.ok(r.failed.includes('move_marker_residue'))
+  assert.ok(r.failed.includes('strikethrough_leak'))
 })
 
 test('speaker_label_style: mixing 名字 12:34 and 名字： each ≥3 times fires soft; a uniform file does not', () => {
@@ -390,7 +445,7 @@ test('logic_size_sanity: 逻辑稿 > 成稿×1.10 fires; a duplicated long line 
   const bloated = '正文内容'.repeat(80)              // 320 汉字 → 1.33×
   const r1 = auditLogicPair(refined, bloated)
   assert.equal(r1.mode, 'logic')
-  assert.equal(r1.status, 'ok', 'logic findings are soft — never a fail')
+  assert.equal(r1.status, 'ok', 'size/dup findings are soft')
   const sz = r1.findings.find((f) => f.name === 'logic_size_sanity')
   assert.ok(sz.severity === 'soft' && sz.count === 1, 'size gate fires soft')
   assert.ok(r1.metrics.sizeRatio > 1.10, `ratio ${r1.metrics.sizeRatio}`)
@@ -406,6 +461,16 @@ test('logic_size_sanity: 逻辑稿 > 成稿×1.10 fires; a duplicated long line 
   assert.equal(r2.findings.find((f) => f.name === 'logic_duplicate_para').count, 0, 'no duplicates')
 })
 
+test('logic_order_unchanged: a copied same-order logic draft hard-fails', () => {
+  const lines = Array.from({ length: 28 }, (_, i) => `受访者：这是第 ${i + 1} 段足够长的虚构内容，用来模拟精校稿中的完整问答。`)
+  const refined = `# 访谈\n\n## 原顺序\n\n${lines.join('\n\n')}`
+  const copied = `# 访谈 · 逻辑顺序稿\n\n## 主线脉络（导读）\n\n导读。\n\n## 原顺序\n\n${lines.join('\n\n')}`
+  const r = auditLogicPair(refined, copied)
+  assert.equal(r.status, 'fail')
+  assert.ok(r.failed.includes('logic_order_unchanged'))
+  assert.ok(r.metrics.sameOrderRatio >= 0.985)
+})
+
 test('auditPair threads a glossary into ghost_name / missing_yin and stays silent without one', () => {
   const src = covSrc()
   const refined = fixture('coverage-refined-good.md')
@@ -419,6 +484,7 @@ test('auditPair threads a glossary into ghost_name / missing_yin and stays silen
   const gf = withG.findings.find((f) => f.name === 'ghost_name')
   assert.ok(gf.count >= 1, 'variant residue caught when glossary supplied')
   assert.equal(gf.severity, 'soft', 'ghost_name is soft — does not fail the pair')
+  assert.ok(withG.failed.includes('glossary_variant_residue'), 'hard glossary residue gate fails the pair')
 })
 
 // ---------- 校对表 structural lint (E13) ----------
