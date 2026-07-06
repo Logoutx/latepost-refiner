@@ -1,5 +1,7 @@
 # LatePost-Refiner — Development Plan: two subscription-native interfaces (Claude + Codex) over one core
 
+**Status update:** Phase 3b has landed: Codex now has a no-key subscription-native skill path, and releases are moving to a generated `universal-skill/latepost-refiner/` package that carries both Claude and Codex native runtimes. The older notes below are useful for architecture context but may describe pre-implementation risk.
+
 _Drafted 2026-06-22. Companion to `docs/streamlining-proposal.md` (the collaborator's structure proposal). This is the agreed execution plan._
 
 ## Context

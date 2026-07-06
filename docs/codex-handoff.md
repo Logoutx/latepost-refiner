@@ -1,5 +1,7 @@
 # Handoff — build the no-key Codex skill (Phase 3b)
 
+**Status:** historical. The no-key Codex-native skill has been implemented and is now included in the generated `universal-skill/latepost-refiner/` package. Keep this file as context for the original build request, not as current setup guidance.
+
 _For Codex. Self-contained; assumes no prior conversation. Work on a branch and coordinate before pushing `main` (the maintainer's edition shares this repo)._
 
 ## Goal

@@ -14,10 +14,13 @@
     "README.md",
     "build/",
     "claude-code-skill/",
+    "codex-skills/",
     "core/",
     "docs/",
     "engines/",
     "eval/",
+    "scripts/",
+    "universal-skill/",
     "universal/"
   ],
   "exports": {
@@ -29,6 +32,8 @@
     "latepost-refiner": "node universal/cli.js",
     "web": "node universal/server.js",
     "build:cc": "node build/build-cc.mjs",
+    "build:universal-skill": "node build/build-universal-skill.mjs",
+    "build:skill": "npm run build:universal-skill",
     "build:embed": "node build/embed-assets.mjs",
     "build:binary": "bash build/build-binary.sh",
     "eval": "node eval/run.mjs",

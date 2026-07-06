@@ -37,6 +37,9 @@ jobs:
       - name: Rebuild Claude Code workflow
         run: npm run build:cc
 
+      - name: Rebuild universal skill package
+        run: npm run build:universal-skill
+
       - name: Check whitespace
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -48,12 +51,31 @@ jobs:
       - name: Check generated workflow drift
         run: git diff --exit-code claude-code-skill/scripts/claude-native.js
 
+      - name: Check universal skill package drift
+        run: git diff --exit-code universal-skill/latepost-refiner
+
+      - name: Check universal native runtimes in sync
+        run: |
+          cmp claude-code-skill/scripts/claude-native.js universal-skill/latepost-refiner/scripts/claude-native.js
+          cmp codex-skills/latepost-refiner/scripts/codex-native.mjs universal-skill/latepost-refiner/scripts/codex-native.mjs
+          cmp build/universal-skill/SKILL.md universal-skill/latepost-refiner/SKILL.md
+
       # audit_refined.mjs is copied into the skill bundle by build:cc (build/build-cc.mjs). The build step
       # above regenerates it; this cmp is a backstop that also catches a hand-edited bundle copy.
       - name: Check audit script copies in sync
         run: |
           cmp scripts/audit_refined.mjs claude-code-skill/scripts/audit_refined.mjs
           cmp scripts/audit_refined.mjs codex-skills/latepost-refiner/scripts/audit_refined.mjs
+          cmp scripts/audit_refined.mjs universal-skill/latepost-refiner/scripts/audit_refined.mjs
+
+      - name: Check converter script copies in sync
+        run: |
+          cmp scripts/setup-converters.sh claude-code-skill/setup-converters.sh
+          cmp scripts/install-converters.command claude-code-skill/install-converters.command
+          cmp scripts/setup-converters.sh codex-skills/latepost-refiner/scripts/setup-converters.sh
+          cmp scripts/install-converters.command codex-skills/latepost-refiner/scripts/install-converters.command
+          cmp scripts/setup-converters.sh universal-skill/latepost-refiner/scripts/setup-converters.sh
+          cmp scripts/install-converters.command universal-skill/latepost-refiner/scripts/install-converters.command
 
       # Codex native installs can be zipped as a standalone skill, so its helper carries the small shared
       # runtime files it imports. Keep those copies byte-identical with the repo sources.
@@ -62,6 +84,9 @@ jobs:
           cmp core/spec.js codex-skills/latepost-refiner/core/spec.js
           cmp core/prompts.js codex-skills/latepost-refiner/core/prompts.js
           cmp universal/artifacts.js codex-skills/latepost-refiner/universal/artifacts.js
+          cmp core/spec.js universal-skill/latepost-refiner/core/spec.js
+          cmp core/prompts.js universal-skill/latepost-refiner/core/prompts.js
+          cmp universal/artifacts.js universal-skill/latepost-refiner/universal/artifacts.js
 
       # editorial-spec.md is the one references/ file the two editions share verbatim (deliverables.md and
       # glossary-template.md are intentionally different per-edition adaptations — do NOT cmp those). Fail on
@@ -93,8 +118,13 @@ jobs:
       - name: Rebuild Claude Code workflow
         run: npm run build:cc
 
+      - name: Rebuild universal skill package
+        run: npm run build:universal-skill
+
       - name: Build the skill zip
-        run: bash claude-code-skill/build-zips.sh "$PWD/dist-zips"
+        run: |
+          mkdir -p dist-zips
+          (cd universal-skill && zip -rq "$PWD/../dist-zips/latepost-refiner.zip" latepost-refiner)
 
       - name: Publish to the rolling "latest" release
         env:

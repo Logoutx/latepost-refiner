@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   afterScout,
   afterVerify,
@@ -193,4 +195,34 @@ test('Codex native audit stage records auditFailed for compressed outputs', () =
   assert.ok(fs.existsSync(audited.resultPath))
   assert.ok(audited.auditFailed.length >= 1)
   assert.ok(audited.auditFailed[0].findings.includes('compression_risk'))
+})
+
+test('universal skill Codex helper runs from installed folder layout without API keys', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'latepost-universal-skill-'))
+  const source = path.join(tmp, 'interview.md')
+  const argsPath = path.join(tmp, 'args.json')
+  fs.writeFileSync(source, '记者：请介绍背景。\n受访者：这是虚构样本。\n', 'utf8')
+  fs.writeFileSync(argsPath, JSON.stringify({
+    topic: '测试公司',
+    outputDir: path.join(tmp, 'out'),
+    files: [{ path: source, label: '访谈' }],
+  }), 'utf8')
+
+  const env = { ...process.env }
+  delete env.OPENAI_API_KEY
+  delete env.TAVILY_API_KEY
+
+  const stdout = execFileSync('node', [
+    'universal-skill/latepost-refiner/scripts/codex-native.mjs',
+    'prepare',
+    '--args',
+    argsPath,
+  ], { cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), env, stdio: 'pipe' })
+
+  const commandResult = JSON.parse(stdout.toString('utf8'))
+  const prepared = readJson(path.join(tmp, 'out', '_codex-native', 'args.json'))
+  assert.match(prepared.skillDir, /universal-skill\/latepost-refiner$/)
+  assert.ok(Array.isArray(commandResult.prompts))
+  assert.equal(commandResult.prompts[0].stage, 'single-pass')
+  assert.ok(fs.existsSync(path.join(tmp, 'out', '_codex-native', 'prompt-manifest.json')))
 })

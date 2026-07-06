@@ -1,5 +1,7 @@
 # Codex subscription capability spike
 
+**Status:** completed in June 2026. The no-key Codex-native path is now implemented in `codex-skills/latepost-refiner/` and included in the generated `universal-skill/latepost-refiner/` package. Keep this document as the historical spike protocol and regression checklist.
+
 **Goal:** decide whether the **Codex interface** can run the refinement pipeline on your **ChatGPT subscription with no OpenAI API key** — the prerequisite for the no-key Codex edition (Phase 3 of [dual-interface-plan.md](dual-interface-plan.md)).
 
 **How to run:** open Codex inside this repo, **signed in with your ChatGPT plan** and with **`OPENAI_API_KEY` unset** (we're testing the subscription path, not a metered key). Paste this file, or tell Codex: "run `docs/codex-spike.md` and fill in the Results table." Have Codex attempt each test and report.
@@ -46,9 +48,9 @@ The `verify` stage cross-checks names against public sources. Can a Codex subage
 
 | Test | Result | Mechanism / notes |
 |---|---|---|
-| A — parallel subagents, no key | ☐ pass ☐ fail | |
-| B — `node` runs `core/` JS, no key | ☐ pass ☐ fail | |
-| C — web search, no key | ☐ pass ☐ fail | |
+| A — parallel subagents, no key | pass | Native Codex subagents can be spawned concurrently on the signed-in subscription. |
+| B — `node` runs `core/` JS, no key | pass | Local Node runs deterministic helper/core code with `OPENAI_API_KEY` unset. |
+| C — web search, no key | pass | Built-in Codex browsing can return sourced public facts without Tavily/API keys. |
 
 ## What each outcome means (for Phase 3b)
 

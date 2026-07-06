@@ -1,0 +1,32 @@
+# Manual pipeline (when the Workflow tool is unavailable, e.g. claude.ai)
+
+Run these by hand after Step 0 when there's no Workflow tool. On Claude Code, use the fast-path dispatch in `SKILL.md` instead. The **cost lever** still applies throughout: heavy text (raw transcripts, web pages) stays only in subagent contexts; the main agent holds only the distilled glossary, file list, and output paths — it never reads a whole transcript or a full page of search results into its own context. When done, return to **Step 5 (wrap-up)** in `SKILL.md`.
+
+## Step 1 — Parallel scouting, build the unified glossary
+
+**Why**: ASR loves to get names/brands/proper-nouns wrong, and the same person/brand often appears written several different ways across files (transliteration, English name, nicknames mixed). You have to read everything and cross-corroborate before you can fix a **unified** glossary that makes all files consistent — that's "cross-validation". **But the main agent does not read the full text itself**: delegate reading to subagents and receive only compressed lists.
+
+1. **Parallel scout subagents** (Agent tool, one per transcript, can run in the background). Each `Read`s its own source file (**once only**), does **no web access, no refining**, and reports only a **compressed list**: what speaker labels appear and who each maps to; recurring names/brands/terms and their various spellings (with a one-line locating clue); obvious transcription errors (homophones, English mishearings, `（音）`, embedded timestamps/garble). The raw transcript stays in the subagent's context, **never enters the main context**.
+2. **Main agent merges + internally corroborates**: merge the lists; whatever can be corroborated within the transcripts (file A gives the full name, file B only the nickname) gets unified directly; flag the "residue" — names/brands/companies/products that can't be determined internally and need public-source verification.
+3. **Batch-verify the residue (dispatch a subagent)**: hand the residue to **one verify subagent** that uses WebSearch/WebFetch to **batch**-look up public sources / news / business-registry info by "domain + name", keeping pages in its own context and reporting back only "confirmed spelling/identity + source". By default **verify only key entities** (founders/companies/main brands). Fix and drop `（音）` for what's verified; keep `（音）` or `（音，存疑）` for what can't be found — **never fabricate**.
+4. **Produce the glossary** (template in `references/glossary-template.md`): interview background, unified speaker labels, "various spellings → unified as" for names/brands/terms, transcription errors needing special handling. `Write` it to `<output dir>/校对表.md` (archived alongside the outputs — the real-name verification conclusions are themselves research material), shared by all subsequent refining.
+
+> Single short file: skip the scout/refine split — dispatch one subagent to "read once → build a mini glossary → refine" in a single pass (the main agent still doesn't read the full text).
+
+## Step 2 — Refine each file (parallel)
+
+The transcripts are independent, so **use parallel refine subagents**, one per file: `Read` the shared glossary (`<output dir>/校对表.md`) → `Read` the source file → refine per **[editorial-spec.md](editorial-spec.md)** (the full editorial rules: filler tiers, unnumbered topic headings, name/term fixes, faithful facts, speaker labels, Chinese typesetting, long-file chunking) → `Write` to `<output>/Transcripts/<title>.md` → report sub-headings + key fixes. Each subagent's prompt must be self-contained: glossary path, source path, output path, that file's speaker mapping and notes, the editorial spec, and the title format (see Output spec in `SKILL.md`). When done, **spot-check**: verify the longest file's ending completeness and randomly read 1–2 sub-heading sections — dispatch another subagent; don't read a whole output back into the main context. With only one or two files the main agent may do this itself.
+
+## Step 2.5 — Logical-order rewrite (only when in scope)
+
+Beyond the refined transcript, produce one **logical-order rewrite** per interview: re-sequence the Q&A from "recording order" into "narrative order", so exchanges scattered across the interview that belong to one thread come together and read as a complete story. **This is re-sequencing, not rewriting or summarizing** — copy Q&A blocks verbatim from the refined transcript, not a character changed, nothing dropped, only repositioned.
+
+Parallel subagents, one per file: `Read` that **refined transcript** (not the source — names/terms already unified) → work out 3–7 narrative threads (each an unnumbered `##` sub-heading) → pick an internal ordering per thread (history by time; decisions by problem→insight→decision→result; a product/event by cause→process→result) → move the exchanges over verbatim and arrange them. Only when a move breaks a reference/connective, add one `> [编者] …` bridge or fill a bare “他” with the name; **never rewrite, never add what wasn't said, never draw conclusions**. Add a `## 主线脉络（导读）` section at the top (one paragraph: the main thread + your re-sequencing logic). **No loss, no dup**: every substantive exchange appears once and only once. Structure template in `references/deliverables.md`. `Write` to `<output>/逻辑顺序/<title>.md` (**leave the refined transcript untouched** — it stays the faithful, recording-order, citable archive). Spot-check: does the rewrite cover all of the refined transcript's sub-headings?
+
+## Step 3 — Timeline (only when in scope)
+
+Cross-reference the interview narration with **public sources**, lay out the company's/person's development line by year/phase; tag each entry 【访谈】/【公开】/【公开+访谈】, append a key-people reference table. Structure template in `references/deliverables.md`. **Web verification is batched to a subagent** (look up news, business registry, funding by "company + funding/founding/founder"), keeping pages in the subagent's context. When interview and public sources conflict, list both and note the divergence; don't force a pick. Write to `<output>/<主题>时间线.md`.
+
+## Step 4 — Interview summary (only when in scope)
+
+Based on the refined content: ① categorized key points (by role/topic, each with a concrete fact); ② quotes (by person, faithful, only verbal tics removed, meaning unchanged); ③ industry and company/person insights (point out the angle and the risk — judgment, not restatement). Structure template in `references/deliverables.md`. Write to `<output>/<主题>访谈总结.md`.

@@ -12,26 +12,38 @@
 
 | 你的情况 | 用哪个 | 要 API key 吗 |
 |---|---|---|
-| 在 Claude Code 里常用 | Claude Code 技能 | 不要，走你的订阅 |
-| 在 Codex 里用 | Codex 技能（委托命令行运行时） | 要，填 `OPENAI_API_KEY` |
+| 在 Claude Code 里常用 | 通用技能包里的 Claude Code 原生路径 | 不要，走你的订阅 |
+| 在 Codex 里用 | 通用技能包里的 Codex 原生路径 | 不要，走 ChatGPT/Codex 订阅 |
 | 想用 OpenAI / DeepSeek / GLM / Kimi | 命令行 或 本地网页版 | 要 |
 | 发给不写代码的人 | 单文件 App，双击即用 | 要，填在本机浏览器里 |
 
-> Codex 技能目前委托给命令行运行时（`codex-skills/latepost-refiner/SKILL.md` 的 First Choice: Use The Universal Runtime），因此要一把 `OPENAI_API_KEY`。一个走 Codex 订阅、不要 key 的原生运行时（`codex-native.mjs`：确定性 glue，逐步产出 prompt 交给 Codex 子代理跑）在 **`codex-skill-subscription-runtime` 分支**上，尚未并回 main。
+通用技能包同时带 `scripts/claude-native.js` 和 `scripts/codex-native.mjs`。Claude Code 会走 Workflow；Codex 会走原生子代理 + 本地 Node glue；两条订阅原生路径都不需要 provider API key。命令行、本地网页版和单文件 App 是单独的 API-key fallback。
 
 ## 安装
 
-### Claude Code 技能
+### Claude Code / Codex 通用技能包
+
+发布包是一个 `latepost-refiner/` 文件夹，同时支持 Claude Code 和 Codex：
+
+```
+~/.claude/skills/latepost-refiner  ->  <repo>/universal-skill/latepost-refiner
+~/.codex/skills/latepost-refiner   ->  <repo>/universal-skill/latepost-refiner
+```
+
+- 新机器：`git clone` 后 `npm run build:cc && npm run build:universal-skill`，再把 `universal-skill/latepost-refiner` 链到对应技能目录。
+- 不想 clone：从 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 下载 `latepost-refiner.zip`，解压到 Claude Code 或 Codex 的技能目录即可。
+- 改了逻辑：改 `core/*`，跑 `npm run build:cc && npm run build:universal-skill`，下个会话生效。
+
+### 分平台开发目录
 
 本仓库是源头，用符号链接挂到技能目录：
 
 ```
 ~/.claude/skills/latepost-refiner  ->  <repo>/claude-code-skill
+~/.codex/skills/latepost-refiner   ->  <repo>/codex-skills/latepost-refiner
 ```
 
-- 新机器：`git clone` 后 `ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`。
-- 不想 clone：从 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 下载 `latepost-refiner.zip`（或自己跑 `bash claude-code-skill/build-zips.sh` 打一个），解压到 `~/.claude/skills/` 即可。
-- 改了逻辑：改 `core/*`，跑 `node build/build-cc.mjs`，下个会话生效。
+这两个目录保留给开发和差异调试。正式分享给别人优先用通用技能包。
 
 ### 命令行 / 本地网页版
 
@@ -106,13 +118,17 @@ engines/             命令行版的引擎（Claude Code 版的引擎是 Workflo
   providers.js       各家 provider 的 endpoint、key、差异、模型分层
   fileops.js         两引擎共用的 Read/Write/Edit，带沙箱限制
 build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 scripts/claude-native.js
-claude-code-skill/   Claude Code 版（scripts/claude-native.js 是 build 产物，别手改）
+build/build-universal-skill.mjs  从两条原生技能生成一个通用技能包
+claude-code-skill/   Claude Code 开发版（scripts/claude-native.js 是 build 产物，别手改）
+codex-skills/        Codex 开发版（订阅原生路径，不要 OpenAI API key）
+universal-skill/     对外发布的通用技能包，Claude Code / Codex 都装这个
 universal/           命令行 + 网页 + 单文件 App
 ```
 
 `runPipeline(A, engine)` 只依赖一个 engine 接口的 5 个原语：`agent / parallel / pipeline / phase / log`。
 
 - **Claude Code 版**：这 5 个原语就是 Workflow 工具的全局函数。子代理跑在你的 Claude Code 会话上，不要 API key，也不碰 `engines/`。
+- **Codex 版**：LLM 阶段用 Codex 原生子代理，确定性阶段用 `scripts/codex-native.mjs` 跑本地 Node，不要 `OPENAI_API_KEY`。
 - **命令行版**：`engines/api.js` 用 Anthropic SDK 实现它们，把 `Read/Write/Edit` 做成客户端工具、联网核实用 Anthropic 服务端的 `web_search`——于是 `core/` 里的 prompt 一字不改就能复用。
 
 **为什么 Claude Code 版的脚本要“生成”**：Workflow 沙箱不许 import、不能读写文件，脚本得是单文件、只用全局函数。所以 `build-cc.mjs` 把 `core/*` 去掉 import/export、按依赖拼成一个自包含的 `scripts/claude-native.js`。**改 `core/*` 后重跑 build，别手改 `scripts/claude-native.js`，下次 build 会覆盖。**

@@ -44,9 +44,9 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
 
 ## Native Runtime Workflow
 
-1. Prepare files: convert supported office/PDF inputs to Markdown (needs `markitdown`/`docling` on PATH — if missing, run `bash scripts/setup-converters.sh` once, per [references/native-runtime.md](references/native-runtime.md)), count size, detect existing headings, and choose titles/output paths.
+1. Prepare files: convert supported office/PDF inputs to Markdown (needs `markitdown`/`docling` on PATH — if missing, run `bash "<this skill dir>/scripts/setup-converters.sh"` once, per [references/native-runtime.md](references/native-runtime.md)), count size, detect existing headings, and choose titles/output paths.
 2. Seed from an existing `<out>/校对表.md` unless the user asks for a fresh glossary.
-3. Run `scripts/codex-native.mjs prepare --args run-args.json` to normalize args and generate first-stage prompts.
+3. Run `node "<this skill dir>/scripts/codex-native.mjs" prepare --args run-args.json` to normalize args and generate first-stage prompts.
 4. Spawn native Codex subagents from the generated prompt files:
    - scout/refine/check: one subagent per source file.
    - verify/timeline: use built-in Codex browsing; never require Tavily on the primary path.
@@ -56,7 +56,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
    - `<out>/Transcripts/*.md`
    - `<out>/校对表.md`
    - optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`
-7. Run the deterministic audit stage before writing the final handoff artifacts: `node codex-skills/latepost-refiner/scripts/codex-native.mjs audit --args <out>/_codex-native/args.json --result result.json`, then pass the returned `result-audited.json` to `artifacts`.
+7. Run the deterministic audit stage before writing the final handoff artifacts: `node "<this skill dir>/scripts/codex-native.mjs" audit --args <out>/_codex-native/args.json --result result.json`, then pass the returned `result-audited.json` to `artifacts`.
 8. Read `<out>/review.md` first for unresolved issues; do not dump full transcripts into the main context.
 9. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
