@@ -102,8 +102,8 @@ export const LOGIC_REPORT_SCHEMA = {
 
 // ---------- proofreading rules (kept in sync with SKILL.md Step 2) ----------
 export const RULES = `精校规范（务必全部遵守）：
-1. 保持对话体、不要改写成叙述文章；保留发言人标签，一律用纯文本、不加粗也不加其它样式——写成 李明： 而不是 **李明：**，全篇统一（同一份稿子里所有发言人标签样式必须一致）。
-2. 删口癖、口语赘词与口语重复，合并语义重复句；以“读着顺、信息不丢”为准——不改语气风格与原意，不替发言人加观点，拿不准就保留，宁可漏删一处也别删出歧义。注意：“宁可漏删”只适用于可能改义的词，不适用于纯噪音；纯噪音（语气音、确认复读、卡顿）必须删干净。
+1. 保持对话体、不要改写成叙述文章；发言人标签一律「名字：」纯文本形态，不加粗、不加时间戳、不加其它样式——写成 李明： 而不是 **李明：** 或 李明 12:03：，全篇同一形态（源转录标签里夹的时间戳一律不进成稿标签，溯源靠锚点注释，不靠标签）。
+2. 删口癖、口语赘词与口语重复，合并语义重复句；以“读着顺、信息不丢”为准——不改语气风格与原意，不替发言人加观点，拿不准就保留，宁可漏删一处也别删出歧义。注意：“宁可漏删”只适用于可能改义的词，不适用于纯噪音；纯噪音（语气音、确认复读、卡顿）必须删干净。开场寒暄**只有在纯问候、无任何实质内容时**才折叠成一句括号说明；**夹在寒暄里的产品评论、事实陈述、观点原话必须逐句保留**（例：调试录音设备时对某支麦克风的吐槽、闲聊里带出的一个数字或判断，都属于必须保留的实质内容，不得随寒暄一起折叠）。
    · **径删（纯垫词，无任何语义）**：语气与卡顿音（嗯、呃、啊、哦、欸）；确认复读（对对对、是是是、嗯嗯）；纯卡顿的“那个…这个…就是说…”；句首口头禅式的“然后/其实/就是”；空洞的反问尾巴（对吧、是吧、对不对、你知道——确在向对方求证的留）。
    · **看义删（有义则留，纯垫才删）**：“一个/一种/一些”作量词废垫删、表“一/同一/特指某个”留——“为了让它有一个统一口感”→“为了有统一口感”（删），“跟咖啡豆拼配是一个道理”照留（＝同一个道理，有义），“摆在一个角落、同一个时间、给他一个机会”留；“其实”句首口头禅删、表转折（本以为…其实…、但其实）留；“然后”空接续删、表真实先后或因果留；“就是”卡顿垫词删、表“正是/只是/即”留；“的话”纯提顿删（“做手工的话”→“做手工”）、真条件（“需要的话”）留。
    · **基本别动（多为实义，硬删反而改义）**：“我觉得/我感觉”标记的是发言人立场，删了会把看法读成事实，仅紧邻重复时合并；“一点/一下”表程度或轻微动作，“对…来说/来讲”“包括”“比如”是框定与举例——一般照留。
@@ -111,16 +111,16 @@ export const RULES = `精校规范（务必全部遵守）：
 3. 理顺破碎口语、修语序与冗余助词；有信息量/有个性的金句照留，不要抹平。
 4. 按主题加 ## 小标题：准确概括、不篡改原意、不加原文没有的结论；一律不编号；一份通常 6–20 个。
 4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字），必要时每段重复发言人标签；单个对话段超过约 900 字视为需要重切。
-5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。
+5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。**凡校对表中标 ⚠ 或注明「保留（音）／未能核实／疑为转录误写」的名字：正文每处都写作「名字（音，存疑）」或「名字（音）」，不得裸写**（这些是尚未核实的写法，裸写会被误当成已确认）。
 6. 保留全部事实细节（数字/金额/时间/产品/工艺/渠道/观点）——精校不是摘要。
 7. 发言人规范：采访方追问归对应记者名；被访方旁白/补充按校对表标注；拒答/「以招股书为准」等语境务必原样保留，勿替受访者补数字。
 8. 文件抬头：首行 H1 标题，第二行斜体说明行。
-9. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。代码/英文专名/路径里的 ASCII 引号不动。
+9. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。**书面化的引语、专名与术语首次出现、带反讽或口头禅性质的短语，主动用全角弯引号 “” 标出**（如 他说这是 “行业惯例”、所谓 “现厂制”）。代码/英文专名/路径里的 ASCII 引号不动。
 10. 数字用阿拉伯数字：把汉字数字改成阿拉伯数字（十六个部门→16 个部门，六七十 B 大模型→60-70B 大模型，三四百人→300-400 人，约数范围用连字符）。例外——很短的口语化小数目保留汉字：两个人、三五个、一两次、七八年、一两句话 等约定俗成口语不转；成语/固定词不动（三心二意、五花八门、一五一十）。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。
 11. 中文与英文/数字之间加一个半角空格（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插一个空格（用 GPT-4 做、16 个部门、覆盖 80% 用户、A 轮融资、2021 年底）。不加空格：①数字与紧跟的单位/符号之间（60-70B、80%、$50、5G、A4）；②与全角标点相邻处；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
 12. 长文件分多次接力写（先 Write 抬头+开头，再用 Edit 以已写入的最后一句为锚点追加），务必覆盖到源文件结尾。**每次 Write/Edit 都在单次输出上限内写尽量大的整块（通常一次写完一整段主题、上千字），用尽量少的写入次数完成——别一行一行或一小段一小段地追加。**
 13. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。
-14. **绝不无声跳过任何实质内容段**。若某一段因任何原因（技术困难、平台策略限制、原文无法辨认）确实无法精校，就在原位置保留一行占位标记：> ⚠【未精校段：源文件约第 X-Y 行】原因一句话，然后从下一段继续精校。此为最后手段——正常情况下整份成稿应没有任何占位标记；口水寒暄按规范 2 折叠成一句括号说明不算未精校、不要打标记；段落太长也不是理由（按规范 12 分多次写完）。宁可标记，不可无声省略。`
+14. **绝不无声跳过任何实质内容段**。若确有无法恢复的缺口（原文转录缺失、彻底无法辨认），就在原位置用**一句人话的括号说明**交代，例：（此处约 200 字因转录缺失未能恢复，见源 L120-L150）——**禁止输出工具告警式、系统报错式的文案**。此为最后手段——正常情况下整份成稿应没有任何缺口说明；口水寒暄按规范 2 折叠成一句括号说明不算缺口、不要标；段落太长也不是理由（按规范 12 分多次写完）。宁可如实标注缺口，不可无声省略。`
 
 // Chinese typesetting rules (same source as RULES items 9/10/11): injected into every sub-agent that generates Chinese.
 // Proofreading agents already get them via RULES; summaries/timelines inject this compact version separately
@@ -133,6 +133,59 @@ export const TYPESET = `中文排版三规范（务必遵守）：
 // Single-file one-pass branch does not build a standalone glossary — use a sentinel constant rather than scattered
 // string literals so that timelinePrompt can branch into the “no glossary” fallback path.
 export const SINGLE_FILE_GLOSSARY = '（单文件一遍过，未建独立校对表；校对决定见成稿与精校报告）'
+
+// ---------- machine-readable confidence markers (校对表条目置信标记) ----------
+// A 校对表 entry line was previously *prose only*: “已核实” / ⚠ told a human, but a machine couldn't tell an
+// already-confirmed spelling from one still awaiting review, so an erroneous entry could only be undone by
+// editing the text and hoping the next run re-checked it. These four line-tail tokens make the state MACHINE-
+// readable. They use full-width lenticular brackets 〔…〕 which never appear in renderGlossary's own output, so
+// an old 校对表 (no markers) round-trips completely unchanged — parseGlossary just reports confidence:'unknown'.
+//   〔核实·YYYY-MM〕 — verified: applied a网络核实 conclusion (date optional → 〔核实〕)
+//   〔用户钦定〕     — user: a locked cluster from applyCanonicalOverrides (has structural veto, see below)
+//   〔待复核〕       — recheck: a human撤销/flagged this entry; parse recognises it (render never emits it)
+// Downstream contract (wired by the next task):
+//   · excludeVerified skips only verified/user (both are settled); recheck must be re-verified next round;
+//     unknown keeps today's behaviour verbatim (full backward compatibility — the hard requirement).
+export const CONFIDENCE_VERIFIED = '核实'
+export const CONFIDENCE_USER = '用户钦定'
+export const CONFIDENCE_RECHECK = '待复核'
+// Trailing-token matcher: 〔用户钦定〕 / 〔待复核〕 / 〔核实〕 / 〔核实·2025-07〕 at the very end of an entry line.
+// SF-1: the marker must be preceded by a whitespace char or a ｜ separator (captured group 1) — the render side
+// always emits exactly one leading space before it (see confidenceMark), so a *legitimate* hint that happens to
+// END with the literal string 〔核实〕 (no separating space, e.g. 正文…核实〔核实〕) is NOT mistaken for metadata
+// and stays in the body. Anchored to $ so it can only ever consume a real trailing marker.
+// Residual edge (documented, not handled): a hint deliberately ending with a SPACE + a literal 〔核实〕 token
+// (“… 〔核实〕”) is indistinguishable from a real marker and will be stripped — an extreme collision we accept.
+const CONFIDENCE_RE = new RegExp(`(^|[\\s｜])〔(${CONFIDENCE_USER}|${CONFIDENCE_RECHECK}|${CONFIDENCE_VERIFIED})(?:·([0-9]{4}-[0-9]{2}))?〕\\s*$`)
+// Render side: pick the marker for an entry e0, returned WITH its leading separator space (or '' when none), so
+// every call site is guaranteed the SF-1 space without duplicating the rule. Priority (BLOCKER — confidence must
+// round-trip across batches):
+//   1. locked (in-memory 用户钦定 cluster) OR a prior entry parsed back as confidence:'user' → 〔用户钦定〕
+//   2. re-verified THIS round (a writing is in resolvedMap) → 〔核实·<thisDate>〕 (date omitted when absent)
+//   3. a prior entry parsed back as confidence:'verified' but NOT re-checked this round → its ORIGINAL marker
+//      preserved verbatim, original date段 and all (this is what was silently lost before)
+//   4. recheck / unknown with no fresh verification → no marker (recheck re-renders by this round's conclusion)
+export function confidenceMark(e0, resolvedMap, date) {
+  if (!e0) return ''
+  if (e0.locked || e0.confidence === 'user') return ` 〔${CONFIDENCE_USER}〕`
+  const names = [e0.canonical, ...(e0.variants || [])]
+  const verifiedThisRound = resolvedMap && names.some((n) => resolvedMap.has(n))
+  if (verifiedThisRound) return date ? ` 〔${CONFIDENCE_VERIFIED}·${date}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
+  if (e0.confidence === 'verified') return e0.confidenceDate ? ` 〔${CONFIDENCE_VERIFIED}·${e0.confidenceDate}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
+  return ''
+}
+// Parse side: strip a trailing confidence marker off an entry-line RHS, returning the cleaned string plus the
+// decoded confidence ('verified'|'user'|'recheck'|'unknown') and, for a verified marker, its original date段
+// (confidenceDate, '' when absent) so confidenceMark can re-emit it unchanged next round. Stripping BEFORE the
+// ` ｜ ` split keeps variants/hint byte-identical to the pre-marker parse for every old 校对表. The separator
+// captured by group 1 is dropped along with the marker (slice stops at its index), so no dangling ` ｜`/space.
+function stripConfidence(rhs) {
+  const s = String(rhs == null ? '' : rhs)
+  const m = s.match(CONFIDENCE_RE)
+  if (!m) return { rhs: s, confidence: 'unknown', confidenceDate: '' }
+  const conf = m[2] === CONFIDENCE_USER ? 'user' : m[2] === CONFIDENCE_RECHECK ? 'recheck' : 'verified'
+  return { rhs: s.slice(0, m.index).replace(/\s+$/, ''), confidence: conf, confidenceDate: m[3] || '' }
+}
 
 
 // ---------- pure JS merge (no model cost) ----------
@@ -472,6 +525,13 @@ export function findHeadingConflicts(findings, files, policy) {
 // real name still apply (that's the point of verification). ownStrong spans ALL names, not just canonical
 // (clustering may elect a weak title as canonical with the real name in variants).
 export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
+  // Locked (user-decreed) cluster: the decree is final — short-circuit before the name guard can even look at
+  // a verify hit, so a stray verify conclusion whose query happens to collide with one of the decree's variants
+  // can never rewrite the钦定 canonical. (A locked cluster is normally excluded from verify entirely; this is
+  // belt-and-braces for the case where a prior-glossary verify row matches a freshly-decreed writing.)
+  // confidence:'user' is the SAME decree parsed back from a prior 校对表 (which carries 〔用户钦定〕 but no live
+  // `locked` flag) — a user钦定 keeps its cross-batch veto, so it short-circuits the guard identically (BLOCKER).
+  if (e && (e.locked || e.confidence === 'user')) return e
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
@@ -522,7 +582,7 @@ export function renderRefineGlossary(merged, verified, dedup, a) {
     for (const e0 of list) {
       const e = applyVerifiedEntry(e0, isPerson, resolvedMap, applied, rejected)
       const hint = trimHint(e.hint)
-      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}`)
+      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}${confidenceMark(e0, resolvedMap, a.date)}`)
     }
     if (rows.length) { sec.push('', `## ${title}`); sec.push(...rows) }
   }
@@ -560,9 +620,11 @@ export function renderGlossary(merged, verified, dedup, a) {
     sec.push('', `## ${title}（写法 → 统一）`)
     for (const e0 of list) {
       const e = applyVerified(e0, isPerson)
-      const susp = e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
+      // A locked (用户钦定) cluster is settled — it never carries the ⚠ suspect-ASR flag even if a consumed
+      // cluster was scout-flagged; it renders clean with 〔用户钦定〕 (via confidenceMark) instead.
+      const susp = !e0.locked && e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
         ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
-      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}`)
+      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}${confidenceMark(e0, resolvedMap, a.date)}`)
     }
   }
   block('人名', merged.people, true)
@@ -666,12 +728,16 @@ export function dedupQuestions(dedup) {
 function parseEntityLine(l) {
   const m = l.match(/^- \*\*(.+?)\*\* ← (.*)$/)
   if (!m) return null
-  const parts = (m[2] || '').split(' ｜ ')
+  // Peel the machine-readable confidence marker off the tail FIRST, so an unmarked (legacy) line yields exactly
+  // the same variants/hint as before — the only difference is the added confidence field (defaults to 'unknown').
+  const { rhs, confidence, confidenceDate } = stripConfidence(m[2] || '')
+  const parts = rhs.split(' ｜ ')
   const varsRaw = (parts.shift() || '—').trim()
   const variants = varsRaw === '—' ? [] : varsRaw.split(' / ').map((x) => x.trim()).filter(Boolean)
   let hint = '', crossFile = false
   for (const p of parts) { if (p.trim() === '多份互证') crossFile = true; else if (p.trim()) hint = hint ? `${hint} ｜ ${p.trim()}` : p.trim() }
-  return { canonical: m[1], variants, hint, crossFile }
+  // confidenceDate is carried so a prior 〔核实·YYYY-MM〕 re-renders with its ORIGINAL date next round (BLOCKER).
+  return { canonical: m[1], variants, hint, crossFile, confidence, confidenceDate }
 }
 function parseResolvedLine(body, out) {
   let s = body, rejected = false
@@ -785,13 +851,26 @@ export function mergeDedup(priorSuspects, freshSuspects) {
   return Array.from(m.values())
 }
 
-// P2 — verify-cache exclusion: drop entities already covered by the prior glossary's verify conclusions
-// from THIS batch's verify list (they stay in the cumulative glossary via mergeIntoPrior + carried-forward
-// verified — they just aren't re-checked). The real cost/latency win of the persistent glossary.
+// P2 — verify-cache exclusion: drop entities already SETTLED by the prior glossary from THIS batch's verify
+// list (they stay in the cumulative glossary via mergeIntoPrior + carried-forward verified — they just aren't
+// re-checked). The real cost/latency win of the persistent glossary.
+//
+// Confidence-aware (Wave 2): an entry is "settled" and skipped when EITHER it is covered by a prior verify
+// conclusion (query/canonical match — unchanged behaviour, the historical meaning of this function) OR the prior
+// glossary entry itself is marked confidence ∈ {verified, user} (a网络核实 or 用户钦定 conclusion baked into the
+// entry line). A prior entry marked 'recheck' (a human wrote 〔待复核〕) is FORCE re-verified: its writings are
+// removed from the skip set even if a stale verify row still covered them. 'unknown' prior entries contribute
+// nothing on their own (they only skip via the verify-conclusion path, exactly as before — full back-compat).
 export function excludeVerified(merged, prior) {
   if (!prior) return merged
   const done = new Set()
   for (const r of (prior.verified && prior.verified.resolved) || []) { if (r && r.query) done.add(stripDesc(r.query)); if (r && r.canonical) done.add(stripDesc(r.canonical)) }
+  const priorEntries = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])]
+  const writingsOf = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).filter(Boolean)
+  // Entries the prior glossary marks as settled (verified/user) seed the skip set directly.
+  for (const e of priorEntries) { if (e.confidence === 'verified' || e.confidence === 'user') for (const n of writingsOf(e)) done.add(n) }
+  // recheck overrides everything: force this batch to re-verify those writings.
+  for (const e of priorEntries) { if (e.confidence === 'recheck') for (const n of writingsOf(e)) done.delete(n) }
   if (!done.size) return merged
   const covered = (e) => [e.canonical, ...(e.variants || [])].some((n) => done.has(stripDesc(n)))
   const filt = (list) => (list || []).filter((e) => !covered(e))
@@ -847,5 +926,213 @@ export function weakDupFlags(prior, fresh) {
     if (pe) out.push(`称呼歧义：「${stripDesc(fe.canonical)}」往次校对表与本轮各有一条（往次：${pe.hint || '无说明'}；本轮：${fe.hint || '无说明'}）——可能同一人、也可能不同人；弱称呼脚本不自动合并，请确认是否同指并尽量补真名。`)
   }
   return out
+}
+
+// ---------- user-decreed canonical overrides (钦定正名的结构化否决权) ----------
+// The forensic finding: a user's Step-0 decree (“口语 X/Y 一律写作 Z”) had no *structural* veto — it lived in
+// prose and the merge/verify/name-guard machinery could quietly ignore or overrule it. applyCanonicalOverrides
+// gives that decree teeth by rewriting the merged clusters BEFORE verify/render:
+//   · Any cluster whose canonical or a variant matches an override's canonical/variants (any writing) is forced
+//     to override.canonical; every other writing folds into variants (deduped). The cluster is marked locked.
+//   · If an override matches SEVERAL clusters, they COLLAPSE into one — the decree overrides the weak-key
+//     no-merge guard (isWeakKey / clusterEntities never merge on a bare 王总), because the user has *explicitly*
+//     said these are the same; an explicit human merge is not the over-merge bug that guard defends against.
+//   · An override that matches NOTHING still yields a locked cluster (canonical + its variants), so the refine
+//     glossary is GUARANTEED to carry the decreed spelling even if the scout never surfaced it.
+//
+// A `locked` cluster's contract (consumed by the next task; stated here so the wiring is unambiguous):
+//   · skip网络 verify (the user already decided — nothing to look up)
+//   · skip the person name-guard in applyVerifiedEntry (a verifier disagreement must NOT override a decree)
+//   · render without ⚠ (it is settled, not suspect) — it carries 〔用户钦定〕 via confidenceMark instead
+//   · excludeVerified treats it as already-verified (never re-checked, never dropped)
+// lockReason defaults to '用户钦定'; a supplied override.note is kept verbatim (e.g. “创始人本人确认”).
+//
+// Pure: never mutates the input clusters or overrides; returns a fresh array. Output order is stable — each
+// surviving/locked cluster keeps the position of its first contributing input cluster; overrides that matched
+// nothing append their fresh locked cluster at the end, in override order.
+export function applyCanonicalOverrides(clusters, overrides) {
+  const src = Array.isArray(clusters) ? clusters : []
+  const ovs = Array.isArray(overrides) ? overrides : []
+  // Normalise each override to a canonical + a match-set of all its writings (canonical ∪ variants),
+  // compared via stripDesc so an annotated writing (王总（示例公司董事长）) still matches the bare form.
+  const specs = ovs
+    .map((o) => {
+      const canonical = ((o && o.canonical) || '').trim()
+      if (!canonical) return null
+      const writings = [canonical, ...((o && o.variants) || [])].map((s) => (s || '').trim()).filter(Boolean)
+      const match = new Set(writings.map(stripDesc).filter(Boolean))
+      return { canonical, writings, match, note: (o && o.note) || '' }
+    })
+    .filter(Boolean)
+  const withConflicts = (arr, conflicts) => { Object.defineProperty(arr, 'conflicts', { value: conflicts, enumerable: false }); return arr }
+  if (!specs.length) return withConflicts(src.map((c) => Object.assign({}, c, { variants: [...(c.variants || [])] })), [])
+
+  const clusterWritings = (c) => [c.canonical, ...(c.variants || [])].map((s) => (s || '').trim()).filter(Boolean)
+  const hits = (c, spec) => clusterWritings(c).map(stripDesc).some((n) => spec.match.has(n))
+
+  // SF-2 — spec grouping via union-find, so a cluster hit by MULTIPLE decrees collapses those decrees into ONE
+  // locked cluster instead of the (buggy) first-spec-consumes + second-spec-phantom path. Two specs are unioned
+  // when EITHER (a) they name the same canonical (intentional dedup — pre-existing behaviour) OR (b) they both
+  // hit the same source cluster (the overlap case — a conflict). The group's canonical is its first spec by
+  // original decree order; every other spec's writings fold into variants.
+  const parent = specs.map((_, i) => i)
+  const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x] } return x }
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb) }
+  // (a) same-canonical specs merge (keeps “two decrees naming the same canonical collapse” working).
+  const byCanon = new Map()
+  specs.forEach((s, i) => { if (byCanon.has(s.canonical)) union(byCanon.get(s.canonical), i); else byCanon.set(s.canonical, i) })
+  // Which specs hit each cluster; (b) union all specs that co-hit one cluster (the overlap → conflict case).
+  const clusterHitSpecs = src.map((c) => specs.map((s, i) => (hits(c, s) ? i : -1)).filter((i) => i >= 0))
+  clusterHitSpecs.forEach((hitList) => { for (let k = 1; k < hitList.length; k += 1) union(hitList[0], hitList[k]) })
+
+  // One bucket per union-group root. writings/hints/files accumulate across the group's specs and consumed clusters.
+  const buckets = new Map()   // root → { canonical, note, writings:Set, firstIdx, files, public_figure, suspect_asr, category, hints:Set, matched, canonicals:Set }
+  const rootBucket = (root) => {
+    let b = buckets.get(root)
+    if (!b) { b = { canonical: specs[root].canonical, note: '', writings: new Set(), firstIdx: Infinity, files: new Set(), public_figure: false, suspect_asr: false, category: '', hints: new Set(), matched: false, canonicals: new Set() }; buckets.set(root, b) }
+    return b
+  }
+  // Seed every group from its member specs (so a no-match override still emits its locked cluster). The group
+  // canonical is the LOWEST spec index (root) — i.e. the first decree in the group by original order.
+  specs.forEach((s, i) => {
+    const b = rootBucket(find(i))
+    b.canonicals.add(s.canonical)
+    if (!b.note && s.note) b.note = s.note
+    for (const w of s.writings) b.writings.add(w)
+  })
+
+  const consumed = new Array(src.length).fill(false)
+  src.forEach((c, i) => {
+    const hitList = clusterHitSpecs[i]
+    if (!hitList.length) return
+    consumed[i] = true
+    const b = rootBucket(find(hitList[0]))
+    b.matched = true
+    if (i < b.firstIdx) b.firstIdx = i
+    for (const w of clusterWritings(c)) b.writings.add(w)
+    for (const f of c.files || []) b.files.add(f)
+    b.public_figure = b.public_figure || !!c.public_figure
+    b.suspect_asr = b.suspect_asr || !!c.suspect_asr
+    if (!b.category && c.category) b.category = c.category
+    if (c.hint) for (const h of String(c.hint).split('；')) if (h.trim()) b.hints.add(h.trim())
+  })
+
+  const lockedCluster = (b) => {
+    const files = Array.from(b.files)
+    return {
+      canonical: b.canonical,
+      variants: Array.from(new Set(Array.from(b.writings).filter((n) => n && n !== b.canonical))),
+      hint: Array.from(b.hints).join('；'),
+      files,
+      public_figure: b.public_figure,
+      suspect_asr: b.suspect_asr,
+      category: b.category,
+      crossFile: files.length > 1,
+      locked: true,
+      lockReason: b.note || '用户钦定',
+    }
+  }
+
+  // Conflicts: a group that ended up merging ≥2 DISTINCT decreed canonicals AND actually consumed a cluster —
+  // i.e. one cluster was claimed by competing decrees. (A pure same-canonical merge is intentional, not a conflict.)
+  const conflicts = []
+  for (const b of buckets.values()) {
+    if (b.matched && b.canonicals.size > 1) conflicts.push({ canonicals: Array.from(b.canonicals), resolvedTo: b.canonical })
+  }
+
+  const out = []
+  // Emit locked clusters that consumed at least one input cluster at the position of their first contributor,
+  // interleaved with the untouched pass-through clusters, so overall order stays stable.
+  const emittedAt = new Map()   // firstIdx → bucket (for matched buckets)
+  for (const b of buckets.values()) if (b.matched) emittedAt.set(b.firstIdx, b)
+  src.forEach((c, i) => {
+    if (emittedAt.has(i)) out.push(lockedCluster(emittedAt.get(i)))
+    if (!consumed[i]) out.push(Object.assign({}, c, { variants: [...(c.variants || [])] }))
+  })
+  // No-match groups: emit their locked clusters at the end, in group-root (first-decree) order.
+  for (const root of Array.from(buckets.keys()).sort((a, b) => a - b)) { const b = buckets.get(root); if (!b.matched) out.push(lockedCluster(b)) }
+  return withConflicts(out, conflicts)
+}
+
+// Apply user-decreed canonical overrides to a whole merged bundle (people/brands/terms cluster arrays),
+// routing each override to the ONE category it declares (`category: 'person' | 'brand' | 'term'`, default
+// 'person' — the motivating case is a spoken人名/公司写法混杂). Routing matters because applyCanonicalOverrides
+// emits a locked cluster even for an override that matched nothing; applying the whole override set to all three
+// lists would fabricate that decree in every category. Overrides with no (or an unknown) category fall into
+// 'person'. Pure — returns a fresh bundle; the untouched fields (speakersByFile/errors/notes) pass through.
+export function applyOverridesToMerged(merged, overrides) {
+  if (!merged) return merged
+  const ovs = Array.isArray(overrides) ? overrides.filter((o) => o && o.canonical) : []
+  if (!ovs.length) return merged
+  const catOf = (o) => (o.category === 'brand' ? 'brand' : o.category === 'term' ? 'term' : 'person')
+  const bucket = { person: [], brand: [], term: [] }
+  for (const o of ovs) bucket[catOf(o)].push(o)
+  const lists = { person: merged.people || [], brand: merged.brands || [], term: merged.terms || [] }
+  const people = applyCanonicalOverrides(lists.person, bucket.person)
+  const brands = applyCanonicalOverrides(lists.brand, bucket.brand)
+  const terms = applyCanonicalOverrides(lists.term, bucket.term)
+
+  // SF-2: collect the per-category conflict records (a cluster claimed by ≥2 competing decrees) so the pipeline
+  // can surface them into openQuestions.
+  const overrideConflicts = [...(people.conflicts || []), ...(brands.conflicts || []), ...(terms.conflicts || [])]
+
+  // Risk (c): an override that hit NOTHING in its declared category, but whose writing DOES appear in a cluster of
+  // ANOTHER category, is likely a mis-declared category. We still honour the declaration (a locked cluster is
+  // emitted in the declared category, as designed), but flag it so the pipeline can ask the user to confirm.
+  const clusterWritings = (c) => [c.canonical, ...(c.variants || [])].map((s) => stripDesc((s || '').trim())).filter(Boolean)
+  const listHits = (list, o) => {
+    const match = new Set([o.canonical, ...((o.variants) || [])].map((s) => stripDesc((s || '').trim())).filter(Boolean))
+    return (list || []).some((c) => clusterWritings(c).some((n) => match.has(n)))
+  }
+  const label = { person: '人名', brand: '品牌', term: '术语' }
+  const categoryWarnings = []
+  for (const o of ovs) {
+    const declared = catOf(o)
+    if (listHits(lists[declared], o)) continue                 // matched in-category → fine
+    const foundIn = ['person', 'brand', 'term'].find((k) => k !== declared && listHits(lists[k], o))
+    if (foundIn) categoryWarnings.push({ canonical: o.canonical, declared: label[declared], foundIn: label[foundIn] })
+  }
+  return Object.assign({}, merged, { people, brands, terms, overrideConflicts, categoryWarnings })
+}
+
+// Verify-target filter: a locked (用户钦定) cluster is settled — the user already decided the spelling, so it
+// must never be sent to网络 verify (nothing to look up, and a verifier disagreement must not get a vote). Drop
+// locked clusters from a merged bundle before building the verify chunk list. Pure; the locked clusters still
+// live in the full `merged` used for render/accumulate — only the verify view drops them.
+export function dropLocked(merged) {
+  if (!merged) return merged
+  const filt = (list) => (list || []).filter((e) => !(e && e.locked))
+  return Object.assign({}, merged, { people: filt(merged.people), brands: filt(merged.brands), terms: filt(merged.terms) })
+}
+
+// ---------- filesystem-safe filename (文件名清洗) ----------
+// Join point for timeline / summary / logic output filenames: an entity/topic string flows straight into a
+// path, so a stray “/” would fabricate a directory and “:” / “?” / control chars break on some filesystems,
+// and an over-long name can exceed the 255-byte per-component limit. safeName scrubs the reserved set (both
+// ASCII and the full-width variants ASR/中文输入 commonly emit), collapses runs of whitespace to one space, trims
+// leading/trailing whitespace and dots, then caps the result FIRST by code-point count (`max`, word boundaries
+// not preserved) and THEN by UTF-8 byte budget (`maxBytes`) — a plain cut on each. CJK is preserved.
+// SF-3: the byte cap closes a real overflow — 80 astral (4-byte) chars pass the 80-char cap yet are 320 bytes,
+// blowing the 255-byte filesystem limit. Truncation drops WHOLE code points (never splits a surrogate pair /
+// multibyte char), so the output is always valid UTF-8. maxBytes defaults to 255 (the actual ext4/APFS/NTFS
+// per-component limit) rather than a looser ~200 so an 80-CJK-char title — 240 bytes, the common case — is left
+// intact (CJK 常规路径不变). The 2-arg signature stays backward-compatible: `max` is still a CHARACTER count.
+// An empty result falls back to 'untitled' so the caller never builds a path ending in a bare separator.
+export function safeName(s, max = 80, maxBytes = 255) {
+  let out = String(s == null ? '' : s)
+    .replace(/[\\/:*?"<>|]/g, ' ')   // ASCII reserved path chars
+    .replace(/[：？＊]/g, ' ')         // full-width colon / question / asterisk (common in ASR/中文输入)
+    .replace(/[\r\n\t\f\v]+/g, ' ')   // newlines & other control whitespace → space
+    .replace(/\s+/g, ' ')             // collapse whitespace runs to a single space
+    .trim()
+    .replace(/^[.\s]+|[.\s]+$/g, '')  // strip leading/trailing dots and whitespace
+  let cps = Array.from(out)                      // iterate by code point so a cut never splits a multibyte char
+  if (max > 0 && cps.length > max) cps = cps.slice(0, max)
+  if (maxBytes > 0) {
+    // Drop trailing code points until the UTF-8 encoding fits the byte budget.
+    while (cps.length && Buffer.byteLength(cps.join(''), 'utf8') > maxBytes) cps.pop()
+  }
+  out = cps.join('').replace(/[.\s]+$/g, '')     // truncation may re-expose a trailing dot/space
+  return out || 'untitled'
 }
 

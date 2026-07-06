@@ -28,8 +28,6 @@ Open the printed `http://127.0.0.1:<port>` URL. The UI supports:
 - Single-provider mode or per-category routing.
 - File upload for `.txt`, `.md`, `.docx`, `.pptx`, `.xlsx`, `.pdf`.
 - Scope selection: refined transcript, logical-order rewrite, summary, timeline.
-- Resume via "跳过已完成文件", backed by `<out>/run.json`.
-- Stop button. Cancellation is cooperative and exits after the current model call returns.
 
 API keys are required for real provider calls and are used in memory for the local run; do not write them to output
 files, logs, manifests, or review notes.
@@ -75,10 +73,15 @@ Useful flags:
 - `--base-url <URL>`
 - `--models scout=<id>,verify=<id>,dedup=<id>,refine=<id>,logic=<id>,summary=<id>,timeline=<id>`
 - `--fresh` to ignore existing `校对表.md`
-- `--resume` to read `<out>/run.json` and skip completed refined transcripts
-- `--resume-from <path/to/run.json>` to resume from a specific manifest
+- `--prior-glossary <path>` to seed from an external `校对表.md` (accumulation still writes back to `<out>/校对表.md`)
 - `--heading-policy none|keep|regenerate`
 - `--verify key|deep|none`
+- `--chunk speed|cost` (default `cost`; `speed` splits big files into parallel refine chunks)
+- `--allow-audit-fail` to exit 0 when the only failure is `auditFailed` and products were written (see below)
+- `--no-annotate` / `--no-anchors` to skip inserting 内容缺口 markers / source anchors into the 成稿
+- `--concurrency <N>` to cap parallel model calls
+
+> **Resume is not implemented yet.** There is currently no `--resume` / `--resume-from` flag and no "skip completed files" control — a re-run reprocesses every file. `run.json` records enough (input hashes, artifacts, config) to build resume later, but nothing reads it back to skip work today. Planned, not shipped.
 
 ## Environment
 
@@ -104,9 +107,15 @@ The runtime writes:
 - `<out>/<topic>访谈总结.md` when `summary` is in scope
 - `<out>/<topic>时间线.md` when `timeline` is in scope
 
-Read `review.md` before reporting completion. It consolidates failed files, incomplete endings, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
+Read `review.md` before reporting completion. It consolidates failed files, incomplete endings, audit-gate failures, a thin-校对表 warning, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
 
-Read `run.json` when auditing a run, resuming a run, or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
+Read `run.json` when auditing a run or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
+
+## Exit Code And `auditFailed`
+
+The in-pipeline audit gate runs per file after refine. When a file is still **hard** (`content_gap` / `quote_style`) after one auto-repair, it is recorded in the run's top-level **`auditFailed`** (`[{ path, findings }]`, mirrored in `review.md` and `run.json`). By default the CLI then **exits 1** — but the 成稿 and every other product are **already written to disk**; the non-zero code flags "one or more files need a manual look", not "the run failed". A calling script must therefore check the **`auditFailed` field in `run.json` / `review.md`** to decide per-file follow-up, rather than treating a non-zero exit as a whole-run failure and discarding the output.
+
+Pass **`--allow-audit-fail`** to make the CLI exit **0** when products were generated and the only problem is `auditFailed` (a pipeline error still exits 1). Use it in CI/batch drivers that want to consume the produced transcripts and act on `auditFailed` out-of-band instead of gating on the exit code.
 
 ## Return And Handoff
 
@@ -114,5 +123,4 @@ In the final response to the user:
 - State what was generated and where.
 - Mention unresolved items from `review.md`.
 - Mention whether any `networkUnverified` items should be re-checked.
-- Mention whether resume skipped files.
 - Avoid pasting long transcript content into chat.

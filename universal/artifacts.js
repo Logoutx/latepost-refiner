@@ -101,6 +101,15 @@ function formatAudit(f) {
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
 }
 
+// E13: fired 校对表 lint warnings → one review line each (each finding's sample text carries the counts).
+function glossaryLintItems(result) {
+  const lint = result.glossaryLint
+  if (!lint || !Array.isArray(lint.findings)) return []
+  return lint.findings
+    .filter((f) => f && f.count)
+    .map((f) => (f.samples && f.samples[0] && f.samples[0].text) ? f.samples[0].text : f.name)
+}
+
 export function reviewSections(result = {}, warnings = []) {
   const logic = result.logic || []
   const sections = [
@@ -110,6 +119,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
+    { title: '校对表偏薄，建议人工复核（条目数/身份线索/变体比例）', items: glossaryLintItems(result), priority: 'medium' },
     { title: '源文件已带小标题，需决定保留或重做', items: result.headingConflicts || [], priority: 'medium' },
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },
     { title: '因网络故障未核实，可网络恢复后补查', items: (result.networkUnverified || []).map(formatNetworkItem), priority: 'medium' },
@@ -237,6 +247,11 @@ export function buildRunManifest(result = {}, context = {}) {
     audit: result.audit ? {
       status: result.audit.status,
       files: (result.audit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null, gaps: f.gaps || [], modelMarkers: f.modelMarkers || [] })),
+    } : null,
+    // E13: 校对表 structural lint (all soft) — metrics + only the warnings that fired.
+    glossaryLint: result.glossaryLint ? {
+      metrics: result.glossaryLint.metrics || null,
+      warnings: (result.glossaryLint.findings || []).filter((f) => f && f.count).map((f) => f.name),
     } : null,
     annotations: (result.annotations || []).map((a) => ({ path: a.path, inserted: (a.inserted || []).map((g) => ({ startLine: g.startLine, endLine: g.endLine, chars: g.chars })) })),
     anchors: (result.anchors || []).map((a) => ({ path: a.path, sections: (a.updated || []).length })),

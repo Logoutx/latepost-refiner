@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -225,12 +225,16 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     fileEntries.push(entry)
   }
 
-  // 2. prior glossary (persistent per-company校对表)
+  // 2. prior glossary (persistent per-company校对表). Source priority: an explicit --prior-glossary path >
+  //    the default <outDir>/校对表.md. Accumulation always writes back to <outDir>/校对表.md (glossaryPath),
+  //    so a one-off external seed still lands in the canonical location for the next run.
   const glossaryPath = path.join(outDir, '校对表.md')
+  const explicitPrior = params.priorGlossaryPath ? path.resolve(params.priorGlossaryPath) : null
+  const priorSource = !fresh ? (explicitPrior && fs.existsSync(explicitPrior) ? explicitPrior : (fs.existsSync(glossaryPath) ? glossaryPath : null)) : null
   let priorGlossaryText
-  if (!fresh && fs.existsSync(glossaryPath)) {
-    priorGlossaryText = fs.readFileSync(glossaryPath, 'utf8')
-    notice(`沿用既有校对表：${glossaryPath}`)
+  if (priorSource) {
+    priorGlossaryText = fs.readFileSync(priorSource, 'utf8')
+    notice(`沿用既有校对表：${priorSource}`)
   }
 
   // 3. engine. Three modes: an injected engine (tests), per-category routing (web UI's
@@ -269,48 +273,68 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
 开始：${fileEntries.length} 份文件 · scope=${scope.join(',')} · verify=${verifyDepth} · 输出 ${outDir}
 `)
 
+  // §2 capability injection: with fs available, the audit / anchor / gap-marker work runs INSIDE the pipeline's
+  // per-file gate (not as a post-run wrapper — that avoided a double pass). The closures also RECORD their
+  // results into the accumulators below, so the top-level result.audit / annotations / anchors keep the exact
+  // shape writeRunArtifacts (+ cli/server) already consume. runAudit returns an auditPair file-result so the
+  // gate can read failed/gaps; annotate writes the visible 缺口 marker (only when the gate hits a still-hard
+  // gap); annotateAnchors writes the invisible source anchors. We deliberately do NOT inject `repair` — the
+  // headless API path keeps today's behaviour (mark the gap, let the user decide), never auto-rewriting a 成稿.
+  const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
+  const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
+  const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
+  const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
+  const capabilities = {
+    readFile: (p) => fs.readFileSync(p, 'utf8'),
+    // Risk (a): the pipeline hands us THIS round's in-memory 校对表 (opts.glossaryText) — use it for the
+    // ghost_name / missing_yin checks, because on a first run the file isn't persisted until after the pipeline
+    // returns, so reading it from disk would miss it. Fall back to the on-disk copy only when nothing was passed.
+    runAudit: (f, opts = {}) => {
+      const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
+      const res = auditPairs([{ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText }])
+      const file = res.files[0]
+      auditFilesAcc.push(file)
+      return file
+    },
+    annotate: (f, gaps) => {
+      if (params.annotate === false) return { inserted: [], skipped: [] }
+      const a = annotateFile(f.outPath, gaps)
+      if (a.inserted.length) annotations.push(a)
+      return a
+    },
+    annotateAnchors: (f) => {
+      if (params.anchors === false) return { updated: [], skipped: [] }
+      const a = annotateAnchorsFile(f.path, f.outPath)
+      if (a.updated.length) anchors.push(a)
+      return a
+    },
+  }
+
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, priorGlossaryText, fresh, annotate: params.annotate, files: fileEntries,
+    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode,
+    priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
+    canonicalOverrides: params.canonicalOverrides,
+    capabilities,
+    fresh, annotate: params.annotate, files: fileEntries,
   }
 
   try {
     const r = await runPipeline(A, sel.engine)
     cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
-    // source-aware quality audit: compare each refined transcript against its source (refine scope)
-    const auditList = r.error ? [] : fileEntries.filter((f) => f.outPath && fs.existsSync(f.outPath)).map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
-    const audit = auditList.length ? auditPairs(auditList) : null
-    // Content-gap annotation: insert visible 内容缺口 markers into the 成稿 for HARD gaps (a substantial
-    // source stretch the audit found missing with no fold trace — the silent-omission/censorship failure),
-    // so readers of the document can SEE that something was dropped and where to find it in the source.
-    // Default on; params.annotate === false disables. Idempotent (overlap-checked), so re-runs are safe.
-    // Runs necessarily after deliverables (the pipeline sandbox has no fs) — review.md notes they predate markers.
-    const annotations = []
-    if (audit && params.annotate !== false) {
-      audit.files.forEach((f, i) => {
-        if ((f.gaps || []).some((g) => g.severity === 'hard')) {
-          const a = annotateFile(auditList[i].refinedPath, f.gaps)
-          if (a.inserted.length) annotations.push(a)
-        }
-      })
-    }
-    // Source anchors: after gap annotation, each 成稿's ## sections get an invisible
-    // <!-- 源 L…-L… · 时间-时间 --> comment — provenance from any quote back to the source lines
-    // and the recording timestamp. Deterministic + idempotent; params.anchors === false disables.
-    const anchors = []
-    if (params.anchors !== false) {
-      for (const p of auditList) {
-        const a = annotateAnchorsFile(p.sourcePath, p.refinedPath)
-        if (a.updated.length) anchors.push(a)
-      }
-      if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
-    }
+    // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
+    // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
+    // review.md via reviewSections. All soft — never affects the exit code.
+    const glossaryLint = (wroteGlossary && r.glossary) ? auditGlossary(r.glossary) : null
+    // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
+    const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
+    if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
-    const result = { ...r, audit, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, glossaryLint, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

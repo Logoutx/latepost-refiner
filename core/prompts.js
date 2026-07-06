@@ -1,4 +1,4 @@
-import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath } from './spec.js'
+import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath, safeName } from './spec.js'
 
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
@@ -88,6 +88,7 @@ ${readBlock}
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
   · **知名实体用你已知的正确写法做 canonical**：若这是你认得的知名公司/产品/机构/公众人物，canonical 一律填**你所知的规范写法**，哪怕转录通篇是另一种听写——把转录里的写法放进 variants。例：转录一直写「苍碧科技」、而你知道这家公司规范写法是「苍璧科技」（碧→璧 同音误写），则 canonical=苍璧科技、variants 含 苍碧科技。别让一个一直被听错的名字、因为转录里写法统一就当成正确写法。
   · **拿不准就置 suspect_asr=true**：当你怀疑 canonical 可能是转录的同音/听写误写、却又给不出有把握的正确写法时，suspect_asr=true——这会强制对这一条联网核实（哪怕它只出现一处、没有别的变体，正常不会送核的）。一个写法"看着像真名"、却疑似听错的实体，正是最该标的；宁可多标。
+  · **称呼类同音尤其要标**：称呼写法（X 老师 / X 总 / X 哥 / X 工）里的姓氏若与在场某人物的姓**音近而字不同**（如在场是「沈总」而某处写成「陈总」、「李工」与「黎工」），置 suspect_asr=true，并在 hint 注明疑似所指的是谁（如「疑即沈其安，被听写成陈」），供核实/精校归位。
 - errors：明显转写错误按类别举例（同音字错/英文听写错/（音）标记/夹行时间戳/乱码/Word 残讯）。
 - themes：这份大致谈了哪些主题。
 - has_existing_headings：源文件是否已带小标题行（#/##/【】式标题）。
@@ -235,7 +236,7 @@ ${listText}
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
 }
 
-export function singlePassPrompt(f, a) {
+export function singlePassPrompt(f, a, overrideNote) {
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
@@ -248,7 +249,7 @@ ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
 若读全文时发现源文件其实已带（记者/速记的）小标题、而上方又没有【小标题处理】交代——按默认规范精校，但把这一情况写进 open_questions 提醒委托方决定保留还是重做。
-
+${overrideNote ? `\n${overrideNote}\n` : ''}
 ${RULES}
 
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
@@ -265,7 +266,7 @@ ${list}
 
 ${TYPESET}
 
-写到 ${a.outputDir}/${a.topic}访谈总结.md（输出根目录，不是 Transcripts/）。抬头 H1 + 第二行斜体说明（受访者与采访方、采访时间 ${a.date}）。末尾注一行配套文档（Transcripts/ 下各精校全文）。
+写到 ${a.outputDir}/${safeName(a.topic, 40)}访谈总结.md（输出根目录，不是 Transcripts/；文件名已清洗，勿再改动）。抬头 H1 + 第二行斜体说明（受访者与采访方、采访时间 ${a.date}）。末尾注一行配套文档（Transcripts/ 下各精校全文）。
 你的最终回复即返回值：输出路径 + 各部分小节标题清单。`
 }
 
@@ -283,18 +284,22 @@ ${list}
 
 ${TYPESET}
 
-写到 ${a.outputDir}/${a.topic}时间线.md。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
+写到 ${a.outputDir}/${safeName(a.topic, 40)}时间线.md（文件名已清洗，勿再改动）。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
 }
 
 // Logic-reordered draft: reads the **refined transcript** (not the raw source — names/terms already unified), reordering Q&A from recording order into narrative order.
 // Order-preserving reconstruction (lossless): Q&A blocks are copied verbatim, positions only are swapped; [Editor] bridging notes added only where a move breaks a reference.
-export function logicWritePrompt(f, a) {
-  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。
+export function logicWritePrompt(f, a, missing) {
+  const outName = safeName(f.title)
+  const missNote = (missing && missing.length)
+    ? `\n【上轮遗漏——本轮必须完整纳入】上一遍重排漏掉了以下精校稿小标题对应的问答内容，请本轮务必把它们各自归入合适的主线、整段照原文补齐（不得再遗漏）：${missing.map((h) => `「${h}」`).join('、')}。`
+    : ''
+  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它可能比源文件略短，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
-【输出】Write 到 ${a.outputDir}/逻辑顺序/${f.title}.md
-【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见 Transcripts/${f.title}.md*\`
+【输出】Write 到 ${a.outputDir}/逻辑顺序/${outName}.md
+【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见 Transcripts/${outName}.md*\`
 
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。
