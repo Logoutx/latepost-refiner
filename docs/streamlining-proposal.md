@@ -23,7 +23,7 @@ Today the project already has a strong shared `core/`, but the interface/runtime
 
 1. Claude Code Workflow runtime
    - `build/bootstrap-cc.js`
-   - generated `claude-code-skill/workflow.js`
+   - generated `claude-code-skill/scripts/claude-native.js`
 
 2. Universal Node runtime
    - `universal/cli.js`
@@ -81,7 +81,7 @@ interfaces/
   claude/
     SKILL.md
     references/
-    workflow.js
+    scripts/claude-native.js
     build-zips.sh
 
 build/

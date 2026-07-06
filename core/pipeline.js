@@ -97,7 +97,7 @@ export function normalizeAuditResult(raw, f) {
 
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
-// sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
+// sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/scripts/audit_refined.mjs` and echoes the
 // JSON. content_gap(hard) or quote_style(hard) → optionally auto-repair once (capabilities.repair, or a refine
 // subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
@@ -128,7 +128,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       glossaryArg = ` --glossary ${JSON.stringify(scratch)}`
       stagePreamble = `先用 Write 把下面这段“校对表全文”一字不改写到临时文件 ${JSON.stringify(scratch)}，再运行审计命令。\n<校对表全文>\n${memGlossary}\n</校对表全文>\n\n`
     }
-    const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
+    const cmd = `node ${JSON.stringify(skillDir + '/scripts/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
     let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'stitch' })
     let parsed = parseAuditJson(raw)
@@ -179,7 +179,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     if (typeof cap.annotate === 'function') { try { await cap.annotate(f, (cur.gaps || []).filter((g) => g.severity === 'hard')) } catch { /* best effort */ } }
     else {
       await engine.agent(
-        `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --annotate\n只回复一句话确认即可。`,
+        `用 Bash 运行：node ${JSON.stringify(skillDir + '/scripts/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --annotate\n只回复一句话确认即可。`,
         { label: `annotate:${f.label}`, phase: 'Audit', model: 'stitch' })
     }
   }
@@ -192,7 +192,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     try { const a = await cap.annotateAnchors(f); anchorsAdded = (a && a.updated && a.updated.length) || 0 } catch { anchorsAdded = 0 }
   } else {
     await engine.agent(
-      `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --anchors\n只回复一句话确认即可。`,
+      `用 Bash 运行：node ${JSON.stringify(skillDir + '/scripts/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --anchors\n只回复一句话确认即可。`,
       { label: `anchors:${f.label}`, phase: 'Audit', model: 'stitch' })
   }
 

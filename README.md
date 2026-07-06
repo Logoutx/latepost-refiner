@@ -105,8 +105,8 @@ engines/             命令行版的引擎（Claude Code 版的引擎是 Workflo
   openai.js          OpenAI 兼容引擎（DeepSeek / GLM / Kimi / OpenAI 共用）
   providers.js       各家 provider 的 endpoint、key、差异、模型分层
   fileops.js         两引擎共用的 Read/Write/Edit，带沙箱限制
-build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 workflow.js
-claude-code-skill/   Claude Code 版（workflow.js 是 build 产物，别手改）
+build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 scripts/claude-native.js
+claude-code-skill/   Claude Code 版（scripts/claude-native.js 是 build 产物，别手改）
 universal/           命令行 + 网页 + 单文件 App
 ```
 
@@ -115,7 +115,7 @@ universal/           命令行 + 网页 + 单文件 App
 - **Claude Code 版**：这 5 个原语就是 Workflow 工具的全局函数。子代理跑在你的 Claude Code 会话上，不要 API key，也不碰 `engines/`。
 - **命令行版**：`engines/api.js` 用 Anthropic SDK 实现它们，把 `Read/Write/Edit` 做成客户端工具、联网核实用 Anthropic 服务端的 `web_search`——于是 `core/` 里的 prompt 一字不改就能复用。
 
-**为什么 Claude Code 版的脚本要“生成”**：Workflow 沙箱不许 import、不能读写文件，脚本得是单文件、只用全局函数。所以 `build-cc.mjs` 把 `core/*` 去掉 import/export、按依赖拼成一个自包含的 `workflow.js`。**改 `core/*` 后重跑 build，别手改 `workflow.js`，下次 build 会覆盖。**
+**为什么 Claude Code 版的脚本要“生成”**：Workflow 沙箱不许 import、不能读写文件，脚本得是单文件、只用全局函数。所以 `build-cc.mjs` 把 `core/*` 去掉 import/export、按依赖拼成一个自包含的 `scripts/claude-native.js`。**改 `core/*` 后重跑 build，别手改 `scripts/claude-native.js`，下次 build 会覆盖。**
 
 **流水线**：并行侦察 → 纯 JS 合并聚类 → 分批联网核实 + 同指去重 → 汇成校对表 → 逐份精校 + 结尾核对 → 逻辑重排、总结、时间线（可选）。模型分层、网络熔断（连续出错即停）、人名保护（防张冠李戴）、中文排版三规范的设计，见 `core/` 注释和 `claude-code-skill/SKILL.md`。
 

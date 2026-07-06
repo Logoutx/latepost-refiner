@@ -46,13 +46,13 @@ jobs:
           fi
 
       - name: Check generated workflow drift
-        run: git diff --exit-code claude-code-skill/workflow.js
+        run: git diff --exit-code claude-code-skill/scripts/claude-native.js
 
       # audit_refined.mjs is copied into the skill bundle by build:cc (build/build-cc.mjs). The build step
       # above regenerates it; this cmp is a backstop that also catches a hand-edited bundle copy.
       - name: Check audit script copies in sync
         run: |
-          cmp scripts/audit_refined.mjs claude-code-skill/audit_refined.mjs
+          cmp scripts/audit_refined.mjs claude-code-skill/scripts/audit_refined.mjs
           cmp scripts/audit_refined.mjs codex-skills/latepost-refiner/scripts/audit_refined.mjs
 
       # Codex native installs can be zipped as a standalone skill, so its helper carries the small shared
