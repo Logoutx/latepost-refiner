@@ -135,6 +135,24 @@ DeepSeek 和 OpenAI 没有内置搜索：设了 `TAVILY_API_KEY` 才能让核实
 
 模型特点——DeepSeek 思考模式禁工具调用、GLM 不收 `temperature:0`、Kimi 不支持强制函数调用、OpenAI 用 `max_completion_tokens`——都在 `engines/providers.js` 里处理。
 
+### 便宜档优先 + 升级重跑（`--escalate`，可选）
+
+常规访谈用便宜 provider 精校，靠现有的确定性审计门禁（charRatio 压缩、内容缺口、结尾缺失、引号等）逐份判决；**未过审的文件自动用高档 provider 从源文件重跑精校、再复审**。质量由门禁保证，不靠对某个 provider 的信任。
+
+```sh
+node universal/cli.js --files 访谈.md --topic 试跑 \
+  --provider deepseek --escalate anthropic --verify none
+```
+
+- `--provider` 是第一遍（便宜）档；`--escalate <名>` 指定高档 provider。给了 `--escalate` 才启用；不给则与既有行为逐字节等价。
+- `--escalate-base-url` / `--escalate-models`（如 `refine=claude-opus-4-8`）覆盖高档 provider 的 endpoint / 模型（只用 refine 档）。
+- 结果落盘：`review.md` 有「升级重跑」小节逐份说明（首档失败项 → 升级是否过审）；`run.json` 的 `escalation` 块记录每份的便宜档审计、高档审计、保留了哪一档；两档都没过的文件会**显式标注「两档均未过审」**并保留过审项更少的那一档（持平取高档）。
+- 退出码反映**最终**状态：若升级后不再有 hard 内容门禁失败（内容缺口/引号），即退出 0。
+- 重跑**只从原始源文件**做，绝不拿可能被压缩的便宜档成稿去“恢复”细节。
+- ⚠ **信源提醒**：升级会把**源文件原文**也发送给高档 provider。所以两个 provider 都要有意识地选——尤其当便宜档或高档任一为境内运营方时（见下一节）。本工具不做“敏感话题自动识别”（那是不可靠的承诺），用不用升级由你判断。
+
+（v1 仅命令行支持；网页版参数通道已能透传 `escalate` 对象，但界面暂无对应字段。）
+
 ### 数据去向与信源保护
 
 选 provider 就是选**转录全文发给谁**。这对访谈工具不是普通的隐私条款问题：转录里常有信源身份、未公开信息、offrecord 闲聊。
@@ -143,3 +161,4 @@ DeepSeek 和 OpenAI 没有内置搜索：设了 `TAVILY_API_KEY` 才能让核实
 - Anthropic、OpenAI 由美国公司运营，同样是把全文交给第三方——只是司法辖区与审查机制不同。
 - 涉敏感话题或需保护信源的访谈：命令行与网页版会在选中境内服务商时显示提示；拿不准就别把这份稿子交给该服务商。
 - 本工具刻意**不内置敏感词清单**做内容预判——清单永远不全，且清单本身就是负担。诚实的表述是：全文都会被所选运营方读到，无论内容是什么。
+- 用 `--escalate` 时要多想一层：**源文件原文会同时发给便宜档和升级档两个 provider**。若其一是境内运营方，全文就经过了那一方。请对两个 provider 都做同样的辖区判断——升级不改变“全文交给谁”的性质，只是多交给了一方。

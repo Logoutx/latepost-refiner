@@ -16,6 +16,7 @@ import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
 import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
 import { writeRunArtifacts } from './artifacts.js'
+import { runEscalation, escalationGlossaryText, mergeEscalationUsage, HARD_GATES } from './escalate.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -212,6 +213,99 @@ async function prepareInputFile(f, { topic, date, headingPolicy, outputDir, uplo
   return null
 }
 
+// M10: build the premium (escalation) engine + drive the escalation pass, then REFRESH the pipeline
+// result's audit-derived fields (auditFailed / incomplete / audit.files / audit.status) to the FINAL
+// on-disk state so the exit code, review.md, and run.json reflect post-escalation truth. Returns
+// { premiumUsage, manifest } where manifest is the run.json「escalation」block (provider + per-file records
+// + counts). escalate = { provider, baseURL?, models? }; params.__escalateEngine injects a mock for tests.
+// Mutates `r` (pipeline result) and `audit` in place — the caller assembles them into `result` afterwards.
+async function runEscalationPass({ escalate, audit, r, A, fileEntries, glossaryPath, concurrency, filePolicy, notice, onPhase, onLog, __escalateEngine }) {
+  // 1) premium engine: an injected mock (tests) OR selectEngine on the named provider. A per-tier
+  //    --escalate-models map pins the refine model via modelOverride (escalation only calls the refine tier,
+  //    so pinning all tiers to that id is harmless). Config errors surface as a notice + skip (never fatal —
+  //    a bad escalate config must not sink an otherwise-good run; the cheap 成稿 already exist on disk).
+  let escalateEngine = __escalateEngine
+  let escProvider = escalate.provider
+  if (!escalateEngine) {
+    const modelOverride = escalate.models && (escalate.models.refine || Object.values(escalate.models)[0])
+    try {
+      const esc = selectEngine({ provider: escalate.provider, baseURL: escalate.baseURL, modelOverride, concurrency, filePolicy, onPhase, onLog })
+      escalateEngine = esc.engine
+      escProvider = esc.provider
+      const jn = jurisdictionNote(esc.provider)
+      notice(`升级 provider=${esc.provider}（${esc.info.label}）· 用于未过审文件的源级重跑`)
+      if (jn) notice(`⚠ 升级链路：${jn}`)
+    } catch (e) {
+      notice(`升级 provider 配置无效，已跳过升级重跑（首档成稿照常落盘）：${e.message}`)
+      return null
+    }
+  }
+
+  const glossaryText = escalationGlossaryText(r, glossaryPath)
+  const failingCount = (audit.files || []).filter((f) => f && f.status === 'fail').length
+  if (!failingCount) return null // nothing failed → no escalation (but keep the structure explicit)
+
+  const outcome = await runEscalation({ auditFiles: audit.files, A, fileEntries, escalateEngine, glossaryText, log: (m) => notice(m) })
+  if (!outcome || !outcome.records.length) return null
+
+  // 2) refresh audit.files to the FINAL per-file audit (the on-disk 成稿's audit), so review.md's
+  //    「成稿质量抽查」, run.json audit, and audit.status all reflect what actually shipped.
+  audit.files = (audit.files || []).map((f) => outcome.finalAuditFor(f.file) || f)
+  audit.status = audit.files.some((f) => f && f.status === 'fail') ? 'fail' : 'ok'
+
+  // 3) recompute the pipeline's hard-gate fields from the FINAL audits: auditFailed keeps only the two hard
+  //    content gates (matching the pipeline's contract → drives the exit code), incomplete keeps ending_missing.
+  const finalOf = (outPath) => outcome.finalAuditFor(outPath)
+  const isEscalated = new Set(outcome.records.map((x) => x.outPath))
+  // auditFailed: preserve non-escalated entries verbatim; for escalated ones, rebuild from the final audit.
+  const rebuiltAuditFailed = []
+  for (const entry of r.auditFailed || []) if (!isEscalated.has(entry.path)) rebuiltAuditFailed.push(entry)
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    const hard = ((fa && fa.failed) || []).filter((k) => HARD_GATES.includes(k))
+    if (hard.length) rebuiltAuditFailed.push({ path: outPath, findings: hard })
+  }
+  r.auditFailed = rebuiltAuditFailed
+  // incomplete: same treatment for the ending_missing signal.
+  const rebuiltIncomplete = []
+  for (const entry of r.incomplete || []) if (!isEscalated.has(entry.path || entry)) rebuiltIncomplete.push(entry)
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    if (fa && (fa.failed || []).includes('ending_missing')) rebuiltIncomplete.push({ path: outPath, note: 'deterministic audit: ending_missing' })
+  }
+  r.incomplete = rebuiltIncomplete
+  // Refresh each refined entry's inline audit summary + completeness so per-file consumers see final state.
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    const rr = (r.refined || []).find((x) => (x.outPath || x.path) === outPath)
+    if (rr && fa) {
+      const hard = (fa.failed || []).filter((k) => HARD_GATES.includes(k))
+      const soft = (fa.failed || []).filter((k) => !HARD_GATES.includes(k))
+      rr.audit = { status: hard.length ? 'fail' : 'ok', hardFindings: hard, softFindings: soft, repaired: false, anchorsAdded: (rr.audit && rr.audit.anchorsAdded) || 0, auditUnavailable: false }
+      rr.complete = !(fa.failed || []).includes('ending_missing')
+      rr.checkNote = (fa.failed || []).includes('ending_missing') ? 'deterministic audit: ending_missing' : ''
+    }
+  }
+
+  // 4) loud open-question line for any file that failed BOTH tiers (surfaces in review.md「收尾待问」 + CLI).
+  const both = outcome.records.filter((x) => x.bothFailed)
+  if (both.length) {
+    r.openQuestions = [...(r.openQuestions || []), `升级重跑：${both.length} 份两档均未过审（${both.map((x) => x.label).join('、')}）——请对照源文件人工核对，详见 review.md「升级重跑」`]
+  }
+  notice(`升级重跑完成：${outcome.escalated} 份未过审已升级 ${escProvider}，${outcome.passed} 份通过${outcome.bothFailed ? `，${outcome.bothFailed} 份两档均未过审` : ''}`)
+
+  return {
+    premiumUsage: outcome.premiumUsage,
+    manifest: {
+      provider: escProvider,
+      escalated: outcome.escalated,
+      passed: outcome.passed,
+      bothFailed: outcome.bothFailed,
+      files: outcome.records.map((x) => ({ outPath: x.outPath, label: x.label, escalated: x.escalated, cheapAudit: x.cheapAudit, premiumAudit: x.premiumAudit, kept: x.kept, bothFailed: x.bothFailed, reason: x.reason })),
+    },
+  }
+}
+
 // One-call run used by the web server and CLI. `files` may be filesystem entries
 // [{ path }] or uploads [{ name, base64 }]. onPhase/onLog stream progress.
 export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
@@ -223,7 +317,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     models, outputDir, fresh = false, concurrency,
-    skillDir,
+    skillDir, escalate,
   } = params
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
@@ -368,6 +462,23 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
     const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
     if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
+
+    // M10 cheap-first escalation (OPT-IN): with `escalate` configured, any file whose RAW deterministic
+    // audit FAILED (compression_risk/charRatio, content_gap, ending_missing, quote_style, …) is RE-REFINED
+    // FROM SOURCE on the premium engine and re-audited. Runs BEFORE cross-file consistency so that check
+    // sees the final (post-escalation) 成稿 set. Refreshes r.auditFailed / r.incomplete / audit.files to the
+    // final on-disk state; the cheap+premium audits are kept in `escalation`. No-op unless escalate is set.
+    let escalation = null
+    let escUsage = null
+    if (escalate && audit && !r.error) {
+      escalation = await runEscalationPass({
+        escalate, audit, r, A, fileEntries, glossaryPath,
+        concurrency, filePolicy, notice, onPhase, onLog,
+        __escalateEngine: params.__escalateEngine,
+      })
+      escUsage = escalation ? escalation.premiumUsage : null
+    }
+
     // M8: cross-file numeric consistency over the whole batch (≥2 refined files). Uses this round's rendered
     // 校对表 (in-memory) for entity association, else the on-disk copy. A conflict is attached to the result +
     // manifest and rendered in review.md「跨文件互证」; a ONE-line summary folds into openQuestions so the Step-5
@@ -382,7 +493,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
-    const result = { ...r, audit, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
+    // usage: primary engine totals, plus the premium engine's usage merged in (with a separate `escalation`
+    // sub-object) when escalation ran. mergeEscalationUsage is a no-op-merge when escUsage is null.
+    const usage = escUsage ? mergeEscalationUsage(sel.engine.usage(), escUsage) : sel.engine.usage()
+    const result = { ...r, audit, escalation: escalation ? escalation.manifest : null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
@@ -393,6 +507,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       providerInfo: sel.info,
       warnings,
       usage: result.usage,
+      escalation: result.escalation,
     })
     return { ...result, ...artifacts }
   } finally {

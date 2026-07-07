@@ -48,6 +48,17 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   key 环境变量           anthropic→ANTHROPIC_API_KEY · deepseek→DEEPSEEK_API_KEY ·
                          glm→ZHIPUAI_API_KEY/ZAI_API_KEY · kimi→MOONSHOT_API_KEY · openai→OPENAI_API_KEY
   联网核实              Anthropic/GLM/Kimi 用 provider 原生搜索；DeepSeek/OpenAI 需 TAVILY_API_KEY
+
+升级重跑（cheap-first，可选、默认关闭）:
+  --escalate <名>        指定「升级」provider。给出后即启用便宜档优先：--provider 做第一遍（便宜）精校，
+                         凡审计门禁未过（压缩/charRatio、内容缺口、结尾缺失、引号等）的文件，用本 provider
+                         从【源文件】重跑精校再复审。质量由确定性门禁判定，不靠对 provider 的信任。
+                         不给 --escalate 时行为与既有完全一致（逐字节等价）。
+  --escalate-base-url <URL>  升级 provider 的 endpoint 覆盖
+  --escalate-models <映射>   升级 provider 的模型覆盖（如 refine=claude-opus-4-8；只用 refine 档）
+  ⚠ 信源提醒            升级会把【源文件原文】也发送给升级 provider。两个 provider 都要有意识地选择——
+                         尤其当便宜档或升级档任一为中国境内运营方时（见启动时的信源保护提示）。
+                         本工具不做“敏感话题自动识别”（那是不可靠的承诺）——用不用升级由你判断。
 `
 
 // ---------- argv ----------
@@ -62,6 +73,8 @@ export function parseArgs(argv) {
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
     '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
+    // M10 cheap-first escalation: --escalate names the premium provider for files that fail the audit gate.
+    '--escalate': 'escalate', '--escalate-models': 'escalateModels', '--escalate-base-url': 'escalateBaseURL',
   }
   let i = 0
   while (i < argv.length) {
@@ -123,6 +136,9 @@ export function buildRunParams(a, { env = process.env } = {}) {
     provider: a.provider,
     baseURL: a.baseURL,
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
+    // M10: presence of --escalate enables cheap-first semantics — the normal --provider does the first
+    // (cheap) pass; this names the premium engine re-run on files that FAIL the deterministic audit gate.
+    escalate: a.escalate ? { provider: a.escalate, baseURL: a.escalateBaseURL, models: parseModels(a.escalateModels) } : undefined,
   }
 }
 
@@ -160,6 +176,12 @@ export function printRunSummary(r) {
     let flagged = 0, total = 0
     for (const f of r.audit.files) { const ss = f.sections || []; total += ss.length; flagged += ss.filter((s) => (s.flags || []).length).length }
     if (flagged > 0) console.error(`\n逐节复核：${flagged} 节需人工对照（共 ${total} 节）——见 review.md「逐节复核清单」`)
+  }
+  // M10: cheap-first escalation summary. 「升级重跑：N 份未过审已升级 <provider>，M 份通过」 + a loud both-fail line.
+  if (r.escalation && r.escalation.escalated) {
+    const e = r.escalation
+    console.error(`\n升级重跑：${e.escalated} 份未过审已升级 ${e.provider}，${e.passed} 份通过`)
+    if (e.bothFailed) console.error(`⚠ 其中 ${e.bothFailed} 份两档均未过审——请对照源文件人工核对（见 review.md「升级重跑」）：` + e.files.filter((f) => f.bothFailed).map((f) => f.label).join('、'))
   }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
@@ -202,6 +224,7 @@ export function printRunSummary(r) {
 
   const u = r.usage || { agents: 0, input: 0, output: 0, cacheRead: 0, failed: 0 }
   console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${(u.cacheRead || 0).toLocaleString()}`)
+  if (u.escalation) { const e = u.escalation; console.error(`  其中升级重跑：${e.agents || 0} 个代理调用 · 输入 ${(e.input || 0).toLocaleString()} / 输出 ${(e.output || 0).toLocaleString()} tok`) }
 }
 
 async function main() {
