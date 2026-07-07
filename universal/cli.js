@@ -156,6 +156,10 @@ export function printRunSummary(r) {
   if (r.audit && r.audit.files) {
     const bad = r.audit.files.filter((f) => f.status === 'fail')
     if (bad.length) console.error(`\n⚠ 成稿质量抽查未过 ${bad.length} 份：` + bad.map((f) => `${path.basename(f.file)}（${f.failed.join('/')}）`).join('、'))
+    // M5: 逐节复核 headline — how many ## sections carry a soft mutation/name flag needing manual cross-check.
+    let flagged = 0, total = 0
+    for (const f of r.audit.files) { const ss = f.sections || []; total += ss.length; flagged += ss.filter((s) => (s.flags || []).length).length }
+    if (flagged > 0) console.error(`\n逐节复核：${flagged} 节需人工对照（共 ${total} 节）——见 review.md「逐节复核清单」`)
   }
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   for (const an of r.annotations || []) {

@@ -101,6 +101,49 @@ function formatAudit(f) {
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
 }
 
+// M5: one review line per FLAGGED refined section (empty-flags sections are trusted, omitted). Aggregates the
+// audit's per-file sections[] into human 逐节复核 lines: 「§标题 — 源 L340-L360 · 15:17-16:02 — 存疑数字 2 处（样例…）/
+// 未核实名 1 个 / 语气弱化 1 处 → 对照录音」. Chinese typesetting throughout (全角弯引号, Arabic numerals, Pangu spacing).
+const M5_FLAG_LABEL = {
+  number_drift: '存疑数字',
+  hedge_loss: '语气弱化',
+  content_gap_soft: '疑似漏段',
+  ghost_name: '残留错写名',
+  missing_yin: '未核实名裸写',
+  weak_anchor: '定位弱（未对上源）',
+}
+function formatSectionFlag(flag) {
+  const label = M5_FLAG_LABEL[flag.kind] || flag.kind
+  if (flag.kind === 'number_drift') return `${label} ${flag.count} 处${flag.sample ? `（${flag.sample}）` : ''}`
+  if (flag.kind === 'weak_anchor') return label
+  const unit = flag.kind === 'ghost_name' || flag.kind === 'missing_yin' ? '个' : '处'
+  return `${label} ${flag.count} ${unit}`
+}
+function formatSectionLine(sec) {
+  const src = sec.sourceRange ? `源 L${sec.sourceRange.startLine}-L${sec.sourceRange.endLine}${sec.ts ? ` · ${sec.ts}` : ''}` : '源定位未对上'
+  const flags = (sec.flags || []).map(formatSectionFlag).join(' / ')
+  return `§${sec.title} — ${src} — ${flags} → 对照录音`
+}
+// Collect flagged sections across all audited files. When >1 file, prefix the file basename so lines stay
+// unambiguous. Returns [] when no section carries a flag (or the audit predates sections[]).
+export function sectionReviewItems(result = {}) {
+  const files = (result.audit && result.audit.files) || []
+  const items = []
+  for (const f of files) {
+    const flagged = (f.sections || []).filter((s) => (s.flags || []).length)
+    const prefix = files.length > 1 && f.file ? `${path.basename(f.file)} ` : ''
+    for (const s of flagged) items.push(prefix + formatSectionLine(s))
+  }
+  return items
+}
+// Count summary (total flagged / total sections) for the CLI one-liner + manifest.
+export function sectionReviewSummary(result = {}) {
+  const files = (result.audit && result.audit.files) || []
+  let total = 0, flagged = 0
+  for (const f of files) { const ss = f.sections || []; total += ss.length; flagged += ss.filter((s) => (s.flags || []).length).length }
+  return { flagged, total }
+}
+
 // E13: fired 校对表 lint warnings → one review line each (each finding's sample text carries the counts).
 function glossaryLintItems(result) {
   const lint = result.glossaryLint
@@ -117,6 +160,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
+    { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '校对表偏薄，建议人工复核（条目数/身份线索/变体比例）', items: glossaryLintItems(result), priority: 'medium' },
@@ -246,7 +290,14 @@ export function buildRunManifest(result = {}, context = {}) {
     },
     audit: result.audit ? {
       status: result.audit.status,
-      files: (result.audit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null, gaps: f.gaps || [], modelMarkers: f.modelMarkers || [] })),
+      // M5 sections summary: total flagged vs total ## sections across all audited files (the 逐节复核 headline).
+      sections: sectionReviewSummary(result),
+      files: (result.audit.files || []).map((f) => ({
+        file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null,
+        gaps: f.gaps || [], modelMarkers: f.modelMarkers || [],
+        // Only flagged sections are persisted (a trusted section carries no actionable info for the manifest).
+        sections: (f.sections || []).filter((s) => (s.flags || []).length).map((s) => ({ title: s.title, refinedLines: s.refinedLines, sourceRange: s.sourceRange, ts: s.ts, flags: s.flags })),
+      })),
     } : null,
     // E13: 校对表 structural lint (all soft) — metrics + only the warnings that fired.
     glossaryLint: result.glossaryLint ? {

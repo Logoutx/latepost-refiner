@@ -611,6 +611,422 @@ export function anchorTurns(sourceText, refinedText) {
   return { turns, subs }
 }
 
+// ===== Meaning-atom fidelity (M4): the MUTATION tier =====
+// Every gate above catches DELETION-shaped failures (a stretch vanished). None catches MUTATION-shaped ones,
+// where the words survive but a fact is quietly altered: 亏损 2 亿→2 亿 (lost 亏损), 不到 30%→30% (lost the bound),
+// 可能明年盈利→明年盈利 (lost the hedge), 2019→2021 (changed value). The coverage anchoring is structurally BLIND
+// to these: it excludes number-ish shingles on purpose (NUMBERISH_RE) because RULES 10 rewrites 汉字数字→阿拉伯,
+// so a turn whose only change is a flipped number still "anchors" fine. This tier re-checks exactly what
+// coverage skips — numeric tokens and their polarity/bound qualifiers, plus per-turn hedge density — by
+// NORMALIZING BOTH SIDES the same way (mirroring RULES 10) and diffing the resulting atom multisets, turn-scoped
+// via the existing anchor positions. All findings are SOFT this pass (promotion to hard waits on real-world FP
+// data); leniency contract identical to coverage: unparseable source or zero anchored turns → assessed:false.
+export const ATOMS = {
+  POLARITY_WINDOW: 6,       // chars before a number scanned for a polarity/bound qualifier (不到/亏损/超过…)
+  HEDGE_TURN_MIN: 2,        // source turn needs ≥ this many hedge markers before a total wipe is worth flagging
+  DRIFT_SAMPLES: 12,        // cap on number_drift sample texts (total count still reported)
+  WINDOW_LINES: 6,          // refined lines each side of a turn's anchor line = its search window
+  MIN_ATOM_VALUE_LEN: 1,    // (reserved) minimum canonical-value length to register an atom
+}
+
+// Polarity / bound / sign qualifiers that ride just before a number and flip its meaning. Losing one is as bad
+// as changing the digits (不到 30% → 30% overstates; 亏损 2 亿 → 2 亿 hides a loss). Ordered longest-first so the
+// window scan prefers 亏损 over a bare 亏, 不足 over 不.
+const POLARITY_TOKENS = [
+  '亏损', '盈利', '不到', '不足', '超过', '多于', '少于', '以上', '以下', '左右', '上下', '接近', '将近', '至少', '最多', '大约',
+  '涨', '跌', '降', '增', '减', '亏', '近', '约', '超', '余', '多', '不', '未', '没',
+]
+// Colloquial small oral quantities RULES 10 KEEPS as 汉字 (两三年 / 三五个 / 一两次 / 七八年 / 一两句 / 两个人): a refine
+// that leaves these as 汉字 is CORRECT, so extracting them would false-flag every faithful output. Two cases:
+//   (a) an APPROXIMATION — two adjacent han-digits (三五 / 一两 / 七八 / 两三) — always oral, regardless of what
+//       follows. RULES 10 lists 三五个 / 一两次 / 七八年 verbatim.
+//   (b) a bare single han-digit (no scale, no RECOGNIZED unit) hugging a colloquial 量词 (两个人 / 三个 / 五位):
+//       these are vague small counts. A single digit + a REAL measured unit (3 个月 / 6% / 5 家营收) is NOT oral —
+//       RULES 10 converts those — so this only fires when the trailing unit is a soft classifier, not in ATOM_UNITS.
+const SMALL_ORAL_APPROX_RE = /^[一二两三四五六七八九][一二两三四五六七八九]$/           // 三五 / 一两 / 七八 / 两三
+const SOFT_CLASSIFIER = '个位人句块只种样步口台家'                                   // colloquial 量词 (NOT measured units)
+// Lexical guard: characters that, right after a bare 一/两/三, form a common NON-numeric word — 一直/一般/一下/一些/
+// 一起/一切/一旦/一样/一定/一边/一律/一带/一度/一点/一会/一再/一齐/一致/一连/一味/一同/一块; 两下/两旁; 三番. Without this,
+// 一 (by far the commonest character in Chinese prose) floods the audit with phantom "number 1" atoms even when a
+// polarity word happens to sit nearby. Applied only to a bare single han-digit with no scale and no strong unit.
+const LEXICAL_AFTER_ONE = '直般下些起切旦样定边律带度点会再齐致连味同块流成'
+const LEXICAL_AFTER_TWO = '下旁'            // 两下 / 两旁 (两 is usually numeric, so keep this list tiny)
+// 成语 / fixed four-char idioms containing number chars — never numeric facts. A compact blocklist of the ones
+// that actually collide with number extraction (三心二意 etc. have no trailing unit so rarely reach extraction,
+// but 一五一十 / 五花八门 / 三三两两 look number-dense). Matched as substrings around a candidate.
+const NUMBER_IDIOMS = ['一五一十', '五花八门', '三心二意', '七上八下', '乱七八糟', '三三两两', '五颜六色', '四面八方', '九牛一毛', '十全十美', '一心一意', '独一无二', '三言两语', '千方百计', '成千上万', '五湖四海']
+// Units we canonicalize and keep attached to the value. Longest-first (个月 before 月, 千万 before 万, 美元 before 元).
+// Split by STRENGTH — the single most important false-positive control in this whole tier:
+//   STRONG units are measured quantities (money / percent / multiples / durations-with-classifier). A bare single
+//     han-digit + a STRONG unit is a real fact (三个月 / 六% / 两亿) and is always extracted.
+//   WEAK units are plain time nouns (年/月/日/天). A BARE single-or-double han-digit + a WEAK unit is usually
+//     LEXICAL, not a quantity — 那一年 / 两天后 / 头一天 — and refine legitimately drops the 一 (疫情那一年→那年). So a
+//     weak-unit atom is only kept when the number is arabic, carries a scale char (十/百/千), or has a polarity
+//     qualifier. This is what stops 一/两/三 in running prose from flooding the audit with phantom drift.
+// A number with NO unit at all becomes a bare-value atom ONLY when it is arabic or scale-bearing (2019 / 一百二十);
+// a bare unitless single han-digit (一 in 一下/一般, 两 in 两块, 第三…) is dropped — see the acceptance gate below.
+const STRONG_UNITS = ['千万', '亿', '万', '%', '个月', '个点', '美元', '港元', '倍', '元', '小时', 'B', 'K', 'W', 'k']
+const WEAK_UNITS = ['年', '月', '日', '天']
+const ATOM_UNITS = [...STRONG_UNITS, ...WEAK_UNITS]
+const STRONG_UNIT_SET = new Set(STRONG_UNITS)
+// Char classes.
+const HAN_DIGIT = { '〇': 0, '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 }
+const HAN_SMALL_UNIT = { 十: 10, 百: 100, 千: 1000 }
+const HAN_NUM_CHARS = '〇零一二两三四五六七八九十百千'   // NOTE: 万/亿 are treated as trailing UNITS, not scale, so a value
+                                                    // written 八千万 canonicalizes to 8000万 (== 8000 万) not 80000000.
+
+// Parse one contiguous hanzi-number section (already stripped of any trailing 万/亿/% unit) → integer, or null.
+function parseHanSection(s) {
+  if (!s) return null
+  // positional/year style: contains 〇 or is a bare digit run with no scale unit and length ≥2 (二〇一九 / 一九九八)
+  if (/[〇零]/.test(s) || (/^[一二两三四五六七八九]{2,}$/.test(s) && !/[十百千]/.test(s))) {
+    let out = ''
+    for (const c of s) { if (!(c in HAN_DIGIT)) return null; out += HAN_DIGIT[c] }
+    return Number(out)
+  }
+  let total = 0, cur = 0, seen = false
+  for (const c of s) {
+    if (c in HAN_DIGIT) { cur = HAN_DIGIT[c]; seen = true }
+    else if (c in HAN_SMALL_UNIT) { total += (cur === 0 ? 1 : cur) * HAN_SMALL_UNIT[c]; cur = 0; seen = true }
+    else return null
+  }
+  total += cur
+  return seen ? total : null
+}
+
+// Canonicalize a numeric value string (arabic or hanzi, possibly a range) to a stable key so both sides compare
+// equal regardless of writing system. Ranges (六七十 / 三四十 / 30到40 / 30-40 / 三四百) → "lo-hi"; scalars → the
+// number as a string. Returns null when it isn't really a number. `unit` is passed in only to disambiguate the
+// adjacent-digit range heuristic (六七十 with scale 十 → 60-70; a bare 34 is just 34).
+function canonValue(raw, scale) {
+  const s = String(raw).trim()
+  if (!s) return null
+  // adjacent hanzi digits that form an approximate range: 六七十 (→60-70), 三四百 (→300-400), 两三 (→2-3).
+  // Trigger: 2 distinct consecutive single han-digits, optionally followed by ONE scale char (十/百/千).
+  const rng = s.match(/^([一二两三四五六七八九])([一二两三四五六七八九])([十百千]?)$/)
+  if (rng) {
+    const a = HAN_DIGIT[rng[1]], b = HAN_DIGIT[rng[2]]
+    if (b === a + 1 || b === a) {
+      const mul = rng[3] ? HAN_SMALL_UNIT[rng[3]] : 1
+      const lo = Math.min(a, b) * mul, hi = Math.max(a, b) * mul
+      return `${lo}-${hi}`
+    }
+  }
+  // explicit arabic range 30-40 / 30~40 / 30到40 / 30至40
+  const arng = s.match(/^(\d+(?:\.\d+)?)\s*(?:[-~—－]|到|至)\s*(\d+(?:\.\d+)?)$/)
+  if (arng) return `${Number(arng[1])}-${Number(arng[2])}`
+  // explicit hanzi range 三十到四十
+  if (/[到至]/.test(s)) {
+    const [l, r] = s.split(/[到至]/)
+    const lv = parseHanSection(l), rv = parseHanSection(r)
+    if (lv != null && rv != null) return `${lv}-${rv}`
+  }
+  // pure arabic scalar (allow a decimal)
+  if (/^\d+(?:\.\d+)?$/.test(s)) return String(Number(s))
+  // pure hanzi scalar
+  const v = parseHanSection(s)
+  if (v != null) return String(v)
+  return null
+}
+
+// Attach 万/亿 large-scale words that trail the digits as part of the UNIT (八千万 → value 8000, unit 万; 两亿 →
+// value 2, unit 亿), so an arabic 8000 万 / 2 亿 compares equal. Given the raw run + the matched unit, if the value
+// section still ends in 千万/万/亿 fold it into unit and reparse the head. Returns { value, unit } or null.
+function foldScaleUnit(valueRaw, unit) {
+  let v = valueRaw, u = unit || ''
+  const m = v.match(/(千万|万|亿)$/)
+  if (m && !/^(千万|万|亿)/.test(u)) { u = m[1] + u; v = v.slice(0, v.length - m[1].length) }
+  const cv = canonValue(v)
+  if (cv == null) return null
+  return { value: cv, unit: u }
+}
+
+// Extract meaning-atoms (number + unit + polarity) from ONE turn's raw text. Deterministic, position-tagged so a
+// finding can cite the source line. Skips speaker labels / HH:MM(:SS) timestamps / URLs / small oral numbers /
+// 成语 (all per the EXCEPTIONS contract). `lineBase`/`lineText` let a caller stamp a source line; when scanning a
+// turn we pass the turn's own text so offsets map back through its startLine.
+export function extractNumberAtoms(text) {
+  const atoms = []
+  // Markdown escaping: a raw ASR/Word export writes decimals as 80\.3 / 4\.8 (backslash before the dot); the
+  // refined side un-escapes them to 80.3 / 4.8. Strip a backslash sitting before a dot FIRST so a decimal parses
+  // whole and identically on both sides — otherwise 80\.3% splits into 80 + 3% and phantom-drifts against 80.3%.
+  const raw = String(text || '').replace(/\\(?=[.])/g, '')
+  // Blank out HH:MM(:SS) timestamps and URLs so their digits never register.
+  const masked = raw
+    .replace(/\d{1,2}:\d{2}(?::\d{2})?/g, (m) => ' '.repeat(m.length))
+    .replace(/https?:\/\/[^\s]+/g, (m) => ' '.repeat(m.length))
+  // A number run = arabic digits (with optional decimal / range punctuation) OR a hanzi-number run, then an
+  // optional trailing unit. Full-width digits are folded to half-width first.
+  const half = masked.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+                     .replace(/％/g, '%')
+  const unitAlt = ATOM_UNITS.map(escapeRe).join('|')
+  const numCore = `(?:\\d+(?:\\.\\d+)?(?:\\s*(?:[-~—－]|到|至)\\s*\\d+(?:\\.\\d+)?)?|[${HAN_NUM_CHARS}]+(?:[到至][${HAN_NUM_CHARS}]+)?)`
+  const NUM_RE = new RegExp(`(${numCore})\\s*(百分之)?\\s*(${unitAlt})?`, 'g')
+  // 百分之X → treat as X with unit %. Handle the prefix form separately first (percent BEFORE the digits).
+  const PCT_PREFIX_RE = new RegExp(`百分之\\s*([${HAN_NUM_CHARS}\\d]+(?:[到至\\-~—－][${HAN_NUM_CHARS}\\d]+)?)`, 'g')
+  const claimed = new Array(half.length).fill(false)
+  const pushAtom = (valueRaw, unit, idx, endIdx) => {
+    // skip if this run is inside a number 成语 (一五一十 / 五花八门 …)
+    for (const idm of NUMBER_IDIOMS) {
+      const w = raw.indexOf(idm)
+      if (w >= 0 && idx >= w && idx < w + idm.length) return
+    }
+    // English magnitude words (billion / million / bn / mn): the refine legitimately converts these to 亿/万
+    // (源 1.03 billion → 成稿 10.3 亿美元, 860 million → 8.6 亿), which no value-level comparison can verify. Skip a
+    // number immediately followed by one — extracting it only manufactures conversion-shaped false drift.
+    if (/^\s*(?:billion|million|bn|mn|bil|mil)\b/i.test(raw.slice(endIdx, endIdx + 12))) return
+    const hasArabic = /\d/.test(valueRaw)
+    const hasScale = /[十百千]/.test(valueRaw)      // 一百二十 / 六七十 — a scale char makes a hanzi run unambiguously numeric
+    const isYearForm = /[〇零]/.test(valueRaw) || (/^[一二两三四五六七八九]{3,}$/.test(valueRaw)) // 二〇一九 / 一九九八
+    const pureHan = !hasArabic && /^[一二两三四五六七八九十百千]+(?:[到至][一二两三四五六七八九十百千]+)?$/.test(valueRaw)
+    // small oral approximation kept as 汉字 (三五 / 一两 / 七八) — always oral, drop regardless of unit-lessness
+    if (pureHan && !hasScale && SMALL_ORAL_APPROX_RE.test(valueRaw)) return
+    // colloquial single bare han-digit + soft 量词 (两个人 / 三个 / 五位) with no measured unit → oral, keep as 汉字
+    if (pureHan && !hasScale && !unit && valueRaw.length === 1) {
+      const tail = raw.slice(endIdx, endIdx + 1)
+      if (tail && SOFT_CLASSIFIER.includes(tail)) return
+    }
+    // lexical guard: a bare 一/两/三 that starts a common function word (一直/一般/两下…) is NOT a number — drop it
+    // even if a polarity word happens to sit within the window. Only for a bare single han-digit with no scale.
+    // (tail must be non-empty — ''.includes-style checks would wrongly swallow a number at end-of-string.)
+    if (pureHan && !hasScale && valueRaw.length === 1) {
+      const tail = raw.slice(endIdx, endIdx + 1)
+      if (tail && valueRaw === '一' && LEXICAL_AFTER_ONE.includes(tail)) return
+      if (tail && valueRaw === '两' && LEXICAL_AFTER_TWO.includes(tail)) return
+    }
+    // polarity: scan a small window of ORIGINAL chars before the number for the nearest qualifier (不到/亏损/超过…)
+    const before = raw.slice(Math.max(0, idx - ATOMS.POLARITY_WINDOW), idx)
+    let polarity = null
+    for (const p of POLARITY_TOKENS) { if (before.includes(p)) { polarity = p; break } }
+    // ACCEPTANCE GATE (false-positive control): a bare/weak hanzi number in running prose (一 in 一下/一般, 两 in
+    // 两块, 第三, 那一年) is lexical noise. Accept a hanzi number only when it is unambiguously a quantity —
+    // arabic digits, a scale char (十/百/千), a year form (含〇 或 ≥3 连续汉数), a STRONG measured unit, or a
+    // polarity qualifier riding on it. A WEAK time unit (年/月/日/天) on a bare single/double han-digit does NOT
+    // qualify on its own (那一年 / 两天), which is what keeps 一/两 in running prose out of the atom set.
+    if (!hasArabic) {
+      const strong = unit && STRONG_UNIT_SET.has(unit)
+      if (!hasScale && !isYearForm && !strong && !polarity) return
+    }
+    const folded = foldScaleUnit(valueRaw, unit)
+    if (!folded) return
+    atoms.push({ value: folded.value, unit: folded.unit, polarity, idx, key: `${folded.value}|${folded.unit}` })
+  }
+  for (const m of half.matchAll(PCT_PREFIX_RE)) {
+    const idx = m.index ?? 0
+    for (let k = idx; k < idx + m[0].length; k += 1) claimed[k] = true
+    pushAtom(m[1], '%', idx, idx + m[0].length)
+  }
+  for (const m of half.matchAll(NUM_RE)) {
+    const idx = m.index ?? 0
+    if (claimed[idx]) continue
+    const valueRaw = m[1]
+    // 百分之 captured as the mid group → percent
+    const unit = m[3] || (m[2] ? '%' : '')
+    // guard: a lone scale/number char that is actually part of a claimed percent run
+    let overlap = false
+    for (let k = idx; k < idx + m[0].length; k += 1) if (claimed[k]) { overlap = true; break }
+    if (overlap) continue
+    pushAtom(valueRaw, unit, idx, idx + m[0].length)
+  }
+  return atoms
+}
+
+// Hedge / evidentiality markers (modality). Losing ALL of them from a turn that otherwise survived turns a hedged
+// claim into a flat assertion (可能明年盈利 → 明年盈利). Counted per turn; 左右 is deliberately omitted (it is almost
+// always the numeric "约" sense handled as polarity, not a standalone hedge).
+const HEDGE_TOKENS = ['可能', '也许', '大概', '应该', '据说', '听说', '号称', '估计', '差不多', '我觉得', '我感觉', '大约', '或许', '说不定', '好像', '似乎', '恐怕']
+export function countHedges(text) {
+  const s = String(text || '')
+  let n = 0
+  for (const h of HEDGE_TOKENS) { let i = 0; while ((i = s.indexOf(h, i)) >= 0) { n += 1; i += h.length } }
+  return n
+}
+
+// The refined PARAGRAPH containing a given 1-based line: the contiguous run of non-blank lines around it (a
+// refined turn is one paragraph). Tighter than the ±N-line number window on purpose — hedge detection must not
+// bleed into a neighboring section's hedges (which would mask a real wipe as a false negative).
+function paragraphAround(refLines, line1) {
+  let i = Math.min(Math.max(line1 - 1, 0), refLines.length - 1)
+  if (!refLines[i] || !refLines[i].trim()) return refLines[i] || ''
+  let lo = i, hi = i
+  while (lo > 0 && refLines[lo - 1].trim()) lo -= 1
+  while (hi < refLines.length - 1 && refLines[hi + 1].trim()) hi += 1
+  return refLines.slice(lo, hi + 1).join('\n')
+}
+
+// Human-facing atom label with 盘古之白: a space between the digits and a CJK unit (2 亿 / 8000 万 / 3 个月) and
+// after a polarity word (不到 30% / 亏损 2 亿), but NOT before a symbol unit (30%, $50) or when there is no unit.
+export function atomLabel(a) {
+  const symbolUnit = !a.unit || /^[%$]/.test(a.unit) || /^[A-Za-z]/.test(a.unit)
+  const core = symbolUnit ? `${a.value}${a.unit || ''}` : `${a.value} ${a.unit}`
+  return a.polarity ? `${a.polarity} ${core}` : core
+}
+
+// Compare source-turn atoms against the refined region. Turn-scoped: each substantive anchored source turn's
+// atoms are looked for in a window of refined lines around its anchor line (± ATOMS.WINDOW_LINES); a miss there
+// falls back to a document-wide check (lower confidence, so it only ever downgrades — never invents — a finding).
+// Returns { assessed, sourceNumbers, refinedNumbers, drifted, driftSamples, hedgeTurnsLost, hedgeSamples,
+// assessedTurns, sourceHedges, refinedHedges, perTurn } where perTurn feeds M5's section flags.
+export function checkMeaningAtoms(sourceText, refinedText) {
+  const empty = {
+    assessed: false, sourceNumbers: 0, refinedNumbers: 0, drifted: 0, driftSamples: [],
+    hedgeTurnsLost: 0, hedgeSamples: [], assessedTurns: 0, sourceHedges: 0, refinedHedges: 0, perTurn: [],
+  }
+  const { turns, subs } = anchorTurns(sourceText, refinedText)
+  if (!turns.length || !subs.length) return empty
+  const refLines = refinedText.split(/\r?\n/)
+  const refAllAtoms = extractNumberAtoms(refinedText)
+  // Match on VALUE, not value+unit. A raw ASR transcript frequently drops or mis-attaches the unit that the
+  // refine then restores (源 69.2 → 成稿 69.2%, 源 52 倍 → 成稿 252 倍), and unit-strict matching turns every such
+  // asymmetry into phantom drift. The value carries the fact; polarity carries the direction — those two are what
+  // we defend. A pure unit swap between two magnitudes is rarer and far noisier to flag, so it is left out this
+  // pass (SOFT tier, near-zero-FP mandate). refValueSet is the doc-wide fallback; the window is value-scoped too.
+  const refValueSet = new Set(refAllAtoms.map((a) => a.value))
+  const sourceNumbers = subs.reduce((s, t) => s + extractNumberAtoms(t.text).length, 0)
+  const refinedNumbers = refAllAtoms.length
+  const sourceHedges = subs.reduce((s, t) => s + countHedges(t.text), 0)
+  const refinedHedges = countHedges(refinedText)
+
+  const driftSamples = []
+  const hedgeSamples = []
+  const perTurn = []
+  let drifted = 0
+  let hedgeTurnsLost = 0
+  let assessedTurns = 0
+
+  for (const t of subs) {
+    if (!t.found || !t.anchor) continue   // no reliable region to compare against → skip (lenient)
+    assessedTurns += 1
+    const lo = Math.max(0, t.anchor.line - 1 - ATOMS.WINDOW_LINES)
+    const hi = Math.min(refLines.length, t.anchor.line + ATOMS.WINDOW_LINES)
+    const windowText = refLines.slice(lo, hi).join('\n')
+    const winAtoms = extractNumberAtoms(windowText)
+    const winValueSet = new Set(winAtoms.map((a) => a.value))
+    const winByValue = new Map()
+    for (const a of winAtoms) { if (!winByValue.has(a.value)) winByValue.set(a.value, []); winByValue.get(a.value).push(a) }
+    const srcAtoms = extractNumberAtoms(t.text)
+    const turnDrift = []
+    for (const sa of srcAtoms) {
+      const inWindow = winValueSet.has(sa.value)
+      const inDoc = refValueSet.has(sa.value)
+      if (!inWindow && !inDoc) {
+        // the number VALUE vanished from the refined output entirely → a changed or dropped number
+        turnDrift.push({ kind: 'missing', atom: sa, foundText: windowText.replace(/\s+/g, ' ').slice(0, 50) })
+        continue
+      }
+      // present, but did the polarity/sign qualifier survive nearby? Only assess when the SOURCE carried one
+      // and the value matched IN-WINDOW (a doc-wide match is too far to judge polarity).
+      if (sa.polarity && inWindow) {
+        const cands = winByValue.get(sa.value) || []
+        const polarityKept = cands.some((ra) => ra.polarity === sa.polarity)
+        // For sign words (亏损/盈利/涨/跌) also accept the qualifier appearing anywhere in the window text.
+        const inWindowText = windowText.includes(sa.polarity)
+        if (!polarityKept && !inWindowText) {
+          turnDrift.push({ kind: 'polarity', atom: sa, foundText: (cands[0] ? `${cands[0].value}${cands[0].unit}` : windowText.replace(/\s+/g, ' ').slice(0, 40)) })
+        }
+      }
+    }
+    // hedge wipe: source turn had ≥ HEDGE_TURN_MIN hedges, yet its refined PARAGRAPH has none, while the turn
+    // otherwise anchored (content kept, uncertainty stripped). Use the tighter paragraph (not the ±N window) so a
+    // neighboring section's hedge can't mask a real wipe.
+    const srcHedge = countHedges(t.text)
+    const paraText = paragraphAround(refLines, t.anchor.line)
+    const winHedge = countHedges(paraText)
+    const hedgeLost = srcHedge >= ATOMS.HEDGE_TURN_MIN && winHedge === 0
+    if (hedgeLost) {
+      hedgeTurnsLost += 1
+      hedgeSamples.push({ text: `源第 ${t.startLine} 行：${srcHedge} 处不确定语气（${HEDGE_TOKENS.filter((h) => t.text.includes(h)).slice(0, 4).join('、')}）在成稿窗口内全部消失`, line: t.startLine })
+    }
+    if (turnDrift.length) {
+      drifted += turnDrift.length
+      for (const d of turnDrift) {
+        if (driftSamples.length < ATOMS.DRIFT_SAMPLES) {
+          const a = d.atom
+          driftSamples.push({
+            text: d.kind === 'polarity'
+              ? `源第 ${t.startLine} 行：“${atomLabel(a)}” 的限定词“${a.polarity}”在成稿中消失，成稿作“${d.foundText}”`
+              : `源第 ${t.startLine} 行：“${atomLabel(a)}” 未在成稿对应段出现（成稿作“${d.foundText}”）`,
+            line: t.startLine,
+          })
+        }
+      }
+    }
+    perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, drift: turnDrift, hedgeLost, srcHedge })
+  }
+
+  return {
+    assessed: assessedTurns > 0,
+    sourceNumbers, refinedNumbers,
+    drifted, driftSamples,
+    hedgeTurnsLost, hedgeSamples,
+    assessedTurns, sourceHedges, refinedHedges,
+    perTurn,
+  }
+}
+
+// ===== Per-section operator review checklist (M5) =====
+// auditPair returns sections[]: one entry per ## heading of the refined doc, carrying every issue localizable to
+// that section so a human can jump straight to the risky stretches instead of re-reading the whole file. Reuses
+// the SAME section-detection + source-range logic annotateAnchors uses (headings, section body span, matched
+// turns → sectionRange), so a section's reported source range stays in lock-step with its anchor comment. A
+// section with an empty flags[] is a trusted section (rendered only in the count, not the checklist).
+const M5_HEADING_RE = /^##\s+/
+export function buildSections(sourceText, refinedText, { atoms = null, coverage = null, glossary = null } = {}) {
+  const lines = refinedText.split(/\r?\n/)
+  const headIdx = lines.map((l, i) => (M5_HEADING_RE.test(l) ? i : -1)).filter((i) => i >= 0)
+  if (!headIdx.length) return []
+  const { subs } = anchorTurns(sourceText, refinedText)
+  // ghost/yin hits carry a refined line already — bucket by section via line ranges.
+  const ghostHits = glossary ? checkGhostName(refinedText, glossary).samples : []
+  const yinHits = glossary ? checkMissingYin(refinedText, glossary).samples : []
+  const sections = []
+  for (let k = 0; k < headIdx.length; k += 1) {
+    const h = headIdx[k]
+    const title = lines[h].replace(M5_HEADING_RE, '').trim()
+    // Section span is the heading's own 1-based line through the line before the next heading. Include the
+    // heading line itself: refined headings carry hanzi (## 海外扩张), so a turn's anchor legitimately lands on
+    // the heading rather than the first body line — counting from `h+1` keeps that turn inside its section.
+    const from = h + 1   // 1-based, heading line inclusive
+    const to = k + 1 < headIdx.length ? headIdx[k + 1] : lines.length
+    const refinedLines = { start: h + 1, end: to }
+    const matched = subs.filter((t) => t.found && t.anchor.line >= from && t.anchor.line <= to)
+    const range = matched.length ? sectionRange(matched) : null
+    const flags = []
+    // number_drift / hedge_loss localized by the anchor line of each per-turn record
+    if (atoms && atoms.assessed) {
+      const inHere = (aln) => aln >= from && aln <= to
+      const driftHere = atoms.perTurn.filter((p) => inHere(p.anchorLine) && p.drift.length)
+      const driftCount = driftHere.reduce((s, p) => s + p.drift.length, 0)
+      if (driftCount) {
+        const sample = driftHere.flatMap((p) => p.drift).slice(0, 2).map((d) => atomLabel(d.atom)).join('、')
+        flags.push({ kind: 'number_drift', count: driftCount, sample })
+      }
+      const hedgeHere = atoms.perTurn.filter((p) => inHere(p.anchorLine) && p.hedgeLost).length
+      if (hedgeHere) flags.push({ kind: 'hedge_loss', count: hedgeHere })
+    }
+    // content_gap_soft / scattered loss whose source range overlaps this section's matched source range
+    if (coverage && coverage.assessed && range) {
+      const soft = (coverage.gaps || []).filter((g) => g.severity === 'soft' && g.startLine <= range.endLine && g.endLine >= range.startLine)
+      if (soft.length) flags.push({ kind: 'content_gap_soft', count: soft.length })
+    }
+    // unverified （音） names present in this section (ghost/yin sample lines are 1-based refined body lines)
+    const ghostN = ghostHits.filter((s) => s.line >= from && s.line <= to).length
+    const yinN = yinHits.filter((s) => s.line >= from && s.line <= to).length
+    if (ghostN) flags.push({ kind: 'ghost_name', count: ghostN })
+    if (yinN) flags.push({ kind: 'missing_yin', count: yinN })
+    // weak / no anchor: substantive-looking section body (has anchorable content nearby) yet no matched turns
+    if (!matched.length) flags.push({ kind: 'weak_anchor', count: 1 })
+    sections.push({
+      title,
+      refinedLines,
+      sourceRange: range ? { startLine: range.startLine, endLine: range.endLine } : null,
+      ts: range ? range.ts : null,
+      flags,
+    })
+  }
+  return sections
+}
+
 // The scan: which substantive source turns never surface in the refined text, grouped into gaps.
 export function scanCoverage(sourceText, refinedText) {
   const { turns, subs } = anchorTurns(sourceText, refinedText)
@@ -840,6 +1256,9 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   const ending = endingCovered(sourceText, refinedText)
 
   const coverage = scanCoverage(sourceText, refinedText)
+  // M4 mutation tier: number-atom + hedge fidelity. refine mode only (a summary/timeline legitimately drops
+  // qualifiers). All-soft; SOFT findings never enter failed[] this pass (see below).
+  const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText) : null
 
   const metrics = {
     sourceChars: sChars, refinedChars: rChars, charRatio,
@@ -847,6 +1266,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     sourceEmptyDensity: Number(sEmptyDensity.toFixed(4)), refinedEmptyDensity: Number(rEmptyDensity.toFixed(4)), emptyReduction,
     endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
+    ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
   }
 
   // Editorial deterministic checks (typesetting + glossary residue). quote_style is HARD → it opens its own
@@ -882,8 +1302,20 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...speakerFindings,    // speaker_label_style (soft)
     ghostFinding,          // ghost_name (soft; empty when no glossary)
     yinFinding,            // missing_yin (soft; empty when no glossary)
+    // M4 mutation-tier findings — SOFT ONLY this pass (deliberately NOT added to gates/failed[]; promotion to
+    // hard waits until real-world FP data accumulates). number_drift: a source number atom absent from the
+    // refined region (changed / dropped) or present with its polarity qualifier stripped (不到 30%→30%, 亏 2 亿→
+    // 2 亿). hedge_loss: turns whose ≥2 uncertainty markers were all wiped though the content otherwise anchored.
+    ...(atoms && atoms.assessed ? [
+      { name: 'number_drift', severity: 'soft', count: atoms.drifted, samples: atoms.driftSamples },
+      { name: 'hedge_loss', severity: 'soft', count: atoms.hedgeTurnsLost,
+        samples: atoms.hedgeSamples.concat(atoms.hedgeTurnsLost ? [{ text: `全篇不确定语气密度：源 ${atoms.sourceHedges} 处 → 成稿 ${atoms.refinedHedges} 处`, line: 1 }] : []) },
+    ] : []),
   ])
-  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers }
+  // M5 per-section review checklist: one entry per ## section of the refined doc, flags aggregate everything
+  // localizable to it (number_drift / hedge_loss / content_gap_soft / ghost_name / missing_yin / weak_anchor).
+  const sections = buildSections(sourceText, refinedText, { atoms, coverage, glossary })
+  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections }
 }
 
 // Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay ≤ 1.10× the 成稿 in 汉字
