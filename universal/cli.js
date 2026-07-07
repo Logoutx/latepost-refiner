@@ -32,6 +32,11 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --heading-policy <策略> none | keep | regenerate（默认 none）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
   --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
+  --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
+                         把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
+                         审计门禁照跑，兜住单请求的静默压缩风险）
+  --effort <映射>        如 refine=medium,summary=low（推理力度，仅 refine/logic/summary/timeline 生效、仅 opus/
+                         sonnet/fable 支持；档位 low|medium|high|xhigh|max；不设=默认 high）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
@@ -62,6 +67,7 @@ export function parseArgs(argv) {
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
     '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
+    '--refine-mode': 'refineMode', '--effort': 'effort',
   }
   let i = 0
   while (i < argv.length) {
@@ -87,6 +93,21 @@ export const parseModels = (s) => {
   const m = {}
   for (const pair of s.split(',')) { const [k, v] = pair.split('='); if (k && v) m[k.trim()] = v.trim() }
   return m
+}
+// M12: `--effort refine=medium,summary=low`. Only the smart-tier categories (refine/logic/summary/timeline)
+// take effort; unknown keys and unknown levels are dropped (the API engine also guards by model, so a stray
+// value is harmless). Levels mirror the SDK's OutputConfig.effort enum.
+const EFFORT_CATS = new Set(['refine', 'logic', 'summary', 'timeline'])
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+export const parseEffort = (s) => {
+  if (!s) return undefined
+  const m = {}
+  for (const pair of s.split(',')) {
+    const [k, v] = pair.split('=')
+    const key = k && k.trim(), val = v && v.trim()
+    if (EFFORT_CATS.has(key) && EFFORT_LEVELS.has(val)) m[key] = val
+  }
+  return Object.keys(m).length ? m : undefined
 }
 
 export function buildRunParams(a, { env = process.env } = {}) {
@@ -115,6 +136,9 @@ export function buildRunParams(a, { env = process.env } = {}) {
     headingPolicy: a.headingPolicy || 'none',
     models: parseModels(a.models),
     chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,
+    refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
+    effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
+
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors

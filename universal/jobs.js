@@ -223,7 +223,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     models, outputDir, fresh = false, concurrency,
-    skillDir,
+    skillDir, refineMode, effort,
   } = params
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
@@ -308,6 +308,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
   const capabilities = {
     readFile: (p) => fs.readFileSync(p, 'utf8'),
+    // M11a single-shot refine writes the model's response text straight to the 成稿 (no Write-tool agent). Only
+    // the single-shot path uses this; the agentic path still writes via the model's Write tool. mkdir -p first
+    // so a first-run Transcripts/ dir exists, then the downstream audit reads it back from disk unchanged.
+    writeFile: (p, text) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text, 'utf8') },
     // Risk (a): the pipeline hands us THIS round's in-memory 校对表 (opts.glossaryText) — use it for the
     // ghost_name / missing_yin checks, because on a first run the file isn't persisted until after the pipeline
     // returns, so reading it from disk would miss it. Fall back to the on-disk copy only when nothing was passed.
@@ -351,6 +355,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
     scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode,
+    refineMode: refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a: default agentic (byte-equivalent)
+    effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
+    captureSingleShot: params.captureSingleShot,   // M11b: batch-submit hook — capture single-shot payloads instead of sending (see scripts/batch_refine.mjs)
     priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
     canonicalOverrides: params.canonicalOverrides,
     capabilities,

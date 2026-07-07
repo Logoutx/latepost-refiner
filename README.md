@@ -135,6 +135,34 @@ DeepSeek 和 OpenAI 没有内置搜索：设了 `TAVILY_API_KEY` 才能让核实
 
 模型特点——DeepSeek 思考模式禁工具调用、GLM 不收 `temperature:0`、Kimi 不支持强制函数调用、OpenAI 用 `max_completion_tokens`——都在 `engines/providers.js` 里处理。
 
+### 精校模式：agentic（默认）与 single-shot
+
+- **agentic（默认）**：精校子代理用 Read/Write/Edit 工具循环，边读边写、可分块并行——大文件、要最稳的场景用它。
+- **single-shot**（`--refine-mode single-shot`）：每份文件**只发一个请求**——把源文整篇塞进 prompt，模型一次返回成稿，脚本落盘。更省更快，适合归档批量。**仅限 ≤45000 字**的文件（响应封顶，再大会截断），超限会被拒并提示改用 agentic。single-shot 历史上的坑是「无声压缩成摘要」，所以精校后**确定性源比对审计门禁照跑**——兜住这个失败。仅 opus/sonnet/fable，且宿主有 fs 时可用（Claude Code 沙箱无 fs，会自动回退 agentic）。
+
+### 批处理归档精校（Anthropic Batch API，5 折价格）
+
+给「没人等、纯归档」的大批量转录用：`scripts/batch_refine.mjs`，两步（因为批处理是异步、可断点续跑的）。**Batch 价格是即时接口的 50%，结果通常 1 小时内就绪。**
+
+```sh
+# 1) 提交：现在跑侦察/核实/校对表（即时计费），把 refine 投成批处理后退出
+ANTHROPIC_API_KEY=... node scripts/batch_refine.mjs submit \
+  --files a.txt b.txt c.txt --topic 某公司 --out ~/Downloads/某公司 \
+  --background "背景…" [--effort refine=medium]
+#   → 打印 batchId，写 <out>/batch-state.json；--dry-run 仍跑侦察/核实、但只打印请求负载、不投批处理
+
+# 2) 续跑：读状态、轮询到结束、取回结果、写成稿、跑完整审计门禁 + 源锚点 + review.md/run.json
+ANTHROPIC_API_KEY=... node scripts/batch_refine.mjs resume --dir ~/Downloads/某公司 \
+  [--max-wait-min 90 --poll-sec 30]
+#   → resume 幂等：批处理没结束就再等，某份出错就留着不精校、列进 review.md，可对该份改用 agentic 重跑
+```
+
+**成本估算**：Batch 把 refine 的输入/输出/思考 token 全部按 5 折计费；侦察/核实在 submit 阶段仍走即时接口（正常价，但这部分本来就便宜）。一份 2 小时访谈（约 20-40K 字）单请求精校的 refine 输出约 40-80K token，Batch 折后通常几毛到一两块钱人民币一份；批量越大越划算。审计是本地确定性脚本，零模型成本。
+
+### 推理力度（effort，M12）
+
+`--effort refine=medium` 给精校/交付调**推理力度**（`output_config.effort`：low|medium|high|xhigh|max，默认 high）。仅 `refine/logic/summary/timeline` 生效、仅 opus/sonnet/fable 支持（haiku 会报错，自动跳过）。要不要把默认降到 medium，先按 `eval/effort-experiment.md` 的两臂实验跑分定夺——金标通过率 100%、filler 指标不退、真稿抽查无新硬门禁，才采纳。
+
 ### 数据去向与信源保护
 
 选 provider 就是选**转录全文发给谁**。这对访谈工具不是普通的隐私条款问题：转录里常有信源身份、未公开信息、offrecord 闲聊。
