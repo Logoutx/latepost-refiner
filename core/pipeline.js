@@ -144,10 +144,10 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     }
     const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
-    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'stitch' })
+    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
     let parsed = parseAuditJson(raw)
     if (!parsed) { // one retry
-      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'stitch' })
+      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'haiku' })
       parsed = parseAuditJson(raw)
     }
     return normalizeAuditResult(parsed, f)
@@ -194,7 +194,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     else {
       await engine.agent(
         `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --annotate\n只回复一句话确认即可。`,
-        { label: `annotate:${f.label}`, phase: 'Audit', model: 'stitch' })
+        { label: `annotate:${f.label}`, phase: 'Audit', model: 'haiku' })
     }
   }
 
@@ -207,7 +207,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   } else {
     await engine.agent(
       `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --anchors\n只回复一句话确认即可。`,
-      { label: `anchors:${f.label}`, phase: 'Audit', model: 'stitch' })
+      { label: `anchors:${f.label}`, phase: 'Audit', model: 'haiku' })
   }
 
   return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }

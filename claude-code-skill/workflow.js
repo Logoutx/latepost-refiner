@@ -1278,7 +1278,9 @@ function safeName(s, max = 80, maxBytes = 255) {
   if (max > 0 && cps.length > max) cps = cps.slice(0, max)
   if (maxBytes > 0) {
     // Drop trailing code points until the UTF-8 encoding fits the byte budget.
-    while (cps.length && Buffer.byteLength(cps.join(''), 'utf8') > maxBytes) cps.pop()
+    // Pure-JS byte counting: the Workflow sandbox has no Node Buffer global.
+    const utf8Len = (s) => { let n = 0; for (const ch of s) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4 } return n }
+    while (cps.length && utf8Len(cps.join('')) > maxBytes) cps.pop()
   }
   out = cps.join('').replace(/[.\s]+$/g, '')     // truncation may re-expose a trailing dot/space
   return out || 'untitled'
@@ -1733,10 +1735,10 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     }
     const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
-    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'stitch' })
+    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
     let parsed = parseAuditJson(raw)
     if (!parsed) { // one retry
-      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'stitch' })
+      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'haiku' })
       parsed = parseAuditJson(raw)
     }
     return normalizeAuditResult(parsed, f)
@@ -1783,7 +1785,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     else {
       await engine.agent(
         `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --annotate\n只回复一句话确认即可。`,
-        { label: `annotate:${f.label}`, phase: 'Audit', model: 'stitch' })
+        { label: `annotate:${f.label}`, phase: 'Audit', model: 'haiku' })
     }
   }
 
@@ -1796,7 +1798,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   } else {
     await engine.agent(
       `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --anchors\n只回复一句话确认即可。`,
-      { label: `anchors:${f.label}`, phase: 'Audit', model: 'stitch' })
+      { label: `anchors:${f.label}`, phase: 'Audit', model: 'haiku' })
   }
 
   return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }

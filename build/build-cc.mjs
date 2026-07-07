@@ -24,6 +24,12 @@ const out = [
   read('build/bootstrap-cc.js'),
 ].join('\n\n') + '\n'
 
+// Sandbox-safety guard: the Workflow script sandbox has no Node globals — a bare Buffer/process/require
+// reference in the bundle only explodes at run time, so fail the build instead.
+for (const bad of [/\bBuffer\./, /\bprocess\.env\b/, /\brequire\(/]) {
+  if (bad.test(out)) throw new Error(`sandbox-unsafe reference in generated bundle: ${bad}`)
+}
+
 const dest = join(root, 'claude-code-skill/workflow.js')
 writeFileSync(dest, out)
 console.log(`✓ generated ${dest} (${out.split('\n').length} lines)`)
