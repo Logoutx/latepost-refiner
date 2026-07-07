@@ -22,27 +22,84 @@ function mockEngine() {
       if (opts.label && opts.label.startsWith('refine:')) {
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }
-      if (opts.label && opts.label.startsWith('check:')) return { complete: false, note: '结尾未覆盖' }
       return null
     },
   }
 }
 
-test('runJob writes review queue and manifest artifacts', async () => {
+// A source whose distinctive last sentence the refine will DROP, so the deterministic audit's ending_missing
+// gate fires → the file lands in `incomplete`. The omitted tail is a single short closing turn (well under the
+// content_gap single-turn threshold), so ending_missing is the only finding — no hard content_gap, no marker.
+const TRUNC_SOURCE = [
+  '采访者：先请你介绍一下自己。',
+  '受访者：我在一家虚构的工业检测公司做研发，入行差不多十年了，主要负责视觉算法这一块。',
+  '采访者：这些年最大的变化是什么？',
+  '受访者：客户从只看价格，变成开始认真评估检测精度和交付周期，这对我们其实是好事。',
+  '采访者：好的，那今天就先聊到这里，非常感谢你抽空接受这次访谈。',
+].join('\n') + '\n'
+
+// The refined output faithfully covers everything EXCEPT the closing "今天就先聊到这里，非常感谢……" line.
+const TRUNC_REFINED = [
+  '# tiny',
+  '*测试项目访谈*',
+  '',
+  '## 开场',
+  '',
+  '采访者：先请你介绍一下自己。',
+  '',
+  '受访者：我在一家虚构的工业检测公司做研发，入行差不多十年了，主要负责视觉算法这一块。',
+  '',
+  '采访者：这些年最大的变化是什么？',
+  '',
+  '受访者：客户从只看价格，变成开始认真评估检测精度和交付周期，这对我们其实是好事。',
+  '',
+].join('\n')
+
+function truncatedEndingEngine() {
+  const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  return {
+    phase() {}, log() {}, usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((t) => t().catch(() => null))),
+    // Single short file → one-pass branch → runJob refines via a `refine:` agent (not the pipeline stage).
+    // The agent reports success; the test pre-writes the 成稿 on disk for the deterministic audit to read.
+    agent: async (_prompt, opts = {}) => {
+      usage.agents++
+      if (opts.label && opts.label.startsWith('refine:')) {
+        return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
+      }
+      return null
+    },
+  }
+}
+
+test('runJob writes review queue and manifest artifacts (deterministic audit ending_missing → incomplete)', async () => {
   const outputDir = tmpdir()
+  const src = path.join(outputDir, 'tiny-src.md')
+  fs.writeFileSync(src, TRUNC_SOURCE, 'utf8')
+  // Pre-write the refined output that the one-pass refine agent "produces" (the injected engine reports success
+  // but does not itself write a 成稿; the deterministic audit reads this file from disk and detects the dropped ending).
+  const outPath = path.join(outputDir, 'Transcripts', 'tiny-src.md')
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, TRUNC_REFINED, 'utf8')
+
   const result = await runJob({
-    __engine: mockEngine(),
-    files: [{ name: 'tiny.txt', base64: Buffer.from('采访者：你好\n受访者：你好\n').toString('base64') }],
+    __engine: truncatedEndingEngine(),
+    files: [{ path: src }],
     topic: '测试项目',
     date: '2026-06',
     outputDir,
     scope: ['refine'],
     verifyDepth: 'none',
+    anchors: false, // keep the pre-written 成稿 byte-stable so the ending check reads exactly what we wrote
   })
 
   assert.equal(result.provider, 'injected')
   assert.equal(fs.existsSync(result.reviewPath), true)
   assert.equal(fs.existsSync(result.manifestPath), true)
+
+  // Completeness now comes from the deterministic source-aware audit (ending_missing), not a haiku check agent.
+  assert.equal(result.incomplete.length, 1, 'the dropped ending is caught by the deterministic audit')
+  assert.match(result.incomplete[0].note, /ending_missing/)
 
   const review = fs.readFileSync(result.reviewPath, 'utf8')
   assert.match(review, /疑似中途截断，需要检查结尾/)
@@ -166,7 +223,6 @@ function overrideEngine() {
     }),
     agent: async (_p, o) => {
       if (/^scout/.test(o.label)) return { speakers: [{ label: '记者', role: '记者' }], people: [{ canonical: '王总', variants: [], hint: '受访者' }], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 2, text: '虚构样本。' }, special_notes: [] }
-      if (/^check/.test(o.label)) return { complete: true, note: '' }
       return null // dedup/verify/audit-agent → null (audit uses the injected capability, not an agent)
     },
   }

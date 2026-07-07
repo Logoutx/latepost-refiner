@@ -1,11 +1,12 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, CHECK_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, withCheck, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName } from './spec.js'
-import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, checkPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName } from './spec.js'
+import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
-// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged by a cheap stitch
-// agent. Returns a REFINE_REPORT-shaped object (path = f.outPath) or null if it
+// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
+// when the host injects fs capability, or by a cheap stitch agent in the Workflow sandbox. Returns a
+// REFINE_REPORT-shaped object (path = f.outPath) or null if it
 // could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
-// completeness check + source-aware audit) rather than silently dropped.
+// source-aware audit) rather than silently dropped.
 async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   const chunks = splitForRefine(f, A.chunkMode)
   if (chunks.length <= 1) {
@@ -22,9 +23,21 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   const good = partReps.filter(Boolean)
   if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
   const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
-  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，结尾核对/审计会进一步标记`)
-  const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
-  if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，审计会进一步标记`)
+  const cap = (A && A.capabilities) || {}
+  if (typeof cap.stitch === 'function') {
+    try {
+      const stitched = await cap.stitch(f, chunks)
+      if (stitched == null) { engine.log(`精校分块：${f.label} 确定性拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+      engine.log(`精校分块：${f.label} 已确定性拼接 ${chunks.length} 块`)
+    } catch (e) {
+      engine.log(`精校分块：${f.label} 确定性拼接失败：${(e && e.message) || e}`)
+      return null
+    }
+  } else {
+    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+    if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+  }
   return {
     path: f.outPath,
     headings: good.flatMap((r) => r.headings || []),
@@ -106,6 +119,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const src = f.path, out = f.outPath
   const skillDir = A.skillDir || '.'
   const cap = capabilities || {}
+  const directAudit = typeof cap.runAudit === 'function'
 
   // Risk (a): the audit's ghost_name / missing_yin checks need THIS round's rendered 校对表. On a first run it is
   // only in memory (persistGlossary writes it to disk AFTER the pipeline returns), so reading <out>/校对表.md would
@@ -140,7 +154,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   }
 
   const first = await audit()
-  if (!first) { engine.log(`审计不可用：${f.label}（子代理未能返回可解析 JSON，降级为仅记录，不阻断）`); return { status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0 } }
+  if (!first) { engine.log(`审计不可用：${f.label}（子代理未能返回可解析 JSON，降级为仅记录，不阻断）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
 
   const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
   const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
@@ -196,7 +210,18 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       { label: `anchors:${f.label}`, phase: 'Audit', model: 'stitch' })
   }
 
-  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded }
+  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }
+}
+
+const DEDUP_SKIP_UNKNOWN_RATIO = 0.10
+const entityCount = (merged) => ((merged && merged.people) || []).length + ((merged && merged.brands) || []).length + ((merged && merged.terms) || []).length
+function dedupCoverage(prior, merged) {
+  const target = dropLocked(merged)
+  const total = entityCount(target)
+  if (!prior || !total) return { total, unknown: total, covered: 0, unknownRatio: total ? 1 : 0, skip: false }
+  const unknown = entityCount(excludeVerified(target, prior))
+  const unknownRatio = unknown / total
+  return { total, unknown, covered: total - unknown, unknownRatio, skip: unknownRatio <= DEDUP_SKIP_UNKNOWN_RATIO }
 }
 
 export async function runPipeline(A, engine) {
@@ -238,6 +263,8 @@ let scoutSuspect = []
 let scoutFailed = []   // files whose scout returned nothing (stalled) — refined anyway (glossary degraded), surfaced for re-scout
 let dedup = null
 let auditFailed = []    // §2: per-file hard audit findings (content_gap/quote_style) still failing after one repair
+let incomplete = []     // Derived from direct deterministic audit ending_missing failures.
+let unchecked = []      // Refined files lacking a direct audit capability, or whose audit errored.
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
@@ -274,8 +301,8 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   }
   const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
   if (rep) {
-    refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '结尾核对待跑' })]
-    refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]   // completeness check runs in the shared phase below
+    refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
+    refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
   } else {
     failed = [f.label]
   }
@@ -330,11 +357,14 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
     if (vc.overflow > 0) engine.log(`核实：实体过多，${vc.overflow} 项超出 ${VERIFY_CHUNK * MAX_CHUNKS} 上限未送检`)
   }
   const dedupList = dedupListText(mergedThisBatch)
+  const dedupStats = dedupCoverage(prior, mergedThisBatch)
+  const skipDedup = !!(dedupList && dedupStats.skip)
+  if (skipDedup) engine.log(`疑似同指缓存：跳过语义同指排查，往次校对表覆盖 ${dedupStats.covered}/${dedupStats.total} 个非钦定实体，新/未知 ${dedupStats.unknown} 个（${Math.round(dedupStats.unknownRatio * 100)}%，阈值 ≤10%）`)
   const [vparts, dedupRes] = await engine.parallel([
     () => vc.chunks.length
       ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, schema: VERIFY_SCHEMA })))
       : Promise.resolve([]),
-    () => dedupList
+    () => dedupList && !skipDedup
       ? engine.agent(dedupPrompt(dedupList, A), { label: 'dedup:semantic', phase: 'Verify', model: M.dedup, schema: DEDUP_SCHEMA })
       : Promise.resolve(null),
   ])
@@ -373,10 +403,8 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   if (scope.includes('refine')) {
     engine.phase('Refine')
     engine.log(`▶ 3/${scope.includes('logic') ? 5 : 4} 精校 Refine：${A.files.length} 份逐份精校${A.chunkMode === 'speed' ? '（大文件分块并行）' : ''}`)
-    // Refine ONLY — the ending-completeness check is NOT in the critical path here; it runs last (after the
-    // deliverables are written to disk) so a slow / stalled cheap check can't cost the expensive refine or the
-    // deliverables. And refine runs even when scout failed for a file (findings[i] null): refine reads the
-    // source directly and the glossary is only an aid, so a stalled cheap scout degrades the glossary but
+    // Refine runs even when scout failed for a file (findings[i] null): refine reads the source directly and
+    // the glossary is only an aid, so a stalled cheap scout degrades the glossary but
     // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
       (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, findings[i] || {}, A, M))
@@ -384,13 +412,13 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
   if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
   failed = A.files.filter((f, i) => scope.includes('refine') && !positional[i]).map((f) => f.label)
-  refined = positional.map((rep, i) => rep && Object.assign({}, rep, { outPath: A.files[i].outPath, complete: null, checkNote: '结尾核对待跑' })).filter(Boolean)
+  refined = positional.map((rep, i) => rep && Object.assign({}, rep, { outPath: A.files[i].outPath, complete: null, checkNote: '审计待跑' })).filter(Boolean)
   refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: findings[i] && findings[i].ending_anchor })).filter((p) => p.rep)
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
-// §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch/JS
-// completeness and BEFORE logic/summary/timeline. A hard content_gap or quote_style triggers one auto-repair +
+// §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch and
+// BEFORE logic/summary/timeline. A hard content_gap or quote_style triggers one auto-repair +
 // one re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
 // Anchors run on the (possibly repaired) 成稿. With fs the host injects capabilities.runAudit/annotateAnchors/
 // repair; without (CC sandbox) a subagent runs audit_refined.mjs. Skipped for a scope with no refine output.
@@ -402,10 +430,23 @@ if (scope.includes('refine') && refinedPairs.length) {
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
   // through unchanged.
   const results = await engine.parallel(refinedPairs.map(({ f, onePassGlossaryText }) => () => runAuditStep(A, engine, f, capabilities, onePassGlossaryText || glossary)))
+  const hasDirectAudit = !!(capabilities && typeof capabilities.runAudit === 'function')
   refinedPairs.forEach(({ f }, k) => {
-    const a = results[k] || { status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0 }
+    const a = results[k] || { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit: hasDirectAudit }
+    const endingMissing = (a.failedFindings || []).includes('ending_missing') || (a.softFindings || []).includes('ending_missing')
     const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
-    if (r) r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
+    if (r) {
+      r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
+      if (a.directAudit && !a.auditUnavailable) {
+        r.complete = !endingMissing
+        r.checkNote = endingMissing ? 'deterministic audit: ending_missing' : ''
+      } else {
+        r.complete = null
+        r.checkNote = a.auditUnavailable ? 'audit unavailable' : 'no direct audit capability'
+      }
+    }
+    if (a.directAudit && !a.auditUnavailable && endingMissing) incomplete.push({ path: f.outPath, note: 'deterministic audit: ending_missing' })
+    if (!a.directAudit || a.auditUnavailable) unchecked.push(f.outPath)
     if ((a.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: a.auditFailed })
   })
   if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
@@ -466,29 +507,13 @@ const [summary, timeline] = await engine.parallel([
     : Promise.resolve(null)),
 ])
 
-// Completeness check — runs LAST, off the critical path. The expensive refine and the deliverables are
-// already written to disk, so a slow / failed / stalled haiku check can no longer cost them (the failure mode
-// that bit the 5.25-万字 run, where a stuck 结尾核对 agent held the whole run hostage). The deterministic
-// source-aware audit (run post-pipeline on the files) is the authoritative completeness signal; this agent is
-// a best-effort refinement folded back into `refined`.
-if (refinedPairs.length) {
-  engine.phase('Check')
-  engine.log(`▶ 结尾核对 Check：${refinedPairs.length} 份（不阻塞已落盘的成稿与交付物）`)
-  const chks = await engine.parallel(refinedPairs.map(({ f, anchor }) => () =>
-    engine.agent(checkPrompt(f, anchor), { label: `check:${f.label}`, phase: 'Check', model: 'haiku', schema: CHECK_SCHEMA })))
-  refinedPairs.forEach(({ f, rep }, k) => {
-    const w = withCheck(rep, chks[k], f)
-    const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
-    if (r) { r.complete = w.complete; r.checkNote = w.checkNote }
-  })
-}
 
 return {
   glossary,
   refined,
   failed,
-  incomplete: refined.filter((r) => r.complete === false).map((r) => ({ path: r.outPath || r.path, note: r.checkNote })),
-  unchecked: refined.filter((r) => r.complete === null).map((r) => r.outPath || r.path),
+  incomplete,
+  unchecked,
   headingConflicts,
   scoutSuspect,
   scoutFailed,

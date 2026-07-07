@@ -180,10 +180,9 @@ ${anchorNote}
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
 }
 
-// Merge the K chunk part-files into the final transcript. The script can't touch the filesystem, so a
-// cheap agent does it — but by CONCATENATION (one tool call), never by retyping the content (which would
-// hit the per-response output cap on a long transcript and risk paraphrase). The post-stitch completeness
-// check + the source-aware audit (charRatio) backstop a bad merge.
+// Merge the K chunk part-files into the final transcript in the Workflow sandbox. Universal injects a
+// deterministic fs stitch capability; this prompt is only the no-fs fallback and still requires pure
+// concatenation, never retyping the content. The source-aware audit backstops a bad merge.
 export function stitchPrompt(f, chunks) {
   const parts = chunks.map((c) => partPath(f.outPath, c.idx))
   const list = parts.map((p, i) => `  ${i + 1}. ${p}`).join('\n')
@@ -203,19 +202,6 @@ ${list}
 拼好后用一句话回复：已合并 ${chunks.length} 块到 ${f.outPath}。`
 }
 
-export function checkPrompt(f, anchor) {
-  const src = (anchor && anchor.text)
-    ? `源转录共 ${anchor.line || '?'} 行，原文最后一句是：“${anchor.text}”。`
-    : `先用 Read 读源文件 ${f.path} 的最后约 30 行，确定原文结尾内容。`
-  return `你是「结尾完整性」核对代理。${src}
-用 Read 读成稿 ${f.outPath} 的最后约 60 行。**判 complete 前先确认成稿倒数若干段的实质内容确实对应到了源文件结尾（上面的锚点附近）**：
-- **注意：精校稿因删口癖、并碎句，行数与字数本就比源文件少约 15-30%——绝不能因为成稿比源文件短、或行数比源文件少就判 complete=false。完整性只看「源文件结尾那句的实质内容有没有出现在成稿结尾」，不做行数/字数比例的推断。**
-- 对应上了 → complete=true。
-- 成稿在**远早于结尾处**就以一句收束注（如“后续为离场闲聊，从略”）收住、中间大段源文件内容缺失 → 这是中途截断，**complete=false**，在 note 写明大约从哪一段起缺。
-- 只有当收束注**前一段已对应到源文件末尾区域**时，该收束注才算正常收尾（complete=true）。
-再用 Search/Read 快速抽查成稿质量：若仍有明显纯噪音口癖（嗯、呃、对对对、是是是、我我、就就 等；“那个/这个/就是说”仅在纯卡顿时算）或单段超过约 900 字，写进 note，即使结尾完整也要提醒。
-按 schema 返回 complete 与 note。`
-}
 
 export function dedupPrompt(listText, a) {
   return `你是「疑似同指」核查子代理。下面是从多份访谈里抽出、已按“共享强名”聚类后的实体清单。聚类是纯字符串匹配，**抓不到写法完全不同、却其实指同一对象**的情况——例如同音异写的人名（王勇 / 汪勇）、口号的不同转写（现场制 / 现厂制）、同一产品的不同叫法。
