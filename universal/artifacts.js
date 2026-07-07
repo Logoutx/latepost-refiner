@@ -144,6 +144,23 @@ export function sectionReviewSummary(result = {}) {
   return { flagged, total }
 }
 
+// M8: one review line per cross-file numeric conflict. Format (Chinese typesetting: “” quotes, Arabic numerals,
+// Pangu spacing — the unit carries its own 盘古 space when CJK, none for %/symbol/Latin): 「实体“云洲仪器”：文件 A
+// 第 3 行作“2019 年”，文件 B 第 3 行作“2020 年”——请对照录音确认哪个是对的」. Reused by review.md and the CLI count.
+function xfileUnitLabel(value, unit) {
+  if (!unit) return String(value)
+  // symbol/Latin units hug the number (30%, 5B); CJK units take a 盘古 space (2019 年, 8000 万, 3 个月).
+  return /^[%$]/.test(unit) || /^[A-Za-z]/.test(unit) ? `${value}${unit}` : `${value} ${unit}`
+}
+export function formatCrossFileConflict(c) {
+  const entity = c.entity || '(未定实体)'
+  const parts = (c.values || []).map((v) => `文件 ${v.label} 第 ${v.line} 行作“${xfileUnitLabel(v.value, c.unit)}”`)
+  return `实体“${entity}”：${parts.join('，')}——请对照录音确认哪个是对的`
+}
+export function crossFileConflictItems(result = {}) {
+  return (result.crossFileConflicts || []).map(formatCrossFileConflict)
+}
+
 // E13: fired 校对表 lint warnings → one review line each (each finding's sample text carries the counts).
 function glossaryLintItems(result) {
   const lint = result.glossaryLint
@@ -160,6 +177,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
+    { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
@@ -287,6 +305,9 @@ export function buildRunManifest(result = {}, context = {}) {
       suspectedDuplicates: result.suspectedDuplicates || [],
       networkUnverified: result.networkUnverified || [],
       openQuestions: result.openQuestions || [],
+      // M8: cross-file numeric conflicts (same entity + unit, disjoint values across ≥2 files). Structured so a
+      // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
+      crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),
     },
     audit: result.audit ? {
       status: result.audit.status,

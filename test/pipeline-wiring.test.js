@@ -66,9 +66,15 @@ test('override: a locked person entry renders WITHOUT ⚠ even when its source c
 
 test('override: excludeVerified via prior confidence coexists with a fresh decree (both skip verify)', async () => {
   const labels = [], prompts = []
+  // Two OLDER dated verified entries (2024-*) so the M9b age-rotation (ROTATE_REVERIFY=2) picks THOSE as the
+  // oldest, leaving 沈其安 (2025-01, the newest verified) still excluded — this keeps the original assertion
+  // "a prior verified entry is not re-verified" valid under M9b. The two older entries are not in this batch's
+  // scout, so re-opening them is a no-op (no fresh cluster to un-filter); they never reach the verify prompt.
   const priorMd = [
     '# X 统一校对表（采访时间 2025-01）', '', '## 人名（写法 → 统一）',
-    '- **沈其安** ← 沈总 ｜ 创始人 〔核实·2025-01〕', // confidence:verified → skip
+    '- **旧甲** ← 旧甲变体 ｜ 早期条目 〔核实·2024-01〕',   // oldest verified → rotated (no fresh cluster → no-op)
+    '- **旧乙** ← 旧乙变体 ｜ 早期条目 〔核实·2024-02〕',   // 2nd oldest verified → rotated (no-op)
+    '- **沈其安** ← 沈总 ｜ 创始人 〔核实·2025-01〕',        // newest verified → stays excluded (not rotated)
   ].join('\n')
   const eng = engine(labels, {
     '^scout': { speakers: [{ label: '记者', role: '记者' }], people: [{ canonical: '沈其安', variants: ['沈总'] }, { canonical: '新人', variants: [] }], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [] },
@@ -76,7 +82,8 @@ test('override: excludeVerified via prior confidence coexists with a fresh decre
   }, prompts)
   await runPipeline(A({ verifyDepth: 'deep', priorGlossaryText: priorMd, files: [F(), F({ path: '/s/B.txt', label: 'B', outPath: '/o/Transcripts/B.md' })], canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘'] }] }), eng)
   const verifyPrompts = prompts.filter((x) => /^verify/.test(x.label)).map((x) => x.prompt).join('\n')
-  assert.ok(!/沈其安|沈总/.test(verifyPrompts), 'a prior verified entry is not re-verified')
+  assert.ok(!/沈其安|沈总/.test(verifyPrompts), 'the NEWEST prior verified entry is not re-verified (M9b rotates only the 2 oldest)')
+  assert.ok(!/旧甲|旧乙/.test(verifyPrompts), 'the rotated old entries have no fresh cluster this batch → re-opening them is a no-op')
   assert.ok(!/陈涛|陈焘/.test(verifyPrompts), 'the fresh decree is not verified')
   assert.ok(/新人/.test(verifyPrompts), 'a genuinely new entity still gets verified')
 })

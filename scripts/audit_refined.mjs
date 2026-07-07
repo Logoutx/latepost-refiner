@@ -1749,6 +1749,163 @@ export function auditPairs(pairs) {
   return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
 }
 
+// ============================================================================
+// M8 — cross-file claim consistency (batch-level, deterministic, ZERO model calls)
+// ----------------------------------------------------------------------------
+// The gap: two files in ONE batch can state the SAME fact with DIFFERENT numbers and every per-file gate passes
+// (each file is internally faithful to its own source — the audit compares a refined file only against ITS source,
+// never against a sibling file). checkCrossFileClaims is a pure, append-only cross-check over a whole batch's
+// refined texts: it extracts (entity, number-atom) pairs per file — reusing extractNumberAtoms (the M4 number
+// atoms: value + unit + polarity, writing-system-normalized) — associates each atom with the ONE unambiguous
+// entity in a small char window, and flags an entity+unit-class that carries MATERIALLY different values across
+// files. It is deliberately conservative (near-zero false positives): a flag is only raised when association is
+// unambiguous, both sides carry a unit, and the values genuinely conflict (range overlap and scalar==range-endpoint
+// are NOT conflicts; 30 vs 30.0 is not a conflict — extractNumberAtoms already canonicalizes both to "30").
+// Wired at the batch level in universal/jobs.js (which has every refined file + the glossary); the Claude Code
+// edition's core/pipeline.js runs in a no-fs sandbox and cannot read the refined files back, so M8 is universal-only
+// (documented in claude-code-skill/references/return-handling.md).
+export const XFILE = {
+  WINDOW: 24,          // chars each side of a number atom scanned for an associating entity token
+  MIN_LATIN_LEN: 2,    // a capitalized/Latin candidate entity must be ≥ this many chars (drops "A轮"/"5G" noise)
+  MAX_SNIPPET: 60,     // per-value snippet length in a conflict record
+  MAX_VALUES: 8,       // cap on distinct values reported per conflict (runaway guard)
+}
+
+// Parse a canonical atom value string (already normalized by extractNumberAtoms: a scalar "2019"/"30" or a range
+// "60-70") into { lo, hi } numbers. A scalar becomes lo==hi. Returns null if it isn't a clean numeric form.
+function xfileValueSpan(value) {
+  const s = String(value == null ? '' : value).trim()
+  const rng = s.match(/^(-?\d+(?:\.\d+)?)-(-?\d+(?:\.\d+)?)$/)
+  if (rng) { const lo = Number(rng[1]), hi = Number(rng[2]); if (Number.isFinite(lo) && Number.isFinite(hi)) return { lo: Math.min(lo, hi), hi: Math.max(lo, hi) } }
+  if (/^-?\d+(?:\.\d+)?$/.test(s)) { const v = Number(s); if (Number.isFinite(v)) return { lo: v, hi: v } }
+  return null
+}
+// Two canonical values MATERIALLY conflict iff their spans are DISJOINT (no overlap). This single rule subsumes
+// every "do not flag" case the spec names: identical scalars overlap (30 vs 30.0 → both "30" → overlap → no flag);
+// a scalar inside a range overlaps (60-70 vs 65 → [65,65]⊂[60,70] → overlap → no flag); a scalar at a range
+// endpoint overlaps (60-70 vs 60 → overlap → no flag); two overlapping ranges do not flag. Only genuinely
+// separated values (2019 vs 2020, 60-70 vs 80) are disjoint → a real conflict.
+function xfileValuesConflict(a, b) {
+  const sa = xfileValueSpan(a), sb = xfileValueSpan(b)
+  if (!sa || !sb) return false
+  return sa.hi < sb.lo || sb.hi < sa.lo   // disjoint ⇒ conflict
+}
+
+// All occurrence start-indices of `needle` in `hay` (non-overlapping, plain substring). Used to place entity
+// tokens on a line so a number atom can find the entity(ies) within its window.
+function xfileOccurrences(hay, needle) {
+  const out = []
+  if (!needle) return out
+  let i = 0
+  while ((i = hay.indexOf(needle, i)) >= 0) { out.push(i); i += needle.length }
+  return out
+}
+
+// Build the candidate-entity index for ONE line: glossary canonicals that occur on the line, plus capitalized
+// Latin runs (e.g. a fictional product code "GX200"). Each candidate is { name, positions:[startIdx…] }. Latin
+// candidates are lower-noise-gated by length; a Latin run that is a substring of a matched glossary canonical is
+// dropped (the glossary name is the more specific association). De-duped by name.
+function xfileLineCandidates(line, glossaryCanonicals) {
+  const byName = new Map()
+  const add = (name, positions) => { if (!name || !positions.length) return; const prev = byName.get(name); if (prev) prev.positions.push(...positions); else byName.set(name, { name, positions: [...positions] }) }
+  for (const g of glossaryCanonicals || []) { const name = String(g || '').trim(); if (!name) continue; const pos = xfileOccurrences(line, name); if (pos.length) add(name, pos) }
+  // Capitalized/Latin tokens (start uppercase, ≥ MIN_LATIN_LEN alphanumerics) — a lightweight entity signal when
+  // the glossary is thin. Skip one already covered as a substring of a matched glossary canonical.
+  const gnames = Array.from(byName.keys())
+  for (const m of line.matchAll(/[A-Z][A-Za-z0-9]{1,}/g)) {
+    const tok = m[0]
+    if (tok.length < XFILE.MIN_LATIN_LEN) continue
+    if (gnames.some((gn) => gn.includes(tok))) continue
+    add(tok, [m.index ?? 0])
+  }
+  return Array.from(byName.values())
+}
+
+// The ONE unambiguous entity for an atom at char offset `idx` on a line: an entity is a candidate if any of its
+// occurrences falls within ±XFILE.WINDOW of idx. If exactly ONE DISTINCT candidate name qualifies → return it;
+// zero or ≥2 distinct names → null (ambiguous; the atom is dropped, per the conservative contract).
+function xfileAssociate(idx, candidates) {
+  const near = []
+  for (const c of candidates) {
+    if (c.positions.some((p) => Math.abs(p - idx) <= XFILE.WINDOW)) near.push(c.name)
+  }
+  const distinct = Array.from(new Set(near))
+  return distinct.length === 1 ? distinct[0] : null
+}
+
+// Blank a leading speaker label so the SPEAKER's name is never mistaken for the entity a number is about. The
+// refined format is `名字：内容` (a short label + full-width colon at line start, RULES 1). Without this, the
+// label name (often itself a glossary canonical) sits within the window of an early atom and makes EVERY such
+// atom's association ambiguous (2 candidates) → the whole check would silently find nothing. We replace the label
+// span (up to and incl. the first 全角冒号, only when it is short and near line start) with spaces so char offsets
+// stay aligned for extractNumberAtoms + candidate positions. A 半角: is left alone (it is not the label form and
+// commonly appears mid-sentence, e.g. a ratio). Markdown 小标题 (`## …`) lines carry no label and pass through.
+function xfileStripLabel(line) {
+  const c = line.indexOf('：')
+  if (c < 0 || c > 12) return line                 // no 全角冒号, or too far in to be a label
+  const label = line.slice(0, c)
+  if (/[\s，。；？！,.;?!]/.test(label)) return line // real prose punctuation inside → not a bare label
+  return ' '.repeat(c + 1) + line.slice(c + 1)
+}
+
+// checkCrossFileClaims(files, glossaryCanonicals):
+//   files = [{ label, sourceText?, refinedText }]  — sourceText is accepted for signature parity but the cross-check
+//     runs on refinedText (the shipped artifact; that is where a cross-file discrepancy actually lands).
+//   glossaryCanonicals = string[] — the per-company 校对表 canonical names, passed in for entity association
+//     (parseGlossaryLite(...).entries.map(e => e.canonical) at the call site).
+// Returns { conflicts } where each conflict = { entity, unit, values:[{label, value, line, snippet}…] }: the SAME
+// entity + SAME unit-class carrying disjoint values in ≥2 DIFFERENT files. `unit` is the canonical atom unit
+// (''=no unit); a conflict requires a NON-empty unit on both sides (a bare unitless count is too ambiguous to
+// cross-compare). Pure and order-stable.
+export function checkCrossFileClaims(files, glossaryCanonicals = []) {
+  const list = (files || []).filter((f) => f && typeof f.refinedText === 'string' && f.refinedText.trim())
+  if (list.length < 2) return { conflicts: [] }
+  // key = `${entity} ${unit}` → Map(fileLabel → { label, value, line, snippet }). One observation per
+  // (entity, unit, file): the FIRST occurrence in that file wins (stable, and keeps the snippet deterministic).
+  // A per-file value that is internally inconsistent (same entity+unit stated two ways within ONE file) is out of
+  // M8's scope — that is a single-file audit concern — so we only record the first and compare ACROSS files.
+  const table = new Map()
+  for (const f of list) {
+    const label = f.label || '(未命名)'
+    const lines = String(f.refinedText).split(/\r?\n/)
+    const seenInFile = new Set()   // `${entity} ${unit}` already recorded for THIS file
+    for (let li = 0; li < lines.length; li += 1) {
+      const line = lines[li]
+      if (!line || !line.trim()) continue
+      const scan = xfileStripLabel(line)   // speaker label blanked (offsets preserved) so it can't self-associate
+      const atoms = extractNumberAtoms(scan)
+      if (!atoms.length) continue
+      const candidates = xfileLineCandidates(scan, glossaryCanonicals)
+      if (!candidates.length) continue
+      for (const a of atoms) {
+        if (!a.unit) continue                                  // both sides must carry a unit — skip unitless
+        const entity = xfileAssociate(a.idx, candidates)
+        if (!entity) continue                                  // ambiguous / no entity in window → skip
+        const key = `${entity} ${a.unit}`
+        if (seenInFile.has(key)) continue                      // first occurrence per file only
+        seenInFile.add(key)
+        if (!table.has(key)) table.set(key, new Map())
+        const perFile = table.get(key)
+        if (perFile.has(label)) continue                       // (defensive) one obs per file
+        const snippet = line.trim().slice(0, XFILE.MAX_SNIPPET)
+        perFile.set(label, { label, value: a.value, line: li + 1, snippet })
+      }
+    }
+  }
+  const conflicts = []
+  for (const [key, perFile] of table) {
+    const obs = Array.from(perFile.values())
+    if (obs.length < 2) continue                               // need ≥2 different files
+    // Conflict iff at least one pair of observations carries disjoint values. (All values agreeing → no conflict.)
+    let conflict = false
+    for (let i = 0; i < obs.length && !conflict; i += 1) for (let j = i + 1; j < obs.length; j += 1) { if (xfileValuesConflict(obs[i].value, obs[j].value)) { conflict = true; break } }
+    if (!conflict) continue
+    const [entity, unit] = key.split(' ')
+    conflicts.push({ entity, unit, values: obs.slice(0, XFILE.MAX_VALUES) })
+  }
+  return { conflicts }
+}
+
 function usage() {
   return `用法:
   node scripts/audit_refined.mjs <精校稿.md> [更多.md...]          # 只查输出干净度

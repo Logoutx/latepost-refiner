@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
@@ -251,6 +251,7 @@ A.prior = prior
 A.doNotMerge = (prior && prior.doNotMerge) || []   // P4: human-confirmed distinct referents, carried forward to dedup + render
 let conflicts = []                                  // P4: this batch's verify conclusions that disagree with the prior glossary
 let weakDups = []                                   // P4b: cross-batch weak-honorific (张总/李总) ambiguities to disambiguate
+let reopenNotes = []                                // M9a: prior 〔核实〕 entries this batch re-queued for verify on new contradicting evidence
 if (prior) engine.log(`沿用往次校对表：已知 ${prior.people.length} 人名 / ${prior.brands.length} 品牌 / ${prior.terms.length} 术语、${(prior.verified.resolved || []).length} 条核实结论——本轮在其上累积`)
 
 let glossary = ''
@@ -346,9 +347,26 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
   // verify (web-lookup fact-checking, chunked and parallelised) and dedup (semantic co-reference check across all entities) are independent of each other — run both concurrently in the same parallel
   let verified = null
   // terms count too (verifyChunks already submits terms for checking; the deep level requires all terms to be verified, and omitting terms from the threshold would cause a terms-only interview to silently skip verification)
+  // M9 firebreak (anti-fossilization): BEFORE the verify-cache exclusion, decide which prior 〔核实〕 entries to
+  // pull back into the verify queue this batch — (M9a) any prior-verified entry whose scout cluster this batch
+  // grew a NEW contradicting strong writing, and (M9b) the N oldest verified entries on a rotation by age. Both
+  // are skipped when verify is off (nothing would be re-checked anyway). The reopened writings are removed from
+  // excludeVerified's skip set so a re-opened entity that ALSO recurs this batch drops back into verifyTarget;
+  // M9a's notes surface into the glossary render (A.reopenNotes → 本轮重新入队复核 section) and openQuestions.
+  let forceReopen = []
+  if (A.verifyDepth !== 'none' && prior) {
+    const reopen = contradictionReopen(prior, mergedThisBatch)   // M9a: scout-evidence contradiction (no model call)
+    const rot = rotateReverify(prior, ROTATE_REVERIFY)           // M9b: oldest-N age rotation
+    reopenNotes = reopen.notes
+    forceReopen = Array.from(new Set([...reopen.writings, ...rot.writings]))
+    if (reopen.notes.length) engine.log(`往批核实复核（M9a）：${reopen.notes.length} 项旧核实结论遇新写法证据，已重新入队核实`)
+    if (rot.count) engine.log(`轮换复核：${rot.count} 项旧核实结论重新入队（最早 ${rot.oldest || '无日期（视为最旧）'}）`)
+  }
+  A.reopenNotes = reopenNotes
   // P2: don't re-verify entities the prior glossary already confirmed — verify only this batch's new ones.
   // §1: also drop locked (用户钦定) clusters — a decree is final, nothing to look up.
-  const verifyTarget = excludeVerified(dropLocked(mergedThisBatch), prior)
+  // M9: forceReopen pulls the firebreak-selected prior-verified writings back out of the skip set.
+  const verifyTarget = excludeVerified(dropLocked(mergedThisBatch), prior, forceReopen)
   if (prior) { const sk = (mergedThisBatch.people.length + mergedThisBatch.brands.length + mergedThisBatch.terms.length) - (verifyTarget.people.length + verifyTarget.brands.length + verifyTarget.terms.length); if (sk > 0) engine.log(`核实缓存：跳过 ${sk} 项往次已核实实体，本轮只核新实体`) }
   const doVerify = A.verifyDepth !== 'none' && (verifyTarget.people.length || verifyTarget.brands.length || verifyTarget.terms.length)
   const vc = doVerify ? verifyChunks(verifyTarget, A.verifyDepth) : { chunks: [], eligible: 0, excluded: 0, overflow: 0 }
@@ -521,7 +539,7 @@ return {
   networkUnverified: netUnverified,
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(overrideQuestions),
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(overrideQuestions).concat(reopenNotes),
   summary,
   timeline,
 }

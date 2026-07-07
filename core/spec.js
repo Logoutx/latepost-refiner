@@ -662,6 +662,10 @@ export function renderGlossary(merged, verified, dedup, a) {
   sec.push('', '## 需特别处理的转写错误')
   for (const er of merged.errors) sec.push(`- [${er.file}] ${er.kind}：${er.examples.slice(0, 6).join('；')}`)
   if (merged.notes.length) sec.push('', '## 各份特别提醒', ...merged.notes.map((n) => '- ' + n))
+  // M9a re-open notes: a DERIVED, ephemeral section (like 发言人登记 / it has no parseGlossary grammar, so it is
+  // never read back and cannot fossilize into the persistent body). Lists the prior 〔核实〕 entries this batch
+  // sent back to verify because the scout surfaced a new contradicting strong writing.
+  if (a.reopenNotes && a.reopenNotes.length) { sec.push('', '## 本轮重新入队复核（往批核实遇新写法证据）'); for (const nt of a.reopenNotes) sec.push(`- ${nt}`) }
   if (verified && ((verified.resolved || []).length || (verified.unresolved || []).length)) {
     sec.push('', '## 联网核实结论（已采纳的已应用到上表正文；标 ⚠ 的与正文强名冲突、未采纳，待人工确认）')
     for (const r of verified.resolved || []) {
@@ -890,7 +894,16 @@ export function mergeDedup(priorSuspects, freshSuspects) {
 // entry line). A prior entry marked 'recheck' (a human wrote 〔待复核〕) is FORCE re-verified: its writings are
 // removed from the skip set even if a stale verify row still covered them. 'unknown' prior entries contribute
 // nothing on their own (they only skip via the verify-conclusion path, exactly as before — full back-compat).
-export function excludeVerified(merged, prior) {
+//
+// M9 firebreak — `forceReopen` (optional): a set/array of prior-entry writings that this batch has decided to
+// RE-adjudicate even though they parse as settled (verified/user). Two callers feed it (see core/pipeline.js):
+// M9a contradiction re-open (a fresh scout cluster carries a NEW strong variant a prior-verified entry lacks) and
+// M9b age-rotation (the N oldest verified entries, cycled back in). It is applied EXACTLY like the recheck path —
+// each writing is deleted from `done` — so a re-opened entry that ALSO recurs as a fresh cluster this batch drops
+// back into the verify candidate pool. (An entity not mentioned this batch has no fresh cluster to un-filter, so
+// re-opening it is a harmless no-op — you can only re-check what is on the table.) Default empty → behaviour is
+// byte-for-byte the pre-M9 function (full back-compat; dedupCoverage's call passes nothing and is unchanged).
+export function excludeVerified(merged, prior, forceReopen) {
   if (!prior) return merged
   const done = new Set()
   for (const r of (prior.verified && prior.verified.resolved) || []) { if (r && r.query) done.add(stripDesc(r.query)); if (r && r.canonical) done.add(stripDesc(r.canonical)) }
@@ -900,10 +913,88 @@ export function excludeVerified(merged, prior) {
   for (const e of priorEntries) { if (e.confidence === 'verified' || e.confidence === 'user') for (const n of writingsOf(e)) done.add(n) }
   // recheck overrides everything: force this batch to re-verify those writings.
   for (const e of priorEntries) { if (e.confidence === 'recheck') for (const n of writingsOf(e)) done.delete(n) }
+  // M9 force-reopen: same treatment as recheck, applied AFTER the settled-seed pass so it always wins.
+  for (const n of forceReopen || []) { const k = stripDesc(n); if (k) done.delete(k) }
   if (!done.size) return merged
   const covered = (e) => [e.canonical, ...(e.variants || [])].some((n) => done.has(stripDesc(n)))
   const filt = (list) => (list || []).filter((e) => !covered(e))
   return Object.assign({}, merged, { people: filt(merged.people), brands: filt(merged.brands), terms: filt(merged.terms) })
+}
+
+// ---------- M9 glossary firebreak (anti-fossilization) ----------
+// The gap: excludeVerified treats confidence:'verified' as PERMANENTLY settled — such an entry is skipped from
+// re-verification in every future batch. The M3 provenance guard (confidenceMark) stops NEW evidence-free entries
+// from earning 〔核实〕, but an OLD/legacy 〔核实〕 (or one that was right once and is contradicted now) never gets
+// re-checked. M9a and M9b are the two firebreaks that let a settled entry back into the verify queue. Both return
+// a plain array of prior-entry WRITINGS to hand to excludeVerified's `forceReopen`; M9a additionally returns the
+// human-facing notes that surface the re-open (glossary render + openQuestions).
+
+// M9a — contradiction re-open. glossaryConflicts (below) already detects, AFTER verify runs, that this batch's
+// verify disagreed with the prior canonical — but by then the prior entry was already EXCLUDED from verify, so the
+// disagreement is only reported, never re-adjudicated. M9a moves the trigger EARLIER: before exclusion, using only
+// the SCOUT clusters (no model call), detect that a prior *verified* entry has acquired a NEW strong variant
+// (real-name-like, not a weak honorific) that its canonical+variants do not already contain. That is fresh
+// evidence the settled spelling may be wrong, so the entry is force-reopened (re-verified this batch) and a note
+// is carried out. Only 'verified' entries are eligible — a 'user' decree is a human ruling that a new ASR variant
+// must NOT silently override (excludeVerified/applyVerifiedEntry keep locking it); 'recheck' is already re-queued.
+// Match prior↔fresh by a shared STRONG name (same rule as mergeEntityLists.strongSet), then require the fresh
+// cluster to contribute a strong name the prior entry lacks.
+export function contradictionReopen(prior, fresh) {
+  const empty = { writings: [], notes: [] }
+  if (!prior || !fresh) return empty
+  const strongOf = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).filter((n) => n && !isWeakKey(n))
+  const allNamesOf = (e) => new Set([e.canonical, ...(e.variants || [])].map(stripDesc).filter(Boolean))
+  const freshEntries = [...(fresh.people || []), ...(fresh.brands || []), ...(fresh.terms || [])]
+  const freshStrong = freshEntries.map((e) => ({ e, strong: strongOf(e) }))
+  const priorVerified = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])].filter((e) => e && e.confidence === 'verified')
+  const writings = []
+  const notes = []
+  const seen = new Set()
+  for (const pe of priorVerified) {
+    const pStrong = new Set(strongOf(pe))
+    if (!pStrong.size) continue
+    const pNames = allNamesOf(pe)
+    // A fresh cluster that shares ≥1 strong name with this prior entry AND carries a strong name the prior entry
+    // does not already list → a contradicting new writing. (stripDesc-compared throughout so an annotated writing
+    // like 沈其安（示例公司）still matches the bare form.)
+    let newVariant = null
+    for (const { strong } of freshStrong) {
+      if (!strong.some((n) => pStrong.has(n))) continue          // not the same entity
+      const extra = strong.find((n) => !pNames.has(n))            // a strong name the prior entry lacks
+      if (extra) { newVariant = extra; break }
+    }
+    if (!newVariant) continue
+    for (const n of pNames) if (!seen.has(n)) { seen.add(n); writings.push(n) }
+    notes.push(`“${pe.canonical}”往批核实结论遇到新写法证据“${newVariant}”，已重新入队核实`)
+  }
+  return { writings, notes }
+}
+
+// M9b — rotating spot re-verify. excludeVerified drops ALL verified entries forever; this cycles the N=2 OLDEST
+// verified entries (by their 〔核实·YYYY-MM〕 date — the marker format parseGlossary decodes into confidenceDate)
+// back into the verify candidate pool each batch, so a stale canonical is eventually re-examined even absent any
+// contradiction signal. Undated legacy 〔核实〕 markers (confidenceDate '') count as OLDEST (they sort first). Only
+// 'verified' entries rotate: 'user' is a human decree (never auto-rechecked), 'recheck' is already re-queued.
+// Returns { writings, count, oldest } where oldest is the earliest date string ('' → undated) for the log line.
+// A re-confirmed entry gets a refreshed date automatically (confidenceMark tier 2 re-stamps 〔核实·<thisDate>〕);
+// a changed answer flows through glossaryConflicts. Rotation is a no-op for an entry not mentioned this batch.
+export const ROTATE_REVERIFY = 2
+export function rotateReverify(prior, n = ROTATE_REVERIFY) {
+  const empty = { writings: [], count: 0, oldest: null }
+  if (!prior || n <= 0) return empty
+  const verified = [...(prior.people || []), ...(prior.brands || []), ...(prior.terms || [])].filter((e) => e && e.confidence === 'verified')
+  if (!verified.length) return empty
+  // Sort oldest-first: undated ('') sorts before any real YYYY-MM (string compare, '' < '2020-01'); a plain
+  // lexical compare on YYYY-MM is a correct chronological order. Ties keep input (glossary) order via index.
+  const sorted = verified
+    .map((e, i) => ({ e, i, d: e.confidenceDate || '' }))
+    .sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : a.i - b.i))
+  const pick = sorted.slice(0, n)
+  const writingsOf = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).filter(Boolean)
+  const writings = []
+  const seen = new Set()
+  for (const { e } of pick) for (const w of writingsOf(e)) if (!seen.has(w)) { seen.add(w); writings.push(w) }
+  return { writings, count: pick.length, oldest: pick.length ? (pick[0].d || '') : null }
 }
 
 // P3 — cross-interview speaker registry: unify speakers recurring across ≥ 2 files (chiefly the interviewer)
