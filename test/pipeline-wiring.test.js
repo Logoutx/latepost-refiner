@@ -12,12 +12,11 @@ const F = (over = {}) => ({ path: '/s/A.txt', label: 'A', lines: 100, chars: 500
 const A = (over = {}) => ({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [F()], ...over })
 
 // A configurable mock engine. `on` maps a label-prefix regex → a reply (or (prompt)=>reply). Unhandled
-// scout/refine/check/dedup labels get sensible defaults; everything else returns null.
+// scout/refine/dedup labels get sensible defaults; everything else returns null.
 function engine(labels, on = {}, capturePrompts = null) {
   const def = (l) => {
     if (/^scout/.test(l)) return { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [] }
     if (/^refine/.test(l)) return { path: 'x', headings: ['某节'], key_fixes: [], open_questions: [] }
-    if (/^check/.test(l)) return { complete: true, note: '' }
     if (/^dedup/.test(l)) return { suspects: [] }
     if (/^(summary|timeline)/.test(l)) return `/o/${l}.md`
     return null
@@ -279,6 +278,62 @@ test('fresh:true ignores priorGlossaryPath entirely', async () => {
   const eng = engine(labels)
   await runPipeline(A({ fresh: true, priorGlossaryPath: '/o/校对表.md', capabilities: { readFile: () => { capRead += 1; return PRIOR_MD } } }), eng)
   assert.equal(capRead, 0, 'fresh short-circuits the prior read')
+})
+
+// ---------- dedup skip on returning batches (prior-glossary coverage) ----------
+// When the prior 校对表 already covers ≥90% of this batch's (non-钦定) entities, the semantic dedup agent is
+// skipped — its whole job is catching NEW cross-writing co-references, and a returning batch of already-known
+// entities has almost none. The deterministic dedup-adjacent logic (weakDupFlags, suspectUnverified) still runs.
+
+// A configurable engine that also captures engine.log lines (the base `engine` helper swallows them).
+function engineWithLogs(labels, logs, on = {}) {
+  const base = engine(labels, on)
+  return { ...base, log: (m) => { logs.push(String(m)) } }
+}
+
+// Prior glossary with N verified people (canonicals 人0…人{N-1}), each 〔核实〕 so excludeVerified counts them covered.
+const priorWithVerified = (n) => [
+  '# X 统一校对表（采访时间 2025-01）', '', '## 人名（写法 → 统一）',
+  ...Array.from({ length: n }, (_, i) => `- **人${i}** ← 变${i} ｜ 受访者 〔核实·2025-01〕`),
+].join('\n')
+
+// A scout that reports the given people canonicals (no variants) on file A, so mergeFindings yields exactly them.
+const scoutPeople = (canonicals) => ({
+  '^scout:A': { speakers: [{ label: '记者', role: '记者' }], people: canonicals.map((c) => ({ canonical: c, variants: [] })), brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [] },
+  '^scout:B': { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [] },
+})
+
+const TWO_FILES = [F(), F({ path: '/s/B.txt', label: 'B', outPath: '/o/Transcripts/B.md' })]
+
+test('dedup skip: prior covers ≥90% of the batch → the dedup agent is skipped and the coverage counts are logged', async () => {
+  const labels = [], logs = []
+  // 9 prior-verified people + 1 genuinely new one = 10 total, 1 unknown → ratio 0.10 (≤ threshold) → skip.
+  const known = Array.from({ length: 9 }, (_, i) => `人${i}`)
+  const eng = engineWithLogs(labels, logs, scoutPeople([...known, '新人']))
+  const r = await runPipeline(A({ verifyDepth: 'none', priorGlossaryText: priorWithVerified(9), files: TWO_FILES }), eng)
+  assert.ok(!labels.includes('dedup:semantic'), 'the semantic dedup agent is NOT dispatched when prior coverage clears the threshold')
+  const skipLog = logs.find((l) => l.includes('疑似同指缓存') && l.includes('跳过'))
+  assert.ok(skipLog, 'a skip log line is emitted')
+  assert.ok(/9\/10/.test(skipLog) && /10%/.test(skipLog), 'the log states the covered/total counts and the unknown ratio')
+  assert.deepEqual(r.suspectedDuplicates, [], 'no fresh suspects are produced on a skipped batch')
+})
+
+test('dedup skip: below the coverage threshold the dedup agent still runs', async () => {
+  const labels = [], logs = []
+  // 5 prior-verified + 5 new = 10 total, 5 unknown → ratio 0.50 (> threshold) → NO skip.
+  const known = Array.from({ length: 5 }, (_, i) => `人${i}`)
+  const fresh = Array.from({ length: 5 }, (_, i) => `新${i}`)
+  const eng = engineWithLogs(labels, logs, scoutPeople([...known, ...fresh]))
+  await runPipeline(A({ verifyDepth: 'none', priorGlossaryText: priorWithVerified(5), files: TWO_FILES }), eng)
+  assert.ok(labels.includes('dedup:semantic'), 'the semantic dedup agent runs when too many entities are new')
+  assert.ok(!logs.some((l) => l.includes('疑似同指缓存')), 'no skip line is logged when dedup runs')
+})
+
+test('dedup skip: a first run (no prior) never skips dedup', async () => {
+  const labels = [], logs = []
+  const eng = engineWithLogs(labels, logs, scoutPeople(['甲', '乙', '丙']))
+  await runPipeline(A({ verifyDepth: 'none', files: TWO_FILES }), eng) // no priorGlossaryText
+  assert.ok(labels.includes('dedup:semantic'), 'with no prior glossary there is nothing to skip against — dedup always runs')
 })
 
 // ---------- SF-5 normalizeAuditResult shape guard ----------

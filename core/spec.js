@@ -65,13 +65,6 @@ export const REFINE_REPORT_SCHEMA = {
   },
 }
 
-export const CHECK_SCHEMA = {
-  type: 'object',
-  properties: {
-    complete: { type: 'boolean', description: '成稿是否覆盖到源文件结尾' },
-    note: { type: 'string', description: '不完整时说明缺到哪' },
-  },
-}
 
 export const DEDUP_SCHEMA = {
   type: 'object',
@@ -353,16 +346,6 @@ export function dedupListText(merged) {
   return lines.join('\n')
 }
 
-// Completion report and authoritative output path: rep.path is self-reported by the proofreading agent;
-// all downstream consumers use f.outPath, which is the path we instructed it to write to.
-export const withCheck = (rep, chk, f) => Object.assign({}, rep, {
-  outPath: f.outPath,
-  // Normalise to a strict three-state: true / false / null.
-  // A failed check agent or a response missing this field (schema does not enforce it) both map to null (unchecked).
-  // Leaving it as undefined would let it slip through both the "incomplete" and "unchecked" guards.
-  complete: (chk && typeof chk.complete === 'boolean') ? chk.complete : null,
-  checkNote: chk ? (chk.note || '') : 'check agent failed',
-})
 
 // ---------- chunked refine for large transcripts ----------
 // A single refine agent on a long transcript is both the wall-clock long pole AND prone to

@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
-import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
+import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
@@ -307,6 +307,21 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const a = annotateAnchorsFile(f.path, f.outPath)
       if (a.updated.length) anchors.push(a)
       return a
+    },
+    // Deletion #2 (provider side): with fs, the chunk part-files are merged deterministically by the pure
+    // stitchParts() (one blank line between parts, exact-dup seam heading collapsed) — no stitch subagent, so
+    // no per-response output cap and no paraphrase risk on a long transcript. The Workflow sandbox (no fs) has
+    // no such capability and falls back to the concatenation agent. Reads <outPath>.part{idx} in chunk order,
+    // writes f.outPath, and drops the consumed parts (cleanupRefineParts also sweeps them post-run — idempotent).
+    // Returns a truthy summary; the pipeline consumer only distinguishes truthy (merged) from null (failed).
+    stitch: (f, chunks) => {
+      const parts = (chunks || []).map((c) => partPath(f.outPath, c.idx))
+      const texts = parts.map((p) => fs.readFileSync(p, 'utf8'))
+      const merged = stitchParts(texts)
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, merged, 'utf8')
+      for (const p of parts) { try { fs.rmSync(p, { force: true }) } catch { /* ignore */ } }
+      return { path: f.outPath, merged: parts.length, bytes: Buffer.byteLength(merged, 'utf8') }
     },
   }
 
