@@ -103,7 +103,7 @@ function findEntry(g, canonical) {
 }
 
 test('confidenceMark: locked → 〔用户钦定〕; verified name → 〔核实·date〕 (date optional); otherwise empty', () => {
-  const resolved = new Map([['臻选', { query: '臻选', canonical: '真选' }]])
+  const resolved = new Map([['臻选', { query: '臻选', canonical: '真选', source: 'example.com 官网品牌介绍页' }]])
   // SF-1: confidenceMark returns the marker WITH its leading separator space (or '' when none).
   assert.equal(confidenceMark({ canonical: '甄选', locked: true }, resolved, '2025-07'), ' 〔用户钦定〕')
   assert.equal(confidenceMark({ canonical: '真选', variants: ['臻选'] }, resolved, '2025-07'), ' 〔核实·2025-07〕')
@@ -118,7 +118,7 @@ test('render→parse: a verified entry round-trips to confidence "verified"', ()
     terms: [{ canonical: '臻选', variants: ['真选'], hint: '核心计划', files: ['A'], crossFile: false }],
     errors: [], notes: [],
   }
-  const verified = { resolved: [{ query: '臻选', canonical: '甄选', identity: '品质战略', source: '公开资料' }], unresolved: [] }
+  const verified = { resolved: [{ query: '臻选', canonical: '甄选', identity: '品质战略', source: 'example.com 官网品牌介绍页' }], unresolved: [] }
   const md = renderGlossary(merged, verified, null, GA)
   assert.ok(md.includes('〔核实·2025-07〕'), 'a verified entry line carries the machine marker')
   const g = parseGlossary(md)
@@ -200,7 +200,7 @@ test('BLOCKER: verified/user markers survive a full render→parse→merge→re-
     errors: [], notes: [],
   }
   // 王志远 was resolved THIS round (query 王总 → 王志远), so it renders 〔核实·2025-07〕.
-  const verified1 = { resolved: [{ query: '王总', canonical: '王志远', identity: '受访者', source: '公开资料' }], unresolved: [] }
+  const verified1 = { resolved: [{ query: '王总', canonical: '王志远', identity: '受访者', source: 'example.com 官网团队页' }], unresolved: [] }
   const md1 = renderGlossary(round1, verified1, null, GA)
   assert.ok(md1.includes('王志远') && /王志远.*〔核实·2025-07〕/.test(md1), 'round-1: verified marker present')
   assert.ok(/甄选.*〔用户钦定〕/.test(md1), 'round-1: user marker present')

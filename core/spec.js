@@ -140,10 +140,13 @@ export const SINGLE_FILE_GLOSSARY = '（单文件一遍过，未建独立校对�
 // editing the text and hoping the next run re-checked it. These four line-tail tokens make the state MACHINE-
 // readable. They use full-width lenticular brackets 〔…〕 which never appear in renderGlossary's own output, so
 // an old 校对表 (no markers) round-trips completely unchanged — parseGlossary just reports confidence:'unknown'.
-//   〔核实·YYYY-MM〕 — verified: applied a网络核实 conclusion (date optional → 〔核实〕)
+//   〔核实·YYYY-MM〕 — verified: applied a网络核实 conclusion backed by a CONCRETE source (date optional → 〔核实〕)
 //   〔用户钦定〕     — user: a locked cluster from applyCanonicalOverrides (has structural veto, see below)
-//   〔待复核〕       — recheck: a human撤销/flagged this entry; parse recognises it (render never emits it)
-// Downstream contract (wired by the next task):
+//   〔待复核〕       — recheck: EITHER a human撤销/flagged this entry, OR (M3 provenance guard) this round's
+//                     verify resolved it but named no concrete source (isConcreteSource(source) failed) — the
+//                     resolution is still applied to the entry body, just not trusted permanently. Either way
+//                     parse decodes it the same (confidence:'recheck') and excludeVerified re-verifies it.
+// Downstream contract:
 //   · excludeVerified skips only verified/user (both are settled); recheck must be re-verified next round;
 //     unknown keeps today's behaviour verbatim (full backward compatibility — the hard requirement).
 export const CONFIDENCE_VERIFIED = '核实'
@@ -157,11 +160,51 @@ export const CONFIDENCE_RECHECK = '待复核'
 // Residual edge (documented, not handled): a hint deliberately ending with a SPACE + a literal 〔核实〕 token
 // (“… 〔核实〕”) is indistinguishable from a real marker and will be stripped — an extreme collision we accept.
 const CONFIDENCE_RE = new RegExp(`(^|[\\s｜])〔(${CONFIDENCE_USER}|${CONFIDENCE_RECHECK}|${CONFIDENCE_VERIFIED})(?:·([0-9]{4}-[0-9]{2}))?〕\\s*$`)
+
+// ---------- provenance guard (M3): 核实 requires a CONCRETE source ----------
+// The gap this closes: excludeVerified treats confidence:'verified' as PERMANENTLY settled — such an entry is
+// skipped from re-verification in every future batch (see excludeVerified below). If the verify agent hallucinates
+// a canonical and writes a vague/self-referential source (“网络搜索”、“公开资料” — the search ACTION, not a citation
+// of what was found), that wrong name would otherwise be locked in forever, silently propagating to every batch.
+// The guard: 〔核实〕 may only be earned when `source` names actual evidence (a URL/domain, or a specific
+// publication/page). Anything else — including the verify prompt's own disciplined-sounding hedges — falls back
+// to 〔待复核〕 (machine-assigned, not just hand-written): the resolution is still APPLIED this run
+// (applyVerifiedEntry / the name-guard are untouched — only the PERMANENT-TRUST marker is withheld), and
+// excludeVerified already force-re-verifies any confidence:'recheck' entry next batch (see below) — so a
+// no-evidence hit gets one more chance to be checked properly instead of being trusted forever on the first guess.
+// Blocklist: generic hedges a model reaches for when it has NO real citation — the search action itself
+// (网络搜索/联网搜索/搜索结果/web search), a vague wave at "public info" with nothing specific named
+// (公开资料/公开信息), or an admission it has nothing (常识/据记忆/模型知识/未提供/无来源/common knowledge).
+// Matched case/width-insensitively as a SUBSTRING, so “搜索确认” and “经网络搜索确认” both fail alike.
+const CONCRETE_SOURCE_BLOCKLIST = [
+  '网络搜索', '联网搜索', '公开资料', '公开信息', '常识', '据记忆', '模型知识', '未提供', '无来源', '搜索结果',
+  'web search', 'common knowledge',
+]
+// URL/domain fragment: scheme, www., or a bare domain with a common TLD (letters/digits/hyphen label + TLD),
+// anywhere in the string (“36kr.com 2025-03 报道” must match on the bare-domain branch, no scheme/www needed).
+const URL_FRAGMENT_RE = /\bhttps?:\/\/|\bwww\.|\b[a-z0-9-]+\.(?:com|cn|org|net|gov|edu|io|co)\b/i
+export function isConcreteSource(s) {
+  if (!s || typeof s !== 'string') return false
+  // Width-insensitive: fold full-width ASCII (Ａ-Ｚ／ａ-ｚ／０-９) down to half-width before every other check,
+  // so a blocklist term or URL fragment typed in full-width CJK input method still matches.
+  const norm = s.replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim()
+  if (!norm) return false
+  const low = norm.toLowerCase()
+  if (CONCRETE_SOURCE_BLOCKLIST.some((b) => low.includes(b.toLowerCase()))) return false
+  if (URL_FRAGMENT_RE.test(norm)) return true
+  // No URL: fall back to a length heuristic — a real citation names a specific publication/page/document,
+  // which reads longer than a bare hedge (“搜索确认” is 4 chars; “公司官网 about 页” / “36 氪 2021 年报道” both
+  // clear 6). Short-circuits false positives from generic short phrases that dodge the blocklist by wording.
+  return norm.length >= 6
+}
 // Render side: pick the marker for an entry e0, returned WITH its leading separator space (or '' when none), so
 // every call site is guaranteed the SF-1 space without duplicating the rule. Priority (BLOCKER — confidence must
 // round-trip across batches):
 //   1. locked (in-memory 用户钦定 cluster) OR a prior entry parsed back as confidence:'user' → 〔用户钦定〕
-//   2. re-verified THIS round (a writing is in resolvedMap) → 〔核实·<thisDate>〕 (date omitted when absent)
+//   2. re-verified THIS round (a writing is in resolvedMap) AND its source is CONCRETE (isConcreteSource) →
+//      〔核实·<thisDate>〕 (date omitted when absent); re-verified but source is NOT concrete → 〔待复核〕
+//      instead (machine-assigned provenance guard — see above; the resolution itself is still applied to the
+//      entry body by applyVerifiedEntry, only the confidence marker is withheld)
 //   3. a prior entry parsed back as confidence:'verified' but NOT re-checked this round → its ORIGINAL marker
 //      preserved verbatim, original date段 and all (this is what was silently lost before)
 //   4. recheck / unknown with no fresh verification → no marker (recheck re-renders by this round's conclusion)
@@ -169,8 +212,11 @@ export function confidenceMark(e0, resolvedMap, date) {
   if (!e0) return ''
   if (e0.locked || e0.confidence === 'user') return ` 〔${CONFIDENCE_USER}〕`
   const names = [e0.canonical, ...(e0.variants || [])]
-  const verifiedThisRound = resolvedMap && names.some((n) => resolvedMap.has(n))
-  if (verifiedThisRound) return date ? ` 〔${CONFIDENCE_VERIFIED}·${date}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
+  const hit = resolvedMap && names.map((n) => resolvedMap.get(n)).find(Boolean)
+  if (hit) {
+    if (isConcreteSource(hit.source)) return date ? ` 〔${CONFIDENCE_VERIFIED}·${date}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
+    return ` 〔${CONFIDENCE_RECHECK}〕`   // resolved this round, but no concrete evidence — applied, not永久信任
+  }
   if (e0.confidence === 'verified') return e0.confidenceDate ? ` 〔${CONFIDENCE_VERIFIED}·${e0.confidenceDate}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
   return ''
 }
