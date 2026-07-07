@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -155,6 +155,28 @@ export function cleanupRefineParts(fileEntries) {
       try { fs.rmSync(partPath(f.outPath, i), { force: true }) } catch { /* ignore */ }
     }
   }
+}
+
+// M8 batch-level cross-file claim consistency. Runs ONLY here on the universal path (this layer has fs, so it can
+// read every refined file back + the persisted 校对表); the CC-sandbox pipeline has no fs and the refined text
+// never enters its orchestration layer, so M8 is universal-only (see claude-code-skill/references/return-handling.md).
+// Reads each successfully-refined file's on-disk text, extracts glossary canonicals for entity association, and
+// returns the conflict list (empty when < 2 refined files or no conflict). Never throws — an unreadable file is
+// skipped, and any internal error degrades to no conflicts (M8 must never break a run).
+export function computeCrossFileConflicts(refined, glossaryText) {
+  try {
+    const files = []
+    for (const r of refined || []) {
+      const p = r && (r.outPath || r.path)
+      if (!p) continue
+      let text
+      try { text = fs.readFileSync(p, 'utf8') } catch { continue }
+      files.push({ label: r.label || path.basename(p, path.extname(p)), refinedText: text })
+    }
+    if (files.length < 2) return []
+    const canonicals = (parseGlossaryLite(glossaryText || '').entries || []).map((e) => e.canonical).filter(Boolean)
+    return checkCrossFileClaims(files, canonicals).conflicts || []
+  } catch { return [] }
 }
 
 // Persist the returned glossary (pure-JS output; no agent writes it). Cumulative across runs.
@@ -346,10 +368,21 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
     const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
     if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
+    // M8: cross-file numeric consistency over the whole batch (≥2 refined files). Uses this round's rendered
+    // 校对表 (in-memory) for entity association, else the on-disk copy. A conflict is attached to the result +
+    // manifest and rendered in review.md「跨文件互证」; a ONE-line summary folds into openQuestions so the Step-5
+    // batch-ask surfaces it. Never fatal — computeCrossFileConflicts swallows its own errors.
+    const crossFileGlossary = (r.glossary && r.glossary !== SINGLE_FILE_GLOSSARY) ? r.glossary : (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : '')
+    const crossFileConflicts = !r.error ? computeCrossFileConflicts(r.refined, crossFileGlossary) : []
+    if (crossFileConflicts.length) {
+      notice(`跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突——见 review.md「跨文件互证」`)
+      // Fold ONE summary line into openQuestions (the per-conflict detail lives in review.md / run.json).
+      r.openQuestions = [...(r.openQuestions || []), `跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突（每份内部都合规）——请对照录音确认哪个是对的，详见 review.md「跨文件互证」`]
+    }
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
-    const result = { ...r, audit, glossaryLint, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: sel.engine.usage(), startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
