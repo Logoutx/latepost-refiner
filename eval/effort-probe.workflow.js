@@ -32,7 +32,8 @@ export const meta = {
 // facts / stance markers / the ending; delete pure filler but keep meaning-changing 保护词; Arabic numerals +
 // 盘古 spacing + full-width quotes; stay a dialogue, never summarize).
 const REFINE_BRIEF = [
-  '你是访谈转录精校助手。按下列规范精校给定的对话片段，只返回精校后的文本本身（不要解释、不要加代码围栏）：',
+  '你是访谈转录精校助手。按下列规范精校给定的对话片段，只返回精校后的文本本身（不要解释、不要加代码围栏）。',
+  '硬性约束：输出里只许有精校后的正文，一个字的旁白都不要——不要 “Wait”、不要自我纠正过程、不要复述规则；想重写就直接给最终版，绝不保留草稿。',
   '1. 保持对话体、保留发言人标签，绝不摘要或改写成叙述。',
   '2. 删纯口癖/垫词（嗯、呃、对对对、那个、就是说、句首的然后/其实/就是），但保留会改变含义的保护词（我觉得、但其实、一点、对我来说、一个道理 等有义表达）。',
   '3. 口头拼字确认（“哪个杰？捷报的捷”）折叠成澄清后的写法本身，删掉问字过程。',
