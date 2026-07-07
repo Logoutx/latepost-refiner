@@ -64,6 +64,77 @@ const CLIENT_TOOLS = TOOL_SPECS.map((s) => ({ name: s.name, description: s.descr
 
 const MAX_TURNS = 100 // tool-loop ceiling per agent (reads + writes + edits + searches + nudges)
 
+// ---- Prompt caching (Anthropic ephemeral breakpoints) -----------------------
+// Agent loops re-send the whole growing conversation every turn. Without cache
+// breakpoints Anthropic bills the full prefix at 1× each turn (the 24:1 input:output
+// we measured). We place exactly TWO `cache_control` breakpoints per request:
+//   1) the tools+system prefix (shared across every agent in a run), and
+//   2) the last block of the last message (the running conversation).
+// Each turn then re-reads the cached prefix at 0.1× and writes only the new suffix
+// at 1.25×. Anthropic allows up to 4 breakpoints; because `messages` is reused
+// across turns, a breakpoint we set on turn N would still be there on turn N+1, so
+// we STRIP any cache_control we previously added to message blocks before re-adding
+// one — this keeps the count pinned at 2 and never trips the 4-breakpoint limit.
+const EPHEMERAL = { type: 'ephemeral' }
+
+// Return a shallow clone of a content block with cache_control removed.
+const stripCC = (block) => {
+  if (!block || typeof block !== 'object' || !('cache_control' in block)) return block
+  const { cache_control, ...rest } = block
+  return rest
+}
+
+// Set cache_control on the LAST content block of a message's content.
+// - string content → wrap into a single text block carrying the breakpoint
+// - array content  → clone, mark the last block (works for text and tool_result)
+// Returns new content; never mutates the input.
+function markLastBlock(content) {
+  if (typeof content === 'string') {
+    return [{ type: 'text', text: content, cache_control: EPHEMERAL }]
+  }
+  if (Array.isArray(content) && content.length) {
+    const out = content.map(stripCC) // drop any breakpoint left from a previous turn
+    const last = out[out.length - 1]
+    out[out.length - 1] = { ...last, cache_control: EPHEMERAL }
+    return out
+  }
+  return content // empty/absent content → nothing to cache
+}
+
+// Pure: given Messages request params, return a NEW params object with two cache
+// breakpoints (system prefix + last message). Unit-testable without any API call.
+export function withCacheBreakpoints(params = {}) {
+  const out = { ...params }
+
+  // 1) System prompt breakpoint. String → single cached text block; array → mark last block.
+  if (typeof out.system === 'string') {
+    out.system = [{ type: 'text', text: out.system, cache_control: EPHEMERAL }]
+  } else if (Array.isArray(out.system) && out.system.length) {
+    const sys = out.system.map(stripCC)
+    const last = sys[sys.length - 1]
+    sys[sys.length - 1] = { ...last, cache_control: EPHEMERAL }
+    out.system = sys
+  }
+
+  // 2) Conversation breakpoint on the last block of the last message. Also strip any
+  //    stale breakpoints from EARLIER messages so the total stays at 2, not 2-per-turn.
+  if (Array.isArray(out.messages) && out.messages.length) {
+    const msgs = out.messages.map((m) => {
+      if (!m || typeof m !== 'object') return m
+      if (Array.isArray(m.content)) return { ...m, content: m.content.map(stripCC) }
+      return m
+    })
+    const lastIdx = msgs.length - 1
+    const lastMsg = msgs[lastIdx]
+    if (lastMsg && typeof lastMsg === 'object') {
+      msgs[lastIdx] = { ...lastMsg, content: markLastBlock(lastMsg.content) }
+    }
+    out.messages = msgs
+  }
+
+  return out
+}
+
 function execTool(tu, filePolicy) {
   const r = runFileTool(tu.name, tu.input || {}, filePolicy)
   const block = { type: 'tool_result', tool_use_id: tu.id, content: r.text }
@@ -101,8 +172,10 @@ export function makeApiEngine(opts = {}) {
   }
 
   // One streamed Messages request (streaming avoids HTTP timeouts on large outputs).
+  // withCacheBreakpoints adds the ephemeral cache_control breakpoints just before the
+  // wire call, so every request in the tool loop reuses the cached tools+system prefix.
   async function create(params) {
-    const stream = client.messages.stream(params)
+    const stream = client.messages.stream(withCacheBreakpoints(params))
     const msg = await stream.finalMessage()
     tally(msg.usage)
     return msg
