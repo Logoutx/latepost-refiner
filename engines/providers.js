@@ -32,10 +32,12 @@ export const PROVIDERS = {
     maxTokensParam: 'max_tokens',
     forceStructured: true,
     jsonSchemaResponse: false, // only response_format:json_object; forcing covers structured output
-    // deepseek-chat = non-thinking, tool-capable (thinking mode disables function calling).
-    // NOTE: deepseek-chat is slated for deprecation 2026-07-24 — override with --models if needed.
-    models: { haiku: 'deepseek-chat', sonnet: 'deepseek-chat', opus: 'deepseek-chat' },
-    note: '推理(thinking)模式不支持工具调用，故全档用非思考的 deepseek-chat（2026-07-24 后将弃用，可用 --models 覆盖为 deepseek-v4-flash/pro 的非思考模式）',
+    // Non-thinking tiers (thinking mode disables function calling): v4-flash for mechanical
+    // stages, v4-pro for the writing stages. Validated 2026-07-07 on a real 34K-char interview:
+    // the old all-deepseek-chat default failed hard gates (compression + a real dropped section);
+    // the flash/pro split passed everything. deepseek-chat is deprecated 2026-07-24 anyway.
+    models: { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' },
+    note: '非思考模式分档：机械/核实档用 deepseek-v4-flash，精校/成稿档用 deepseek-v4-pro（thinking 模式不支持工具调用；旧默认 deepseek-chat 已弃用，可用 --models 覆盖）',
   },
   glm: {
     label: 'GLM (Zhipu / z.ai)',
