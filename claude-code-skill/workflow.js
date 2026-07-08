@@ -155,6 +155,40 @@ const TYPESET = `中文排版三规范（务必遵守）：
 // string literals so that timelinePrompt can branch into the “no glossary” fallback path.
 const SINGLE_FILE_GLOSSARY = '（单文件一遍过，未建独立校对表；校对决定见成稿与精校报告）'
 
+// ---------- per-phase reasoning-effort DEFAULTS (M12 caps) ----------
+// The M12 --effort knob only sets effort when the user passes it; otherwise a sub-agent INHERITS the session's
+// reasoning effort. A maximum-effort session therefore made EVERY phase (mechanical ones included) burn maximal
+// thinking — one real run took 117 min where the same work at normal effort took 15-25 min. These per-phase
+// defaults CAP that: they are applied whenever the user has NOT overridden a phase (see effortFor below), so a
+// run can never inherit an extreme session effort.
+//
+// This is a CAP on the CEILING, not a cut: it must never lower any judgment phase below its proven-good baseline
+// (the API edition's implicit 'high'), only stop a maxed session from inflating a phase past 'high'.
+//   · ALL judgment phases (verify / dedup / refine / logic / summary / timeline) are capped at 'high' — strong
+//     reasoning, but never the 'xhigh'/'max' that caused the 2-hour run. verify (web entity-checking, exactly
+//     what catches mis-heard names) and dedup (semantic same-referent judgment) are NOT mechanical: their
+//     slow-run cost was a network stall, not thinking time, so dropping them below 'high' would be an unproven
+//     quality risk. refine is likewise NOT lowered below 'high' — the document-level proof that 'medium' keeps
+//     faithfulness isn't in yet, so 'medium' stays a user opt-in (--effort refine=medium, protocol in
+//     eval/effort-experiment.md).
+//   · Only the genuinely mechanical haiku phases (scout / stitch) go 'low' — and those are effort no-ops anyway.
+// A user --effort <cat>=<level> override (A.effort[category]) always WINS over these defaults.
+//
+// Effort only affects the opus/sonnet/fable tiers — the haiku-tier entries here (scout / stitch) are harmless
+// no-ops via the api.js EFFORT_ALLOWED guard, kept in the map for completeness so a future model-tier change
+// stays covered. NOTE: the pipeline does NOT pass effort at the haiku (scout/stitch) call sites today — only the
+// opus/sonnet sites read this map (see effortFor use in pipeline.js) — because the CC-edition bootstrap forwards
+// opts.effort RAW (no per-model guard), and haiku 400-errors on effort. These two entries are documentation +
+// future-proofing; if scout/stitch ever move to a smart tier, wire their call sites AND add a haiku guard to
+// build/bootstrap-cc.js at the same time.
+const DEFAULT_EFFORT = {
+  scout: 'low', verify: 'high', dedup: 'high', refine: 'high',
+  stitch: 'low', logic: 'high', summary: 'high', timeline: 'high',
+}
+// Resolve the effective effort for a phase: the user's per-category override wins, else the built-in cap.
+// `??` (not `||`) so only null/undefined fall through to the default — a deliberately-set value is honoured as-is.
+const effortFor = (A, category) => (A && A.effort && A.effort[category]) ?? DEFAULT_EFFORT[category]
+
 // ---------- machine-readable confidence markers (校对表条目置信标记) ----------
 // A 校对表 entry line was previously *prose only*: “已核实” / ⚠ told a human, but a machine couldn't tell an
 // already-confirmed spelling from one still awaiting review, so an erroneous entry could only be undone by
@@ -1694,7 +1728,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   const overrideNote = (A.singleShotOverrideNote && A.singleShotOverrideNote[f.label]) || ''
   const maxTokens = singleShotMaxTokens(chars)
   const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote)
-  const model = M.refine, effort = A.effort && A.effort.refine
+  const model = M.refine, effort = effortFor(A, 'refine')   // M12-defaults: user override wins, else cap at 'high'
   // M11b batch-submit seam: when A.captureSingleShot is set, hand the built payload to it INSTEAD of sending —
   // the batch script reuses the whole scout→verify→glossary→single-shot-prompt pipeline to assemble batch
   // requests, then submits them itself. The rep is marked captured:true so the audit gate skips it (no 成稿 on
@@ -1720,20 +1754,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     if (!r || !r.degrade) return r
     engine.log(`单请求精校不可用（运行时无 fs / complete 能力）：${f.label} 回退代理式精校`)
   }
-  const eff = A.effort || {}   // M12: per-category reasoning effort (smart tier). Passed straight to agent opts;
-                               // the API engine emits output_config.effort only for allowed models, the CC Workflow agent forwards opts.effort.
+  // M12: per-category reasoning effort (smart tier). effortFor = user override ?? per-phase default cap. Passed
+  // straight to agent opts; the API engine emits output_config.effort only for allowed models, the CC Workflow
+  // agent forwards opts.effort.
+  const refineEffort = effortFor(A, 'refine')
   const chunks = splitForRefine(f, A.chunkMode)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
   }
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })))
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
   const good = partReps.filter(Boolean)
   if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
   const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
@@ -2019,7 +2055,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: (A.effort || {}).refine, schema: REFINE_REPORT_SCHEMA })
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -2099,10 +2135,10 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
   if (skipDedup) engine.log(`疑似同指缓存：跳过语义同指排查，往次校对表覆盖 ${dedupStats.covered}/${dedupStats.total} 个非钦定实体，新/未知 ${dedupStats.unknown} 个（${Math.round(dedupStats.unknownRatio * 100)}%，阈值 ≤10%）`)
   const [vparts, dedupRes] = await engine.parallel([
     () => vc.chunks.length
-      ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, schema: VERIFY_SCHEMA })))
+      ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, effort: effortFor(A, 'verify'), schema: VERIFY_SCHEMA })))
       : Promise.resolve([]),
     () => dedupList && !skipDedup
-      ? engine.agent(dedupPrompt(dedupList, A), { label: 'dedup:semantic', phase: 'Verify', model: M.dedup, schema: DEDUP_SCHEMA })
+      ? engine.agent(dedupPrompt(dedupList, A), { label: 'dedup:semantic', phase: 'Verify', model: M.dedup, effort: effortFor(A, 'dedup'), schema: DEDUP_SCHEMA })
       : Promise.resolve(null),
   ])
   const goodParts = (vparts || []).filter(Boolean)
@@ -2208,7 +2244,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
   logic = lreps.map((lrep, k) => toEntry(lrep, refinedPairs[k].f, refinedPairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -2218,7 +2254,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = refinedPairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
@@ -2240,10 +2276,10 @@ if (refined.length && (scope.includes('summary') || scope.includes('timeline')))
 }
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: (A.effort || {}).summary })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: (A.effort || {}).timeline })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
     : Promise.resolve(null)),
 ])
 

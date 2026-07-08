@@ -127,6 +127,40 @@ export const TYPESET = `中文排版三规范（务必遵守）：
 // string literals so that timelinePrompt can branch into the “no glossary” fallback path.
 export const SINGLE_FILE_GLOSSARY = '（单文件一遍过，未建独立校对表；校对决定见成稿与精校报告）'
 
+// ---------- per-phase reasoning-effort DEFAULTS (M12 caps) ----------
+// The M12 --effort knob only sets effort when the user passes it; otherwise a sub-agent INHERITS the session's
+// reasoning effort. A maximum-effort session therefore made EVERY phase (mechanical ones included) burn maximal
+// thinking — one real run took 117 min where the same work at normal effort took 15-25 min. These per-phase
+// defaults CAP that: they are applied whenever the user has NOT overridden a phase (see effortFor below), so a
+// run can never inherit an extreme session effort.
+//
+// This is a CAP on the CEILING, not a cut: it must never lower any judgment phase below its proven-good baseline
+// (the API edition's implicit 'high'), only stop a maxed session from inflating a phase past 'high'.
+//   · ALL judgment phases (verify / dedup / refine / logic / summary / timeline) are capped at 'high' — strong
+//     reasoning, but never the 'xhigh'/'max' that caused the 2-hour run. verify (web entity-checking, exactly
+//     what catches mis-heard names) and dedup (semantic same-referent judgment) are NOT mechanical: their
+//     slow-run cost was a network stall, not thinking time, so dropping them below 'high' would be an unproven
+//     quality risk. refine is likewise NOT lowered below 'high' — the document-level proof that 'medium' keeps
+//     faithfulness isn't in yet, so 'medium' stays a user opt-in (--effort refine=medium, protocol in
+//     eval/effort-experiment.md).
+//   · Only the genuinely mechanical haiku phases (scout / stitch) go 'low' — and those are effort no-ops anyway.
+// A user --effort <cat>=<level> override (A.effort[category]) always WINS over these defaults.
+//
+// Effort only affects the opus/sonnet/fable tiers — the haiku-tier entries here (scout / stitch) are harmless
+// no-ops via the api.js EFFORT_ALLOWED guard, kept in the map for completeness so a future model-tier change
+// stays covered. NOTE: the pipeline does NOT pass effort at the haiku (scout/stitch) call sites today — only the
+// opus/sonnet sites read this map (see effortFor use in pipeline.js) — because the CC-edition bootstrap forwards
+// opts.effort RAW (no per-model guard), and haiku 400-errors on effort. These two entries are documentation +
+// future-proofing; if scout/stitch ever move to a smart tier, wire their call sites AND add a haiku guard to
+// build/bootstrap-cc.js at the same time.
+export const DEFAULT_EFFORT = {
+  scout: 'low', verify: 'high', dedup: 'high', refine: 'high',
+  stitch: 'low', logic: 'high', summary: 'high', timeline: 'high',
+}
+// Resolve the effective effort for a phase: the user's per-category override wins, else the built-in cap.
+// `??` (not `||`) so only null/undefined fall through to the default — a deliberately-set value is honoured as-is.
+export const effortFor = (A, category) => (A && A.effort && A.effort[category]) ?? DEFAULT_EFFORT[category]
+
 // ---------- machine-readable confidence markers (校对表条目置信标记) ----------
 // A 校对表 entry line was previously *prose only*: “已核实” / ⚠ told a human, but a machine couldn't tell an
 // already-confirmed spelling from one still awaiting review, so an erroneous entry could only be undone by

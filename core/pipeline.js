@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
@@ -40,7 +40,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   const overrideNote = (A.singleShotOverrideNote && A.singleShotOverrideNote[f.label]) || ''
   const maxTokens = singleShotMaxTokens(chars)
   const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote)
-  const model = M.refine, effort = A.effort && A.effort.refine
+  const model = M.refine, effort = effortFor(A, 'refine')   // M12-defaults: user override wins, else cap at 'high'
   // M11b batch-submit seam: when A.captureSingleShot is set, hand the built payload to it INSTEAD of sending —
   // the batch script reuses the whole scout→verify→glossary→single-shot-prompt pipeline to assemble batch
   // requests, then submits them itself. The rep is marked captured:true so the audit gate skips it (no 成稿 on
@@ -66,20 +66,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     if (!r || !r.degrade) return r
     engine.log(`单请求精校不可用（运行时无 fs / complete 能力）：${f.label} 回退代理式精校`)
   }
-  const eff = A.effort || {}   // M12: per-category reasoning effort (smart tier). Passed straight to agent opts;
-                               // the API engine emits output_config.effort only for allowed models, the CC Workflow agent forwards opts.effort.
+  // M12: per-category reasoning effort (smart tier). effortFor = user override ?? per-phase default cap. Passed
+  // straight to agent opts; the API engine emits output_config.effort only for allowed models, the CC Workflow
+  // agent forwards opts.effort.
+  const refineEffort = effortFor(A, 'refine')
   const chunks = splitForRefine(f, A.chunkMode)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
   }
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })))
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
   const good = partReps.filter(Boolean)
   if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
   const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
@@ -365,7 +367,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: (A.effort || {}).refine, schema: REFINE_REPORT_SCHEMA })
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -445,10 +447,10 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
   if (skipDedup) engine.log(`疑似同指缓存：跳过语义同指排查，往次校对表覆盖 ${dedupStats.covered}/${dedupStats.total} 个非钦定实体，新/未知 ${dedupStats.unknown} 个（${Math.round(dedupStats.unknownRatio * 100)}%，阈值 ≤10%）`)
   const [vparts, dedupRes] = await engine.parallel([
     () => vc.chunks.length
-      ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, schema: VERIFY_SCHEMA })))
+      ? engine.parallel(vc.chunks.map((ct, i) => () => engine.agent(verifyPrompt(ct, A), { label: `verify:${i + 1}/${vc.chunks.length}`, phase: 'Verify', model: M.verify, effort: effortFor(A, 'verify'), schema: VERIFY_SCHEMA })))
       : Promise.resolve([]),
     () => dedupList && !skipDedup
-      ? engine.agent(dedupPrompt(dedupList, A), { label: 'dedup:semantic', phase: 'Verify', model: M.dedup, schema: DEDUP_SCHEMA })
+      ? engine.agent(dedupPrompt(dedupList, A), { label: 'dedup:semantic', phase: 'Verify', model: M.dedup, effort: effortFor(A, 'dedup'), schema: DEDUP_SCHEMA })
       : Promise.resolve(null),
   ])
   const goodParts = (vparts || []).filter(Boolean)
@@ -554,7 +556,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
   logic = lreps.map((lrep, k) => toEntry(lrep, refinedPairs[k].f, refinedPairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -564,7 +566,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = refinedPairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
@@ -586,10 +588,10 @@ if (refined.length && (scope.includes('summary') || scope.includes('timeline')))
 }
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: (A.effort || {}).summary })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: (A.effort || {}).timeline })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
     : Promise.resolve(null)),
 ])
 

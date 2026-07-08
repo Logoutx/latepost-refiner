@@ -11,7 +11,7 @@ import { outputConfigFor, makeApiEngine } from '../engines/api.js'
 import { singleShotPrompt } from '../core/prompts.js'
 import {
   SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, SINGLE_SHOT_TOK_CEILING, SINGLE_SHOT_TOK_MIN,
-  contentLength,
+  contentLength, DEFAULT_EFFORT, effortFor,
 } from '../core/spec.js'
 import { runPipeline } from '../core/pipeline.js'
 import { BatchClient, resolveBaseURL, parseJSONL, resultToOutput, DEFAULT_BASE_URL } from '../engines/batch.js'
@@ -181,6 +181,94 @@ test('CC bootstrap bundle forwards opts.effort into the Workflow agent()', () =>
   assert.ok(/agent\(prompt,\s*opts\.effort\s*\?/.test(boot), 'bootstrap forwards effort onto the agent() call')
   const bundle = fs.readFileSync(path.join(root, 'claude-code-skill/workflow.js'), 'utf8')
   assert.ok(/opts\.effort/.test(bundle), 'the built bundle contains the effort passthrough (build:cc ran)')
+})
+
+// ======================================================================================
+// M12-defaults — per-phase reasoning-effort CAPS (a run never inherits an extreme session effort)
+// ======================================================================================
+
+test('effortFor resolves user override ?? per-phase default; DEFAULT_EFFORT haiku entries are guarded no-ops', () => {
+  // pure resolution: no override → the built-in cap
+  assert.equal(effortFor({}, 'refine'), 'high', 'no override → default cap (high)')
+  assert.equal(effortFor(undefined, 'verify'), 'high', 'null args → default cap (high)')
+  assert.equal(effortFor({ effort: {} }, 'dedup'), 'high', 'empty effort map → default cap (high)')
+  // a user override wins for its phase and does NOT disturb sibling phases
+  assert.equal(effortFor({ effort: { refine: 'medium' } }, 'refine'), 'medium', 'override wins')
+  assert.equal(effortFor({ effort: { refine: 'medium' } }, 'verify'), 'high', 'sibling phase keeps its default')
+  // the committed cap table
+  assert.deepEqual(DEFAULT_EFFORT, {
+    scout: 'low', verify: 'high', dedup: 'high', refine: 'high',
+    stitch: 'low', logic: 'high', summary: 'high', timeline: 'high',
+  }, 'all judgment phases capped at high; only mechanical haiku phases (scout/stitch) go low')
+  // the haiku-tier default entries are harmless: api.js strips effort for haiku (it 400-errors on it)…
+  assert.equal(outputConfigFor('claude-haiku-4-5', DEFAULT_EFFORT.scout), undefined, 'scout default is a no-op on haiku')
+  assert.equal(outputConfigFor('claude-haiku-4-5', DEFAULT_EFFORT.stitch), undefined, 'stitch default is a no-op on haiku')
+  // …while a judgment-phase default lands on a smart tier (proving it is a valid effort value, just tier-gated)
+  assert.deepEqual(outputConfigFor('claude-sonnet-4-6', DEFAULT_EFFORT.verify), { effort: 'high' })
+})
+
+// Records every agent() call's label/model/effort, and returns stage-appropriate stubs so a single offline run
+// exercises scout→verify→dedup→refine→logic→summary→timeline. runAudit/annotateAnchors capabilities are injected
+// so the audit gate uses them (no audit sub-agents fire). All names/data are FICTIONAL.
+function effortWireEngine(rec) {
+  return {
+    agent: async (_p, o = {}) => {
+      rec.push({ label: o.label || '', model: o.model, effort: o.effort })
+      const L = o.label || ''
+      if (/^scout/.test(L)) return {
+        speakers: [{ label: '记者', role: '记者' }, { label: '受访者', role: '受访者' }],
+        people: [{ canonical: '林川', variants: [], hint: '示例公司创始人', public_figure: true }],
+        brands: [{ canonical: '示例科技', variants: ['例科技'], hint: '自家公司', category: '自家' }],
+        terms: [{ canonical: '冷链仓配', variants: [], hint: '业务术语' }],
+        errors: [], themes: ['业务'], has_existing_headings: false,
+        ending_anchor: { line: 40, text: '这是结尾。' }, special_notes: [],
+      }
+      if (/^verify/.test(L)) return { resolved: [], unresolved: [] }
+      if (/^dedup/.test(L)) return { suspects: [] }
+      if (/^refine/.test(L)) return { path: 'x', headings: ['开场'], key_fixes: [], open_questions: [] }
+      if (/^logic/.test(L)) return { path: 'x', mainline: '主线', threads: [{ title: 'T', logic: '时间', source_sections: ['开场'] }], open_questions: [] }
+      return 'stub-doc'   // summary / timeline return document text
+    },
+    parallel: (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null))),
+    pipeline: async (items, ...stages) => Promise.all((items || []).map(async (item, i) => { let v = item; for (const s of stages) { try { v = await s(v, item, i) } catch { return null } if (!v) return null } return v })),
+    phase: () => {}, log: () => {},
+  }
+}
+
+const auditCaps = () => ({ runAudit: async () => ({ status: 'ok', failed: [], gaps: [] }), annotateAnchors: async () => ({ updated: [] }) })
+const effByPrefix = (rec, re) => rec.filter((c) => re.test(c.label))
+
+test('with NO user effort, every phase agent receives its DEFAULT_EFFORT cap end-to-end', async () => {
+  const rec = []
+  await runPipeline(A({
+    scope: ['refine', 'logic', 'summary', 'timeline'], verifyDepth: 'key', capabilities: auditCaps(),
+    files: [F(), F({ path: '/s/B.txt', label: 'B', outPath: '/o/Transcripts/B.md' })],
+  }), effortWireEngine(rec))
+  // writing phases pinned at 'high'
+  assert.ok(effByPrefix(rec, /^refine/).length >= 2 && effByPrefix(rec, /^refine/).every((c) => c.effort === 'high'), 'all refine agents → high')
+  assert.ok(effByPrefix(rec, /^logic/).length >= 2 && effByPrefix(rec, /^logic/).every((c) => c.effort === 'high'), 'all logic agents → high')
+  assert.equal(effByPrefix(rec, /^summary/)[0].effort, 'high', 'summary → high')
+  assert.equal(effByPrefix(rec, /^timeline/)[0].effort, 'high', 'timeline → high')
+  // verify / dedup are judgment phases → capped at 'high' (ceiling cap, never dropped below baseline)
+  assert.ok(effByPrefix(rec, /^verify/).length >= 1 && effByPrefix(rec, /^verify/).every((c) => c.effort === 'high'), 'all verify agents → high')
+  assert.equal(effByPrefix(rec, /^dedup/)[0].effort, 'high', 'dedup → high')
+  // the haiku scout call sites are intentionally NOT wired (effort stays undefined) — the map entry is doc-only
+  assert.ok(effByPrefix(rec, /^scout/).length >= 1 && effByPrefix(rec, /^scout/).every((c) => c.effort === undefined), 'scout (haiku) receives no effort by design')
+})
+
+test('a user --effort override wins for its phase; the other phases keep their default caps', async () => {
+  const rec = []
+  await runPipeline(A({
+    scope: ['refine', 'logic', 'summary', 'timeline'], verifyDepth: 'key', capabilities: auditCaps(),
+    effort: { refine: 'medium' },   // user opts refine down to 'medium'
+    files: [F(), F({ path: '/s/B.txt', label: 'B', outPath: '/o/Transcripts/B.md' })],
+  }), effortWireEngine(rec))
+  assert.ok(effByPrefix(rec, /^refine/).every((c) => c.effort === 'medium'), 'refine honours the user override (medium)')
+  assert.ok(effByPrefix(rec, /^logic/).every((c) => c.effort === 'high'), 'logic keeps its default cap (high)')
+  assert.equal(effByPrefix(rec, /^summary/)[0].effort, 'high', 'summary keeps default (high)')
+  assert.equal(effByPrefix(rec, /^timeline/)[0].effort, 'high', 'timeline keeps default (high)')
+  assert.ok(effByPrefix(rec, /^verify/).every((c) => c.effort === 'high'), 'verify keeps default (high)')
+  assert.equal(effByPrefix(rec, /^dedup/)[0].effort, 'high', 'dedup keeps default (high)')
 })
 
 // ======================================================================================
