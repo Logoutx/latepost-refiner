@@ -240,7 +240,7 @@ test('API exposes protected model catalog without leaking keys', async () => {
     assert.equal(ok.status, 200)
     const body = JSON.parse(ok.body)
     assert.equal(sawAuth, 'Bearer deepseek-key')
-    assert.equal(body.defaults.stage.refine, 'deepseek-v4-flash')
+    assert.equal(body.defaults.stage.refine, 'deepseek-v4-pro') // registry default since 2026-07-07: writing stages ride v4-pro
     assert.equal(ok.body.includes('deepseek-key'), false)
   } finally {
     await close(server)

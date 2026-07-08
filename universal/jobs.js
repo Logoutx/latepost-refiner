@@ -16,6 +16,7 @@ import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
 import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
 import { writeRunArtifacts } from './artifacts.js'
+import { buildRunLogEntry, appendRunLog } from './runlog.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -401,7 +402,21 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       warnings,
       usage: result.usage,
     })
-    return { ...result, ...artifacts }
+
+    // Per-run log (time/tokens/estimated cost) — additive, never fatal, opt-out via params.runLog===false
+    // (CLI: --no-run-log). `models` is the provider's tier→model-id default map (needed for DeepSeek's
+    // flash/pro cost split); anthropic prices flat so it needs no map; router/injected engines simply
+    // price as "unknown" (estimateCost → null for any provider it doesn't recognise).
+    let runLog = null
+    if (params.runLog !== false) {
+      const runLogModels = (PROVIDERS[sel.provider] && PROVIDERS[sel.provider].models) || null
+      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels })
+      const logRes = appendRunLog(entry, { logPath: params.runLogPath })
+      if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }
+      else notice(`警告：运行日志写入失败：${logRes.error}`)
+    }
+
+    return { ...result, ...artifacts, runLog }
   } finally {
     if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
   }

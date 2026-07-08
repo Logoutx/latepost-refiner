@@ -44,6 +44,8 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
   --no-anchors           不往成稿各小节插源锚点注释（默认会插：<!-- 源 L25-L38 · 08:00-12:05 -->，
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
+  --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
+                         时间/token 用量/估算成本）
   --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
                          （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
 
@@ -60,7 +62,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
@@ -142,6 +144,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors
+    runLog: a.noRunLog ? false : undefined,     // default on: appends one line to ~/.config/latepost-refiner/runs.jsonl
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     provider: a.provider,
@@ -226,6 +229,8 @@ export function printRunSummary(r) {
 
   const u = r.usage || { agents: 0, input: 0, output: 0, cacheRead: 0, failed: 0 }
   console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${(u.cacheRead || 0).toLocaleString()}`)
+
+  if (r.runLog && r.runLog.path) console.error(`运行日志：已追加 ${r.runLog.path}（第 ${r.runLog.lineCount} 行）`)
 }
 
 async function main() {
