@@ -241,6 +241,41 @@ ${RULES}
 完成后按 schema 返回 path、headings、key_fixes、open_questions。`
 }
 
+// M11a single-shot refine: same editorial contract as singlePassPrompt, but the FULL source text is inlined
+// into the prompt and the model returns the refined document AS ITS RESPONSE TEXT (no Read, no Write, no tools).
+// `sourceText` is the whole file content (the caller size-gates it against SINGLE_SHOT_MAX_CHARS before calling).
+// `glossaryBlock` is optional — the multi-file / batch path passes the rendered 校对表 so 写法 stay unified; a bare
+// single-shot run passes '' and the model builds its own mini-glossary as in singlePassPrompt. The response is
+// written to f.outPath verbatim by JS, so it MUST be pure document text: first line the H1, no preamble/epilogue,
+// no code fence, no report — the deterministic source-aware audit then gates it exactly as any other 成稿.
+export function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote) {
+  const glossary = (glossaryBlock && glossaryBlock.trim())
+    ? `【统一校对表】（“联网核实结论”与“写法统一”优先级最高；标 ⚠ 的条目未采纳、勿套用；术语/品牌请初次落笔即写对）：\n${glossaryBlock}\n`
+    : '边读边在心里建一张迷你校对表（发言人对应、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。'
+  return `你是访谈转录「精校」子代理（单请求一次成稿）。
+
+采访背景：${a.background}
+
+${glossary}
+下面 <源转录> 标签之间是需要精校的**完整**转录原文（${f.path}）。按规范精校全文。
+${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
+${f.notes ? `【额外提醒】${f.notes}` : ''}
+${headingNote(a.headingPolicy)}
+若源文件其实已带（记者/速记的）小标题、而上方又没有【小标题处理】交代——按默认规范精校（正文末尾可留一行 \`<!-- 注：源文件原带小标题，已按默认规范重排 -->\` 提醒委托方）。
+${overrideNote ? `\n${overrideNote}\n` : ''}
+${RULES}
+
+【输出格式（务必严格）】直接输出精校后的**成稿正文本身**，不要任何前言、说明、代码围栏或结尾总结：
+- 第一行必须是 \`# ${f.title}\`
+- 第二行必须是 \`${f.subtitle}\`
+- 随后是带 \`##\` 小标题的精校正文，必须覆盖到源文件结尾（收尾客套可折成一句括号说明；正文绝不能中途断掉）。
+- 你回复的全部文本会被原样写入成稿文件，所以**除了成稿内容之外不要输出任何其它字符**。
+
+<源转录>
+${sourceText}
+</源转录>`
+}
+
 export function summaryPrompt(a, refined) {
   const list = refined.map((r) => '- ' + (r.outPath || r.path)).join('\n')
   return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${a.topic}访谈总结》：

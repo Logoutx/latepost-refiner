@@ -1,5 +1,5 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
-import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
 // 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
@@ -7,19 +7,79 @@ import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, ver
 // REFINE_REPORT-shaped object (path = f.outPath) or null if it
 // could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
 // source-aware audit) rather than silently dropped.
+// M11a single-shot refine for ONE file: read the source text, size-gate it, send ONE non-tool request whose
+// response IS the refined document, write it via a capability. Requires fs-side capabilities (readFile +
+// writeFile) AND an engine.complete (the non-tool primitive) — the CC sandbox has neither, so this returns
+// { degrade:true } and refineFile falls back to the agentic path (logged once). A file over SINGLE_SHOT_MAX_CHARS
+// is REFUSED with a clear error routed into open_questions (never silently truncated). The full source-aware
+// audit runs downstream unchanged — the safety net for single-shot's silent-compression failure mode.
+async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
+  const cap = (A && A.capabilities) || {}
+  const capturing = typeof A.captureSingleShot === 'function'
+  // readFile is needed either way (to inline the source). The SEND path additionally needs engine.complete +
+  // writeFile; the CAPTURE path (batch submit) needs neither — it hands the built payload to captureSingleShot.
+  // Missing what THIS path needs → degrade to agentic (CC sandbox has no fs/complete). Ordered so a submit-time
+  // mock engine without complete() still captures.
+  if (typeof cap.readFile !== 'function') return { degrade: true }
+  if (!capturing && (typeof engine.complete !== 'function' || typeof cap.writeFile !== 'function')) return { degrade: true }
+  let sourceText
+  try { sourceText = await cap.readFile(f.path) } catch (e) {
+    engine.log(`单请求精校：${f.label} 读源失败（${(e && e.message) || e}）——回退代理式`)
+    return { degrade: true }
+  }
+  const chars = contentLength(sourceText)
+  if (chars > SINGLE_SHOT_MAX_CHARS) {
+    engine.log(`单请求精校：${f.label} 约 ${chars} 字，超过单请求上限 ${SINGLE_SHOT_MAX_CHARS} 字——拒绝，请对该份改用 agentic 模式（--refine-mode agentic）`)
+    return {
+      path: f.outPath, headings: [], key_fixes: [],
+      open_questions: [`「${f.label}」约 ${chars} 字，超过 single-shot 上限 ${SINGLE_SHOT_MAX_CHARS} 字（响应封顶会截断长文）——本份未精校，请改用 agentic 模式（--refine-mode agentic）重跑`],
+      refused: true,
+    }
+  }
+  const glossaryBlock = (glossary && glossary !== SINGLE_FILE_GLOSSARY) ? glossary : ''
+  const overrideNote = (A.singleShotOverrideNote && A.singleShotOverrideNote[f.label]) || ''
+  const maxTokens = singleShotMaxTokens(chars)
+  const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote)
+  const model = M.refine, effort = A.effort && A.effort.refine
+  // M11b batch-submit seam: when A.captureSingleShot is set, hand the built payload to it INSTEAD of sending —
+  // the batch script reuses the whole scout→verify→glossary→single-shot-prompt pipeline to assemble batch
+  // requests, then submits them itself. The rep is marked captured:true so the audit gate skips it (no 成稿 on
+  // disk yet — the refined files are written on `resume`).
+  if (typeof A.captureSingleShot === 'function') {
+    A.captureSingleShot(f, { prompt, maxTokens, model, effort })
+    return { path: f.outPath, headings: [], key_fixes: [], open_questions: [], singleShot: true, captured: true }
+  }
+  const text = await engine.complete(prompt, { label: `refine:${f.label}`, model, effort, maxTokens })
+  if (text == null || !String(text).trim()) { engine.log(`单请求精校：${f.label} 返回空——记为失败`); return null }
+  try { await cap.writeFile(f.outPath, String(text)) } catch (e) {
+    engine.log(`单请求精校：${f.label} 写成稿失败（${(e && e.message) || e}）`)
+    return null
+  }
+  return { path: f.outPath, headings: [], key_fixes: [], open_questions: [], singleShot: true }
+}
+
 async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
+  // M11a: single-shot mode builds ONE request per file (source inlined, response = 成稿). Falls back to agentic
+  // when the runtime can't support it (no fs / no complete primitive — e.g. the CC sandbox).
+  if (A.refineMode === 'single-shot') {
+    const r = await refineFileSingleShot(engine, f, glossary, finding, A, M)
+    if (!r || !r.degrade) return r
+    engine.log(`单请求精校不可用（运行时无 fs / complete 能力）：${f.label} 回退代理式精校`)
+  }
+  const eff = A.effort || {}   // M12: per-category reasoning effort (smart tier). Passed straight to agent opts;
+                               // the API engine emits output_config.effort only for allowed models, the CC Workflow agent forwards opts.effort.
   const chunks = splitForRefine(f, A.chunkMode)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })
   }
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })))
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: eff.refine, schema: REFINE_REPORT_SCHEMA })))
   const good = partReps.filter(Boolean)
   if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
   const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
@@ -144,10 +204,10 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     }
     const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
-    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'stitch' })
+    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
     let parsed = parseAuditJson(raw)
     if (!parsed) { // one retry
-      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'stitch' })
+      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'haiku' })
       parsed = parseAuditJson(raw)
     }
     return normalizeAuditResult(parsed, f)
@@ -194,7 +254,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     else {
       await engine.agent(
         `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --annotate\n只回复一句话确认即可。`,
-        { label: `annotate:${f.label}`, phase: 'Audit', model: 'stitch' })
+        { label: `annotate:${f.label}`, phase: 'Audit', model: 'haiku' })
     }
   }
 
@@ -207,7 +267,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   } else {
     await engine.agent(
       `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)} --anchors\n只回复一句话确认即可。`,
-      { label: `anchors:${f.label}`, phase: 'Audit', model: 'stitch' })
+      { label: `anchors:${f.label}`, phase: 'Audit', model: 'haiku' })
   }
 
   return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }
@@ -269,9 +329,14 @@ let unchecked = []      // Refined files lacking a direct audit capability, or w
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
-if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
+if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot) {
   // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
-  // Length judged by 正文字数, not lines.
+  // (M11b: a batch-submit capture pass forces the else-branch so even a tiny lone file is captured as a
+  // single-shot batch request via refineFileSingleShot, not sent through the one-pass Write-tool agent.)
+  // Length judged by 正文字数, not lines. NOTE (M11a): refineMode:'single-shot' does NOT change this branch —
+  // one-pass is already the cheapest possible refine (one agent, no scout/verify), so a tiny single file always
+  // takes it. Single-shot's one-request-per-file contract governs the standard refineFile path (multi-file /
+  // larger single files); see refineFileSingleShot.
   const f = A.files[0]
   engine.phase('Refine')
   engine.log(`▶ 精校 Refine：单份短文件（约 ${refineSize(f)} 字）一遍过，不建独立校对表`)
@@ -300,7 +365,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, schema: REFINE_REPORT_SCHEMA })
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: (A.effort || {}).refine, schema: REFINE_REPORT_SCHEMA })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -440,16 +505,19 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS) {
 // one re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
 // Anchors run on the (possibly repaired) 成稿. With fs the host injects capabilities.runAudit/annotateAnchors/
 // repair; without (CC sandbox) a subagent runs audit_refined.mjs. Skipped for a scope with no refine output.
-if (scope.includes('refine') && refinedPairs.length) {
+// M11b: on a batch-submit capture pass (A.captureSingleShot), no 成稿 is on disk yet (files are written on
+// resume), so every captured rep is excluded from the audit gate here — resume runs the full audit after fetch.
+const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
+if (scope.includes('refine') && pairsToAudit.length) {
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${refinedPairs.length} 份逐份源比对（content_gap / 引号 hard → 自动修复一次 → 复检；仍 hard 记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（content_gap / 引号 hard → 自动修复一次 → 复检；仍 hard 记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
   // through unchanged.
-  const results = await engine.parallel(refinedPairs.map(({ f, onePassGlossaryText }) => () => runAuditStep(A, engine, f, capabilities, onePassGlossaryText || glossary)))
+  const results = await engine.parallel(pairsToAudit.map(({ f, onePassGlossaryText }) => () => runAuditStep(A, engine, f, capabilities, onePassGlossaryText || glossary)))
   const hasDirectAudit = !!(capabilities && typeof capabilities.runAudit === 'function')
-  refinedPairs.forEach(({ f }, k) => {
+  pairsToAudit.forEach(({ f }, k) => {
     const a = results[k] || { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit: hasDirectAudit }
     const endingMissing = (a.failedFindings || []).includes('ending_missing') || (a.softFindings || []).includes('ending_missing')
     const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
@@ -486,7 +554,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })))
   logic = lreps.map((lrep, k) => toEntry(lrep, refinedPairs[k].f, refinedPairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -496,7 +564,7 @@ if (scope.includes('logic') && refinedPairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = refinedPairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, schema: LOGIC_REPORT_SCHEMA })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: (A.effort || {}).logic, schema: LOGIC_REPORT_SCHEMA })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
@@ -518,16 +586,17 @@ if (refined.length && (scope.includes('summary') || scope.includes('timeline')))
 }
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: (A.effort || {}).summary })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: (A.effort || {}).timeline })
     : Promise.resolve(null)),
 ])
 
 
 return {
   glossary,
+  refineMode: A.refineMode === 'single-shot' ? 'single-shot' : 'agentic',  // M11a: run-level refine mode (per-file singleShot/refused markers ride on each refined[i])
   refined,
   failed,
   incomplete,

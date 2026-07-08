@@ -427,6 +427,34 @@ export function refineSize(f) {
   return Math.round(((f && f.lines) || 0) * 14)
 }
 export const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+
+// ---------- single-shot refine (M11a) ----------
+// Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
+// IS the refined document (no Read/Write/Edit tool loop, no structured_output). It's the byte-for-byte editorial
+// contract of a normal refine, just delivered in one turn — cheaper/faster for archival bulk, and the natural
+// unit for the Anthropic Batch API (one request = one file). Its known historical failure is silent compression
+// (one agent squeezing a whole file into one output budget → it summarizes — the claude.ai-style failure), so
+// the deterministic source-aware audit gates run UNCHANGED afterward as the safety net.
+// SIZE GATE: refuse files over SINGLE_SHOT_MAX_CHARS. A refined transcript is ≈ the source 字数 (near-lossless,
+// light compression), and Chinese output runs ≈ 1.6-2.0 tokens/字, so the response for a 45K-字 file needs
+// ~72-90K output tokens — right at the opus/fable 96K ceiling (maxTokensFor). Bigger files can't fit their
+// output under the cap → truncation-prone → route them to agentic mode (multi-write, no per-response cap).
+export const SINGLE_SHOT_MAX_CHARS = 45000
+// max_tokens formula: ceil(sourceChars × TOK_PER_CHAR) + FLOOR_SLACK, clamped to [MIN, opus/fable ceiling].
+// TOK_PER_CHAR = 2.2 covers ~2.0 tok/字 of near-lossless refined output plus adaptive-thinking headroom (thinking
+// counts toward max_tokens); FLOOR_SLACK guarantees room for 抬头/小标题 on a tiny file; the 96000 cap is the
+// opus/fable output ceiling (maxTokensFor), and is exactly why the size gate sits at 45000 (45000×2.2+2048 ≈
+// 101K clamps to 96K — a file that big would have its tail silently cut). Pure + exported so tests pin the curve.
+export const SINGLE_SHOT_TOK_PER_CHAR = 2.2
+export const SINGLE_SHOT_TOK_FLOOR = 2048
+export const SINGLE_SHOT_TOK_MIN = 8000
+export const SINGLE_SHOT_TOK_CEILING = 96000
+export function singleShotMaxTokens(sourceChars) {
+  const n = Math.max(0, Math.round(Number(sourceChars) || 0))
+  const want = Math.ceil(n * SINGLE_SHOT_TOK_PER_CHAR) + SINGLE_SHOT_TOK_FLOOR
+  return Math.min(SINGLE_SHOT_TOK_CEILING, Math.max(SINGLE_SHOT_TOK_MIN, want))
+}
+
 export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
 export const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
@@ -1250,7 +1278,9 @@ export function safeName(s, max = 80, maxBytes = 255) {
   if (max > 0 && cps.length > max) cps = cps.slice(0, max)
   if (maxBytes > 0) {
     // Drop trailing code points until the UTF-8 encoding fits the byte budget.
-    while (cps.length && Buffer.byteLength(cps.join(''), 'utf8') > maxBytes) cps.pop()
+    // Pure-JS byte counting: the Workflow sandbox has no Node Buffer global.
+    const utf8Len = (s) => { let n = 0; for (const ch of s) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4 } return n }
+    while (cps.length && utf8Len(cps.join('')) > maxBytes) cps.pop()
   }
   out = cps.join('').replace(/[.\s]+$/g, '')     // truncation may re-expose a trailing dot/space
   return out || 'untitled'

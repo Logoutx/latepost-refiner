@@ -51,6 +51,20 @@ function maxTokensFor(modelId) {
 // Adaptive thinking helps the high-judgment tiers; Haiku 4.5 is left without a thinking config.
 const thinkingFor = (modelId) => (/opus|sonnet|fable/.test(modelId) ? { type: 'adaptive' } : undefined)
 
+// M12 reasoning-effort knob. The SDK carries effort in `output_config.effort`
+// (MessageCreateParams.output_config.effort — SDK 0.104.2 resources/messages/messages.d.ts:825-830,
+// values 'low'|'medium'|'high'|'xhigh'|'max'), a field SEPARATE from `thinking`, so effort and adaptive
+// thinking COMPOSE — we can set both on a request. GUARD (mirrors thinkingFor's allowlist exactly): only the
+// adaptive-thinking tiers (opus/sonnet/fable) may carry effort; Haiku 4.5 is the ONLY excluded tier because
+// output_config.effort 400-errors on it (see maxTokensFor's note). An out-of-allowlist model, an absent effort,
+// or an unrecognised value → no output_config emitted (today's default 'high' behaviour, byte-for-byte).
+const EFFORT_ALLOWED = /opus|sonnet|fable/
+const EFFORT_VALUES = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+export function outputConfigFor(modelId, effort) {
+  if (!effort || !EFFORT_VALUES.has(effort) || !EFFORT_ALLOWED.test(modelId)) return undefined
+  return { effort }
+}
+
 // Server-side web tools (GA, dynamic filtering, no beta header). Only verify/timeline
 // agents receive these tools; offline stages should not be able to browse.
 const WEB_TOOLS = [
@@ -188,9 +202,10 @@ export function makeApiEngine(opts = {}) {
       .join('\n')
       .trim()
 
-  async function runAgent(prompt, { model, schema, label } = {}) {
+  async function runAgent(prompt, { model, schema, label, effort, maxTokens } = {}) {
     const modelId = resolveModelFor(model)
     const thinking = thinkingFor(modelId)
+    const outputConfig = outputConfigFor(modelId, effort)
     const tools = [...CLIENT_TOOLS]
     if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) {
@@ -205,8 +220,9 @@ export function makeApiEngine(opts = {}) {
       : prompt
 
     const messages = [{ role: 'user', content: sys }]
-    const base = { model: modelId, max_tokens: maxTokensFor(modelId), tools }
+    const base = { model: modelId, max_tokens: maxTokens || maxTokensFor(modelId), tools }
     if (thinking) base.thinking = thinking
+    if (outputConfig) base.output_config = outputConfig
 
     let nudges = 0
     for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -241,6 +257,7 @@ export function makeApiEngine(opts = {}) {
       const forced = await create({
         ...base,
         thinking: undefined, // forced tool_choice is incompatible with adaptive thinking
+        output_config: undefined, // and effort rides with adaptive thinking — drop it for the forced call too
         tool_choice: { type: 'tool', name: 'structured_output' },
         messages,
       })
@@ -249,6 +266,39 @@ export function makeApiEngine(opts = {}) {
     }
     log(`⚠ ${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）未提交`)
     return null
+  }
+
+  // M11a single-shot refine: ONE non-tool request whose response text IS the deliverable (no Read/Write/Edit
+  // tool loop, no structured_output). Used by the single-shot refine mode — the prompt inlines the full source
+  // and the model returns the refined document directly; JS writes it to disk. maxTokens is computed by the
+  // caller from source size (singleShotMaxTokens), effort/thinking apply exactly as in runAgent (they compose).
+  // Returns the response text, or null on refusal/empty. Shares the same streaming create() (cache breakpoints,
+  // usage tally) as every other request.
+  async function completeOnce(prompt, { model, effort, maxTokens, label } = {}) {
+    const modelId = resolveModelFor(model)
+    const thinking = thinkingFor(modelId)
+    const outputConfig = outputConfigFor(modelId, effort)
+    const params = { model: modelId, max_tokens: maxTokens || maxTokensFor(modelId), messages: [{ role: 'user', content: prompt }] }
+    if (thinking) params.thinking = thinking
+    if (outputConfig) params.output_config = outputConfig
+    const msg = await create(params)
+    if (msg.stop_reason === 'refusal') { log(`⚠ ${label || 'single-shot'} 被安全策略拒绝（refusal）`); return null }
+    const text = textOf(msg)
+    return text || null
+  }
+
+  // Wrapped in the concurrency limiter like agent(), so a batch of single-shot files respects the global cap.
+  function complete(prompt, completeOpts = {}) {
+    return limit(async () => {
+      usage.agents++
+      try {
+        return await completeOnce(prompt, completeOpts)
+      } catch (e) {
+        usage.failed++
+        log(`⚠ ${completeOpts.label || 'single-shot'} 失败：${e.message}`)
+        return null
+      }
+    })
   }
 
   // The concurrency limiter wraps each agent (the leaf unit of work). Nested parallel
@@ -292,5 +342,5 @@ export function makeApiEngine(opts = {}) {
     )
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }) }
+  return { agent, complete, parallel, pipeline, phase, log, usage: () => ({ ...usage }) }
 }

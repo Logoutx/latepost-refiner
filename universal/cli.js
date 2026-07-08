@@ -32,6 +32,11 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --heading-policy <策略> none | keep | regenerate（默认 none）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
   --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
+  --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
+                         把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
+                         审计门禁照跑，兜住单请求的静默压缩风险）
+  --effort <映射>        如 refine=medium,summary=low（推理力度，仅 refine/logic/summary/timeline 生效、仅 opus/
+                         sonnet/fable 支持；档位 low|medium|high|xhigh|max；不设=默认 high）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
@@ -39,6 +44,8 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
   --no-anchors           不往成稿各小节插源锚点注释（默认会插：<!-- 源 L25-L38 · 08:00-12:05 -->，
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
+  --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
+                         时间/token 用量/估算成本）
   --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
                          （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
 
@@ -66,7 +73,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
@@ -75,6 +82,7 @@ export function parseArgs(argv) {
     '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
     // M10 cheap-first escalation: --escalate names the premium provider for files that fail the audit gate.
     '--escalate': 'escalate', '--escalate-models': 'escalateModels', '--escalate-base-url': 'escalateBaseURL',
+    '--refine-mode': 'refineMode', '--effort': 'effort',
   }
   let i = 0
   while (i < argv.length) {
@@ -100,6 +108,21 @@ export const parseModels = (s) => {
   const m = {}
   for (const pair of s.split(',')) { const [k, v] = pair.split('='); if (k && v) m[k.trim()] = v.trim() }
   return m
+}
+// M12: `--effort refine=medium,summary=low`. Only the smart-tier categories (refine/logic/summary/timeline)
+// take effort; unknown keys and unknown levels are dropped (the API engine also guards by model, so a stray
+// value is harmless). Levels mirror the SDK's OutputConfig.effort enum.
+const EFFORT_CATS = new Set(['refine', 'logic', 'summary', 'timeline'])
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+export const parseEffort = (s) => {
+  if (!s) return undefined
+  const m = {}
+  for (const pair of s.split(',')) {
+    const [k, v] = pair.split('=')
+    const key = k && k.trim(), val = v && v.trim()
+    if (EFFORT_CATS.has(key) && EFFORT_LEVELS.has(val)) m[key] = val
+  }
+  return Object.keys(m).length ? m : undefined
 }
 
 export function buildRunParams(a, { env = process.env } = {}) {
@@ -128,9 +151,13 @@ export function buildRunParams(a, { env = process.env } = {}) {
     headingPolicy: a.headingPolicy || 'none',
     models: parseModels(a.models),
     chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,
+    refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
+    effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
+
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors
+    runLog: a.noRunLog ? false : undefined,     // default on: appends one line to ~/.config/latepost-refiner/runs.jsonl
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     provider: a.provider,
@@ -225,6 +252,8 @@ export function printRunSummary(r) {
   const u = r.usage || { agents: 0, input: 0, output: 0, cacheRead: 0, failed: 0 }
   console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${(u.cacheRead || 0).toLocaleString()}`)
   if (u.escalation) { const e = u.escalation; console.error(`  其中升级重跑：${e.agents || 0} 个代理调用 · 输入 ${(e.input || 0).toLocaleString()} / 输出 ${(e.output || 0).toLocaleString()} tok`) }
+
+  if (r.runLog && r.runLog.path) console.error(`运行日志：已追加 ${r.runLog.path}（第 ${r.runLog.lineCount} 行）`)
 }
 
 async function main() {
