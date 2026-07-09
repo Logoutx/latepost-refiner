@@ -350,6 +350,35 @@ function scoutLooksGarbled(f) {
   return names.some((n) => longestHanziRun(n) >= 16)
 }
 
+// ---------- glossary note (hint) accumulation policy ----------
+// A row's note field (the text after ｜) is human-review signal: when the same entity recurs across chunks or
+// across cumulative batches, a fresh conflicting note MUST NOT silently overwrite the prior one or be dropped.
+// The note is also embedded in refine prompts and is re-parsed + re-merged on every cumulative run, so an
+// unbounded append would grow without limit and bloat prompts. Policy: union of DISTINCT clauses (separator
+// '；', which stays inside a single ｜-field and never re-splits a row); clauses carrying ⚠ (review flags, and
+// the truncation mark itself) are always kept; plain notes are capped at MAX_HINT_NOTES and any overflow is
+// flagged with an explicit truncation marker rather than dropped silently. First-N (not last-N) is kept on
+// purpose: the leading clause carries the verified-identity tag (applyVerifiedEntry prepends it) and is what the
+// condensed refine glossary surfaces via trimHint, so the head is the most valuable note. mergeHints is
+// idempotent — mergeHints(x, x) === x, and once a row is truncated the marker stays put on every later merge.
+const HINT_SEP = '；'
+const MAX_HINT_NOTES = 3
+const HINT_TRUNC_MARK = '⚠ 说明较多、已保留前若干条，其余从略——请查阅往次校对表并人工整理'
+const HEADERLESS_MARK = '⚠ 原校对表此行缺少分类标题、已按术语暂存——请人工归类'
+const hintClauses = (h) => (h == null ? [] : String(h).split(HINT_SEP).map((s) => s.trim()).filter(Boolean))
+function mergeHints(a, b) {
+  const seen = new Set(); const notes = []; const warns = []; let truncated = false
+  for (const p of [...hintClauses(a), ...hintClauses(b)]) {
+    if (p === HINT_TRUNC_MARK) { truncated = true; continue }   // recomputed below — never store two markers
+    if (seen.has(p)) continue
+    seen.add(p)
+    if (p.includes('⚠')) warns.push(p); else notes.push(p)
+  }
+  let kept = notes
+  if (notes.length > MAX_HINT_NOTES) { kept = notes.slice(0, MAX_HINT_NOTES); truncated = true }
+  return [...kept, ...warns, ...(truncated ? [HINT_TRUNC_MARK] : [])].join(HINT_SEP)
+}
+
 function clusterEntities(entries) {
   const clusters = []
   for (const e of entries) {
@@ -374,12 +403,15 @@ function clusterEntities(entries) {
     const canonical = Object.keys(counts).sort((x, y) => counts[y] - counts[x] || y.length - x.length)[0]
       || Array.from(c.names)[0] || ''
     const variants = Array.from(c.names).filter((n) => n !== canonical)
-    const hints = Array.from(new Set(c.entries.map((e) => e.hint).filter(Boolean))).slice(0, 2)
+    // Fold every entry's note through the bounded-union policy. Was a silent `.slice(0, 2)`, which truncated a
+    // 3rd+ distinct note without a trace; mergeHints dedups, always keeps ⚠ flags, caps plain notes, and marks
+    // overflow explicitly so a many-note conflict surfaces for human review instead of vanishing.
+    const hint = c.entries.map((e) => e.hint).filter(Boolean).reduce((acc, h) => mergeHints(acc, h), '')
     const files = Array.from(new Set(c.entries.map((e) => e.file)))
     return {
       canonical,
       variants,
-      hint: hints.join('；'),
+      hint,
       files,
       public_figure: c.entries.some((e) => e.public_figure),
       suspect_asr: c.entries.some((e) => e.suspect_asr),   // any scout flagged it a likely ASR mishear → force verify
@@ -906,6 +938,9 @@ function parseResolvedLine(body, out) {
   if (rm) { out.push({ query: rm[1], canonical: rm[2], identity: rm[3] || '', source: rm[4], rejected }); return true }
   return false
 }
+// Section titles parseGlossary / renderGlossary know how to emit or read. Any OTHER `##` block (and the
+// preamble) is treated as foreign: its entity-looking rows are rescued into 术语 rather than dropped (see below).
+const KNOWN_SECTION = [/^采访背景/, /^发言人统一标注/, /^发言人登记/, /^人名（写法/, /^品牌.*（写法/, /^术语.*（写法/, /^需特别处理的转写错误/, /^各份特别提醒/, /^本轮重新入队复核/, /^联网核实结论/, /^补核结论/, /^写法统一/, /^疑似同指/, /^确认不同指/]
 function parseGlossary(md) {
   const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [] }
   if (!md || !md.trim()) return g
@@ -916,7 +951,8 @@ function parseGlossary(md) {
   let cur = { title: '__preamble__', body: [] }
   for (const l of lines) { const m = l.match(/^##\s+(.*)$/); if (m) { sections.push(cur); cur = { title: m[1], body: [] } } else cur.body.push(l) }
   sections.push(cur)
-  const get = (re) => sections.find((s) => re.test(s.title))
+  const all = (re) => sections.filter((s) => re.test(s.title))
+  const get = (re) => all(re)[0]
   const bg = get(/^采访背景/); if (bg) g.background = bg.body.join('\n').trim()
   const spk = get(/^发言人统一标注/)
   if (spk) {
@@ -928,10 +964,20 @@ function parseGlossary(md) {
       if (ms && grp) grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' })
     }
   }
-  const parseEntities = (sec) => { const out = []; if (!sec) return out; for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else g.extra.push(l) } return out }
-  g.people = parseEntities(get(/^人名（写法/))
-  g.brands = parseEntities(get(/^品牌.*（写法/))
-  g.terms = parseEntities(get(/^术语.*（写法/))
+  // Parse entity rows from EVERY matching section, not just the first. A concatenated or hand-merged 校对表 can
+  // repeat the same `## 术语…` header; `sections.find` silently dropped every later block (reproduced data-loss).
+  const parseEntities = (secs) => { const out = []; for (const sec of secs || []) for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else g.extra.push(l) } return out }
+  g.people = parseEntities(all(/^人名（写法/))
+  g.brands = parseEntities(all(/^品牌.*（写法/))
+  g.terms = parseEntities(all(/^术语.*（写法/))
+  // Rescue entity-looking rows stranded OUTSIDE any recognized entity section — the preamble, or a chunk whose
+  // category header was lost/mangled. Silently ignoring them is the reproduced loss; instead fold them into 术语
+  // (the neutral catch-all) with an explicit marker so the human can re-file. Well-formed renderGlossary output
+  // has no such rows (all its sections are recognized), so this is a no-op on a clean render→parse round-trip.
+  for (const s of sections) {
+    if (s.title !== '__preamble__' && KNOWN_SECTION.some((re) => re.test(s.title))) continue
+    for (const l of s.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) g.terms.push({ ...e, hint: mergeHints(e.hint, HEADERLESS_MARK) }) }
+  }
   const errs = get(/^需特别处理的转写错误/)
   if (errs) for (const l of errs.body) { const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/); if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] }) }
   const nt = get(/^各份特别提醒/)
@@ -976,7 +1022,7 @@ function mergeEntityLists(priorList, freshList) {
       names.delete(home.canonical)
       home.variants = Array.from(names)
       home.crossFile = true
-      if (!home.hint && fe.hint) home.hint = fe.hint
+      if (fe.hint) home.hint = mergeHints(home.hint, fe.hint)   // was: keep prior, drop the fresh note (silent loss)
       home.public_figure = home.public_figure || fe.public_figure
       if (!home.category && fe.category) home.category = fe.category
     } else out.push(Object.assign({}, fe, { variants: [...(fe.variants || [])] }))
