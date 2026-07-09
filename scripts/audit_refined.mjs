@@ -2308,6 +2308,22 @@ export const NUMERIC_CONSISTENCY = {
 // Near a number these mark it as an estimate/bound, not an exact stated fact → the atom is skipped.
 const NUMERIC_APPROX_NEAR = /约|左右|上下|接近|将近|大约|大概|差不多|可能|估计|也许|或许|至少|最多|起码|将近|好几|几十|上百|上千/
 
+// Trailing copula / connector particles peeled off a measured-noun key so equivalent copula wording keys to the
+// SAME quantity (毛利率为 / 毛利率是 / 增长率达到 → 毛利率 / 增长率). Conservative list; a char is peeled ONLY when it
+// is the last char of the run AND the remainder stays ≥ 2 chars (never strip to empty or a single ambiguous char).
+const KEYNOUN_COPULA_TAIL = new Set(['为', '是', '约', '达', '到', '在', '有', '共', '计', '至', '近', '超', '逾'])
+// Shared measured-noun extraction — used by BOTH checkNumericConsistency (P6, within-doc conflicts) and the P1
+// derivative_context_review, so both group a quantity by the same key. Given the text immediately BEFORE a number,
+// return the noun key: the trailing 汉字 run (Pangu space trimmed), capped at KEYNOUN_MAX, with trailing copulas
+// peeled. Returns '' when there is no 汉字 run or the result is shorter than KEYNOUN_MIN.
+function measuredNounKey(before) {
+  const m = String(before || '').replace(/\s+$/, '').match(/[一-龥]+$/)
+  if (!m) return ''
+  let noun = m[0].slice(-NUMERIC_CONSISTENCY.KEYNOUN_MAX)
+  while (noun.length >= 3 && KEYNOUN_COPULA_TAIL.has(noun[noun.length - 1])) noun = noun.slice(0, -1)
+  return noun.length >= NUMERIC_CONSISTENCY.KEYNOUN_MIN ? noun : ''
+}
+
 // checkNumericConsistency(text): the SAME (measured-noun, unit) carrying DISJOINT exact values ≥2 times in ONE
 // document. Returns { conflicts } where each = { keyNoun, unit, values:[{ value, line, snippet }…] }.
 export function checkNumericConsistency(text) {
@@ -2323,12 +2339,10 @@ export function checkNumericConsistency(text) {
       if (a.polarity) continue                                   // any qualifier → a bound/estimate, not an exact fact
       const before = line.slice(Math.max(0, a.idx - NUMERIC_CONSISTENCY.WINDOW), a.idx)
       if (NUMERIC_APPROX_NEAR.test(before)) continue             // hedge/estimate right before → skip
-      // measured-noun = trailing 汉字 run before the number; strip a Pangu space (中文与数字间的半角空格) first so
-      // 毛利率 30% still yields the noun 毛利率.
-      const m = before.replace(/\s+$/, '').match(/[一-龥]+$/)
-      if (!m) continue
-      const keyNoun = m[0].slice(-NUMERIC_CONSISTENCY.KEYNOUN_MAX)
-      if (keyNoun.length < NUMERIC_CONSISTENCY.KEYNOUN_MIN) continue
+      // measured-noun key (trailing 汉字 run before the number, Pangu space trimmed, trailing copulas peeled so
+      // 毛利率为 / 毛利率是 group together) — the shared helper the derivative_context_review check also uses.
+      const keyNoun = measuredNounKey(before)
+      if (!keyNoun) continue
       const key = `${keyNoun} ${a.unit}`
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key).push({ value: a.value, line: li + 1, snippet: raw.trim().slice(0, NUMERIC_CONSISTENCY.SNIPPET) })
@@ -2445,17 +2459,46 @@ function derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) {
   return false
 }
 
+// derivative_context_review (warning tier): an interview magnitude that PASSES the hard gate by matching the corpus
+// value+unit can still be a fabrication BUILT AROUND an unrelated corpus number of the same magnitude (corpus 融资 2
+// 亿 → derivative 亏损 2 亿【访谈】). This corroborates the LOCAL context: does the derivative line's own measured-
+// noun (or a ≥2-char tail of it) appear within ±DERIV_CONTEXT_CHARS of ANY corpus occurrence of that exact value+
+// unit? Returns { ok, snippet } — ok:false with the nearest corpus window when the noun is nowhere near the figure.
+// Never hard-fails; a too-short/absent derivative noun is handled by the caller (it simply does not run the check).
+const DERIV_CONTEXT_CHARS = 40
+function derivContextCorroboration(derivNoun, corpusStr, occIdxs) {
+  let nearest = ''
+  for (const idx of occIdxs || []) {
+    const win = corpusStr.slice(Math.max(0, idx - DERIV_CONTEXT_CHARS), idx + DERIV_CONTEXT_CHARS)
+    if (!nearest) nearest = win
+    // look for the derivative noun, then progressively shorter tails down to 2 chars (the specific measured concept
+    // — 亏损 / 融资 — sits at the tail, closest to the number; a generic subject prefix like 公司去年 is dropped).
+    for (let len = derivNoun.length; len >= 2; len -= 1) {
+      if (win.includes(derivNoun.slice(derivNoun.length - len))) return { ok: true, snippet: '' }
+    }
+  }
+  return { ok: false, snippet: nearest.replace(/\s+/g, ' ').trim().slice(0, 60) }
+}
+
 // checkDerivativeAttribution(corpusText, derivativeText):
 //   corpusText = source transcript(s) + refined 成稿 concatenated (the interview's ground-truth figures).
 //   derivativeText = the rendered 时间线 or 访谈总结.
 // Returns { assessed, hardFail[], reporterVerify[], review[] }. Pure and order-stable.
 export function checkDerivativeAttribution(corpusText, derivativeText) {
-  const empty = { assessed: false, hardFail: [], reporterVerify: [], review: [] }
+  const empty = { assessed: false, hardFail: [], reporterVerify: [], review: [], contextReview: [] }
   const deriv = String(derivativeText || '')
   if (!deriv.trim()) return empty
-  const corpusAtoms = extractDerivativeAtoms(String(corpusText || ''))
+  const corpusStr = String(corpusText || '')
+  const corpusAtoms = extractDerivativeAtoms(corpusStr)
   const corpusKeys = new Set(corpusAtoms.map((a) => `${a.value}|${a.unit}`))
   const corpusValues = new Set(corpusAtoms.map((a) => a.value))
+  // exact value+unit → the corpus offsets where that figure occurs (feeds the derivative_context_review windows).
+  const corpusOccByKey = new Map()
+  for (const a of corpusAtoms) {
+    const k = `${a.value}|${a.unit}`
+    if (!corpusOccByKey.has(k)) corpusOccByKey.set(k, [])
+    corpusOccByKey.get(k).push(a.idx)
+  }
   const corpusByUnit = new Map()
   const corpusMoneyAbs = []
   for (const a of corpusAtoms) {
@@ -2473,6 +2516,7 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
   const hardFail = []
   const reporterVerify = []
   const review = []
+  const contextReview = []
   const lines = deriv.split(/\r?\n/)
   for (let li = 0; li < lines.length; li += 1) {
     const rawLine = lines[li]
@@ -2497,6 +2541,17 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
           if (!derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs)) {
             if (canHardFail) hardFail.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
             else review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注量纲数字，但无可比对语料（复核）' })
+          } else if (corpusKeys.has(`${a.value}|${a.unit}`)) {
+            // Hard gate satisfied by an EXACT value+unit corpus match (range / scale overlaps are skipped — no single
+            // occurrence to window around). Corroborate the LOCAL context: is the derivative's measured-noun echoed
+            // near the figure in the corpus? If not, raise a SOFT 复核 item — the figure may be lifted off an
+            // unrelated corpus number of the same magnitude. Never a hard fail.
+            const derivNoun = measuredNounKey(line.slice(0, a.idx))
+            if (derivNoun) {
+              const corr = derivContextCorroboration(derivNoun, corpusStr, corpusOccByKey.get(`${a.value}|${a.unit}`))
+              if (!corr.ok) contextReview.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet,
+                note: `标【访谈】、该数值在语料中出现过，但邻近语境“${derivNoun}”与语料对不上（语料邻近：${corr.snippet || '—'}）——请核对是否套用了无关数字` })
+            }
           }
         } else if (!corpusValues.has(a.value)) {
           review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注但源文无对应，且非量纲数字（复核）' })
@@ -2509,7 +2564,7 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
       }
     }
   }
-  return { assessed: true, hardFail, reporterVerify, review }
+  return { assessed: true, hardFail, reporterVerify, review, contextReview }
 }
 
 // auditDerivative: wrap checkDerivativeAttribution into a file-result shaped like the rest of the audit
@@ -2525,10 +2580,12 @@ export function auditDerivative({ corpusText, derivativeText, kind = 'derivative
       samples: r.reporterVerify.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，公开来源·待记者核实）`, line: x.line })) },
     { name: 'derivative_review', severity: 'soft', count: r.review.length,
       samples: r.review.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，${x.note}）`, line: x.line })) },
+    { name: 'derivative_context_review', severity: 'soft', count: r.contextReview.length,
+      samples: r.contextReview.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，${x.note}）`, line: x.line })) },
     { name: 'numeric_inconsistency', severity: 'soft', count: numericConflicts.length,
       samples: numericConflicts.slice(0, 12).map((c) => ({ text: `“${c.keyNoun}”在本件出现互相矛盾的数值：${c.values.map((v) => `第 ${v.line} 行作“${atomLabel({ value: v.value, unit: c.unit })}”`).join('，')}——请对照核对`, line: c.values[0] ? c.values[0].line : 1 })) },
   ]
-  return { file: derivativeFile, kind, mode: 'derivative', status: r.hardFail.length ? 'fail' : 'ok', assessed: r.assessed, failed: r.hardFail.length ? ['derivative_attribution'] : [], findings, hardFail: r.hardFail, reporterVerify: r.reporterVerify, review: r.review, numericConflicts }
+  return { file: derivativeFile, kind, mode: 'derivative', status: r.hardFail.length ? 'fail' : 'ok', assessed: r.assessed, failed: r.hardFail.length ? ['derivative_attribution'] : [], findings, hardFail: r.hardFail, reporterVerify: r.reporterVerify, review: r.review, contextReview: r.contextReview, numericConflicts }
 }
 
 // auditDerivativeFile: read the derivative + its interview corpus (source transcripts and/or refined 成稿) from

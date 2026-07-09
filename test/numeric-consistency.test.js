@@ -29,6 +29,17 @@ test('P6 core: the same 毛利率 stated as 30% and 45% in one doc is ONE confli
   assert.ok(conflicts[0].values.every((v) => v.line > 0 && v.snippet), 'each occurrence carries a line ref + snippet')
 })
 
+test('P6 copula wording keys the SAME noun: 毛利率为 30% / 毛利率是 45% → ONE conflict (为/是 stripped)', () => {
+  // Finding 3: the measured-noun key strips a trailing copula (为/是/达/到…) so equivalent wording groups together
+  // instead of splitting into 毛利率为 vs 毛利率是 and missing the contradiction.
+  const doc = ['沈其安：毛利率为 30%。', '', '沈其安：毛利率是 45%。'].join('\n')
+  const { conflicts } = checkNumericConsistency(doc)
+  assert.equal(conflicts.length, 1, '为/是 copulas peeled → one 毛利率 group, one conflict')
+  assert.equal(conflicts[0].keyNoun, '毛利率', 'the key is the bare noun, copula removed')
+  assert.equal(conflicts[0].unit, '%')
+  assert.deepEqual(conflicts[0].values.map((v) => v.value).sort(), ['30', '45'])
+})
+
 test('P6 the same value repeated is NOT a conflict (30% and 30% agree)', () => {
   const doc = ['沈其安：毛利率 30% 很稳定。', '', '沈其安：确实，毛利率 30% 我们保持了好几年。'].join('\n')
   assert.equal(checkNumericConsistency(doc).conflicts.length, 0)

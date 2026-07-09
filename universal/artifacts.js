@@ -198,6 +198,7 @@ export function derivativeReporterItems(result = {}) {
     const base = path.basename(f.file || '')
     for (const x of f.reporterVerify || []) out.push(`${base} 第 ${x.line} 行：${x.text}（公开来源·待记者核实）`)
     for (const x of f.review || []) out.push(`${base} 第 ${x.line} 行：${x.text}（${x.note || '复核'}）`)
+    for (const x of f.contextReview || []) out.push(`${base} 第 ${x.line} 行：${x.text}（${x.note || '语境复核'}）`)
   }
   return out
 }
@@ -458,7 +459,7 @@ export function buildRunManifest(result = {}, context = {}) {
       status: result.derivativeAudit.status,
       files: (result.derivativeAudit.files || []).map((f) => ({
         file: f.file, kind: f.kind, status: f.status,
-        hardFail: f.hardFail || [], reporterVerify: f.reporterVerify || [], review: f.review || [],
+        hardFail: f.hardFail || [], reporterVerify: f.reporterVerify || [], review: f.review || [], contextReview: f.contextReview || [],
       })),
     } : null,
     audit: result.audit ? {

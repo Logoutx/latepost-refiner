@@ -815,6 +815,43 @@ test('derivative guard: a legitimate money-scale conversion (8000 万 ⇄ 0.8 �
   assert.equal(bad.hardFail[0].value, '5')
 })
 
+// ---------- P1 (Finding 1): derivative_context_review — a passed magnitude with no local corroboration ----------
+
+test('derivative_context_review: a 访谈 magnitude that matches a corpus value+unit but under a DIFFERENT noun → SOFT 复核, no hard fail', () => {
+  // The fabrication class the corpus-wide value+unit check missed: 2 亿 is present in the corpus (as 融资 2 亿), so
+  // the hard gate passes, but the derivative built 亏损 2 亿 — a figure the interviewee never stated for a loss.
+  const corpus = '周砚 00:00\n公司完成融资 2 亿，账上现金够用。'
+  const deriv = '## 时间线\n- 公司去年亏损 2 亿【访谈】。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok', 'the hard gate stays satisfied — 2 亿 exists in the corpus')
+  assert.equal(r.hardFail.length, 0, 'value+unit present → never a hard fail')
+  assert.equal(r.contextReview.length, 1, 'the context mismatch is surfaced as one 复核 item')
+  assert.equal(r.contextReview[0].value, '2')
+  assert.equal(r.contextReview[0].unit, '亿')
+  assert.equal((r.findings.find((f) => f.name === 'derivative_context_review') || {}).count, 1, 'as a soft finding')
+  assert.equal(r.findings.find((f) => f.name === 'derivative_context_review').severity, 'soft')
+  assert.match(r.findings.find((f) => f.name === 'derivative_context_review').samples[0].text, /亏损/, 'the sample cites the mismatched noun')
+})
+
+test('derivative_context_review: a corroborated figure (derivative and corpus share the noun near the value) → NO warning', () => {
+  const corpus = '周砚 00:00\n公司完成融资 2 亿，账上现金够用。'
+  const deriv = '## 时间线\n- 公司完成融资 2 亿【访谈】。'   // same noun (融资) beside the same figure
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.equal(r.hardFail.length, 0)
+  assert.equal(r.contextReview.length, 0, 'the shared noun near the value corroborates the figure — no 复核 item')
+})
+
+test('derivative_context_review: the original fabrication class (value ABSENT from the corpus) still HARD-fails', () => {
+  const corpus = '周砚 00:00\n公司完成融资 2 亿，账上现金够用。'
+  const deriv = '## 时间线\n- 公司去年亏损 5 亿【访谈】。'   // 5 亿 appears nowhere in the corpus
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'fail', 'a value absent entirely from the corpus is still a hard fabrication')
+  assert.deepEqual(r.failed, ['derivative_attribution'])
+  assert.equal(r.hardFail.length, 1)
+  assert.equal(r.contextReview.length, 0, 'a hard fail is not also double-counted as a context review')
+})
+
 test('checkDerivativeAttribution: an empty derivative is not assessed (no findings)', () => {
   const r = checkDerivativeAttribution('沈其安：融资 2 亿元。', '')
   assert.equal(r.assessed, false)
