@@ -70,13 +70,26 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // straight to agent opts; the API engine emits output_config.effort only for allowed models, the CC Workflow
   // agent forwards opts.effort.
   const refineEffort = effortFor(A, 'refine')
-  const chunks = splitForRefine(f, A.chunkMode)
+  // Provider-aware auto-chunk: if the engine that will run refine declares a faithful-length budget for the model
+  // actually assigned to refine (respects --models AND the category-router's smart engine), split any file over
+  // it — a weaker-but-cheaper model silently compresses long transcripts. Anthropic / the CC sandbox expose no
+  // refineBudget → rb null → budget undefined → splitForRefine behaves byte-identically to before. See
+  // engines/providers.js for the per-model budgets and the retention evidence behind them.
+  const rb = (typeof engine.refineBudget === 'function') ? engine.refineBudget(M.refine) : null
+  const budget = rb ? rb.budget : undefined
+  const chunks = splitForRefine(f, A.chunkMode, budget)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
       { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
   }
-  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接`)
+  // autoChunk trace: record ONLY when the model budget (not merely opt-in speed mode) drove the split. `off`
+  // suppresses chunking upstream, so it can never reach here; when both speed and budget fired, `parts` is the
+  // final (larger) count. Rides on the returned report → surfaced in run.json + review.md via artifacts.js.
+  const autoChunk = (rb && refineSize(f) > rb.budget)
+    ? { label: f.label, model: rb.model, budget: rb.budget, contentLength: refineSize(f), parts: chunks.length }
+    : null
+  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${autoChunk ? `（自动：约 ${autoChunk.contentLength} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : ''}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>
@@ -106,6 +119,7 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     key_fixes: good.flatMap((r) => r.key_fixes || []),
     open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
     chunked: chunks.length,
+    ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
   }
 }
 
@@ -625,6 +639,7 @@ return {
   networkUnverified: netUnverified,
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
+  autoChunk: refined.map((r) => r.autoChunk).filter(Boolean),   // provider-budget auto-split records → run.json + review.md
   logic,
   openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(overrideQuestions).concat(reopenNotes),
   summary,

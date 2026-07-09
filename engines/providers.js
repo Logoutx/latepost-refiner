@@ -37,6 +37,19 @@ export const PROVIDERS = {
     // the old all-deepseek-chat default failed hard gates (compression + a real dropped section);
     // the flash/pro split passed everything. deepseek-chat is deprecated 2026-07-24 anyway.
     models: { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' },
+    // Per-model faithful-refine budget, in 正文字数 (content chars). A model that silently compresses a long
+    // transcript into a summary must be auto-split BELOW the length where it starts folding content — the refine
+    // pipeline chunks any file whose 字数 exceeds this, at speaker-turn boundaries (see splitForRefine). Keyed by
+    // model id (NOT tier) so a --models override that pins a raw id still resolves the right budget. Evidence from
+    // real single-agent refine runs (retention = 成稿字数 ÷ 源正文字数; hard floor 0.55, healthy ≈ 0.79–0.83):
+    //   deepseek-v4-pro — 34,769 字 → 0.827 (healthy); 53,576 字 / 4 speakers → 0.552 (scraped the floor, ~2,665
+    //     字 folded away). Faithful zone ends between ~35K and ~54K, so 28000 keeps a 53.6K file at 2 balanced
+    //     chunks ≈ 27K, comfortably inside the proven-good zone.
+    //   deepseek-v4-flash — thinner evidence: at 34,769 字 it kept only 0.714 and silently dropped a section, so a
+    //     bigger safety margin → 18000. TUNABLE: raise it as clean-run data accumulates.
+    // Every OTHER provider/model is intentionally unset → no cap → zero behaviour change (Anthropic Opus proved
+    // faithful at 52.5K, so it needs none). Adjust these two numbers as evidence improves.
+    refineCharBudget: { 'deepseek-v4-pro': 28000, 'deepseek-v4-flash': 18000 },
     note: '非思考模式分档：机械/核实档用 deepseek-v4-flash，精校/成稿档用 deepseek-v4-pro（thinking 模式不支持工具调用；旧默认 deepseek-chat 已弃用，可用 --models 覆盖）',
   },
   glm: {
@@ -93,6 +106,16 @@ export function jurisdictionNote(provider) {
   const cfg = PROVIDERS[provider]
   if (!cfg || cfg.jurisdiction !== 'PRC') return ''
   return `信源保护提示：${cfg.label} 由中国境内公司运营，转录全文将传输至其服务器处理并受当地法规约束（含内容审查——审查即意味着内容被服务端读取）。涉敏感话题或需保护信源的访谈请慎用，或改用其他服务商；改用海外 endpoint 不改变运营方。`
+}
+
+// Faithful-refine budget (正文字数) for a resolved model id under a provider, or undefined when none is declared
+// (every provider/model except the two DeepSeek tiers today). The refine pipeline auto-splits a file whose 字数
+// exceeds this — at speaker-turn boundaries — so a weaker-but-cheaper model never silently compresses a long
+// transcript. Unset ⇒ no cap ⇒ zero behaviour change. Keyed by model id so a --models override still maps.
+export function refineCharBudgetFor(provider, modelId) {
+  const cfg = PROVIDERS[provider]
+  const b = cfg && cfg.refineCharBudget && cfg.refineCharBudget[modelId]
+  return (typeof b === 'number' && b > 0) ? b : undefined
 }
 
 // First env var in keyEnv[] that is set (used by the CLI to find the key).

@@ -494,10 +494,20 @@ export function dedupListText(merged) {
 // deterministic shared rule the agents follow: a speaker turn belongs to whichever chunk's line span
 // contains the turn's opening label line — no overlap, no gap. Parts are written to
 // <outPath>.part{idx} and merged by a cheap stitch agent (the script can't concat files either).
-// Chunking is OFF unless the run explicitly asks for speed (A.chunkMode === 'speed'); the per-chunk opus
-// overhead (each chunk agent re-thinks + re-ingests RULES) is an intrinsic ~1.5× token premium, so the
-// user opts into it per run (SKILL.md Step 0 asks speed-vs-cost). When on, settings are CONSERVATIVE —
-// only large files chunk, and into at most 2 — a balanced ~35% refine speedup for ~1.5× tokens.
+// Refine chunking has TWO independent drivers, unified in splitForRefine:
+//  1. SPEED (opt-in, A.chunkMode === 'speed'): a coarse batch-speed lever for a strong model. The per-chunk
+//     overhead (each chunk agent re-thinks + re-ingests RULES) is an intrinsic ~1.5× token premium, so the user
+//     opts in per run (SKILL.md Step 0 asks speed-vs-cost). CONSERVATIVE — only large files, at most 2 chunks —
+//     a balanced ~35% refine speedup for ~1.5× tokens.
+//  2. BUDGET (automatic, faithfulness): a weaker-but-cheaper model silently compresses a long transcript into a
+//     summary past its faithful length. When the model actually assigned to refine declares a per-model budget
+//     (engines/providers.js refineCharBudget; passed in as `budget`), any file over it is auto-split BELOW that
+//     length so retention stays healthy. No flag; keyed on the resolved model, so Anthropic (no budget) is
+//     unchanged. Chunks are as LARGE as safely possible (target = budget), never fine-diced — an old experiment
+//     showed 4K-字 chunks fragment sub-headings; big chunks avoid that. Count is UNCAPPED (split as many times as
+//     the file needs), because each chunk still stays ≈ budget-sized.
+// When both apply, the chunk count is the LARGER of the two. A.chunkMode === 'off' disables ALL chunking
+// (including auto) — the escape hatch. Unset budget + non-speed mode ⇒ one agent, exactly as before.
 // Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
 // NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
 // ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
@@ -545,7 +555,7 @@ export function singleShotMaxTokens(sourceChars) {
 
 export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
-export const MAX_REFINE_CHUNKS = 2          // conservative cap — speed mode is a coarse batch-speed lever for Opus, not a fine split
+export const MAX_REFINE_CHUNKS = 2          // conservative cap for SPEED mode only — a coarse batch lever, not a fine split (budget mode is uncapped)
 const singleChunk = (f) => {
   const lines = (f && f.lines) || 0
   return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
@@ -568,12 +578,24 @@ function evenLineChunks(f, K) {
   for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
   return chunks
 }
-export function splitForRefine(f, mode) {
+// N-way balanced split at speaker-turn boundaries. `mode` is 'speed' | 'off' | undefined (cost); `budget` is the
+// resolved model's faithful-refine 字数 cap (undefined = none). Returns 1 chunk (singleChunk) unless a driver
+// fires. Both drivers feed the SAME evenLineChunks divider, so whole turns stay intact and sizes are balanced
+// (not greedy-first). K = max(speed count, budget count); 'off' forces one agent regardless of budget.
+export function splitForRefine(f, mode, budget) {
   const lines = (f && f.lines) || 0
   const size = refineSize(f)                 // 字数, not lines
-  if (mode !== 'speed' || size <= REFINE_CHUNK_CHARS || lines <= 1) return singleChunk(f)   // cost mode (default) → one agent
-  const K = Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
-  return evenLineChunks(f, K)
+  if (mode === 'off' || lines <= 1) return singleChunk(f)   // escape hatch, or unsplittable → one agent
+  // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+  const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
+    ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+    : 1
+  // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
+  const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
+    ? Math.max(2, Math.ceil(size / budget))
+    : 1
+  const K = Math.max(speedK, budgetK)
+  return K <= 1 ? singleChunk(f) : evenLineChunks(f, K)   // no driver fired → cost mode (default) → one agent
 }
 
 // Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged

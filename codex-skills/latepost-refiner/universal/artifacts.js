@@ -249,6 +249,13 @@ export function glossarySourceItems(result = {}) {
   return out
 }
 
+// Provider-budget auto-split notice — one plain-language line per file, purely informational (no action needed).
+// 「甲 — 约 53576 字，超过 deepseek-v4-pro 忠实处理长度 28000 字，已按发言轮边界分为 2 段精校」.
+export function autoChunkItems(result = {}) {
+  return (result.autoChunk || []).map((a) =>
+    `${a.label || path.basename(a.model || '')} — 约 ${a.contentLength} 字，超过 ${a.model} 忠实处理长度 ${a.budget} 字，已按发言轮边界分为 ${a.parts} 段精校`)
+}
+
 export function reviewSections(result = {}, warnings = []) {
   const logic = result.logic || []
   const sections = [
@@ -273,6 +280,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '逻辑顺序稿失败', items: logic.filter((l) => !l.path).map((l) => l.label || jsonLine(l)), priority: 'medium' },
     { title: '逻辑顺序稿疑漏小标题', items: logic.filter((l) => l.missingSections && l.missingSections.length).map(formatLogicGap), priority: 'medium' },
     { title: '收尾待问', items: (result.openQuestions || []).map(jsonLine), priority: 'medium' },
+    { title: '已自动分段精校（文件超出该模型忠实处理长度，已按发言轮边界切分——仅告知，无需处理）', items: autoChunkItems(result), priority: 'low' },
     { title: '预检提示', items: warnings, priority: 'low' },
   ]
   if (result.error) sections.unshift({ title: '流水线未执行', items: [result.error], priority: 'high' })
@@ -485,6 +493,9 @@ export function buildRunManifest(result = {}, context = {}) {
     } : null,
     annotations: (result.annotations || []).map((a) => ({ path: a.path, inserted: (a.inserted || []).map((g) => ({ startLine: g.startLine, endLine: g.endLine, chars: g.chars })) })),
     anchors: (result.anchors || []).map((a) => ({ path: a.path, sections: (a.updated || []).length })),
+    // Provider-aware auto-chunking: files auto-split because their 字数 exceeded the refine model's faithful
+    // length. Empty unless a budgeted provider (e.g. DeepSeek) hit the cap. Human-readable lines in review.md.
+    autoChunk: (result.autoChunk || []).map((a) => ({ label: a.label, model: a.model, budget: a.budget, contentLength: a.contentLength, parts: a.parts })),
     usage,
   }
 }

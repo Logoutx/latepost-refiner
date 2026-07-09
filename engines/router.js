@@ -46,6 +46,13 @@ export function makeRouterEngine({ engines, onPhase, onLog }) {
       return v
     }))
   }
+  // Refine auto-chunk budget comes from the engine that will actually run refine — the `smart` sub-engine
+  // (labelToCategory('refine') === 'smart'). Delegating here keeps "the model actually assigned to refine"
+  // correct under mixed per-category routing; a smart engine without the method (e.g. Anthropic) → undefined.
+  function refineBudget(tier) {
+    const e = engines.smart
+    return (e && typeof e.refineBudget === 'function') ? e.refineBudget(tier) : undefined
+  }
   function usage() {
     // sum over UNIQUE sub-engine instances (categories may share one), + per-category map
     const seen = new Set()
@@ -63,5 +70,5 @@ export function makeRouterEngine({ engines, onPhase, onLog }) {
     }
     return { ...total, byCategory }
   }
-  return { agent, parallel, pipeline, phase, log, usage }
+  return { agent, parallel, pipeline, phase, log, usage, refineBudget }
 }

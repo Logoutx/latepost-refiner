@@ -31,7 +31,9 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
   --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
-  --chunk <模式>         speed | cost（默认 cost=每份单代理；speed 把大文件拆块并行，多文件批量提速、更费额度）
+  --chunk <模式>         speed | cost | off（默认 cost=每份单代理，但对声明了「忠实处理长度」的 provider（如
+                         DeepSeek）会在超长时自动按发言轮边界分段精校，防止弱模型把长稿压成摘要；speed 把大文件拆块
+                         并行，多文件批量提速、更费额度；off=彻底关闭一切分块，含上面的自动分段）
   --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
                          把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
                          审计门禁照跑，兜住单请求的静默压缩风险）
@@ -150,7 +152,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     verifyDepth: a.verifyDepth || 'key',
     headingPolicy: a.headingPolicy || 'none',
     models: parseModels(a.models),
-    chunkMode: a.chunkMode === 'speed' ? 'speed' : undefined,
+    chunkMode: a.chunkMode === 'speed' ? 'speed' : (a.chunkMode === 'off' ? 'off' : undefined),   // 'off' disables ALL chunking incl. auto
     refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
     effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
 

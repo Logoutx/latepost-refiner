@@ -93,6 +93,7 @@ export function makeOpenAIEngine(opts = {}) {
   const {
     apiKey, baseURL,
     models = {}, // { haiku, sonnet, opus } → provider model id
+    refineCharBudget = null, // { <model-id>: 正文字数 } faithful-refine cap per model (from the provider registry); null = none
     maxTokensParam = 'max_tokens',
     forceStructured = true,
     nativeSearch = null, // provider native web search: { tool, echo? } — used on online stages
@@ -253,5 +254,16 @@ export function makeOpenAIEngine(opts = {}) {
     )
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }) }
+  // Faithful-refine budget for the model a refine tier resolves to (respects a --models override, since it
+  // routes through resolveModel just like an actual refine call). Returns { model, budget } when this provider
+  // declares a budget for that model id, else undefined — the pipeline reads it to decide auto-chunking, and
+  // undefined means "no cap" (unchanged behaviour). Pure lookup, no network.
+  function refineBudget(tier) {
+    if (!refineCharBudget) return undefined
+    const model = resolveModel(tier)
+    const budget = refineCharBudget[model]
+    return (typeof budget === 'number' && budget > 0) ? { model, budget } : undefined
+  }
+
+  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }), refineBudget }
 }

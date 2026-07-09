@@ -73,6 +73,43 @@ test('size falls back to bytes, then lines, when chars is absent', () => {
   assert.equal(splitForRefine({ lines: 50, label: 'A' }, 'speed').length, 1, 'few lines → single')
 })
 
+// ---------- budget-driven auto-chunk (provider-aware, uncapped) ----------
+
+test('budget auto-chunk: a file over the model budget splits into ceil(字数/budget) balanced turn-boundary chunks', () => {
+  const chunks = splitForRefine({ lines: 2400, chars: 53576, label: 'A' }, undefined, 28000) // 53,576 / 28,000 → 2 (the headline case)
+  assert.equal(chunks.length, 2, '53,576 字 at budget 28,000 → 2 balanced chunks (≈ 27K each, inside the proven-good zone)')
+  assertContiguous(chunks, 2400)
+  const many = splitForRefine({ lines: 3000, chars: 90000, label: 'A' }, undefined, 18000) // 90,000 / 18,000 → 5
+  assert.equal(many.length, 5, 'budget mode is UNCAPPED — 5 chunks, unlike speed mode\'s cap of 2')
+  assertContiguous(many, 3000)
+})
+
+test('budget auto-chunk triggers only when 字数 EXCEEDS the budget (>, not ≥) — the exact boundary', () => {
+  assert.equal(splitForRefine({ lines: 2000, chars: 28000, label: 'A' }, undefined, 28000).length, 1, 'exactly at budget → 1 (no trigger)')
+  assert.equal(splitForRefine({ lines: 2000, chars: 28001, label: 'A' }, undefined, 28000).length, 2, 'one 字 over the budget → 2')
+})
+
+test('no budget (undefined) is zero behaviour change — cost mode stays a single agent regardless of 字数', () => {
+  for (const chars of [4000, 30000, 120000]) {
+    assert.equal(splitForRefine({ lines: 2000, chars, label: 'A' }, undefined, undefined).length, 1, `${chars} 字, no budget → 1`)
+    assert.equal(splitForRefine({ lines: 2000, chars, label: 'A' }, 'cost', undefined).length, 1, `${chars} 字, cost mode, no budget → 1`)
+  }
+})
+
+test('chunk off: disables ALL chunking, including a budget that would otherwise fire', () => {
+  assert.equal(splitForRefine({ lines: 2000, chars: 90000, label: 'A' }, 'off', 18000).length, 1, 'off beats an over-budget file')
+  assert.equal(splitForRefine({ lines: 2000, chars: 90000, label: 'A' }, 'off').length, 1, 'off with no budget → 1')
+  assert.equal(splitForRefine({ lines: 2000, chars: 90000, label: 'A' }, 'off', undefined).length, 1)
+})
+
+test('speed + budget: chunk count is the max of the speed cap and the (uncapped) budget count', () => {
+  const budgetWins = splitForRefine({ lines: 3000, chars: 90000, label: 'A' }, 'speed', 18000) // speedK=2, budgetK=5 → 5
+  assert.equal(budgetWins.length, 5, 'budget-derived 5 > speed cap 2 → 5')
+  assertContiguous(budgetWins, 3000)
+  const speedWins = splitForRefine({ lines: 2000, chars: 20000, label: 'A' }, 'speed', 28000) // speedK=2, budgetK=1 (20K ≤ 28K) → 2
+  assert.equal(speedWins.length, 2, 'speed cap 2 > budget count 1 → 2 (speed still fires when the budget alone would not)')
+})
+
 // ---------- splitForScout / mergeScoutChunks (oversized-file scout resilience) ----------
 
 test('splitForScout: a normal interview stays one scout agent; only oversized merges chunk', () => {
@@ -370,7 +407,7 @@ function mockEngine(labels, opts = {}) {
     if (/^(summary|timeline)/.test(label)) return `/out/${label}.md`
     return null
   }
-  return {
+  const e = {
     agent: async (_p, o) => { labels.push(o.label); return (opts.fail && opts.fail(o.label)) ? null : reply(o.label) },
     parallel: (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null))),
     pipeline: async (items, ...stages) => Promise.all((items || []).map(async (item, i) => {
@@ -380,6 +417,9 @@ function mockEngine(labels, opts = {}) {
     })),
     phase: () => {}, log: () => {},
   }
+  // Only a budgeted engine (DeepSeek etc.) exposes refineBudget; omitting it mirrors Anthropic / the CC sandbox.
+  if (opts.refineBudget) e.refineBudget = opts.refineBudget
+  return e
 }
 
 test('speed mode: pipeline routes a large file through 2 chunk agents + a stitch agent (no separate check phase)', async () => {
@@ -428,6 +468,48 @@ test('cost mode (default): pipeline keeps a single refine agent even for a large
   assert.ok(labels.includes('refine:A') && labels.includes('refine:B'), 'single refine agent per file')
   assert.ok(!labels.some((l) => /#/.test(l)), 'no chunk agents in cost mode')
   assert.ok(!labels.some((l) => /^stitch/.test(l)), 'no stitch agent in cost mode')
+})
+
+// ---------- provider-aware auto-chunk (pipeline wiring, mock engine) ----------
+
+// A stub budget resolver stands in for a real provider engine's refineBudget(tier). 25,000 字 / 10,000 budget → 3
+// chunks — an uncapped N-way split speed mode (max 2) could never produce, so it also proves budget≠speed.
+const stubBudget = (model, budget) => (() => ({ model, budget }))
+
+test('auto-chunk: an over-budget file on a budgeted engine splits into ceil(字数/budget) agents and records autoChunk', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] },
+    mockEngine(labels, { refineBudget: stubBudget('stub-pro', 10000) }), // 25000/10000 → 3
+  )
+  assert.ok(labels.includes('refine:A#1/3') && labels.includes('refine:A#2/3') && labels.includes('refine:A#3/3'), 'three chunk agents from the budget (uncapped)')
+  assert.equal(r.autoChunk.length, 1, 'one autoChunk record for the file')
+  assert.deepEqual(r.autoChunk[0], { label: 'A', model: 'stub-pro', budget: 10000, contentLength: 25000, parts: 3 }, 'the record carries model/budget/字数/parts')
+  assert.equal(r.refined.length, 1, 'the file is still refined (stitched)')
+})
+
+test('no auto-chunk when the engine declares no budget (Anthropic / CC path unchanged)', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] },
+    mockEngine(labels), // no refineBudget method
+  )
+  assert.ok(labels.includes('refine:A'), 'a single refine agent')
+  assert.ok(!labels.some((l) => /refine:A#/.test(l)), 'no chunk agents without a declared budget')
+  assert.deepEqual(r.autoChunk, [], 'nothing recorded')
+})
+
+test('--chunk off suppresses auto-chunk even when the file exceeds the model budget (the escape hatch)', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', chunkMode: 'off', files: [file] },
+    mockEngine(labels, { refineBudget: stubBudget('stub-pro', 10000) }),
+  )
+  assert.ok(labels.includes('refine:A') && !labels.some((l) => /refine:A#/.test(l)), 'off → one agent despite the budget')
+  assert.deepEqual(r.autoChunk, [], 'no autoChunk recorded when chunking is off')
 })
 
 // ---------- resilience: cheap gate agents can't hold the expensive refine hostage ----------

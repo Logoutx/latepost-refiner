@@ -100,6 +100,22 @@ test('writeRunArtifacts writes review.md and run.json', () => {
   assert.equal(JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8')).artifacts.reviewPath, paths.reviewPath)
 })
 
+test('provider-budget auto-chunk is traced in run.json and rendered as a plain-language review.md line', () => {
+  const withAuto = {
+    ...baseResult,
+    autoChunk: [{ label: '甲', model: 'deepseek-v4-pro', budget: 28000, contentLength: 53576, parts: 2 }],
+  }
+  const manifest = buildRunManifest(withAuto, { outputDir: '/tmp/out', topic: 'T' })
+  assert.deepEqual(manifest.autoChunk, [{ label: '甲', model: 'deepseek-v4-pro', budget: 28000, contentLength: 53576, parts: 2 }], 'run.json carries the structured autoChunk record')
+  const md = buildReviewMarkdown(withAuto, { outputDir: '/tmp/out', topic: 'T' })
+  assert.match(md, /已按发言轮边界分为 2 段精校/, 'review.md states the split in plain language')
+  assert.match(md, /超过 deepseek-v4-pro 忠实处理长度 28000 字/, 'review.md names the model and its budget')
+  // Empty by default → no autoChunk key noise and no review section
+  const bare = buildRunManifest(baseResult, { outputDir: '/tmp/out', topic: 'T' })
+  assert.deepEqual(bare.autoChunk, [], 'no auto-chunk → empty array')
+  assert.ok(!reviewSections(baseResult, []).some((s) => s.title.includes('已自动分段精校')), 'no section when nothing auto-chunked')
+})
+
 test('manifest carries content-gap details and annotations; review renders 内容缺口', () => {
   const gap = { startLine: 25, endLine: 38, turns: 5, chars: 434, severity: 'hard', trace: false }
   const withGaps = {
