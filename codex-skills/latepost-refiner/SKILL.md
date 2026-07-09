@@ -7,17 +7,20 @@ description: Refine rough LatePost-style interview transcripts into research-gra
 
 Use this skill to turn rough dialogue transcripts into faithful, citable research documents. The job is refinement, not summarization: keep dialogue form, preserve facts and tone, remove noise, correct transcription errors, and add structure.
 
-## First Choice: Use The Universal Runtime
+## First Choice In Codex: Native Subscription Runtime
 
-When this repo is available locally, prefer the Node Universal runtime over manual execution. It provides the closest Codex equivalent to the Claude Workflow edition: shared prompts, schemas, provider routing, persistent glossary, review queue, run manifest, resume, and local web UI.
+When running inside Codex, prefer the Codex native runtime in [references/native-runtime.md](references/native-runtime.md). It runs on the signed-in ChatGPT/Codex subscription through native subagents and deterministic local Node helpers. It does **not** require `OPENAI_API_KEY` or `TAVILY_API_KEY` on the primary path.
 
-Read [references/universal-runtime.md](references/universal-runtime.md) when:
-- Running the local web app or CLI.
-- Choosing provider/model settings.
-- Resuming a prior run from `run.json`.
-- Explaining output artifacts or verification behavior.
+Read [references/native-runtime.md](references/native-runtime.md) when:
+- Running from Codex or installing this skill for Codex.
+- Using no-key scout, verify, refine, logic, summary, or timeline stages.
+- Explaining the generated prompt manifests, local audit, quality scorecard, `review.md`, or `run.json`.
 
-For Codex-triggered runs, default to OpenAI unless the user asks for another provider or lacks an OpenAI key. Use the OpenAI model profile in `references/universal-runtime.md`: `gpt-5.4-mini` for mechanical scout/check work and `gpt-5.4` for verification, dedup, refinement, logical rewrite, summary, and timeline. Reserve `gpt-5.5` for an explicit premium/deep run.
+Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch work, `gpt-5.4` for verify/dedup/summary, and `gpt-5.5` for quality-critical refine, logic planning, and logic writing. `verifyDepth: deep` should keep web verification on the native browsing path and surface unresolved items rather than asking for a Tavily key.
+
+## Universal Runtime Fallback
+
+Use [references/universal-runtime.md](references/universal-runtime.md) for the local web app or CLI, non-Codex users, provider/API-key routing, or when the user explicitly wants Anthropic/DeepSeek/GLM/Kimi/OpenAI API execution. This fallback is useful, but it is not the primary Codex path.
 
 ## Opening Questions
 
@@ -36,7 +39,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
 
 ## Runtime Workflow
 
-1. Prepare files: convert supported office/PDF inputs to Markdown, count size, detect existing headings, and choose titles/output paths.
+1. Prepare files: convert supported office/PDF inputs and normalize SRT subtitles to Markdown, count size, detect existing headings, and choose titles/output paths.
 2. Seed from an existing `<out>/校对表.md` unless the user asks for a fresh glossary.
 3. Run the Universal runtime through the web UI or CLI.
 4. Inspect generated artifacts:

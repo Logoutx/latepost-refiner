@@ -104,3 +104,11 @@ node "<skill dir>/scripts/audit_refined.mjs" --source "<source.md>" --refined "<
 ```
 
 Fix or surface compression risk, under-refinement, missing endings, leftover pure filler (嗯/呃, 对对对/是是是, 我我/就就), phrase repeats (因为因为/涂鸦涂鸦/重复年份), ASR glue (20182018/SaaSAPP), broken fragment starts, and over-long paragraphs. 啊/哦/欸 and 这个/那个 are soft candidates — inspect context, don't blanket-delete. If the deterministic audit is unavailable, do a weaker no-shell checklist: compare source vs output for suspicious compression, missing tail content, collapsed speaker turns, repeated phrases, and under-cleaned filler; mark unresolved doubt in the handoff.
+
+## Never Skip Silently
+
+Never silently omit any substantive source section. If a section truly cannot be refined — for any reason: technical difficulty, platform policy restriction, illegible source — leave a one-line placeholder in place and continue from the next section:
+
+> ⚠【未精校段：源文件约第 X-Y 行】原因一句话
+
+This is a last resort: a normal refine has ZERO placeholder markers. Chit-chat folded into a one-line stage direction per the noise rules is NOT an unrefined section — no marker. A section being long is never a reason — write it in multiple passes per the long-file rules. A visible marker always beats a silent gap: readers must be able to see that something is missing and find it in the source.

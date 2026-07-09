@@ -9,7 +9,8 @@ import {
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
 } from '../core/spec.js'
-import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt } from '../core/prompts.js'
+import { checkMissingYin, parseGlossaryLite } from '../scripts/audit_refined.mjs'
+import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt, summaryPrompt } from '../core/prompts.js'
 import { concatFiles, makeFilePolicy } from '../engines/fileops.js'
 import { runPipeline } from '../core/pipeline.js'
 
@@ -320,10 +321,42 @@ test('renderGlossary flags an unresolved suspect in the archival table (never sh
   assert.ok(/卫昭.*⚠ 侦察疑为转录误写/.test(g), 'unresolved suspect carries a ⚠ note in the glossary body')
 })
 
+test('renderGlossary trusts user-supplied speakers without forcing （音） everywhere', () => {
+  const merged = {
+    speakersByFile: [{ label: '访谈 A', speakers: [{ label: '方岑', role: '受访者', identity: '星桥航天副总工程师' }] }],
+    people: [{ canonical: '方岑', variants: ['方琛'], suspect_asr: true, hint: '星桥航天副总工程师、受访者', files: ['访谈 A'] }],
+    brands: [],
+    terms: [],
+    errors: [],
+    notes: [],
+  }
+  const g = renderGlossary(merged, { resolved: [], unresolved: [{ query: '方岑', note: '公开网页未找到直接身份页' }] }, null, {
+    topic: 'T',
+    date: '2025-09',
+    background: 'bg',
+    doNotMerge: [],
+    files: [{ speakerHints: '方岑=星桥航天副总工程师、受访者' }],
+  })
+  assert.ok(!/方岑.*⚠ 侦察疑为转录误写/.test(g), 'trusted speaker row is not treated as unsafe ASR')
+  assert.ok(/方岑：公开核实不足；按发言人信息使用/.test(g), 'public lookup gap is still recorded')
+  assert.ok(!/方岑：未能核实，保留（音）/.test(g), 'trusted speaker does not become a missing_yin trigger')
+  const glossary = parseGlossaryLite(g)
+  assert.equal(checkMissingYin('方岑：我来解释天隼三号。', glossary).count, 0)
+})
+
 test('scoutPrompt instructs knowledge-canonical and the suspect_asr flag', () => {
   const p = scoutPrompt({ path: '/s/A.txt', label: 'A', lines: 100 }, { background: 'bg' })
   assert.ok(p.includes('知名实体用你已知的正确写法') && p.includes('苍璧科技'), 'knowledge-canonical instruction present')
   assert.ok(p.includes('suspect_asr=true'), 'suspect-flag instruction present')
+})
+
+test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {
+  const A = { topic: '星桥航天方岑访谈', outputDir: '/out', skillDir: '/skill', date: '2026-07' }
+  const p = summaryPrompt(A, [{ outPath: '/out/Transcripts/a.md' }])
+  assert.ok(p.includes('/out/星桥航天方岑访谈总结.md'))
+  assert.ok(!p.includes('访谈访谈总结'))
+  const q = summaryPrompt({ ...A, topic: '示例公司' }, [{ outPath: '/out/Transcripts/a.md' }])
+  assert.ok(q.includes('/out/示例公司访谈总结.md'))
 })
 
 // ---------- pipeline routing (mock engine, zero tokens) ----------
@@ -333,7 +366,6 @@ function mockEngine(labels, opts = {}) {
     if (/^scout/.test(label)) return { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 1467, text: '就到这里。' }, special_notes: [] }
     if (/^refine/.test(label)) return { path: 'x', headings: ['某节'], key_fixes: [], open_questions: [] }
     if (/^stitch/.test(label)) return '已合并'
-    if (/^check/.test(label)) return { complete: true, note: '' }
     if (/^dedup/.test(label)) return { suspects: [] }
     if (/^(summary|timeline)/.test(label)) return `/out/${label}.md`
     return null
@@ -350,13 +382,39 @@ function mockEngine(labels, opts = {}) {
   }
 }
 
-test('speed mode: pipeline routes a large file through 2 chunk agents + a stitch agent, then one check', async () => {
+test('speed mode: pipeline routes a large file through 2 chunk agents + a stitch agent (no separate check phase)', async () => {
   const labels = []
   const file = { path: '/src/A.txt', label: 'A', lines: 1467, chars: 21000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
   await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', chunkMode: 'speed', files: [file] }, mockEngine(labels))
   assert.ok(labels.includes('refine:A#1/2') && labels.includes('refine:A#2/2'), 'two chunk agents (conservative cap)')
-  assert.ok(labels.includes('stitch:A'), 'a stitch agent ran')
-  assert.ok(labels.includes('check:A'), 'completeness check ran on the stitched file')
+  assert.ok(labels.includes('stitch:A'), 'a stitch agent ran (no fs capability injected → agent fallback)')
+  assert.ok(!labels.some((l) => /^check/.test(l)), 'the separate haiku completeness check phase is gone — completeness now comes from the deterministic audit')
+})
+
+test('deterministic stitch: when a stitch capability is injected, chunked refine uses it and does NOT dispatch the stitch agent', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1467, chars: 21000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const stitchCalls = []
+  const capabilities = {
+    stitch: (f, chunks) => { stitchCalls.push({ outPath: f.outPath, parts: chunks.map((c) => c.idx) }); return { path: f.outPath, merged: chunks.length } },
+    // No runAudit → the audit gate falls back to an agent (returns null in the mock → unavailable), which is fine here.
+  }
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', chunkMode: 'speed', capabilities, files: [file] }, mockEngine(labels))
+  assert.ok(labels.includes('refine:A#1/2') && labels.includes('refine:A#2/2'), 'both chunk agents still ran')
+  assert.equal(stitchCalls.length, 1, 'the deterministic stitch capability was invoked exactly once')
+  assert.deepEqual(stitchCalls[0], { outPath: '/out/Transcripts/A.md', parts: [1, 2] }, 'it received the file outPath and both chunk indices')
+  assert.ok(!labels.some((l) => /^stitch/.test(l)), 'the stitch AGENT was NOT dispatched when the capability is present')
+  assert.equal(r.refined.length, 1, 'the file was still refined (stitched deterministically)')
+})
+
+test('deterministic stitch: without a stitch capability (Workflow sandbox), the stitch agent fallback IS dispatched', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1467, chars: 21000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  // No capabilities at all → the no-fs fallback path.
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', chunkMode: 'speed', files: [file] }, mockEngine(labels))
+  assert.ok(labels.includes('refine:A#1/2') && labels.includes('refine:A#2/2'), 'both chunk agents ran')
+  assert.ok(labels.includes('stitch:A'), 'the stitch agent fallback ran when no stitch capability is injected')
+  assert.equal(r.refined.length, 1, 'the file was still refined (stitched by the agent)')
 })
 
 test('cost mode (default): pipeline keeps a single refine agent even for a large file (no chunk, no stitch)', async () => {
@@ -387,14 +445,16 @@ test('refine runs even when scout fails for a file (scout decoupled; surfaced as
   assert.equal(r.refined.length, 2, 'both files refined')
 })
 
-test('completeness check runs AFTER deliverables and a failed/stalled check never blocks them', async () => {
+test('an unavailable audit (no fs capability, fallback agent fails to parse) surfaces the file as unchecked and never blocks deliverables', async () => {
   const labels = []
   const file = { path: '/s/A.txt', label: 'A', lines: 500, chars: 5000, title: 'A', subtitle: '*s*', outPath: '/o/Transcripts/A.md' }
-  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('check') }))
-  assert.ok(r.summary, 'the summary deliverable is produced even though the check failed')
-  assert.ok(labels.indexOf('summary') !== -1 && labels.indexOf('check:A') !== -1, 'both ran')
-  assert.ok(labels.indexOf('summary') < labels.indexOf('check:A'), 'check runs after the deliverable, not before')
-  assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'a failed check surfaces as unchecked; the run still completes')
+  // No capabilities are injected (CC-sandbox shape), so the audit gate falls back to an agent; the mock returns
+  // null for every audit/audit-retry label → the audit degrades to "unavailable" and the file is unchecked.
+  const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('audit') }))
+  assert.ok(r.summary, 'the summary deliverable is produced even though the audit was unavailable')
+  assert.ok(!labels.some((l) => /^check/.test(l)), 'no separate completeness check phase exists anymore')
+  assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'an unavailable audit surfaces the file as unchecked (completeness could not be determined)')
+  assert.deepEqual(r.incomplete, [], 'unavailable ≠ incomplete: an audit that could not run must not be reported as a truncated ending')
   assert.equal(r.failed.length, 0, 'the refine itself succeeded')
 })
 

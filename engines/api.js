@@ -51,6 +51,20 @@ function maxTokensFor(modelId) {
 // Adaptive thinking helps the high-judgment tiers; Haiku 4.5 is left without a thinking config.
 const thinkingFor = (modelId) => (/opus|sonnet|fable/.test(modelId) ? { type: 'adaptive' } : undefined)
 
+// M12 reasoning-effort knob. The SDK carries effort in `output_config.effort`
+// (MessageCreateParams.output_config.effort — SDK 0.104.2 resources/messages/messages.d.ts:825-830,
+// values 'low'|'medium'|'high'|'xhigh'|'max'), a field SEPARATE from `thinking`, so effort and adaptive
+// thinking COMPOSE — we can set both on a request. GUARD (mirrors thinkingFor's allowlist exactly): only the
+// adaptive-thinking tiers (opus/sonnet/fable) may carry effort; Haiku 4.5 is the ONLY excluded tier because
+// output_config.effort 400-errors on it (see maxTokensFor's note). An out-of-allowlist model, an absent effort,
+// or an unrecognised value → no output_config emitted (today's default 'high' behaviour, byte-for-byte).
+const EFFORT_ALLOWED = /opus|sonnet|fable/
+const EFFORT_VALUES = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+export function outputConfigFor(modelId, effort) {
+  if (!effort || !EFFORT_VALUES.has(effort) || !EFFORT_ALLOWED.test(modelId)) return undefined
+  return { effort }
+}
+
 // Server-side web tools (GA, dynamic filtering, no beta header). Only verify/timeline
 // agents receive these tools; offline stages should not be able to browse.
 const WEB_TOOLS = [
@@ -63,6 +77,77 @@ const ONLINE_LABEL = /^(verify|timeline)/
 const CLIENT_TOOLS = TOOL_SPECS.map((s) => ({ name: s.name, description: s.description, input_schema: s.parameters }))
 
 const MAX_TURNS = 100 // tool-loop ceiling per agent (reads + writes + edits + searches + nudges)
+
+// ---- Prompt caching (Anthropic ephemeral breakpoints) -----------------------
+// Agent loops re-send the whole growing conversation every turn. Without cache
+// breakpoints Anthropic bills the full prefix at 1× each turn (the 24:1 input:output
+// we measured). We place exactly TWO `cache_control` breakpoints per request:
+//   1) the tools+system prefix (shared across every agent in a run), and
+//   2) the last block of the last message (the running conversation).
+// Each turn then re-reads the cached prefix at 0.1× and writes only the new suffix
+// at 1.25×. Anthropic allows up to 4 breakpoints; because `messages` is reused
+// across turns, a breakpoint we set on turn N would still be there on turn N+1, so
+// we STRIP any cache_control we previously added to message blocks before re-adding
+// one — this keeps the count pinned at 2 and never trips the 4-breakpoint limit.
+const EPHEMERAL = { type: 'ephemeral' }
+
+// Return a shallow clone of a content block with cache_control removed.
+const stripCC = (block) => {
+  if (!block || typeof block !== 'object' || !('cache_control' in block)) return block
+  const { cache_control, ...rest } = block
+  return rest
+}
+
+// Set cache_control on the LAST content block of a message's content.
+// - string content → wrap into a single text block carrying the breakpoint
+// - array content  → clone, mark the last block (works for text and tool_result)
+// Returns new content; never mutates the input.
+function markLastBlock(content) {
+  if (typeof content === 'string') {
+    return [{ type: 'text', text: content, cache_control: EPHEMERAL }]
+  }
+  if (Array.isArray(content) && content.length) {
+    const out = content.map(stripCC) // drop any breakpoint left from a previous turn
+    const last = out[out.length - 1]
+    out[out.length - 1] = { ...last, cache_control: EPHEMERAL }
+    return out
+  }
+  return content // empty/absent content → nothing to cache
+}
+
+// Pure: given Messages request params, return a NEW params object with two cache
+// breakpoints (system prefix + last message). Unit-testable without any API call.
+export function withCacheBreakpoints(params = {}) {
+  const out = { ...params }
+
+  // 1) System prompt breakpoint. String → single cached text block; array → mark last block.
+  if (typeof out.system === 'string') {
+    out.system = [{ type: 'text', text: out.system, cache_control: EPHEMERAL }]
+  } else if (Array.isArray(out.system) && out.system.length) {
+    const sys = out.system.map(stripCC)
+    const last = sys[sys.length - 1]
+    sys[sys.length - 1] = { ...last, cache_control: EPHEMERAL }
+    out.system = sys
+  }
+
+  // 2) Conversation breakpoint on the last block of the last message. Also strip any
+  //    stale breakpoints from EARLIER messages so the total stays at 2, not 2-per-turn.
+  if (Array.isArray(out.messages) && out.messages.length) {
+    const msgs = out.messages.map((m) => {
+      if (!m || typeof m !== 'object') return m
+      if (Array.isArray(m.content)) return { ...m, content: m.content.map(stripCC) }
+      return m
+    })
+    const lastIdx = msgs.length - 1
+    const lastMsg = msgs[lastIdx]
+    if (lastMsg && typeof lastMsg === 'object') {
+      msgs[lastIdx] = { ...lastMsg, content: markLastBlock(lastMsg.content) }
+    }
+    out.messages = msgs
+  }
+
+  return out
+}
 
 function execTool(tu, filePolicy) {
   const r = runFileTool(tu.name, tu.input || {}, filePolicy)
@@ -101,8 +186,10 @@ export function makeApiEngine(opts = {}) {
   }
 
   // One streamed Messages request (streaming avoids HTTP timeouts on large outputs).
+  // withCacheBreakpoints adds the ephemeral cache_control breakpoints just before the
+  // wire call, so every request in the tool loop reuses the cached tools+system prefix.
   async function create(params) {
-    const stream = client.messages.stream(params)
+    const stream = client.messages.stream(withCacheBreakpoints(params))
     const msg = await stream.finalMessage()
     tally(msg.usage)
     return msg
@@ -115,9 +202,10 @@ export function makeApiEngine(opts = {}) {
       .join('\n')
       .trim()
 
-  async function runAgent(prompt, { model, schema, label } = {}) {
+  async function runAgent(prompt, { model, schema, label, effort, maxTokens } = {}) {
     const modelId = resolveModelFor(model)
     const thinking = thinkingFor(modelId)
+    const outputConfig = outputConfigFor(modelId, effort)
     const tools = [...CLIENT_TOOLS]
     if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) {
@@ -132,8 +220,9 @@ export function makeApiEngine(opts = {}) {
       : prompt
 
     const messages = [{ role: 'user', content: sys }]
-    const base = { model: modelId, max_tokens: maxTokensFor(modelId), tools }
+    const base = { model: modelId, max_tokens: maxTokens || maxTokensFor(modelId), tools }
     if (thinking) base.thinking = thinking
+    if (outputConfig) base.output_config = outputConfig
 
     let nudges = 0
     for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -168,6 +257,7 @@ export function makeApiEngine(opts = {}) {
       const forced = await create({
         ...base,
         thinking: undefined, // forced tool_choice is incompatible with adaptive thinking
+        output_config: undefined, // and effort rides with adaptive thinking — drop it for the forced call too
         tool_choice: { type: 'tool', name: 'structured_output' },
         messages,
       })
@@ -176,6 +266,39 @@ export function makeApiEngine(opts = {}) {
     }
     log(`⚠ ${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）未提交`)
     return null
+  }
+
+  // M11a single-shot refine: ONE non-tool request whose response text IS the deliverable (no Read/Write/Edit
+  // tool loop, no structured_output). Used by the single-shot refine mode — the prompt inlines the full source
+  // and the model returns the refined document directly; JS writes it to disk. maxTokens is computed by the
+  // caller from source size (singleShotMaxTokens), effort/thinking apply exactly as in runAgent (they compose).
+  // Returns the response text, or null on refusal/empty. Shares the same streaming create() (cache breakpoints,
+  // usage tally) as every other request.
+  async function completeOnce(prompt, { model, effort, maxTokens, label } = {}) {
+    const modelId = resolveModelFor(model)
+    const thinking = thinkingFor(modelId)
+    const outputConfig = outputConfigFor(modelId, effort)
+    const params = { model: modelId, max_tokens: maxTokens || maxTokensFor(modelId), messages: [{ role: 'user', content: prompt }] }
+    if (thinking) params.thinking = thinking
+    if (outputConfig) params.output_config = outputConfig
+    const msg = await create(params)
+    if (msg.stop_reason === 'refusal') { log(`⚠ ${label || 'single-shot'} 被安全策略拒绝（refusal）`); return null }
+    const text = textOf(msg)
+    return text || null
+  }
+
+  // Wrapped in the concurrency limiter like agent(), so a batch of single-shot files respects the global cap.
+  function complete(prompt, completeOpts = {}) {
+    return limit(async () => {
+      usage.agents++
+      try {
+        return await completeOnce(prompt, completeOpts)
+      } catch (e) {
+        usage.failed++
+        log(`⚠ ${completeOpts.label || 'single-shot'} 失败：${e.message}`)
+        return null
+      }
+    })
   }
 
   // The concurrency limiter wraps each agent (the leaf unit of work). Nested parallel
@@ -219,5 +342,5 @@ export function makeApiEngine(opts = {}) {
     )
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }) }
+  return { agent, complete, parallel, pipeline, phase, log, usage: () => ({ ...usage }) }
 }

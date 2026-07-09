@@ -9,16 +9,26 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength } from '../core/spec.js'
-import { auditPairs } from '../scripts/audit_refined.mjs'
-import { PROVIDERS, PROVIDER_NAMES, resolveKey } from '../engines/providers.js'
+import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript } from '../scripts/audit_refined.mjs'
+import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
 import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
 import { writeRunArtifacts } from './artifacts.js'
+import { runEscalation, escalationGlossaryText, mergeEscalationUsage, HARD_GATES } from './escalate.js'
+import { buildRunLogEntry, appendRunLog } from './runlog.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
+
+export class JobConfigError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'JobConfigError'
+    this.code = 'CONFIG_ERROR'
+  }
+}
 
 export function loadDotEnv(filePath = path.join(REPO_ROOT, '.env'), env = process.env) {
   if (!fs.existsSync(filePath)) return false
@@ -46,6 +56,13 @@ export const deriveTitle = (src) => path.basename(src, path.extname(src)).replac
 
 export async function convertToMarkdown(src, workDir) {
   const ext = path.extname(src).toLowerCase()
+  if (ext === '.srt') {
+    fs.mkdirSync(workDir, { recursive: true })
+    const dest = path.join(workDir, path.basename(src, ext) + '.md')
+    const normalized = normalizeSrtTranscript(fs.readFileSync(src, 'utf8'), { sourceFile: src })
+    fs.writeFileSync(dest, normalized, 'utf8')
+    return dest
+  }
   if (!CONVERT_EXT.has(ext)) return src // .txt / .md used as-is
   fs.mkdirSync(workDir, { recursive: true })
   const dest = path.join(workDir, path.basename(src, ext) + '.md')
@@ -69,6 +86,7 @@ export async function convertToMarkdown(src, workDir) {
 export async function prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) {
   const mdPath = await convertToMarkdown(src, workDir)
   const content = fs.readFileSync(mdPath, 'utf8')
+  const sourceKind = path.extname(src).toLowerCase() === '.srt' ? 'srt' : 'text'
   const lines = content.split('\n').length
   const bytes = Buffer.byteLength(content, 'utf8')
   const chars = contentLength(content)   // 正文字数 (汉字 + 英文词/数字)；文档长度以此衡量，行数仅供 Read 分页
@@ -76,6 +94,8 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const title = deriveTitle(src)
   const entry = {
     path: mdPath, label: title, title,
+    originalPath: path.resolve(src),
+    sourceKind,
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
     lines, bytes, chars,
@@ -149,6 +169,28 @@ export function cleanupRefineParts(fileEntries) {
   }
 }
 
+// M8 batch-level cross-file claim consistency. Runs ONLY here on the universal path (this layer has fs, so it can
+// read every refined file back + the persisted 校对表); the CC-sandbox pipeline has no fs and the refined text
+// never enters its orchestration layer, so M8 is universal-only (see claude-code-skill/references/return-handling.md).
+// Reads each successfully-refined file's on-disk text, extracts glossary canonicals for entity association, and
+// returns the conflict list (empty when < 2 refined files or no conflict). Never throws — an unreadable file is
+// skipped, and any internal error degrades to no conflicts (M8 must never break a run).
+export function computeCrossFileConflicts(refined, glossaryText) {
+  try {
+    const files = []
+    for (const r of refined || []) {
+      const p = r && (r.outPath || r.path)
+      if (!p) continue
+      let text
+      try { text = fs.readFileSync(p, 'utf8') } catch { continue }
+      files.push({ label: r.label || path.basename(p, path.extname(p)), refinedText: text })
+    }
+    if (files.length < 2) return []
+    const canonicals = (parseGlossaryLite(glossaryText || '').entries || []).map((e) => e.canonical).filter(Boolean)
+    return checkCrossFileClaims(files, canonicals).conflicts || []
+  } catch { return [] }
+}
+
 // Persist the returned glossary (pure-JS output; no agent writes it). Cumulative across runs.
 export function persistGlossary(result, glossaryPath) {
   if (result.glossary && result.glossary !== SINGLE_FILE_GLOSSARY) {
@@ -159,6 +201,9 @@ export function persistGlossary(result, glossaryPath) {
   return false
 }
 
+// Standalone same-provider audit-repair utility (retry loop). NOTE: as of the M-series merge this is NOT
+// wired into runJob — the headless path deliberately does in-pipeline audit + opt-in escalation instead of
+// auto-rewriting a 成稿 (see runJob below). Kept as an exported, unit-tested helper (test/quality-repair.test.js).
 export const QUALITY_REPAIR_MAX_RETRIES = 2
 
 function auditListForFiles(files = []) {
@@ -275,80 +320,347 @@ export async function auditAndRepairRefined({ A, result, engine, maxRetries = QU
   return { audit, attempts }
 }
 
-// One-call run used by the web server. `files` are uploads: [{ name, base64 }] (raw bytes,
-// any type — docx/pdf converted via markitdown). onPhase/onLog stream progress.
-export async function runJob(params, { onPhase, onLog } = {}) {
+async function prepareInputFile(f, { topic, date, headingPolicy, outputDir, uploadDir, convertedDir }) {
+  if (f && typeof f.path === 'string' && f.path.trim()) {
+    const src = path.resolve(f.path)
+    if (!fs.existsSync(src)) throw new JobConfigError(`找不到文件 ${src}`)
+    try {
+      return await prepareFile(src, { topic, date, headingPolicy, outputDir, workDir: convertedDir })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  if (f && typeof f.name === 'string' && f.name.trim()) {
+    fs.mkdirSync(uploadDir, { recursive: true })
+    const src = path.join(uploadDir, path.basename(f.name))
+    fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
+    try {
+      return await prepareFile(src, { topic, date, headingPolicy, outputDir, workDir: uploadDir })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  return null
+}
+
+// M10: build the premium (escalation) engine + drive the escalation pass, then REFRESH the pipeline
+// result's audit-derived fields (auditFailed / incomplete / audit.files / audit.status) to the FINAL
+// on-disk state so the exit code, review.md, and run.json reflect post-escalation truth. Returns
+// { premiumUsage, manifest } where manifest is the run.json「escalation」block (provider + per-file records
+// + counts). escalate = { provider, baseURL?, models? }; params.__escalateEngine injects a mock for tests.
+// Mutates `r` (pipeline result) and `audit` in place — the caller assembles them into `result` afterwards.
+async function runEscalationPass({ escalate, audit, r, A, fileEntries, glossaryPath, concurrency, filePolicy, notice, onPhase, onLog, __escalateEngine }) {
+  // 1) premium engine: an injected mock (tests) OR selectEngine on the named provider. A per-tier
+  //    --escalate-models map pins the refine model via modelOverride (escalation only calls the refine tier,
+  //    so pinning all tiers to that id is harmless). Config errors surface as a notice + skip (never fatal —
+  //    a bad escalate config must not sink an otherwise-good run; the cheap 成稿 already exist on disk).
+  let escalateEngine = __escalateEngine
+  let escProvider = escalate.provider
+  if (!escalateEngine) {
+    const modelOverride = escalate.models && (escalate.models.refine || Object.values(escalate.models)[0])
+    try {
+      const esc = selectEngine({ provider: escalate.provider, baseURL: escalate.baseURL, modelOverride, concurrency, filePolicy, onPhase, onLog })
+      escalateEngine = esc.engine
+      escProvider = esc.provider
+      const jn = jurisdictionNote(esc.provider)
+      notice(`升级 provider=${esc.provider}（${esc.info.label}）· 用于未过审文件的源级重跑`)
+      if (jn) notice(`⚠ 升级链路：${jn}`)
+    } catch (e) {
+      notice(`升级 provider 配置无效，已跳过升级重跑（首档成稿照常落盘）：${e.message}`)
+      return null
+    }
+  }
+
+  const glossaryText = escalationGlossaryText(r, glossaryPath)
+  const failingCount = (audit.files || []).filter((f) => f && f.status === 'fail').length
+  if (!failingCount) return null // nothing failed → no escalation (but keep the structure explicit)
+
+  const outcome = await runEscalation({ auditFiles: audit.files, A, fileEntries, escalateEngine, glossaryText, log: (m) => notice(m) })
+  if (!outcome || !outcome.records.length) return null
+
+  // 2) refresh audit.files to the FINAL per-file audit (the on-disk 成稿's audit), so review.md's
+  //    「成稿质量抽查」, run.json audit, and audit.status all reflect what actually shipped.
+  audit.files = (audit.files || []).map((f) => outcome.finalAuditFor(f.file) || f)
+  audit.status = audit.files.some((f) => f && f.status === 'fail') ? 'fail' : 'ok'
+
+  // 3) recompute the pipeline's hard-gate fields from the FINAL audits: auditFailed keeps only the two hard
+  //    content gates (matching the pipeline's contract → drives the exit code), incomplete keeps ending_missing.
+  const finalOf = (outPath) => outcome.finalAuditFor(outPath)
+  const isEscalated = new Set(outcome.records.map((x) => x.outPath))
+  // auditFailed: preserve non-escalated entries verbatim; for escalated ones, rebuild from the final audit.
+  const rebuiltAuditFailed = []
+  for (const entry of r.auditFailed || []) if (!isEscalated.has(entry.path)) rebuiltAuditFailed.push(entry)
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    const hard = ((fa && fa.failed) || []).filter((k) => HARD_GATES.includes(k))
+    if (hard.length) rebuiltAuditFailed.push({ path: outPath, findings: hard })
+  }
+  r.auditFailed = rebuiltAuditFailed
+  // incomplete: same treatment for the ending_missing signal.
+  const rebuiltIncomplete = []
+  for (const entry of r.incomplete || []) if (!isEscalated.has(entry.path || entry)) rebuiltIncomplete.push(entry)
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    if (fa && (fa.failed || []).includes('ending_missing')) rebuiltIncomplete.push({ path: outPath, note: 'deterministic audit: ending_missing' })
+  }
+  r.incomplete = rebuiltIncomplete
+  // Refresh each refined entry's inline audit summary + completeness so per-file consumers see final state.
+  for (const outPath of isEscalated) {
+    const fa = finalOf(outPath)
+    const rr = (r.refined || []).find((x) => (x.outPath || x.path) === outPath)
+    if (rr && fa) {
+      const hard = (fa.failed || []).filter((k) => HARD_GATES.includes(k))
+      const soft = (fa.failed || []).filter((k) => !HARD_GATES.includes(k))
+      rr.audit = { status: hard.length ? 'fail' : 'ok', hardFindings: hard, softFindings: soft, repaired: false, anchorsAdded: (rr.audit && rr.audit.anchorsAdded) || 0, auditUnavailable: false }
+      rr.complete = !(fa.failed || []).includes('ending_missing')
+      rr.checkNote = (fa.failed || []).includes('ending_missing') ? 'deterministic audit: ending_missing' : ''
+    }
+  }
+
+  // 4) loud open-question line for any file that failed BOTH tiers (surfaces in review.md「收尾待问」 + CLI).
+  const both = outcome.records.filter((x) => x.bothFailed)
+  if (both.length) {
+    r.openQuestions = [...(r.openQuestions || []), `升级重跑：${both.length} 份两档均未过审（${both.map((x) => x.label).join('、')}）——请对照源文件人工核对，详见 review.md「升级重跑」`]
+  }
+  notice(`升级重跑完成：${outcome.escalated} 份未过审已升级 ${escProvider}，${outcome.passed} 份通过${outcome.bothFailed ? `，${outcome.bothFailed} 份两档均未过审` : ''}`)
+
+  return {
+    premiumUsage: outcome.premiumUsage,
+    manifest: {
+      provider: escProvider,
+      escalated: outcome.escalated,
+      passed: outcome.passed,
+      bothFailed: outcome.bothFailed,
+      files: outcome.records.map((x) => ({ outPath: x.outPath, label: x.label, escalated: x.escalated, cheapAudit: x.cheapAudit, premiumAudit: x.premiumAudit, kept: x.kept, bothFailed: x.bothFailed, reason: x.reason })),
+    },
+  }
+}
+
+// One-call run used by the web server and CLI. `files` may be filesystem entries
+// [{ path }] or uploads [{ name, base64 }]. onPhase/onLog stream progress.
+export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedMs = Date.now()
   const startedAt = new Date(startedMs).toISOString()
+  const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
     provider = 'anthropic', apiKey, baseURL, tavilyKey,
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     models, outputDir, fresh = false, concurrency,
-    skillDir,
+    skillDir, escalate, refineMode, effort,
   } = params
-  if (!files.length) throw new Error('未提供任何文件')
+  if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
-  const workDir = path.join(outDir, '.uploads')
-  fs.mkdirSync(workDir, { recursive: true })
+  const uploadDir = path.join(outDir, '.uploads')
+  const convertedDir = path.join(outDir, '.converted')
+  const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
+
+  if (!fs.existsSync(path.join(resolvedSkillDir, 'references', 'deliverables.md'))) {
+    notice(`警告：${resolvedSkillDir}/references/deliverables.md 不存在——总结/时间线/逻辑稿的结构模板将读不到。用 --skill-dir 指向含 references/ 的目录。`)
+  }
 
   // 1. materialize uploads to disk, then prepare each
   const fileEntries = []
   const warnings = []
   for (const f of files) {
-    if (!f || !f.name) continue
-    const src = path.join(workDir, path.basename(f.name))
-    fs.writeFileSync(src, Buffer.from(f.base64 || '', 'base64'))
-    const { entry, headingWarning } = await prepareFile(src, { topic, date, headingPolicy, outputDir: outDir, workDir })
+    const prepared = await prepareInputFile(f, { topic, date, headingPolicy, outputDir: outDir, uploadDir, convertedDir })
+    if (!prepared) continue
+    const { entry, headingWarning } = prepared
     if (headingWarning) warnings.push(headingWarning)
+    if (headingWarning) notice(`提示：${headingWarning}`)
     fileEntries.push(entry)
   }
 
-  // 2. prior glossary (persistent per-company校对表)
+  // 2. prior glossary (persistent per-company校对表). Source priority: an explicit --prior-glossary path >
+  //    the default <outDir>/校对表.md. Accumulation always writes back to <outDir>/校对表.md (glossaryPath),
+  //    so a one-off external seed still lands in the canonical location for the next run.
   const glossaryPath = path.join(outDir, '校对表.md')
+  const explicitPrior = params.priorGlossaryPath ? path.resolve(params.priorGlossaryPath) : null
+  const priorSource = !fresh ? (explicitPrior && fs.existsSync(explicitPrior) ? explicitPrior : (fs.existsSync(glossaryPath) ? glossaryPath : null)) : null
   let priorGlossaryText
-  if (!fresh && fs.existsSync(glossaryPath)) priorGlossaryText = fs.readFileSync(glossaryPath, 'utf8')
+  if (priorSource) {
+    priorGlossaryText = fs.readFileSync(priorSource, 'utf8')
+    notice(`沿用既有校对表：${priorSource}`)
+  }
 
   // 3. engine. Three modes: an injected engine (tests), per-category routing (web UI's
   //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
   //    run from the web category's key (or the top-level tavilyKey).
   const categories = params.categories
-  const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
   const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY
   if (webTavily) process.env.TAVILY_API_KEY = webTavily
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
-  else if (categories) sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
-  else sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
+  else if (categories) {
+    try {
+      sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  } else {
+    try {
+      sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
+    } catch (e) {
+      throw new JobConfigError(e.message)
+    }
+  }
+  if (sel.provider !== 'anthropic' && sel.provider !== 'injected' && sel.provider !== 'router') {
+    notice(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
+    if (sel.info.note) notice(`注意：${sel.info.note}`)
+    const jn = jurisdictionNote(sel.provider)
+    if (jn) notice(`⚠ ${jn}`)
+    if (!process.env.TAVILY_API_KEY && (scope.includes('timeline') || verifyDepth !== 'none')) {
+      notice('提示：未设 TAVILY_API_KEY——非 anthropic provider 的联网核实/时间线将降级（refine 不受影响）。')
+    }
+  }
+  notice(`
+开始：${fileEntries.length} 份文件 · scope=${scope.join(',')} · verify=${verifyDepth} · 输出 ${outDir}
+`)
+
+  // §2 capability injection: with fs available, the audit / anchor / gap-marker work runs INSIDE the pipeline's
+  // per-file gate (not as a post-run wrapper — that avoided a double pass). The closures also RECORD their
+  // results into the accumulators below, so the top-level result.audit / annotations / anchors keep the exact
+  // shape writeRunArtifacts (+ cli/server) already consume. runAudit returns an auditPair file-result so the
+  // gate can read failed/gaps; annotate writes the visible 缺口 marker (only when the gate hits a still-hard
+  // gap); annotateAnchors writes the invisible source anchors. We deliberately do NOT inject `repair` — the
+  // headless API path keeps today's behaviour (mark the gap, let the user decide), never auto-rewriting a 成稿.
+  const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
+  const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
+  const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
+  const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
+  const capabilities = {
+    readFile: (p) => fs.readFileSync(p, 'utf8'),
+    // M11a single-shot refine writes the model's response text straight to the 成稿 (no Write-tool agent). Only
+    // the single-shot path uses this; the agentic path still writes via the model's Write tool. mkdir -p first
+    // so a first-run Transcripts/ dir exists, then the downstream audit reads it back from disk unchanged.
+    writeFile: (p, text) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text, 'utf8') },
+    // Risk (a): the pipeline hands us THIS round's in-memory 校对表 (opts.glossaryText) — use it for the
+    // ghost_name / missing_yin checks, because on a first run the file isn't persisted until after the pipeline
+    // returns, so reading it from disk would miss it. Fall back to the on-disk copy only when nothing was passed.
+    runAudit: (f, opts = {}) => {
+      const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
+      const res = auditPairs([{ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText }])
+      const file = res.files[0]
+      auditFilesAcc.push(file)
+      return file
+    },
+    annotate: (f, gaps) => {
+      if (params.annotate === false) return { inserted: [], skipped: [] }
+      const a = annotateFile(f.outPath, gaps)
+      if (a.inserted.length) annotations.push(a)
+      return a
+    },
+    annotateAnchors: (f) => {
+      if (params.anchors === false) return { updated: [], skipped: [] }
+      const a = annotateAnchorsFile(f.path, f.outPath)
+      if (a.updated.length) anchors.push(a)
+      return a
+    },
+    // Deletion #2 (provider side): with fs, the chunk part-files are merged deterministically by the pure
+    // stitchParts() (one blank line between parts, exact-dup seam heading collapsed) — no stitch subagent, so
+    // no per-response output cap and no paraphrase risk on a long transcript. The Workflow sandbox (no fs) has
+    // no such capability and falls back to the concatenation agent. Reads <outPath>.part{idx} in chunk order,
+    // writes f.outPath, and drops the consumed parts (cleanupRefineParts also sweeps them post-run — idempotent).
+    // Returns a truthy summary; the pipeline consumer only distinguishes truthy (merged) from null (failed).
+    stitch: (f, chunks) => {
+      const parts = (chunks || []).map((c) => partPath(f.outPath, c.idx))
+      const texts = parts.map((p) => fs.readFileSync(p, 'utf8'))
+      const merged = stitchParts(texts)
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, merged, 'utf8')
+      for (const p of parts) { try { fs.rmSync(p, { force: true }) } catch { /* ignore */ } }
+      return { path: f.outPath, merged: parts.length, bytes: Buffer.byteLength(merged, 'utf8') }
+    },
+  }
 
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, priorGlossaryText, fresh, files: fileEntries,
+    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode,
+    refineMode: refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a: default agentic (byte-equivalent)
+    effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
+    captureSingleShot: params.captureSingleShot,   // M11b: batch-submit hook — capture single-shot payloads instead of sending (see scripts/batch_refine.mjs)
+    priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
+    canonicalOverrides: params.canonicalOverrides,
+    capabilities,
+    fresh, annotate: params.annotate, files: fileEntries,
   }
 
   try {
     const r = await runPipeline(A, sel.engine)
     cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
-    const result = { ...r, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage: null }
-    if (!r.error) await auditAndRepairRefined({ A, result, engine: sel.engine, onLog })
+    // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
+    // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
+    // review.md via reviewSections. All soft — never affects the exit code.
+    const glossaryLint = (wroteGlossary && r.glossary) ? auditGlossary(r.glossary) : null
+    // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
+    const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
+    if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
+
+    // M10 cheap-first escalation (OPT-IN): with `escalate` configured, any file whose RAW deterministic
+    // audit FAILED (compression_risk/charRatio, content_gap, ending_missing, quote_style, …) is RE-REFINED
+    // FROM SOURCE on the premium engine and re-audited. Runs BEFORE cross-file consistency so that check
+    // sees the final (post-escalation) 成稿 set. Refreshes r.auditFailed / r.incomplete / audit.files to the
+    // final on-disk state; the cheap+premium audits are kept in `escalation`. No-op unless escalate is set.
+    let escalation = null
+    let escUsage = null
+    if (escalate && audit && !r.error) {
+      escalation = await runEscalationPass({
+        escalate, audit, r, A, fileEntries, glossaryPath,
+        concurrency, filePolicy, notice, onPhase, onLog,
+        __escalateEngine: params.__escalateEngine,
+      })
+      escUsage = escalation ? escalation.premiumUsage : null
+    }
+
+    // M8: cross-file numeric consistency over the whole batch (≥2 refined files). Uses this round's rendered
+    // 校对表 (in-memory) for entity association, else the on-disk copy. A conflict is attached to the result +
+    // manifest and rendered in review.md「跨文件互证」; a ONE-line summary folds into openQuestions so the Step-5
+    // batch-ask surfaces it. Never fatal — computeCrossFileConflicts swallows its own errors.
+    const crossFileGlossary = (r.glossary && r.glossary !== SINGLE_FILE_GLOSSARY) ? r.glossary : (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : '')
+    const crossFileConflicts = !r.error ? computeCrossFileConflicts(r.refined, crossFileGlossary) : []
+    if (crossFileConflicts.length) {
+      notice(`跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突——见 review.md「跨文件互证」`)
+      // Fold ONE summary line into openQuestions (the per-conflict detail lives in review.md / run.json).
+      r.openQuestions = [...(r.openQuestions || []), `跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突（每份内部都合规）——请对照录音确认哪个是对的，详见 review.md「跨文件互证」`]
+    }
     const finishedMs = Date.now()
-    result.usage = sel.engine.usage()
+    const finishedAt = new Date(finishedMs).toISOString()
+    const durationMs = finishedMs - startedMs
+    // usage: primary engine totals, plus the premium engine's usage merged in (with a separate `escalation`
+    // sub-object) when escalation ran. mergeEscalationUsage is a no-op-merge when escUsage is null.
+    const usage = escUsage ? mergeEscalationUsage(sel.engine.usage(), escUsage) : sel.engine.usage()
+    const result = { ...r, audit, escalation: escalation ? escalation.manifest : null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
       startedAt,
-      finishedAt: new Date(finishedMs).toISOString(),
-      durationMs: finishedMs - startedMs,
+      finishedAt,
+      durationMs,
       provider: sel.provider,
       providerInfo: sel.info,
       warnings,
       usage: result.usage,
+      escalation: result.escalation,
     })
-    return { ...result, ...artifacts }
+
+    // Per-run log (time/tokens/estimated cost) — additive, never fatal, opt-out via params.runLog===false
+    // (CLI: --no-run-log). `models` is the provider's tier→model-id default map (needed for DeepSeek's
+    // flash/pro cost split); anthropic prices flat so it needs no map; router/injected engines simply
+    // price as "unknown" (estimateCost → null for any provider it doesn't recognise).
+    let runLog = null
+    if (params.runLog !== false) {
+      const runLogModels = (PROVIDERS[sel.provider] && PROVIDERS[sel.provider].models) || null
+      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels })
+      const logRes = appendRunLog(entry, { logPath: params.runLogPath })
+      if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }
+      else notice(`警告：运行日志写入失败：${logRes.error}`)
+    }
+
+    return { ...result, ...artifacts, runLog }
   } finally {
     if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
   }

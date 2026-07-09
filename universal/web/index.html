@@ -98,6 +98,7 @@
           <label>服务商</label>
           <select id="provider"></select>
           <p class="hint" id="providerNote"></p>
+          <p class="hint" id="providerRisk" style="color:var(--warn)"></p>
         </div>
         <div>
           <label>API Key <span class="opt" id="keyHint"></span></label>
@@ -144,11 +145,12 @@
   <div class="card">
     <h2>输入</h2>
     <div class="filebox" id="filebox" tabindex="0">
-      选择转录文件<br><span class="opt">.txt / .md / .docx / .pptx / .xlsx / .pdf</span>
+      选择转录文件<br><span class="opt">.txt / .md / .srt / .docx / .pptx / .xlsx / .pdf</span>
     </div>
     <input type="file" id="files" multiple class="hidden"
-           accept=".txt,.md,.docx,.pptx,.xlsx,.pdf,text/plain,text/markdown">
+           accept=".txt,.md,.srt,.docx,.pptx,.xlsx,.pdf,text/plain,text/markdown">
     <ul id="fileList"></ul>
+    <p class="hint" id="fileEstimate"></p>
     <div class="row" style="margin-top:8px">
       <div><label>主题 <span class="opt">用于文件名</span></label><input type="text" id="topic" placeholder="示例公司"></div>
       <div><label>采访时间 <span class="opt">YYYY-MM</span></label><input type="text" id="date" placeholder="2025-02"></div>
@@ -162,9 +164,9 @@
     <label>交付内容</label>
     <div class="checks">
       <label><input type="checkbox" checked disabled> 精校稿</label>
-      <label><input type="checkbox" value="logic"> 逻辑顺序稿</label>
-      <label><input type="checkbox" value="summary"> 总结</label>
-      <label><input type="checkbox" value="timeline"> 时间线</label>
+      <label><input type="checkbox" class="scopeChk" value="logic"> 逻辑顺序稿</label>
+      <label><input type="checkbox" class="scopeChk" value="summary"> 总结</label>
+      <label><input type="checkbox" class="scopeChk" value="timeline"> 时间线</label>
     </div>
     <div class="row3" style="margin-top:12px">
       <div><label>核实范围</label><select id="verify"><option value="key">标准（推荐）</option><option value="deep">深度</option><option value="none">关闭</option></select></div>
@@ -236,6 +238,7 @@ function onProvider() {
   const p = PROVIDERS.find(x => x.name === $('provider').value) || {}
   $('keyHint').textContent = '（' + (p.keyEnv || []).join(' / ') + '）'
   $('providerNote').textContent = p.note || ''
+  $('providerRisk').textContent = p.riskNote || ''   // 信源保护提示（境内运营商）
   $('baseURL').placeholder = p.baseURL || '默认'
   $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
   $('searchNote').textContent = p.nativeSearch
@@ -402,6 +405,45 @@ function fileToBase64(file) {
     r.onerror = rej; r.readAsArrayBuffer(file)
   })
 }
+// content-字数：汉字数 + 每个连续英文/数字串各算 1（不是逐字符）——与项目其它地方统一的体量口径。
+function contentWordCount(text) {
+  const hanzi = text.match(/[一-龥]/g) || []
+  const runs = text.match(/[A-Za-z0-9]+/g) || []
+  return hanzi.length + runs.length
+}
+// base64 → UTF-8 text; returns null on decode failure (e.g. a binary file like .docx/.pdf —
+// those are not plain UTF-8 text, so the estimate is skipped silently for them, never blocking).
+function decodeBase64Text(b64) {
+  try {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return null
+  }
+}
+// Rough duration: minutes = 5 + 0.5 * (字数/1000), x1.6 if summary/timeline/logic scope is on,
+// shown as a ±35% range around that midpoint so it reads as an honest estimate, not a promise.
+function updateFileEstimate() {
+  const el = $('fileEstimate')
+  if (!el) return
+  if (!picked.length) { el.textContent = ''; return }
+  let total = 0, counted = 0
+  for (const p of picked) {
+    const text = decodeBase64Text(p.base64)
+    if (text === null) continue   // skip non-text files silently
+    total += contentWordCount(text)
+    counted++
+  }
+  if (!counted) { el.textContent = ''; return }
+  const extraScope = Array.from(document.querySelectorAll('.scopeChk')).some(c => c.checked)
+  let minutes = 5 + 0.5 * (total / 1000)
+  if (extraScope) minutes *= 1.6
+  const lo = Math.max(1, Math.round(minutes * 0.65))
+  const hi = Math.round(minutes * 1.35)
+  el.textContent = `共 ${picked.length} 份 · 约 ${total} 字 · 预计 ${lo}-${hi} 分钟（粗估）`
+}
 async function handleFiles(fileList) {
   const arr = Array.from(fileList || [])
   if (!arr.length) return
@@ -410,11 +452,13 @@ async function handleFiles(fileList) {
   fb.classList.add('has')
   fb.innerHTML = '<b>' + picked.length + ' 份文件</b> · 重新选择'
   $('fileList').innerHTML = picked.map(p => `<li>· ${esc(p.name)}</li>`).join('')
+  updateFileEstimate()
 }
+document.querySelectorAll('.scopeChk').forEach(c => c.addEventListener('change', updateFileEstimate))
 
 function getScope() {
   const scope = ['refine']
-  document.querySelectorAll('.checks input[value]').forEach(c => { if (c.checked) scope.push(c.value) })
+  document.querySelectorAll('.scopeChk').forEach(c => { if (c.checked) scope.push(c.value) })
   return scope
 }
 function parseModels(s) {
@@ -440,7 +484,6 @@ function markPhase(title) { freezePhase(); phaseTitle = title; phaseStart = Date
 function stopClock() { freezePhase(); clearInterval(clockTick); clockTick = null; const el = $('elapsed'); if (el && runStart) el.textContent = '总用时 ' + fmtDur(Date.now() - runStart); runStart = 0; phaseEl = null }
 
 $('run').onclick = run
-{ const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置
 async function run() {
   if (!picked.length) return setStatus('请先选择文件。', true)
   if (!$('topic').value.trim()) return setStatus('请填写主题。', true)
@@ -529,7 +572,55 @@ function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': 
 function escAttr(s) { return esc(s).replace(/"/g, '&quot;') }
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
 
-loadConfig()
+// --- persist non-secret settings across reloads (localStorage, lpr_ prefix) ---
+// Never persist: apiKey / tavilyKey / defKey / mixTavily or any input[type=password] — those
+// stay in-memory only for the run. Restoring the provider selects must happen AFTER loadConfig()
+// populates their <option>s, or the saved value has nothing to match against.
+function persistField(id, key) {
+  const el = $(id)
+  if (!el) return
+  if (el.type === 'password') return   // never persist secrets, even if mis-wired
+  const isCheck = el.type === 'checkbox'
+  const saved = localStorage.getItem(key)
+  if (saved !== null) {
+    if (isCheck) el.checked = saved === '1'; else el.value = saved
+    // #models carries a restored override; mark it touched so onProvider()'s auto-fill
+    // (setSingleModelDefaults) doesn't clobber it right after restore.
+    if (id === 'models' && saved) el.dataset.touched = '1'
+  }
+  const save = () => localStorage.setItem(key, isCheck ? (el.checked ? '1' : '0') : el.value)
+  el.addEventListener('change', save)
+  if (!isCheck) el.addEventListener('blur', save)
+}
+function restoreScope() {
+  const saved = localStorage.getItem('lpr_scope')
+  if (saved === null) return
+  let vals = []
+  try { vals = JSON.parse(saved) } catch { /* ignore malformed */ }
+  document.querySelectorAll('.scopeChk').forEach(c => { c.checked = vals.includes(c.value) })
+}
+function saveScope() {
+  const vals = Array.from(document.querySelectorAll('.scopeChk')).filter(c => c.checked).map(c => c.value)
+  localStorage.setItem('lpr_scope', JSON.stringify(vals))
+}
+function wirePersistence() {
+  { const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置（既有逻辑，key 名保持不变）
+  ;['verify', 'heading', 'topic', 'date', 'background', 'baseURL', 'models', 'chunkSpeed'].forEach(id => persistField(id, 'lpr_' + id))
+  restoreScope()
+  document.querySelectorAll('.scopeChk').forEach(c => c.addEventListener('change', saveScope))
+}
+function wireProviderPersistence() {
+  // provider selects only exist to restore into once loadConfig() has populated their <option>s.
+  // Setting .value via JS does not fire 'change', so re-run each select's own refresh logic
+  // after restoring — same calls their onchange handlers already make.
+  persistField('provider', 'lpr_provider')
+  onProvider()
+  persistField('defProvider', 'lpr_defProvider')
+  if ($('defProvider').value) { fetchDefaultMixedModels(false); refreshCategoryDefaults(true, true) }
+}
+
+wirePersistence()
+loadConfig().then(wireProviderPersistence)
 </script>
 </body>
 </html>

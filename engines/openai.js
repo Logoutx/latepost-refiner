@@ -36,6 +36,20 @@ const structuredTool = (schema) => ({
 const BIG_LABEL = /^(refine|logic|summary|timeline)/i
 const maxTokensFor = (label = '') => (BIG_LABEL.test(label) ? 64000 : 16000)
 
+// ---- Cache observability (OpenAI-compatible providers) ----------------------
+// DeepSeek/Kimi/OpenAI cache the prompt prefix server-side automatically, so there
+// are no request-side knobs to set — we only READ how many prompt tokens were served
+// from cache and fold them into cacheRead. Two provider dialects exist:
+//   • OpenAI style:   usage.prompt_tokens_details.cached_tokens
+//   • DeepSeek style: usage.prompt_cache_hit_tokens (miss-tokens are just plain input)
+// Defensive: any missing field → 0, never throws. Pure + exported for unit testing.
+export function parseCachedTokens(usage) {
+  if (!usage || typeof usage !== 'object') return 0
+  const openaiStyle = usage.prompt_tokens_details?.cached_tokens
+  const deepseekStyle = usage.prompt_cache_hit_tokens
+  return (openaiStyle ?? deepseekStyle ?? 0) || 0
+}
+
 function parseJSON(s) {
   if (s == null) return null
   if (typeof s === 'object') return s
@@ -91,7 +105,7 @@ export function makeOpenAIEngine(opts = {}) {
   const client = opts.client || new OpenAI({ apiKey, baseURL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
-  const usage = { input: 0, output: 0, agents: 0, failed: 0 }
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
   const resolveModel = (m) => models[m] || m || models.opus || 'gpt-4o'
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
@@ -99,7 +113,13 @@ export function makeOpenAIEngine(opts = {}) {
 
   async function create(params) {
     const comp = await client.chat.completions.create(params)
-    if (comp && comp.usage) { usage.input += comp.usage.prompt_tokens || 0; usage.output += comp.usage.completion_tokens || 0 }
+    if (comp && comp.usage) {
+      // OpenAI-style prompt_tokens INCLUDES cached tokens, so cacheRead is a subset of
+      // input reported for observability — we do not subtract it from input.
+      usage.input += comp.usage.prompt_tokens || 0
+      usage.output += comp.usage.completion_tokens || 0
+      usage.cacheRead += parseCachedTokens(comp.usage)
+    }
     return comp
   }
 

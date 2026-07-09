@@ -98,3 +98,11 @@ Keep filename and H1 identical where practical.
 - Write large blocks correctly on first pass instead of many tiny edits — but keep paragraph boundaries: don't merge separate source turns just because one speaker keeps talking. Split long monologues into coherent 200-600-character paragraphs; any single dialogue paragraph over about 900 characters needs re-splitting.
 - Verify the output ending matches the source ending.
 - Before handoff, run the deterministic source-aware audit when available (`audit_refined.mjs --source <source> --refined <refined> --mode refine`): fix or surface compression, under-refinement, missing endings, leftover pure filler/repeats/ASR glue, and over-long paragraphs. 啊/哦/欸 and 这个/那个 are soft candidates — inspect context, don't blanket-delete. Without shell, do the same as a weaker model-side checklist and say if uncertainty remains.
+
+## Never Skip Silently
+
+Never silently omit any substantive source section. If a section truly cannot be refined — for any reason: technical difficulty, platform policy restriction, illegible source — leave a one-line placeholder in place and continue from the next section:
+
+> ⚠【未精校段：源文件约第 X-Y 行】原因一句话
+
+This is a last resort: a normal refine has ZERO placeholder markers. Chit-chat folded into a one-line stage direction per the noise rules is NOT an unrefined section — no marker. A section being long is never a reason — write it in multiple passes per the long-file rules. A visible marker always beats a silent gap: readers must be able to see that something is missing and find it in the source.
