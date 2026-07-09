@@ -22,5 +22,6 @@ universal/embedded-assets.js
 
 # Test run outputs / temp dirs
 /output/
+/.runs/
 /tmp/
 *.local.md

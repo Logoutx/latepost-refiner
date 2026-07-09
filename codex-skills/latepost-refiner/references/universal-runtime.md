@@ -41,7 +41,7 @@ node universal/cli.js \
   --background "<访谈背景、人物、公司、领域>" \
   --scope refine,logic,summary,timeline \
   --verify key \
-  --models scout=gpt-5.4-mini,verify=gpt-5.4,dedup=gpt-5.4,refine=gpt-5.4,logic=gpt-5.4,summary=gpt-5.4,timeline=gpt-5.4 \
+  --models scout=gpt-5.4-mini,verify=gpt-5.4,dedup=gpt-5.4,refine=gpt-5.5,logic=gpt-5.5,summary=gpt-5.4,timeline=gpt-5.4 \
   --out "<输出目录>"
 ```
 
@@ -50,18 +50,18 @@ Default OpenAI profile:
 | Stage | Model | Why |
 |---|---|---|
 | `scout` | `gpt-5.4-mini` | Cheap extraction of speakers/entities/errors. |
-| ending `check` | `gpt-5.4-mini` | Cheap completeness check. |
+| local audit | no model | Deterministic completeness/content-gap/compression checks after refine. |
 | `verify` | `gpt-5.4` | Better judgment for public-source entity verification. |
 | `dedup` | `gpt-5.4` | Better semantic same-referent decisions. |
-| `refine` | `gpt-5.4` | Main quality/cost balance for faithful transcript cleanup. |
-| `logic` | `gpt-5.4` | Good enough for reorder-without-rewrite discipline. |
+| `refine` | `gpt-5.5` | Quality-critical transcript cleanup. Cheap refine is where over-compression usually starts. |
+| `logic` | `gpt-5.5` | Quality-critical reorder-without-rewrite discipline. |
 | `summary` | `gpt-5.4` | Strong synthesis without premium default cost. |
 | `timeline` | `gpt-5.4` | Needs source-aware judgment and chronology. |
 
-Premium profile for especially messy, long, or high-stakes runs:
+Cost-saving profile for low-stakes archive batches, only after audit/evals prove it is safe for that corpus:
 
 ```bash
---models scout=gpt-5.4-mini,verify=gpt-5.4,dedup=gpt-5.4,refine=gpt-5.5,logic=gpt-5.5,summary=gpt-5.5,timeline=gpt-5.5
+--models scout=gpt-5.4-mini,verify=gpt-5.4,dedup=gpt-5.4,refine=gpt-5.4,logic=gpt-5.5,summary=gpt-5.4,timeline=gpt-5.4
 ```
 
 Useful flags:

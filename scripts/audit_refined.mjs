@@ -181,21 +181,29 @@ export function checkSpeakerLabelStyle(refinedText) {
 
 // ---- lightweight glossary parsing (in-file; the real parser in core/spec.js must not be imported) ----
 // Recognizes the 人名 / 品牌 entity rows this repo renders — `- **正字** ← 变体1 / 变体2 ｜ …hint…` — under a
-// section header matching 人名 or 品牌/公司/产品. Also collects names marked unverified: a row whose text
-// carries ⚠ or 未能核实, plus `- query：未能核实，保留（音）` lines from the 联网核实结论 section.
+// section header matching 人名 or 品牌/公司/产品. `missing_yin` is intentionally name-only: uncertain brands,
+// institutions, and terms belong in review.md as open questions, but should not force awkward （音） markers.
 // Returns { entries: [{ canonical, variants[], section }], unverified: [names] }.
 export function parseGlossaryLite(glossaryText) {
   const entries = [], unverified = new Set()
   if (!glossaryText) return { entries, unverified: [] }
-  let inNameOrBrand = false
+  let section = ''
+  const peopleCanonicals = new Set()
   for (const raw of String(glossaryText).split(/\r?\n/)) {
     const line = raw.trim()
     const h = line.match(/^#{1,6}\s+(.*)$/)
-    if (h) { inNameOrBrand = /人名|品牌|公司|产品/.test(h[1]); continue }
+    if (h) {
+      section = /人名/.test(h[1]) ? 'person' : /品牌|公司|产品/.test(h[1]) ? 'brand' : ''
+      continue
+    }
     // unverified-by-web line: `- query：未能核实，保留（音）…`
     const un = line.match(/^-\s*(.+?)：未能核实/)
-    if (un) { const q = un[1].trim(); if (CJK_CHAR.test(q)) unverified.add(q.replace(/\*/g, '')); continue }
-    if (!inNameOrBrand) continue
+    if (un) {
+      const q = un[1].trim().replace(/\*/g, '')
+      if (peopleCanonicals.has(q) && CJK_CHAR.test(q)) unverified.add(q)
+      continue
+    }
+    if (!section) continue
     const m = line.match(/^-\s*\*\*(.+?)\*\*\s*←\s*(.*)$/)
     if (!m) continue
     const canonical = m[1].trim()
@@ -204,9 +212,13 @@ export function parseGlossaryLite(glossaryText) {
     const varsRaw = (fields.shift() || '').trim()
     const variants = (varsRaw === '—' || varsRaw === '（无变体）') ? []
       : varsRaw.split('/').map((x) => x.trim()).filter(Boolean)
-    entries.push({ canonical, variants, section: 'nameOrBrand' })
-    // a suspect/unverified entry (⚠ or 未能核实 anywhere in the row) → its canonical needs a （音） in prose
-    if (/⚠|未能核实/.test(rest)) if (CJK_CHAR.test(canonical)) unverified.add(canonical)
+    entries.push({ canonical, variants, section })
+    if (section === 'person') peopleCanonicals.add(canonical)
+    // A suspect/unverified person row → its canonical needs a （音） in prose. A generic ⚠ can also mean
+    // "verified alias not auto-applied" (e.g. 林湛 → 林湛之), so require explicit uncertainty wording.
+    if (section === 'person' && /未能核实|保留（音）|疑为转录误写/.test(rest)) {
+      if (CJK_CHAR.test(canonical)) unverified.add(canonical)
+    }
   }
   return { entries, unverified: [...unverified] }
 }
@@ -380,6 +392,102 @@ export function checkLogicSize(refinedText, logicText) {
   for (const [key, nos] of seen) if (nos.length >= 2) dups.push({ text: `重复长行（${nos.join(' / ')} 行）：${key.slice(0, 40)}`, line: nos[0] })
   findings.push({ name: 'logic_duplicate_para', severity: 'soft', count: dups.length, samples: dups.slice(0, 12) })
   return findings
+}
+
+function logicComparableLines(text) {
+  return bodyLines(text)
+    .map(({ raw }) => raw.trim())
+    .filter((line) => line && !/^#{1,6}\s/.test(line) && !/^\*〔取自精校稿：/.test(line) && !/^\*基于精校稿/.test(line))
+    .map((line) => line.replace(/\s+/g, ''))
+    .filter((line) => cjkLen(line) >= 8)
+}
+
+function lcsLength(a, b) {
+  const prev = new Array(b.length + 1).fill(0)
+  const curr = new Array(b.length + 1).fill(0)
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      curr[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], curr[j - 1])
+    }
+    for (let j = 0; j <= b.length; j += 1) { prev[j] = curr[j]; curr[j] = 0 }
+  }
+  return prev[b.length]
+}
+
+function refinedHeadings(text) {
+  return String(text || '').split(/\r?\n/)
+    .map((line) => {
+      const m = line.match(/^##\s+(.+?)\s*$/)
+      return m ? m[1].trim() : null
+    })
+    .filter(Boolean)
+}
+
+function logicProvenanceSections(logicText, sourceHeadings = []) {
+  const out = []
+  const source = Array.isArray(sourceHeadings) ? sourceHeadings.filter(Boolean) : []
+  const re = /〔取自精校稿：([^〕]+)〕/g
+  for (const m of String(logicText || '').matchAll(re)) {
+    const block = m[1]
+    const matched = source.filter((h) => block.includes(h))
+    if (matched.length) {
+      out.push(...matched)
+      continue
+    }
+    for (const raw of block.split(/[、,，]/)) {
+      const s = raw.trim()
+      if (s) out.push(s)
+    }
+  }
+  return out
+}
+
+export function checkLogicOrder(refinedText, logicText) {
+  const refinedLines = logicComparableLines(refinedText)
+  const logicLines = logicComparableLines(logicText)
+  const minLen = Math.min(refinedLines.length, logicLines.length)
+  const maxLen = Math.max(refinedLines.length, logicLines.length)
+  const lcs = lcsLength(refinedLines, logicLines)
+  const sameOrderRatio = minLen ? Number((lcs / minLen).toFixed(3)) : 0
+  const lineCountRatio = minLen ? Number((maxLen / minLen).toFixed(3)) : 1
+  const unchanged = minLen >= 20 && sameOrderRatio > 0.85 && lineCountRatio <= 1.08
+  return {
+    metrics: { refinedComparableLines: refinedLines.length, logicComparableLines: logicLines.length, sameOrderRatio, lineCountRatio },
+    finding: {
+      name: 'logic_order_unchanged',
+      severity: 'hard',
+      count: unchanged ? 1 : 0,
+      samples: unchanged ? [{ text: `逻辑稿与精校稿行级同序率 ${sameOrderRatio}，实质重排不足；需先做 logic-plan，再按主线重写`, line: 1 }] : [],
+    },
+  }
+}
+
+export function checkLogicSectionCoverage(refinedText, logicText) {
+  const source = refinedHeadings(refinedText)
+  const cited = logicProvenanceSections(logicText, source)
+  const citedSet = new Set(cited)
+  const missing = source.filter((h) => !citedSet.has(h))
+  const dupes = Array.from(cited.reduce((m, h) => m.set(h, (m.get(h) || 0) + 1), new Map()))
+    .filter(([, n]) => n > 1)
+    .map(([h]) => h)
+  const enough = source.length < 3 || missing.length === 0
+  const findings = []
+  findings.push({
+    name: 'logic_section_coverage',
+    severity: 'hard',
+    count: enough ? 0 : 1,
+    samples: enough ? [] : [{ text: `逻辑稿来源标注漏掉 ${missing.length}/${source.length} 个精校小标题：${missing.slice(0, 8).join('、')}`, line: 1 }],
+  })
+  findings.push({
+    name: 'logic_section_duplicate',
+    severity: 'soft',
+    count: dupes.length,
+    samples: dupes.slice(0, 8).map((h) => ({ text: `同一精校小标题被多个逻辑线索重复引用：${h}`, line: 1 })),
+  })
+  return {
+    metrics: { refinedSections: source.length, citedSections: cited.length, missingSections: missing.length, duplicateSections: dupes.length },
+    findings,
+  }
 }
 
 // Ordered speaker identifiers from either format: source "**发言人 1 …**" or
@@ -1715,18 +1823,19 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections }
 }
 
-// Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay ≤ 1.10× the 成稿 in 汉字
-// count (导读/出处 scaffold tolerance) and carry no duplicated long paragraphs. Both findings soft — a
-// reorder deliverable is judged on preservation, not gated like a refine. Standalone entry (its own CLI
-// flag --logic); returns the same finding shape so downstream wiring is uniform.
+// Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay reasonably sized, carry source
+// provenance for every refined section, and show real reordering when a logic稿 is produced. Size/duplicate findings
+// remain soft; fake same-order logic稿 and missing section provenance are hard.
 export function auditLogicPair(refinedText, logicText, { refinedFile = '<refined>', logicFile = '<logic>' } = {}) {
   const rChars = hanzi(refinedText)
   const lChars = hanzi(logicText)
-  const findings = checkLogicSize(refinedText, logicText)
-  const failed = [] // both findings are soft → never fails
+  const order = checkLogicOrder(refinedText, logicText)
+  const coverage = checkLogicSectionCoverage(refinedText, logicText)
+  const findings = checkLogicSize(refinedText, logicText).concat(order.finding, coverage.findings)
+  const failed = findings.filter((f) => f.severity === 'hard' && f.count).map((f) => f.name)
   return {
-    file: logicFile, mode: 'logic', status: 'ok', failed,
-    metrics: { refinedFile, refinedChars: rChars, logicChars: lChars, sizeRatio: rChars ? Number((lChars / rChars).toFixed(3)) : 1 },
+    file: logicFile, mode: 'logic', status: failed.length ? 'fail' : 'ok', failed,
+    metrics: { refinedFile, refinedChars: rChars, logicChars: lChars, sizeRatio: rChars ? Number((lChars / rChars).toFixed(3)) : 1, ...order.metrics, ...coverage.metrics },
     findings,
   }
 }
@@ -1860,7 +1969,7 @@ function xfileStripLabel(line) {
 export function checkCrossFileClaims(files, glossaryCanonicals = []) {
   const list = (files || []).filter((f) => f && typeof f.refinedText === 'string' && f.refinedText.trim())
   if (list.length < 2) return { conflicts: [] }
-  // key = `${entity} ${unit}` → Map(fileLabel → { label, value, line, snippet }). One observation per
+  // key = `${entity}\u0000${unit}` → Map(fileLabel → { label, value, line, snippet }). One observation per
   // (entity, unit, file): the FIRST occurrence in that file wins (stable, and keeps the snippet deterministic).
   // A per-file value that is internally inconsistent (same entity+unit stated two ways within ONE file) is out of
   // M8's scope — that is a single-file audit concern — so we only record the first and compare ACROSS files.
@@ -1868,7 +1977,7 @@ export function checkCrossFileClaims(files, glossaryCanonicals = []) {
   for (const f of list) {
     const label = f.label || '(未命名)'
     const lines = String(f.refinedText).split(/\r?\n/)
-    const seenInFile = new Set()   // `${entity} ${unit}` already recorded for THIS file
+    const seenInFile = new Set()   // `${entity}\u0000${unit}` already recorded for THIS file
     for (let li = 0; li < lines.length; li += 1) {
       const line = lines[li]
       if (!line || !line.trim()) continue
@@ -1881,7 +1990,7 @@ export function checkCrossFileClaims(files, glossaryCanonicals = []) {
         if (!a.unit) continue                                  // both sides must carry a unit — skip unitless
         const entity = xfileAssociate(a.idx, candidates)
         if (!entity) continue                                  // ambiguous / no entity in window → skip
-        const key = `${entity} ${a.unit}`
+        const key = `${entity}\u0000${a.unit}`
         if (seenInFile.has(key)) continue                      // first occurrence per file only
         seenInFile.add(key)
         if (!table.has(key)) table.set(key, new Map())
@@ -1900,7 +2009,7 @@ export function checkCrossFileClaims(files, glossaryCanonicals = []) {
     let conflict = false
     for (let i = 0; i < obs.length && !conflict; i += 1) for (let j = i + 1; j < obs.length; j += 1) { if (xfileValuesConflict(obs[i].value, obs[j].value)) { conflict = true; break } }
     if (!conflict) continue
-    const [entity, unit] = key.split(' ')
+    const [entity, unit] = key.split('\u0000')
     conflicts.push({ entity, unit, values: obs.slice(0, XFILE.MAX_VALUES) })
   }
   return { conflicts }
@@ -1912,7 +2021,7 @@ function usage() {
   node scripts/audit_refined.mjs --source <源稿.md> --refined <精校稿.md> [--mode refine|summary] [--glossary <校对表.md>] [--strict]
                                                                   # 对比源文：查压缩/欠精校/内容缺口/发言人错归/炮制引语；给 --glossary 时另查残留变体/裸写未核实名
                                                                   # --strict 额外开启 entity_substitution_risk（音近实体替换，误报率偏高，默认关闭）
-  node scripts/audit_refined.mjs --logic <逻辑稿.md> --refined <成稿.md>   # 逻辑稿膨胀/重复段体检（独立入口，soft）
+  node scripts/audit_refined.mjs --logic <逻辑稿.md> --refined <成稿.md>   # 逻辑稿体检：同序复制/漏来源为 hard，膨胀/重复段为 soft
   node scripts/audit_refined.mjs --glossary-only <校对表.md>       # 校对表结构体检（条目数/身份线索/变体比例，独立入口，全 soft）
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
   … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
@@ -1926,7 +2035,8 @@ soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/
   number_drift / hedge_loss（数字漂移 / 不确定语气被抹平）、attribution_mismatch（某轮内容落到了另一位发言人名下）、
   quote_fabrication_risk（引号内措辞源文中无对应——疑似炮制引语）、entity_substitution_risk（仅 --strict）、
   quote_density_low（长正文无弯引号）、speaker_label_style（标签风格混用）、ghost_name（残留错写变体）、
-  missing_yin（未核实名裸写缺（音））、logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段）、
+  missing_yin（未核实名裸写缺（音））、logic_order_unchanged / logic_section_coverage（逻辑稿假重排或漏来源，hard）、
+  logic_size_sanity / logic_duplicate_para（逻辑稿膨胀或重复段，soft）、
   glossary_thin / glossary_hints_sparse / glossary_variants_sparse（校对表偏薄，见 --glossary-only）。`
 }
 
@@ -1951,9 +2061,10 @@ function main() {
   }
   // --logic pairs the 逻辑稿 against the 成稿 (--refined); it is a standalone entry, no --source needed.
   if (logic && refined) {
-    const result = { status: 'ok', files: [auditLogicFile(refined, logic)] }
+    const file = auditLogicFile(refined, logic)
+    const result = { status: file.status, files: [file] }
     console.log(JSON.stringify(result, null, 2))
-    return 0
+    return result.status === 'fail' ? 1 : 0
   }
   if (source && refined) {
     const glossary = getOpt(argv, '--glossary')

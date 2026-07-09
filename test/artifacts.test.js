@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildReviewMarkdown, buildRunManifest, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
+import { buildReviewMarkdown, buildRunManifest, qualityScorecard, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-artifacts-'))
@@ -43,10 +43,18 @@ test('buildReviewMarkdown renders review queue and generated artifacts', () => {
 
   assert.match(md, /^# Review Queue/)
   assert.match(md, /主题：测试项目/)
+  assert.match(md, /## 质量摘要/)
+  assert.match(md, /状态：Blocked/)
   assert.match(md, /未完成，需要补做/)
   assert.match(md, /张三 \/ 章三/)
   assert.match(md, /校对表：校对表\.md/)
   assert.match(md, /精校稿：Transcripts\/A\.md/)
+})
+
+test('qualityScorecard classifies ready, review-needed, and blocked runs', () => {
+  assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, refined: [] }).status, 'ready')
+  assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, networkUnverified: [{ query: '示例品牌' }] }).status, 'review_needed')
+  assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['content_gap'] }] } }).status, 'blocked')
 })
 
 test('buildRunManifest records run config without secrets and hashes source files', () => {
@@ -73,6 +81,7 @@ test('buildRunManifest records run config without secrets and hashes source file
   })
 
   assert.equal(manifest.schemaVersion, 1)
+  assert.equal(manifest.quality.status, 'blocked')
   assert.equal(manifest.config.topic, '测试项目')
   assert.equal(manifest.config.backgroundLength, 'sensitive background'.length)
   assert.equal(manifest.config.backgroundSha256.length, 64)

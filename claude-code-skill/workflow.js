@@ -120,6 +120,23 @@ const LOGIC_REPORT_SCHEMA = {
   },
 }
 
+const LOGIC_PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: '逻辑重排方案 JSON 输出路径' },
+    mainline: { type: 'string', description: '主线脉络：为什么这样重排' },
+    no_reorder_needed: { type: 'boolean', description: '精校稿已天然按叙事顺序组织时置 true，并说明无需另出逻辑稿' },
+    reason: { type: 'string', description: '无需重排或重排策略的理由' },
+    threads: { type: 'array', items: { type: 'object', properties: {
+      title: { type: 'string', description: '该叙事线索的小标题（自描述、不编号）' },
+      logic: { type: 'string', description: '该线索内部排序逻辑：时间 / 因果 / 问题-解法 等' },
+      source_sections: { type: 'array', items: { type: 'string' }, description: '该线索取自精校稿的哪些 ## 小标题，原样照抄' },
+      source_order: { type: 'array', items: { type: 'number' }, description: '这些 source_sections 在精校稿中的 1-based 顺序号' },
+    } } },
+    open_questions: { type: 'array', items: { type: 'string' }, description: '重排前发现、需问委托方的点' },
+  },
+}
+
 
 // ---------- proofreading rules (kept in sync with SKILL.md Step 2) ----------
 const RULES = `精校规范（务必全部遵守）：
@@ -727,9 +744,22 @@ function renderGlossary(merged, verified, dedup, a) {
   const sec = []
   sec.push(`# ${a.topic} 统一校对表（采访时间 ${a.date}）`, '', '## 采访背景', a.background, '')
   sec.push('## 发言人统一标注')
+  const trustedSpeakerNames = new Set()
+  const trustSpeaker = (name) => {
+    const n = stripDesc(String(name || '').trim())
+    if (n && /[\u4e00-\u9fff]/.test(n)) trustedSpeakerNames.add(n)
+  }
+  for (const f of a.files || []) {
+    for (const m of String(f.speakerHints || '').matchAll(/(?:^|[；;，,])\s*([^=＝:：；;,，]+)\s*[=＝:：]/g)) trustSpeaker(m[1])
+  }
   for (const s of merged.speakersByFile) {
     sec.push(`**${s.label}**`)
-    for (const sp of s.speakers) { if (sp && sp.label) sec.push(`- ${sp.label} → ${sp.role || '?'}${sp.identity ? `（${sp.identity}）` : ''}`) }
+    for (const sp of s.speakers) {
+      if (sp && sp.label) {
+        trustSpeaker(sp.label)
+        sec.push(`- ${sp.label} → ${sp.role || '?'}${sp.identity ? `（${sp.identity}）` : ''}`)
+      }
+    }
   }
   // Cross-interview speaker registry (P3): a derived view unifying speakers that recur across ≥2 files
   // (chiefly the interviewer), so refine labels them consistently and the human sees who recurs.
@@ -741,7 +771,9 @@ function renderGlossary(merged, verified, dedup, a) {
       const e = applyVerified(e0, isPerson)
       // A locked (用户钦定) cluster is settled — it never carries the ⚠ suspect-ASR flag even if a consumed
       // cluster was scout-flagged; it renders clean with 〔用户钦定〕 (via confidenceMark) instead.
-      const susp = !e0.locked && e0.suspect_asr && ![e0.canonical, ...(e0.variants || [])].some((n) => resolvedMap.has(n))
+      const forms = [e0.canonical, ...(e0.variants || [])]
+      const speakerTrusted = forms.some((n) => trustedSpeakerNames.has(stripDesc(n)))
+      const susp = !speakerTrusted && !e0.locked && e0.suspect_asr && !forms.some((n) => resolvedMap.has(n))
         ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
       sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}${confidenceMark(e0, resolvedMap, a.date)}`)
     }
@@ -766,7 +798,12 @@ function renderGlossary(merged, verified, dedup, a) {
       const bad = rejected.has(r)
       sec.push(`- ${bad ? '⚠ ' : ''}${r.query} → **${r.canonical}**${r.identity ? `（${r.identity}）` : ''}${bad ? ' ｜ 与部分条目强名不符、疑似张冠李戴，请人工确认' : ''} ｜ 依据：${r.source}`)
     }
-    for (const u of verified.unresolved || []) sec.push(`- ${u.query}：未能核实，保留（音）${u.note ? ` ｜ ${u.note}` : ''}`)
+    for (const u of verified.unresolved || []) {
+      const trusted = trustedSpeakerNames.has(stripDesc(u.query))
+      sec.push(trusted
+        ? `- ${u.query}：公开核实不足；按发言人信息使用${u.note ? ` ｜ ${u.note}` : ''}`
+        : `- ${u.query}：未能核实，保留（音）${u.note ? ` ｜ ${u.note}` : ''}`)
+    }
   }
   const { directives, flags } = splitSuspects(dedup)
   if (directives.length) {
@@ -1350,7 +1387,6 @@ function safeName(s, max = 80, maxBytes = 255) {
 
 
 
-
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
 // (Haiku tends to take 8–9 small 100–200-line bites; Opus reads large chunks —
@@ -1627,10 +1663,20 @@ ${sourceText}
 </源转录>`
 }
 
-function summaryPrompt(a, refined) {
+function summaryDeliverableName(topic) {
+  const raw = String(topic || '').trim()
+  const base = raw.endsWith('访谈') ? raw.slice(0, -2) : raw
+  return `${safeName(base || raw || '访谈', 40)}访谈总结.md`
+}
+
+function summaryPrompt(a, refined, sectionMapPath) {
   const list = refined.map((r) => '- ' + (r.outPath || r.path)).join('\n')
-  return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${a.topic}访谈总结》：
-${list}
+  const mapNote = sectionMapPath
+    ? `\n先 Read 结构索引 ${sectionMapPath}，用它定位每份成稿的小标题、行号、主题标签和关键实体；需要引用原文时再按索引只读相关成稿小节，避免反复通读全文。`
+    : ''
+  const summaryTitle = String(a.topic || '').trim().endsWith('访谈') ? `${a.topic}总结` : `${a.topic}访谈总结`
+  return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${summaryTitle}》：
+${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
 三部分：分类要点（### 按主题小节，每条带具体事实或数字）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
@@ -1638,19 +1684,22 @@ ${list}
 
 ${TYPESET}
 
-写到 ${a.outputDir}/${safeName(a.topic, 40)}访谈总结.md（输出根目录，不是 Transcripts/；文件名已清洗，勿再改动）。抬头 H1 + 第二行斜体说明（受访者与采访方、采访时间 ${a.date}）。末尾注一行配套文档（Transcripts/ 下各精校全文）。
+写到 ${a.outputDir}/${summaryDeliverableName(a.topic)}（输出根目录，不是 Transcripts/；文件名已清洗，勿再改动）。抬头 H1 + 第二行斜体说明（受访者与采访方、采访时间 ${a.date}）。末尾注一行配套文档（Transcripts/ 下各精校全文）。
 你的最终回复即返回值：输出路径 + 各部分小节标题清单。`
 }
 
-function timelinePrompt(a, glossary, refined) {
+function timelinePrompt(a, glossary, refined, sectionMapPath) {
   const list = refined.map((r) => '- ' + (r.outPath || r.path)).join('\n')
+  const mapNote = sectionMapPath
+    ? `先 Read 结构索引 ${sectionMapPath}，优先用其中的时间/阶段/实体线索列候选事件；需要核对上下文时再按索引只读相关成稿小节。`
+    : ''
   const hasGlossary = glossary && glossary.trim() && glossary !== SINGLE_FILE_GLOSSARY
   const glossaryBlock = hasGlossary
     ? `附关键人物对照表（结合下方校对表的真名核实结论；查不到的标“真名未公开”）。\n\n统一校对表（含核实结论）：\n${glossary}`
     : `附关键人物对照表——本次无独立校对表，关键人物真名请你直接用 WebSearch 现查、查不到标“真名未公开”，绝不臆造。`
   return `你是「时间线」子代理。把 ${a.topic} 访谈口述与公开资料对照，产出《${a.topic}时间线》。
 
-步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
+步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；${mapNote ? `${mapNote} ` : ''}再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
 ${list}
 抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一；逐条标【访谈】/【公开】/【公开+访谈】；**源头可溯**：凡【访谈】或【公开+访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
 
@@ -1661,14 +1710,44 @@ ${TYPESET}
 
 // Logic-reordered draft: reads the **refined transcript** (not the raw source — names/terms already unified), reordering Q&A from recording order into narrative order.
 // Order-preserving reconstruction (lossless): Q&A blocks are copied verbatim, positions only are swapped; [Editor] bridging notes added only where a move breaks a reference.
-function logicWritePrompt(f, a, missing) {
+function logicPlanPrompt(f, a, sectionMapPath) {
+  const outName = safeName(f.title)
+  const mapNote = sectionMapPath
+    ? `\n【结构索引】先 Read ${sectionMapPath}，这里列出了精校稿所有 \`##\` 小标题、行号范围、主题标签和关键实体。`
+    : ''
+  return `你是「逻辑顺序重排」规划子代理。你只制定重排方案，不写最终稿。
+
+【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${mapNote}
+【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
+【输出方案】Write JSON 到 ${a.outputDir}/_codex-native/logic-plans/${outName}.json
+
+做法：
+1. 列出精校稿里全部 \`##\` 小标题，给它们按原出现顺序编号 1, 2, 3...
+2. 判断这份精校稿是否已经天然按叙事顺序组织。如果确实已经很顺，置 \`no_reorder_needed=true\`，并在 reason 里说明；不要为了完成任务硬造“假重排”。
+3. 若需要重排，理出 3–7 条叙事线索。每条线索必须给出：
+   - title：自描述小标题，不编号；
+   - logic：内部排序逻辑（时间 / 因果 / 问题→判断→证据→分歧→结论 / 产品起因→经过→结果）；
+   - source_sections：取自哪些精校稿 \`##\` 小标题，必须原样照抄；
+   - source_order：这些小标题在精校稿中的原 1-based 顺序号。
+4. 方案必须能看出**实质重排**：不能只把一节前置、其余照旧；不能只是合并相邻标题；不能把全稿原顺序换成更大的原顺序分组。
+5. 每个精校稿实质 \`##\` 小标题都要被某条线索覆盖一次。拿不准归属的单列到最接近的主线，并在 logic 里说明。
+
+${TYPESET}
+
+完成后按 schema 返回：path、mainline、no_reorder_needed、reason、threads（title、logic、source_sections、source_order）、open_questions。`
+}
+
+function logicWritePrompt(f, a, missing, planPath) {
   const outName = safeName(f.title)
   const missNote = (missing && missing.length)
     ? `\n【上轮遗漏——本轮必须完整纳入】上一遍重排漏掉了以下精校稿小标题对应的问答内容，请本轮务必把它们各自归入合适的主线、整段照原文补齐（不得再遗漏）：${missing.map((h) => `「${h}」`).join('、')}。`
     : ''
+  const planNote = planPath
+    ? `\n【已审重排方案】先 Read ${planPath}。最终稿必须严格按这个 JSON 里的 threads 顺序、source_sections 和 logic 执行；如果方案里 no_reorder_needed=true，就不要写假重排稿，改为返回 open_questions 说明无需另出逻辑稿。`
+    : ''
   return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
-【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它可能比源文件略短，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）
+【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
 【输出】Write 到 ${a.outputDir}/逻辑顺序/${outName}.md
 【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见 Transcripts/${outName}.md*\`
@@ -1685,7 +1764,6 @@ ${TYPESET}
 
 完成后按 schema 返回：path、mainline（导读那段）、threads（每条线索的 title、logic、以及它取自精校稿的哪些小标题 source_sections——**source_sections 必须原样照抄精校稿里的 \`##\` 小标题文字**，供完整性核对）、open_questions。`
 }
-
 
 
 

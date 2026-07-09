@@ -9,7 +9,8 @@ import {
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
 } from '../core/spec.js'
-import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt } from '../core/prompts.js'
+import { checkMissingYin, parseGlossaryLite } from '../scripts/audit_refined.mjs'
+import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt, summaryPrompt } from '../core/prompts.js'
 import { concatFiles, makeFilePolicy } from '../engines/fileops.js'
 import { runPipeline } from '../core/pipeline.js'
 
@@ -320,10 +321,42 @@ test('renderGlossary flags an unresolved suspect in the archival table (never sh
   assert.ok(/卫昭.*⚠ 侦察疑为转录误写/.test(g), 'unresolved suspect carries a ⚠ note in the glossary body')
 })
 
+test('renderGlossary trusts user-supplied speakers without forcing （音） everywhere', () => {
+  const merged = {
+    speakersByFile: [{ label: '访谈 A', speakers: [{ label: '方岑', role: '受访者', identity: '星桥航天副总工程师' }] }],
+    people: [{ canonical: '方岑', variants: ['方琛'], suspect_asr: true, hint: '星桥航天副总工程师、受访者', files: ['访谈 A'] }],
+    brands: [],
+    terms: [],
+    errors: [],
+    notes: [],
+  }
+  const g = renderGlossary(merged, { resolved: [], unresolved: [{ query: '方岑', note: '公开网页未找到直接身份页' }] }, null, {
+    topic: 'T',
+    date: '2025-09',
+    background: 'bg',
+    doNotMerge: [],
+    files: [{ speakerHints: '方岑=星桥航天副总工程师、受访者' }],
+  })
+  assert.ok(!/方岑.*⚠ 侦察疑为转录误写/.test(g), 'trusted speaker row is not treated as unsafe ASR')
+  assert.ok(/方岑：公开核实不足；按发言人信息使用/.test(g), 'public lookup gap is still recorded')
+  assert.ok(!/方岑：未能核实，保留（音）/.test(g), 'trusted speaker does not become a missing_yin trigger')
+  const glossary = parseGlossaryLite(g)
+  assert.equal(checkMissingYin('方岑：我来解释天隼三号。', glossary).count, 0)
+})
+
 test('scoutPrompt instructs knowledge-canonical and the suspect_asr flag', () => {
   const p = scoutPrompt({ path: '/s/A.txt', label: 'A', lines: 100 }, { background: 'bg' })
   assert.ok(p.includes('知名实体用你已知的正确写法') && p.includes('苍璧科技'), 'knowledge-canonical instruction present')
   assert.ok(p.includes('suspect_asr=true'), 'suspect-flag instruction present')
+})
+
+test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {
+  const A = { topic: '星桥航天方岑访谈', outputDir: '/out', skillDir: '/skill', date: '2026-07' }
+  const p = summaryPrompt(A, [{ outPath: '/out/Transcripts/a.md' }])
+  assert.ok(p.includes('/out/星桥航天方岑访谈总结.md'))
+  assert.ok(!p.includes('访谈访谈总结'))
+  const q = summaryPrompt({ ...A, topic: '示例公司' }, [{ outPath: '/out/Transcripts/a.md' }])
+  assert.ok(q.includes('/out/示例公司访谈总结.md'))
 })
 
 // ---------- pipeline routing (mock engine, zero tokens) ----------
