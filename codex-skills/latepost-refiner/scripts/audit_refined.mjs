@@ -405,16 +405,35 @@ function glossarySegIsHint(seg) {
   return !!s && !GLOSSARY_MARKER_ONLY.test(s)
 }
 
-// Parse renderGlossary's 人名 / 品牌 rows into { canonical, hasVariants, hasHint }. Self-contained (the real
-// parser in core/spec.js must not be imported here). A row: `- **正字** ← 变体 / … ｜ hint ｜ …markers…`.
-// 术语 rows are intentionally excluded — 身份 clues don't apply to terms, so counting them would depress the
-// hint ratio unfairly; the lint judges people/brands, where an identity clue is meaningful.
+// ---------- 校对表 source-label validation (P2b) ----------
+// A 校对表 row asserts a canonical writing + an identity/依据. Its content can come from what the interviewee
+// ACTUALLY said (访谈) or from public/external research (公开资料). Presenting a publicly-sourced fact as if the
+// interviewee confirmed it is the failure this guards: a row cited a specific technical designation to public
+// sources while the interviewee had explicitly declined to name it. So every row should carry a source label
+// 【访谈】 or 【公开·待记者核实】 (mirrors the 时间线/总结 label vocabulary), and the audit validates that a row
+// whose note cites external sources is not passed off as 访谈. All soft (a judgment call, not a hard gate).
+const GLOSSARY_LABEL_RE = /【[^】]*】/g
+// Note text that clearly points at an EXTERNAL / public source (not the interviewee's own words).
+const GLOSSARY_EXTERNAL_RE = /据[^，。；、｜]{0,12}(?:报道|消息|披露|介绍|记载)|公开(?:报道|资料|信息|渠道|数据)|官网|官方网站|维基|百科|招股(?:书|说明书)|年报|财报|工商(?:登记|信息|资料)|天眼查|企查查|媒体报道|根据公开|公告显示|官方公布/
+// Parse the 【…】 source label carried in a row's rhs → { label, explicit }. 公开 wins the "public" side; a
+// row can be 【公开+访谈…】 (both). A 【…】 that names neither 访谈 nor 公开 is not a source label (explicit=false).
+function glossaryRowLabel(rest) {
+  const inBr = (String(rest).match(GLOSSARY_LABEL_RE) || []).join('')
+  const pub = /公开/.test(inBr), itv = /访谈/.test(inBr)
+  return { label: pub && itv ? 'both' : pub ? 'public' : itv ? 'interview' : 'none', explicit: pub || itv }
+}
+
+// Parse renderGlossary's 人名 / 品牌 rows into { canonical, section, hasVariants, hasHint, label, hasExplicitLabel,
+// citesExternal, publicMarker, line }. Self-contained (the real parser in core/spec.js must not be imported here).
+// A row: `- **正字** ← 变体 / … ｜ hint ｜ …markers… 〔核实·date〕`. 术语 rows are intentionally excluded — 身份
+// clues don't apply to terms, so counting them would depress the hint ratio unfairly; the lint judges people/brands.
 export function parseGlossaryEntities(glossaryText) {
   const entities = []
   if (!glossaryText) return entities
   let section = null   // 'person' | 'brand' | null
-  for (const raw of String(glossaryText).split(/\r?\n/)) {
-    const line = raw.trim()
+  const lines = String(glossaryText).split(/\r?\n/)
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim()
     const h = line.match(/^#{1,6}\s+(.*)$/)
     if (h) {
       const t = h[1]
@@ -425,11 +444,18 @@ export function parseGlossaryEntities(glossaryText) {
     const m = line.match(/^-\s*\*\*(.+?)\*\*\s*←\s*(.*)$/)
     if (!m) continue
     const canonical = m[1].trim()
-    const segs = m[2].split('｜').map((s) => s.trim())
+    const rest = m[2]
+    const segs = rest.split('｜').map((s) => s.trim())
     const varsRaw = (segs.shift() || '').trim()
     const hasVariants = !(varsRaw === '' || varsRaw === '—' || varsRaw === '（无变体）')
     const hasHint = segs.some(glossarySegIsHint)
-    entities.push({ canonical, section, hasVariants, hasHint })
+    const { label, explicit } = glossaryRowLabel(rest)
+    const noteText = rest.replace(GLOSSARY_LABEL_RE, ' ').replace(/〔[^〕]*〕/g, ' ')
+    const citesExternal = GLOSSARY_EXTERNAL_RE.test(noteText)
+    // a row is publicly-corroborated when it says so (公开 label), or carries a 核实 concrete-source marker, or
+    // is tagged 公众人物 — any of these legitimises an external-sourced note.
+    const publicMarker = label === 'public' || label === 'both' || /〔核实/.test(rest) || /公众人物/.test(rest)
+    entities.push({ canonical, section, hasVariants, hasHint, label, hasExplicitLabel: explicit, citesExternal, publicMarker, line: i + 1 })
   }
   return entities
 }
@@ -461,6 +487,17 @@ export function auditGlossary(glossaryText) {
     findings.push({ name: 'glossary_variants_sparse', severity: 'soft', count: varThin ? 1 : 0,
       samples: varThin ? [{ text: `仅 ${withVar}/${total}（${Math.round(variantRatio * 100)}%）条记录了转写变体——跨文件写法归一可能不完整`, line: 1 }] : [] })
   }
+  // P2b source labels. mislabel (fires in ANY edition; precise): a row whose note cites external/public sources but
+  // is NOT marked public (no 【公开…】/〔核实〕/公众人物) — a公开 fact presented as 访谈亲述. unlabeled (only once the
+  // 校对表 is USING the 【…】 convention — ≥1 labeled row — so a legacy/universal table without labels isn't nagged):
+  // the rows that still lack a source label. Both soft (judgment calls, never a gate).
+  const usesLabels = entities.some((e) => e.hasExplicitLabel)
+  const mislabeled = entities.filter((e) => e.citesExternal && !e.publicMarker)
+  const unlabeled = usesLabels ? entities.filter((e) => !e.hasExplicitLabel) : []
+  findings.push({ name: 'glossary_source_mislabel', severity: 'soft', count: mislabeled.length,
+    samples: mislabeled.slice(0, 12).map((e) => ({ text: `“${e.canonical}”一行引用了公开/外部来源，却${e.label === 'interview' ? '标成了【访谈】' : '未标为【公开·待记者核实】'}——公开或推算的事实勿当访谈亲述`, line: e.line })) })
+  findings.push({ name: 'glossary_source_unlabeled', severity: 'soft', count: unlabeled.length,
+    samples: unlabeled.slice(0, 12).map((e) => ({ text: `“${e.canonical}”未标来源——请补标【访谈】（亲述）或【公开·待记者核实】（取自公开资料）`, line: e.line })) })
   return {
     file: '<glossary>', mode: 'glossary',
     status: 'ok',   // all soft — a thin glossary never fails the audit, only warns

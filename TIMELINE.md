@@ -66,6 +66,10 @@ Matching each answer back to the person who said it gets harder once more than t
 
 A finished document can quietly contradict itself: the same figure — a margin, a headcount, a span of time — is given one number in an early passage and a different number later, and each passage reads as faithful on its own. A human editor caught exactly this once. The tool now reads each finished transcript, and the timeline and summary built from it, for a measured quantity that is named the same way but carries two different exact numbers, and lists both places for a person to check against the recording. It is deliberately cautious: it only pairs the same noun with the same unit, it ignores rough estimates and "up to / no more than" phrasings that are allowed to differ, it never fails a run on its own, and the list is capped so it can never bury the more urgent items.
 
+## July 2026 — Making the reference table say where each fact came from
+
+Alongside each transcript the tool keeps a reference table: how every name, company, and term should be written, and the evidence for it. On one interview a row had quietly stated a specific technical designation as though the interviewee had confirmed it — when in fact he had declined to name it, and the designation had come from public sources. A reference note that can't tell "he said it" from "we looked it up" invites exactly that error. Every row now carries a source label — stated in the interview, or drawn from public/background material (which a reporter must verify) — and the templates and the extraction step ask for it on every entry. The checker then flags any row whose note points to an outside source but is passed off as the interviewee's own words, and, once a table has begun using the labels, lists the rows still missing one. It stays a prompt to review, never a hard failure.
+
 ---
 
 _Milestones are dated to when the work landed. The fuller story — including the dead-ends that shaped these decisions — lives in the private development diary._

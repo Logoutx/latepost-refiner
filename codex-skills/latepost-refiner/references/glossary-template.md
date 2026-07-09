@@ -13,11 +13,13 @@ Write this to `<out>/校对表.md`. It is a cumulative research artifact shared 
 - 涉及公司 / 机构：
 
 ## 人名（各种写法 -> 统一为 + 身份/依据）
-| 转录里的各种写法 | 统一为 | 身份 / 当时 title | 真名核实依据 |
+> 每行标来源：亲述 【访谈】；公开/核实 【公开·待记者核实】；互证 【公开+访谈·待记者核实】。公开或推算的信息勿标【访谈】。
+| 转录里的各种写法 | 统一为 | 身份 / 当时 title | 来源标注 + 依据 |
 |---|---|---|---|
-|  |  |  |  |
+|  |  |  | 【访谈】/【公开·待记者核实】 … |
 
 ## 品牌 / 公司 / 产品（写法 -> 统一）
+> 每条同样标来源 【访谈】/【公开·待记者核实】/【公开+访谈·待记者核实】。
 - 自家品牌 / 母公司：
 - 同业 / 竞品：
 - 上游 / 供应商 / 工厂：
@@ -54,6 +56,7 @@ Write this to `<out>/校对表.md`. It is a cumulative research artifact shared 
 ```
 
 Rules:
+- Label every 人名/品牌 row's source: interviewee-stated → 【访谈】; public/background or your own verification → 【公开·待记者核实】; corroborated by both → 【公开+访谈·待记者核实】. Never mark public, background, or inferred facts as 【访谈】 — a designation the interviewee declined to give is 【公开·待记者核实】, not 访谈.
 - Treat public-source conclusions as research notes, not just editing aids.
 - Carry forward prior verified entities when extending an existing glossary.
 - Do not re-verify prior confirmed entities unless the current batch creates a conflict.

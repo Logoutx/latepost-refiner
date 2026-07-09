@@ -221,13 +221,30 @@ export function escalationItems(result = {}) {
   return esc.files.map((f) => formatEscalationFile(f, esc.provider))
 }
 
+// P2b: the source-label findings are listings (one line PER offending row), rendered in their own review section
+// below — so the thin-table lint (one summary line per finding) must not also echo them.
+const GLOSSARY_SOURCE_FINDINGS = new Set(['glossary_source_mislabel', 'glossary_source_unlabeled'])
+
 // E13: fired 校对表 lint warnings → one review line each (each finding's sample text carries the counts).
 function glossaryLintItems(result) {
   const lint = result.glossaryLint
   if (!lint || !Array.isArray(lint.findings)) return []
   return lint.findings
-    .filter((f) => f && f.count)
+    .filter((f) => f && f.count && !GLOSSARY_SOURCE_FINDINGS.has(f.name))
     .map((f) => (f.samples && f.samples[0] && f.samples[0].text) ? f.samples[0].text : f.name)
+}
+
+// P2b: 校对表 source-label review — one line per row that either (a) cites an external/public source but isn't
+// marked public (公开事实当访谈亲述), or (b) lacks a source label once the table is using the 【…】 convention.
+export function glossarySourceItems(result = {}) {
+  const lint = result.glossaryLint
+  if (!lint || !Array.isArray(lint.findings)) return []
+  const out = []
+  for (const f of lint.findings) {
+    if (!GLOSSARY_SOURCE_FINDINGS.has(f.name) || !f.count) continue
+    for (const s of f.samples || []) out.push(s.text)
+  }
+  return out
 }
 
 export function reviewSections(result = {}, warnings = []) {
@@ -247,6 +264,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '校对表偏薄，建议人工复核（条目数/身份线索/变体比例）', items: glossaryLintItems(result), priority: 'medium' },
+    { title: '校对表来源标注（公开/外部事实勿当访谈亲述；未标来源的行请补标【访谈】或【公开·待记者核实】）', items: glossarySourceItems(result), priority: 'medium' },
     { title: '源文件已带小标题，需决定保留或重做', items: result.headingConflicts || [], priority: 'medium' },
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },
     { title: '因网络故障未核实，可网络恢复后补查', items: (result.networkUnverified || []).map(formatNetworkItem), priority: 'medium' },
