@@ -1,3 +1,4 @@
+// GENERATED FILE — DO NOT EDIT. Source: core/prompts.js. Regenerate: npm run sync:skills
 import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath, safeName } from './spec.js'
 
 // ---------- prompt builders ----------

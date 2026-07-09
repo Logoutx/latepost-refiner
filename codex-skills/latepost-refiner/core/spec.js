@@ -1,3 +1,4 @@
+// GENERATED FILE — DO NOT EDIT. Source: core/spec.js. Regenerate: npm run sync:skills
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
 // (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent

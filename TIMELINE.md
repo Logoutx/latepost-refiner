@@ -42,6 +42,10 @@ With faithfulness settled, attention turned to cost. A second head-to-head confi
 
 The tool learned to read subtitle-style source files: timed caption blocks are turned into clean speaker turns before editing, with the timecodes set aside so they are never mistaken for facts in the interview — and the faithfulness check gained a way to confirm that a re-ordered "logical narrative" draft still covers the whole interview. This work had grown up on a separate line alongside the local-app front end, so the two were merged back together, bringing every edition into step again.
 
+## July 2026 — One source of truth for the shared files
+
+A handful of files ship in more than one place so each edition is self-contained, and those copies had begun to drift apart when edited by hand. A single sync step now regenerates every copy from one source of truth — each generated copy carries a "do not edit" banner — and one check, run before the tests and in continuous integration, fails the build the moment any copy falls out of sync, replacing the earlier file-by-file comparisons.
+
 ---
 
 _Milestones are dated to when the work landed. The fuller story — including the dead-ends that shaped these decisions — lives in the private development diary._

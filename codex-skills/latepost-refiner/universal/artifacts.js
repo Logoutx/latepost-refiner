@@ -1,3 +1,4 @@
+// GENERATED FILE — DO NOT EDIT. Source: universal/artifacts.js. Regenerate: npm run sync:skills
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'

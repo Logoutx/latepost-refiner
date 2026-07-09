@@ -1,3 +1,4 @@
+<!-- GENERATED FILE — DO NOT EDIT. Source: claude-code-skill/references/editorial-spec.md. Regenerate: npm run sync:skills -->
 # Editorial Spec
 
 Use this reference when manually refining transcripts or reviewing runtime output.
@@ -97,13 +98,7 @@ Keep filename and H1 identical where practical.
 - Do not stop mid-topic.
 - Write large blocks correctly on first pass instead of many tiny edits — but keep paragraph boundaries: don't merge separate source turns just because one speaker keeps talking. Split long monologues into coherent 200-600-character paragraphs; any single dialogue paragraph over about 900 characters needs re-splitting.
 - Verify the output ending matches the source ending.
-- Before handoff, run the deterministic source-aware audit when available:
-
-```bash
-node "<skill dir>/scripts/audit_refined.mjs" --source "<source.md>" --refined "<output.md>" --mode refine
-```
-
-Fix or surface compression risk, under-refinement, missing endings, leftover pure filler (嗯/呃, 对对对/是是是, 我我/就就), phrase repeats (因为因为/涂鸦涂鸦/重复年份), ASR glue (20182018/SaaSAPP), broken fragment starts, and over-long paragraphs. 啊/哦/欸 and 这个/那个 are soft candidates — inspect context, don't blanket-delete. If the deterministic audit is unavailable, do a weaker no-shell checklist: compare source vs output for suspicious compression, missing tail content, collapsed speaker turns, repeated phrases, and under-cleaned filler; mark unresolved doubt in the handoff.
+- Before handoff, run the deterministic source-aware audit when available (`audit_refined.mjs --source <source> --refined <refined> --mode refine`): fix or surface compression, under-refinement, missing endings, leftover pure filler/repeats/ASR glue, and over-long paragraphs. 啊/哦/欸 and 这个/那个 are soft candidates — inspect context, don't blanket-delete. Without shell, do the same as a weaker model-side checklist and say if uncertainty remains.
 
 ## Never Skip Silently
 

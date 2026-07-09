@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// GENERATED FILE — DO NOT EDIT. Source: scripts/audit_refined.mjs. Regenerate: npm run sync:skills
 // Deterministic quality audit for refined Chinese interview transcripts.
 //
 // Two modes:
