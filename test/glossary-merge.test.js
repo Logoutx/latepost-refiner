@@ -154,18 +154,28 @@ test('terms with ASCII pipes, brackets, and quotes round-trip unchanged', () => 
   assert.equal(termByName(g, '虚构竖线术语').hint, '说明里有 ASCII | 字符', 'ASCII pipe inside a note is not a field separator')
 })
 
-test('render → parse → render is idempotent on a table with joined notes, special chars, and 40+ rows', () => {
+test('render → parse → render is idempotent (joined notes, special chars, 40+ rows) AND a 待复核 marker survives N cycles', () => {
   const terms = [
     { canonical: '虚构冲突术语', variants: ['甲', '乙'], hint: '第一说明；第二说明' },
     { canonical: '虚构 A|B [beta] "quote"', variants: ['虚构 A|B [草稿]'], hint: '含特殊字符' },
+    // Finding 4: a 待复核 (recheck) flag must survive render→parse→render, not silently vanish when there is no
+    // fresh verification hit — otherwise the next batch stops force-re-verifying the entry.
+    { canonical: '虚构复核术语', variants: ['虚构旧写'], hint: '需人工确认', confidence: 'recheck' },
     ...Array.from({ length: 42 }, (_, i) => ({ canonical: `虚构批量${String(i + 1).padStart(2, '0')}`, variants: [], hint: `说明 ${i + 1}` })),
   ]
-  const merged = mergedOf(terms)
-  const r1 = renderGlossary(merged, { resolved: [], unresolved: [] }, { suspects: [] }, GA)
-  const p = parseGlossary(r1)
-  const r2 = renderGlossary(
-    { people: p.people, brands: p.brands, terms: p.terms, speakersByFile: p.speakersByFile, errors: p.errors, notes: p.notes },
-    p.verified, { suspects: p.dedupSuspects }, GA,
-  )
-  assert.equal(r2, r1, 'a second render of the parsed table is byte-identical to the first')
+  const render = (m, v, d) => renderGlossary(m, v, d, GA)
+  let prev = render(mergedOf(terms), { resolved: [], unresolved: [] }, { suspects: [] })
+  assert.match(prev, /虚构复核术语.*〔待复核〕/, 'the recheck marker is emitted on the first render')
+  for (let cycle = 1; cycle <= 3; cycle += 1) {
+    const p = parseGlossary(prev)
+    const e = p.terms.find((t) => t.canonical === '虚构复核术语')
+    assert.ok(e && e.confidence === 'recheck', `cycle ${cycle}: the marker parses back to confidence 'recheck'`)
+    const next = render(
+      { people: p.people, brands: p.brands, terms: p.terms, speakersByFile: p.speakersByFile, errors: p.errors, notes: p.notes },
+      p.verified, { suspects: p.dedupSuspects },
+    )
+    assert.equal(next, prev, `cycle ${cycle}: re-render is byte-identical to the previous render`)
+    assert.match(next, /〔待复核〕/, `cycle ${cycle}: the 待复核 marker survives the round-trip`)
+    prev = next
+  }
 })

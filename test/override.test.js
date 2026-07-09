@@ -145,7 +145,7 @@ test('render→parse: a locked (user-decreed) entry round-trips to confidence "u
 })
 
 test('parse recognises a hand-written 〔待复核〕 marker as confidence "recheck"', () => {
-  // render never emits 待复核; a human writes it to flag an entry for re-verification. Parse must认得它.
+  // a human can hand-write 待复核 to flag an entry for re-verification; parse must认得它 (render also preserves it).
   const md = [
     '# T 统一校对表（采访时间 2025-07）',
     '',
@@ -231,7 +231,7 @@ test('BLOCKER: verified/user markers survive a full render→parse→merge→re-
   assert.equal(guarded.canonical, '甄选', 'name-guard: a user entry keeps its钦定 canonical against a colliding verify hit')
 })
 
-test('BLOCKER: a hand-written 待复核 forces re-verify (免verify权被撤销), and re-renders clean until re-verified', () => {
+test('BLOCKER: a hand-written 待复核 forces re-verify (免verify权被撤销), and re-renders WITH its 待复核 marker until re-verified', () => {
   const priorMd = [
     '# 示例公司 统一校对表（采访时间 2025-07）', '', '## 人名（写法 → 统一）',
     '- **陈涛** ← 陈焘 ｜ 受访者 〔待复核〕',    // human flagged for re-verification
@@ -244,11 +244,13 @@ test('BLOCKER: a hand-written 待复核 forces re-verify (免verify权被撤销)
   const merged = { people: clusterEntities([{ canonical: '陈涛', variants: ['陈焘'] }, { canonical: '新人物', variants: [] }]), brands: [], terms: [] }
   const out = excludeVerified(merged, priorWithStaleRow)
   assert.ok(out.people.some((x) => x.canonical === '陈涛'), 'recheck FORCES re-verify despite a covering verify row')
-  // Re-render without a fresh conclusion → the recheck entry carries NO marker (it is genuinely unsettled again).
+  // Finding 4: re-render without a fresh conclusion → the recheck entry KEEPS its 〔待复核〕 marker. It is still
+  // unsettled (待复核 is NOT a settled marker — excludeVerified above force-re-verifies it), and the marker MUST
+  // persist so the next batch keeps re-queuing it. Dropping it (the old behavior) silently lost that flag.
   const merged2 = mergeIntoPrior(prior, { speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [] })
   const md2 = renderGlossary(merged2, { resolved: [], unresolved: [] }, null, GA)
   const line = md2.split('\n').find((l) => l.includes('陈涛')) || ''
-  assert.ok(!/〔/.test(line), 'an un-re-verified recheck entry re-renders with no marker (not silently kept as settled)')
+  assert.ok(/〔待复核〕/.test(line), 'an un-re-verified recheck entry re-renders WITH its 待复核 marker (preserved, not dropped)')
 })
 
 // ---------- SF-1: a legitimate hint tail that looks like a marker is not stripped ----------

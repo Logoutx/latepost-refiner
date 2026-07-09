@@ -1182,6 +1182,20 @@ function dedupStutterAtoms(atoms, text) {
 // falls back to a document-wide check (lower confidence, so it only ever downgrades — never invents — a finding).
 // Returns { assessed, sourceNumbers, refinedNumbers, drifted, driftSamples, hedgeTurnsLost, hedgeSamples,
 // assessedTurns, sourceHedges, refinedHedges, perTurn } where perTurn feeds M5's section flags.
+// Unit synonym families for the mutation tier (Finding 2). A same-value pair whose units fall in the SAME family
+// is NOT drift (3 千米 vs 3 公里); the same value under a DIFFERENT family IS a unit mutation (3 个月 → 3 年).
+// 百分点 / 个点 is deliberately its own family — a percentage-point is not the same as a percent. Among the units
+// extractNumberAtoms actually attaches, only 个月/月 are synonyms; the rest document the intended equivalences and
+// cover values that carry those units through other paths.
+const UNIT_FAMILY = new Map([
+  ['个月', '月'], ['月', '月'],
+  ['千米', '公里'], ['公里', '公里'],
+  ['个小时', '小时'], ['小时', '小时'],
+  ['块', '元'], ['元', '元'],
+  ['％', '%'], ['%', '%'],
+])
+const unitFamily = (u) => (u ? (UNIT_FAMILY.get(u) || u) : '')
+
 export function checkMeaningAtoms(sourceText, refinedText) {
   const empty = {
     assessed: false, sourceNumbers: 0, refinedNumbers: 0, drifted: 0, driftSamples: [],
@@ -1242,6 +1256,20 @@ export function checkMeaningAtoms(sourceText, refinedText) {
         sink.push({ kind: 'missing', atom: sa, downgrade, foundText: windowText.replace(/\s+/g, ' ').slice(0, 50) })
         continue
       }
+      // unit mutation (Finding 2): the same VALUE survived but its unit changed families (3 个月 → 3 年). Judged only
+      // when the SOURCE atom carries a unit AND the value matched IN-WINDOW (a doc-wide match is too far, like the
+      // polarity check below). Unit-synonym families (个月/月, 千米/公里…) are NOT drift. A value that is BARE (no unit)
+      // on the refined side is NOT counted — prose reflow can drop a unit, and unit-present-vs-absent is too FP-prone
+      // (this mirrors the value-only match policy: the value carries the fact, so a lone unit drop is not a mutation).
+      if (sa.unit && inWindow) {
+        const cands = winByValue.get(sa.value) || []
+        const refUnitAtom = cands.find((ra) => ra.unit)
+        const sameFamily = cands.some((ra) => ra.unit && unitFamily(ra.unit) === unitFamily(sa.unit))
+        if (refUnitAtom && !sameFamily) {
+          sink.push({ kind: 'unit', atom: sa, downgrade, foundText: atomLabel(refUnitAtom) })
+          continue
+        }
+      }
       // present, but did the polarity/sign qualifier survive nearby? Only assess when the SOURCE carried one
       // and the value matched IN-WINDOW (a doc-wide match is too far to judge polarity).
       if (sa.polarity && inWindow) {
@@ -1273,6 +1301,8 @@ export function checkMeaningAtoms(sourceText, refinedText) {
           driftSamples.push({
             text: d.kind === 'polarity'
               ? `源第 ${t.startLine} 行：“${atomLabel(a)}” 的限定词“${a.polarity}”在成稿中消失，成稿作“${d.foundText}”`
+              : d.kind === 'unit'
+              ? `源第 ${t.startLine} 行：“${atomLabel(a)}” 的单位在成稿中被改写，成稿作“${d.foundText}”`
               : `源第 ${t.startLine} 行：“${atomLabel(a)}” 未在成稿对应段出现（成稿作“${d.foundText}”）`,
             line: t.startLine,
           })

@@ -158,6 +158,40 @@ test('NOT flagged — 两三年 kept as 汉字 in BOTH source and refined does n
   assert.equal(checkMeaningAtoms(src, ref).drifted, 0, 'small oral numbers never enter the atom set → never drift')
 })
 
+// ---------- Finding 2: unit-aware number_drift (a unit mutation is now visible) ----------
+
+test('MUTATION (Finding 2) — a unit mutation on the same value (3 个月 → 3 年) is flagged as number_drift', () => {
+  const src = ['沈其安 00:12', '这个项目我们从最初立项一直到最后正式上线，前前后后满打满算总共也就只用了 3 个月，团队执行力确实很强。'].join('\n')
+  const kept = ['## 进度', '沈其安：这个项目我们从最初立项一直到最后正式上线，前前后后满打满算总共也就只用了 3 个月，团队执行力确实很强。'].join('\n')
+  const bad = ['## 进度', '沈其安：这个项目我们从最初立项一直到最后正式上线，前前后后满打满算总共也就只用了 3 年，团队执行力确实很强。'].join('\n')
+  assert.equal(checkMeaningAtoms(src, kept).drifted, 0, '3 个月 kept → clean')
+  const r = checkMeaningAtoms(src, bad)
+  assert.ok(r.drifted >= 1, 'the same value 3 under a different unit family (个月 → 年) is caught')
+  assert.ok(r.driftSamples.some((s) => s.text.includes('单位')), 'the sample explains it is a unit change')
+})
+
+test('NOT flagged (Finding 2) — a unit-synonym swap (3 千米 → 3 公里) is NOT a unit mutation', () => {
+  // 千米 / 公里 are not ATOM_UNITS, so both extract as a bare value 3 (no unit) — a synonym swap must never register
+  // as a unit drift. (Aside: the scale char 千 inside 千米 tokenizes to a separate value 1000, a pre-existing
+  // extraction detail unrelated to Finding 2, so we assert specifically that no UNIT-kind drift is raised.)
+  const src = ['沈其安 00:12', '我们物流车队单程配送的平均半径，按去年整年的运营数据统计下来，基本就是 3 千米。'].join('\n')
+  const ref = ['## 半径', '沈其安：我们物流车队单程配送的平均半径，按去年整年的运营数据统计下来，基本就是 3 公里。'].join('\n')
+  assert.ok(!checkMeaningAtoms(src, ref).driftSamples.some((s) => s.text.includes('单位')), '千米/公里 do not register as a unit mutation')
+})
+
+test('NOT flagged (Finding 2) — a real unit-synonym pair among ATOM_UNITS (3 个月 → 3 月, same family)', () => {
+  const src = ['沈其安 00:12', '这个项目从最初立项一直到最后正式上线，前前后后满打满算总共用了 3 个月。'].join('\n')
+  const ref = ['## 进度', '沈其安：这个项目从最初立项一直到最后正式上线，前前后后满打满算总共用了 3 月。'].join('\n')
+  assert.equal(checkMeaningAtoms(src, ref).drifted, 0, '个月/月 map to the same family → not a unit mutation')
+})
+
+test('NOT flagged (Finding 2) — a value present only WITHOUT a unit on the refined side is not a unit drift', () => {
+  // Spec choice: unit-present-vs-absent is too FP-prone (prose reflow drops units), so it is NOT counted as drift.
+  const src = ['沈其安 00:12', '这条产品线去年整年下来的综合毛利率，我印象里其实就是稳定在 30% 这个水平上下。'].join('\n')
+  const ref = ['## 毛利', '沈其安：这条产品线去年整年下来的综合毛利率，我印象里其实就是稳定在 30 这个水平上下。'].join('\n')
+  assert.equal(checkMeaningAtoms(src, ref).drifted, 0, 'source 30% vs refined bare 30 → the value matched, unit drop not flagged')
+})
+
 // ---------- P3: number-drift precision (garbage discipline, stutter dedup, turn-aware confidence) ----------
 
 test('P3 stutter dedup — an ASR-doubled number (百分之三十 百分之三十) is ONE fact: a drop is one drift, not two', () => {

@@ -251,7 +251,9 @@ export function isConcreteSource(s) {
 //      entry body by applyVerifiedEntry, only the confidence marker is withheld)
 //   3. a prior entry parsed back as confidence:'verified' but NOT re-checked this round → its ORIGINAL marker
 //      preserved verbatim, original date段 and all (this is what was silently lost before)
-//   4. recheck / unknown with no fresh verification → no marker (recheck re-renders by this round's conclusion)
+//   4. a prior entry parsed back as confidence:'recheck' but NOT re-verified this round → 〔待复核〕 preserved, so
+//      next round's excludeVerified still force-re-verifies it (Finding 4: this marker was silently dropped before)
+//   5. unknown with no fresh verification → no marker
 export function confidenceMark(e0, resolvedMap, date) {
   if (!e0) return ''
   if (e0.locked || e0.confidence === 'user') return ` 〔${CONFIDENCE_USER}〕`
@@ -262,6 +264,9 @@ export function confidenceMark(e0, resolvedMap, date) {
     return ` 〔${CONFIDENCE_RECHECK}〕`   // resolved this round, but no concrete evidence — applied, not永久信任
   }
   if (e0.confidence === 'verified') return e0.confidenceDate ? ` 〔${CONFIDENCE_VERIFIED}·${e0.confidenceDate}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
+  // Finding 4: a prior 〔待复核〕 entry with no fresh verification hit this round must RE-EMIT its marker — dropping it
+  // (the old behavior) lost the flag excludeVerified relies on to force-re-verify the entry next batch.
+  if (e0.confidence === 'recheck') return ` 〔${CONFIDENCE_RECHECK}〕`
   return ''
 }
 // Parse side: strip a trailing confidence marker off an entry-line RHS, returning the cleaned string plus the
