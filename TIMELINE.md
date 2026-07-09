@@ -58,6 +58,10 @@ The same comparison turned up the highest-stakes failure of all: a generated tim
 
 A close look at the strongest engine run showed that almost every "number changed" alarm was a false one: the raw transcript had stuttered a figure ("thirty… thirty people"), or buried a stray number inside a garbled fragment, and the cleaned-up version had rightly dropped it — yet the check counted that tidy-up as a missing fact. The number-checker now knows the difference. A figure the raw transcript repeats on the spot is treated as one fact, not two; a figure sitting inside a passage the tool already recognises as transcription garbage is set aside as a "worth a glance" note rather than a fault; and numbers are compared passage-by-passage against the matching part of the source instead of against the whole document at once, so two unrelated figures can no longer be mistaken for one that drifted. A figure that genuinely was changed or invented in the finished text still raises the alarm, exactly as before.
 
+## July 2026 — Fewer false "wrong speaker" alarms when the room is crowded
+
+Matching each answer back to the person who said it gets harder once more than two people are in the room: a cleaned-up transcript merges or splits turns, and the checker can pin a line to the wrong name. On the strongest run of a four-person interview, all four "wrong speaker" alarms turned out to be these alignment slips, not real mistakes. The check now asks for more before it accuses. In a conversation of three or more people it raises a firm "wrong speaker" fault only when a whole answer plainly sits under the wrong name; a single weak match is set aside as a "please double-check" note instead of an accusation. A genuine swap — an entire answer moved under someone else's name — still fails firmly, and two-person interviews, where the check was already reliable, work exactly as before.
+
 ---
 
 _Milestones are dated to when the work landed. The fuller story — including the dead-ends that shaped these decisions — lives in the private development diary._

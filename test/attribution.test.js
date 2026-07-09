@@ -128,6 +128,78 @@ test('M6 struck source label is excluded from map + flags (transcriber on-the-fl
   assert.equal(r.mismatches, 0, 'a struck-label turn is source-ambiguous → never accused')
 })
 
+// ---------- P4: multi-party attribution tolerance (≥3 speakers) ----------
+// A third guest (发言人3 → 林骁) turns the interview into a 3-party conversation. 林骁 stays below the map
+// sample floor (appears, never trusted-mapped) but IS a real refined label — so it can host a planted swap.
+const GUESTB1 = '我插一句从物流这个角度看，去年整个华南片区的仓配网络其实经历了一次比较大的重构，末端配送的时效压力变得特别明显。'
+const GUESTB2 = '另外关于冷链这块，我们发现生鲜品类在三四线城市的履约成本一直居高不下，这是整个行业普遍都很头疼的一个老问题。'
+function build3Party({ swapTurnIndex = -1, swapTo = '林骁', swapAnswer = null } = {}) {
+  const srcLines = []
+  const out = ['# 三方座谈实录', '', '*采访者：沈其安｜嘉宾：周砚、林骁*', '']
+  QA.forEach(([q, a], i) => {
+    const ans = (i === swapTurnIndex && swapAnswer) ? swapAnswer : a
+    const mm = String(i * 5).padStart(2, '0')
+    srcLines.push(`发言人1   00:${mm}`, q, '', `发言人2   00:${String(i * 5 + 2).padStart(2, '0')}`, ans, '')
+    if (i % 4 === 0) out.push(`## 第 ${i / 4 + 1} 部分`, '')
+    out.push(`沈其安：${q}`, '')
+    out.push(`${(i === swapTurnIndex) ? swapTo : '周砚'}：${ans}`, '')
+  })
+  srcLines.push('发言人3   01:05', GUESTB1, '', '发言人3   01:12', GUESTB2, '')
+  out.push('## 嘉宾补充', '', `林骁：${GUESTB1}`, '', `林骁：${GUESTB2}`, '')
+  return { source: srcLines.join('\n'), refined: out.join('\n') }
+}
+
+// A long, evenly-distinctive answer relabels the WHOLE turn under 林骁 → full corroboration → a true swap.
+const LONG_ANSWER = '关于海外市场的整体布局我这边可以展开讲一下，我们在东南亚的越南和印尼分别设立了本地化的运营团队，同时在中东的迪拜也铺设了一个区域中转仓，欧洲那边则主要通过跨境电商的模式先做小规模的试点验证。'
+// A short answer relabeled under 林骁 → only a partial (2-anchor) corroboration → the multi-party low-confidence case.
+const SHORT_ANSWER = '补充一个数据口径的问题，我们内部对活跃用户的定义一直都有争议，口径不统一导致横向对比起来相当困难。'
+
+test('P4 multi-party TRUE swap (whole answer relabeled to 林骁) STILL hard-fails with ≥3 speakers', () => {
+  const { source, refined } = build3Party({ swapTurnIndex: 4, swapTo: '林骁', swapAnswer: LONG_ANSWER })
+  const r = checkAttribution(source, refined)
+  assert.ok(r.partyCount >= 3, 'a third guest makes this a multi-party conversation')
+  assert.equal(r.mismatches, 1, 'a fully-corroborated relabel is still a hard mismatch in multi-party')
+  assert.equal(r.review, 0, 'a true swap is not downgraded to review')
+  assert.match(r.samples[0].text, /发言人2/, 'cites the source speaker')
+  assert.match(r.samples[0].text, /林骁/, 'cites the wrong label')
+  assert.match(r.samples[0].text, /应为.*周砚/, 'cites the expected label')
+})
+
+test('P4 multi-party LOW-CONFIDENCE mismatch → warning-tier 复核, NOT a hard flag', () => {
+  const { source, refined } = build3Party({ swapTurnIndex: 4, swapTo: '林骁', swapAnswer: SHORT_ANSWER })
+  const r = checkAttribution(source, refined)
+  assert.ok(r.partyCount >= 3)
+  assert.equal(r.mismatches, 0, 'a single misaligned pairing does not hard-fail in multi-party')
+  assert.equal(r.review, 1, 'it is surfaced as a 复核 review item instead')
+  assert.match(r.reviewSamples[0].text, /复核/, 'the review line asks for human review, not a direct edit')
+})
+
+test('P4 two-party control: the SAME swap in a ≤2-speaker interview is UNCHANGED (still a hard mismatch)', () => {
+  const r = checkAttribution(buildSource(), buildRefined({ swapTurnIndex: 4, swapTo: '沈其安' }))
+  assert.equal(r.partyCount, 2, 'two speakers')
+  assert.equal(r.mismatches, 1, 'two-party behavior is preserved exactly')
+  assert.equal(r.review, 0, 'no review tier in two-party mode')
+})
+
+test('P4 multi-party review localizes to a section, and auditPair rides it as a SOFT finding', () => {
+  const { source, refined } = build3Party({ swapTurnIndex: 4, swapTo: '林骁', swapAnswer: SHORT_ANSWER })
+  const attribution = checkAttribution(source, refined)
+  const sections = buildSections(source, refined, { attribution })
+  const flagged = sections.filter((sec) => sec.flags.some((f) => f.kind === 'attribution_review'))
+  assert.equal(flagged.length, 1, 'the low-confidence mismatch surfaces in exactly one section as attribution_review')
+  const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  const ar = r.findings.find((f) => f.name === 'attribution_review')
+  assert.ok(ar && ar.severity === 'soft' && ar.count === 1, 'attribution_review rides as a soft finding')
+  assert.ok(!r.failed.includes('attribution_review') && !r.failed.includes('attribution_mismatch'), 'neither tier gates the pair')
+  assert.equal(r.metrics.attribution.review, 1)
+  assert.equal(r.metrics.attribution.partyCount, 3)
+  // a clean multi-party refine has neither a hard mismatch nor a review item
+  const clean = build3Party({})
+  const rc = auditPair({ sourceText: clean.source, refinedText: clean.refined, mode: 'refine' })
+  assert.ok(!rc.findings.some((f) => f.name === 'attribution_review'), 'no review finding on a faithful multi-party refine')
+  assert.equal(rc.metrics.attribution.mismatches, 0)
+})
+
 // ---------- M7a: quote_fabrication_risk ----------
 
 const QUOTE_SRC = ['周砚   00:00',

@@ -1301,6 +1301,9 @@ export const ATTR = {
   MAJORITY_MIN: 0.8,       // …and its dominant refined label must own ≥ this fraction of them; else 'unassessable'
   MIN_TURN_CHARS: 40,      // normalized-hanzi length a turn needs before an attribution flag is worth raising
   MIN_CORROBORATION: 2,    // anchor shingles that must co-locate in the wrong-label paragraph to confirm a mismatch
+  MULTI_PARTY_MIN: 3,      // ≥ this many distinct source speakers → a multi-party conversation (stricter hard bar)
+  MULTI_STRONG_CORROBORATION: 3,  // multi-party hard flag: ≥ this many corroborating anchors in the wrong paragraph
+  MULTI_CORROBORATION_FRACTION: 0.6, // …AND ≥ this fraction of the turn's anchors — the whole turn sits under the wrong label
 }
 const ATTR_LABEL_RE = /^\s*([一-龥A-Za-z0-9·]{1,12})[：:]/   // `名字：` at line start (inline OR label-on-own-line)
 const ATTR_HEAD_RE = /^#{1,6}\s/
@@ -1332,12 +1335,25 @@ function attrParagraphNorm(refLines, line1) {
 
 // Build the source-speaker → refined-label majority map from high-confidence anchors, then flag the anchored turns
 // that contradict it. Returns { assessed, map, speakers, assessedTurns, mappedSpeakers, mismatches, samples,
-// perTurn } — perTurn (each { startLine, endLine, anchorLine, speaker, label, expected, mismatch }) feeds M5's
-// section flags. Leniency contract identical to coverage/atoms: no parseable anchors → assessed:false.
+// review, reviewSamples, partyCount, perTurn } — perTurn (each { startLine, endLine, anchorLine, speaker, label,
+// expected, mismatch, review }) feeds M5's section flags. Leniency contract identical to coverage/atoms: no
+// parseable anchors → assessed:false.
+//
+// P4 multi-party tolerance: with ≥ ATTR.MULTI_PARTY_MIN distinct source speakers, turn alignment drifts (the
+// refined edition merges / splits turns) so a SINGLE misaligned pairing is a weak signal — every one of the four
+// attribution flags on a real 4-speaker run was this artifact. So in multi-party mode a mismatch only HARD-flags
+// when the wrong-label paragraph corroborates the WHOLE turn (≥ MULTI_STRONG_CORROBORATION anchors AND ≥
+// MULTI_CORROBORATION_FRACTION of the turn's anchors — a genuine relabel of the entire turn); a weaker mismatch
+// that merely clears the base bar drops to a warning-tier 复核 item (review) instead of accusing. A true swap
+// still hard-fails (the whole answer sits under the wrong name → full corroboration). Two-party interviews (≤2
+// speakers, where the check was already accurate) keep the exact prior behavior.
 export function checkAttribution(sourceText, refinedText) {
-  const empty = { assessed: false, map: {}, speakers: {}, assessedTurns: 0, mappedSpeakers: 0, mismatches: 0, samples: [], perTurn: [] }
+  const empty = { assessed: false, map: {}, speakers: {}, assessedTurns: 0, mappedSpeakers: 0, mismatches: 0, samples: [], review: 0, reviewSamples: [], partyCount: 0, perTurn: [] }
   const { subs } = anchorTurns(sourceText, refinedText)
   if (!subs.length) return empty
+  // distinct source speakers among substantive turns — the number of parties in the conversation (P4).
+  const partyCount = new Set(subs.map((t) => t.speaker)).size
+  const multiParty = partyCount >= ATTR.MULTI_PARTY_MIN
   const refLines = refinedText.split(/\r?\n/)
   // rarity over the same substantive source text anchorTurns used, so pickShingles reproduces the anchor shingles.
   const freq = new Map()
@@ -1370,13 +1386,19 @@ export function checkAttribution(sourceText, refinedText) {
     if (trusted) map[s] = label
   }
   const mappedSpeakers = Object.keys(map).length
-  if (!mappedSpeakers) return { ...empty, assessed: false, speakers }
+  if (!mappedSpeakers) return { ...empty, assessed: false, speakers, partyCount }
 
   // 3) flag mismatches against the trusted map (FLAGS exclude the doc's first/last turn + boundary-glue anchors)
   const samples = []
+  const reviewSamples = []
   const perTurn = []
   let mismatches = 0
+  let review = 0
   let assessedTurns = 0
+  const mkText = (t, g, expected) => {
+    const snippet = t.text.replace(/\s+/g, ' ').replace(/~~[^~]*~~/g, '').trim().slice(0, 42)
+    return `源第 ${t.startLine} 行（${t.speaker}）的内容落到了成稿“${g.label}”名下（应为“${expected}”）：${snippet}`
+  }
   for (const t of usable) {
     if (!(t.speaker in map)) continue
     const g = governingLabel(refLines, t.anchor.line)
@@ -1384,7 +1406,8 @@ export function checkAttribution(sourceText, refinedText) {
     const expected = map[t.speaker]
     assessedTurns += 1
     const isMismatch = g.label !== expected
-    let flagged = false
+    let flagged = false      // hard mismatch (attribution_mismatch)
+    let reviewed = false     // warning-tier 复核 item (attribution_review) — multi-party low-confidence only
     if (isMismatch) {
       const isBoundaryTurn = t === firstSub || t === lastSub
       const onHeading = ATTR_HEAD_RE.test(refLines[t.anchor.line - 1] || '')
@@ -1393,21 +1416,24 @@ export function checkAttribution(sourceText, refinedText) {
       const paraNorm = attrParagraphNorm(refLines, t.anchor.line)
       const shingles = pickShingles(t.norm, rarity)
       const corroboration = shingles.filter((w) => paraNorm.includes(w)).length
-      flagged = !isBoundaryTurn && !onHeading && longEnough && corroboration >= ATTR.MIN_CORROBORATION
-      if (flagged) {
-        mismatches += 1
-        if (samples.length < 12) {
-          const snippet = t.text.replace(/\s+/g, ' ').replace(/~~[^~]*~~/g, '').trim().slice(0, 42)
-          samples.push({
-            text: `源第 ${t.startLine} 行（${t.speaker}）的内容落到了成稿“${g.label}”名下（应为“${expected}”）：${snippet}`,
-            line: t.anchor.line,
-          })
-        }
+      const baseOk = !isBoundaryTurn && !onHeading && longEnough && corroboration >= ATTR.MIN_CORROBORATION
+      if (baseOk) {
+        // Multi-party: HARD only when the wrong-label paragraph corroborates the WHOLE turn (a genuine relabel);
+        // a weaker (single-/partial-anchor) mismatch is alignment drift → 复核 warning, not an accusation.
+        // Two-party: the base bar already sufficed (accurate there), so it stays hard exactly as before.
+        const strong = corroboration >= ATTR.MULTI_STRONG_CORROBORATION
+          && corroboration >= Math.ceil(shingles.length * ATTR.MULTI_CORROBORATION_FRACTION)
+        if (!multiParty || strong) flagged = true
+        else reviewed = true
       }
+      if (flagged && samples.length < 12) samples.push({ text: mkText(t, g, expected), line: t.anchor.line })
+      if (reviewed && reviewSamples.length < 12) reviewSamples.push({ text: `${mkText(t, g, expected)}（多方访谈·对齐存疑，请复核而非直接改）`, line: t.anchor.line })
     }
-    perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, speaker: t.speaker, label: g.label, expected, mismatch: flagged })
+    if (flagged) mismatches += 1
+    if (reviewed) review += 1
+    perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, speaker: t.speaker, label: g.label, expected, mismatch: flagged, review: reviewed })
   }
-  return { assessed: true, map, speakers, assessedTurns, mappedSpeakers, mismatches, samples, perTurn }
+  return { assessed: true, map, speakers, assessedTurns, mappedSpeakers, mismatches, samples, review, reviewSamples, partyCount, perTurn }
 }
 
 // ===== Quote-integrity + entity-substitution guards (M7) =====
@@ -1654,6 +1680,8 @@ export function buildSections(sourceText, refinedText, { atoms = null, coverage 
     if (attribution && attribution.assessed) {
       const attrHere = attribution.perTurn.filter((p) => p.mismatch && p.anchorLine >= from && p.anchorLine <= to)
       if (attrHere.length) flags.push({ kind: 'attribution_mismatch', count: attrHere.length, sample: attrHere.map((p) => `${p.speaker}→${p.label}`).slice(0, 2).join('、') })
+      const attrReview = attribution.perTurn.filter((p) => p.review && p.anchorLine >= from && p.anchorLine <= to)
+      if (attrReview.length) flags.push({ kind: 'attribution_review', count: attrReview.length, sample: attrReview.map((p) => `${p.speaker}→${p.label}`).slice(0, 2).join('、') })
     }
     // content_gap_soft / scattered loss whose source range overlaps this section's matched source range
     if (coverage && coverage.assessed && range) {
@@ -1928,7 +1956,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
     ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
-    ...(attribution ? { attribution: { assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches } } : {}),
+    ...(attribution ? { attribution: { assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
     ...(quoteFab ? { quotes: { assessed: quoteFab.assessed, spansChecked: quoteFab.spansChecked, flagged: quoteFab.flagged } } : {}),
   }
 
@@ -1988,6 +2016,11 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     // majority map for its source speaker (Henry's answer sitting under the interviewer's label, or vice versa).
     ...(attribution && attribution.assessed ? [
       { name: 'attribution_mismatch', severity: 'soft', count: attribution.mismatches, samples: attribution.samples },
+    ] : []),
+    // P4 multi-party 复核 tier: a low-confidence attribution mismatch (a single misaligned pairing in a ≥3-party
+    // conversation) — surfaced for human review rather than accused as a hard mismatch. Present only when non-empty.
+    ...(attribution && attribution.assessed && attribution.review ? [
+      { name: 'attribution_review', severity: 'soft', count: attribution.review, samples: attribution.reviewSamples },
     ] : []),
     // M7 quote-integrity finding — SOFT ONLY. quote_fabrication_risk: a refined curly-quote span whose rare bigrams
     // are absent from the source everywhere (a polished line quotation-marked as if spoken).
