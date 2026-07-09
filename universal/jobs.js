@@ -10,7 +10,8 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile } from '../scripts/audit_refined.mjs'
+import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -189,6 +190,32 @@ export function computeCrossFileConflicts(refined, glossaryText) {
     const canonicals = (parseGlossaryLite(glossaryText || '').entries || []).map((e) => e.canonical).filter(Boolean)
     return checkCrossFileClaims(files, canonicals).conflicts || []
   } catch { return [] }
+}
+
+// P1: derivative-attribution guard for the produced 时间线 / 访谈总结. Each is audited against the interview
+// corpus (this run's source transcripts + refined 成稿 — the ground truth of what was actually said). A figure
+// tagged 【访谈】 that is a measured quantity absent from that corpus is a FABRICATED interview figure → hard.
+// Runs post-pipeline (fs, files on disk) exactly where the M8 cross-file check runs. Never throws — a missing
+// deliverable file is skipped. Returns { status, files:[{ file, kind, status, hardFail[], reporterVerify[],
+// review[], failed[] }] } or null. The corpus is the union of every source + 成稿 (extractNumberAtoms
+// canonicalises writing systems identically; the 成稿 covers unit-restoration the derivative legitimately copied).
+export function computeDerivativeAudit(A, result) {
+  try {
+    const outDir = A.outputDir
+    const deliverables = []
+    if ((A.scope || []).includes('summary') && result.summary) deliverables.push({ kind: 'summary', path: path.join(outDir, summaryDeliverableName(A.topic)) })
+    if ((A.scope || []).includes('timeline') && result.timeline) deliverables.push({ kind: 'timeline', path: path.join(outDir, timelineDeliverableName(A.topic)) })
+    if (!deliverables.length) return null
+    const corpus = []
+    for (const f of A.files || []) { for (const p of [f.path, f.outPath]) { if (p && fs.existsSync(p) && !corpus.includes(p)) corpus.push(p) } }
+    const files = []
+    for (const d of deliverables) {
+      if (!fs.existsSync(d.path)) continue    // the deliverable agent did not write the expected file — skip (surfaced elsewhere)
+      files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind }))
+    }
+    if (!files.length) return null
+    return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
+  } catch { return null }
 }
 
 // Persist the returned glossary (pure-JS output; no agent writes it). Cumulative across runs.
@@ -627,13 +654,27 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       // Fold ONE summary line into openQuestions (the per-conflict detail lives in review.md / run.json).
       r.openQuestions = [...(r.openQuestions || []), `跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突（每份内部都合规）——请对照录音确认哪个是对的，详见 review.md「跨文件互证」`]
     }
+
+    // P1: audit the produced 时间线/总结 for fabricated 访谈-attributed figures. A hard fabrication joins
+    // auditFailed (→ non-zero exit + review.md), exactly like any other hard finding; 待核/复核 items are soft.
+    const derivativeAudit = !r.error ? computeDerivativeAudit(A, r) : null
+    if (derivativeAudit) {
+      for (const df of derivativeAudit.files) {
+        if ((df.hardFail || []).length) {
+          r.auditFailed = [...(r.auditFailed || []), { path: df.file, findings: ['derivative_attribution'] }]
+          notice(`⚠ 派生件溯源未过：${path.basename(df.file)} 有 ${df.hardFail.length} 个标【访谈】数字源文无对应（疑炮制）——见 review.md「派生件溯源」`)
+        }
+        const rv = (df.reporterVerify || []).length
+        if (rv) notice(`时间线/总结：${rv} 个公开来源数字待记者核实（见 review.md「派生件溯源」）`)
+      }
+    }
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
     // usage: primary engine totals, plus the premium engine's usage merged in (with a separate `escalation`
     // sub-object) when escalation ran. mergeEscalationUsage is a no-op-merge when escUsage is null.
     const usage = escUsage ? mergeEscalationUsage(sel.engine.usage(), escUsage) : sel.engine.usage()
-    const result = { ...r, audit, escalation: escalation ? escalation.manifest : null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, derivativeAudit, escalation: escalation ? escalation.manifest : null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

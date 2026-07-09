@@ -2126,6 +2126,193 @@ export function checkCrossFileClaims(files, glossaryCanonicals = []) {
   return { conflicts }
 }
 
+// ============================================================================
+// P1 — derivative attribution guard (时间线 / 访谈总结)
+// ----------------------------------------------------------------------------
+// A derived deliverable can state a figure and attribute it to the interview that the interviewee never actually
+// said — the highest-risk newsroom failure (a fabricated 访谈 number reads as fact). The per-file source-aware
+// audit never looked at 时间线/总结. This check does, deterministically, using the SAME extractNumberAtoms +
+// normalisation the rest of the file uses (writing-system + full/half-width folding, timestamp/URL masking):
+//   · Every figure carries a source label the prompts establish: 【访谈】 (interview), 【公开…】 / 【公开+访谈…】
+//     (public / mutually-corroborated — implies 待记者核实), or none.
+//   · An interview-labeled MAGNITUDE atom (money / mass / distance / percent / duration — a measured quantity)
+//     absent from the interview corpus → HARD FAIL (a fabricated 访谈 figure). Bare integers stay warning-tier
+//     (FP-prone: counts, ordinals, list numbers); dates/years used as entry anchors are never flagged.
+//   · A public / 待核 atom → passes, listed as a reporter-verification item.
+//   · An unlabeled atom → warning-tier 复核 item (a summary paraphrases; never hard-fail), listed.
+// "Interview corpus" = the union of the SOURCE transcript(s) AND the refined 成稿 the derivative was built from.
+// extractNumberAtoms canonicalises both writing systems identically; including the 成稿 removes false drift from
+// legitimate unit restoration (源 "1.03 billion" is skipped, 成稿 "10.3 亿" the derivative copied is matched).
+
+// Mass / distance / energy / area / volume units that ATOM_UNITS does NOT attach (it covers money / percent /
+// duration / 倍). These promote a bare "15 吨" to a hard-fail-eligible measured quantity — the exact class the
+// motivating failure invented. Longest-first so 平方公里 beats 公里, 千瓦时 beats 瓦. FP surface is tiny: a match
+// only fires as <number><unit>, and a hard fail additionally requires a pure-【访谈】 line AND absence from the
+// corpus (a real measured quantity is echoed in the 成稿 the derivative was built from).
+const DERIV_MAGNITUDE_UNITS = ['平方公里', '平方千米', '立方米', '平方米', '千瓦时', '兆瓦', '千瓦', '公顷', '千米', '海里', '毫升', '毫克', '千克', '公斤', '公里', '摄氏度', '马赫', '吨', '克', '米', '升', '瓦', '亩']
+
+// Money-scale words → absolute multiplier. The derivative agent may legitimately re-express the same 成稿 amount
+// across scales (8000 万 ⇄ 0.8 亿, both 8e7); comparing only value|unit keys would false-fail that conversion. So
+// a money atom ALSO matches when its absolute magnitude overlaps a same-family source amount. (元/美元 stay
+// key-matched — a currency's magnitude word is what converts, not the currency itself.)
+const DERIV_MONEY_SCALE = { 万: 1e4, 千万: 1e7, 亿: 1e8 }
+
+// One derivative/corpus atom = { value, unit, idx, magnitude }. Base atoms come from extractNumberAtoms (money /
+// percent / duration / 万亿 / bare integer / year); a supplementary pass adds the mass/distance/… magnitudes it
+// misses. A supplementary atom at the same start index as a base bare atom WINS (the unit-bearing reading), so a
+// "15 吨" is one magnitude atom, not a bare "15" plus a "15 吨".
+function extractDerivativeAtoms(text) {
+  const s = String(text || '')
+  const base = extractNumberAtoms(s).map((a) => ({ value: a.value, unit: a.unit, idx: a.idx, magnitude: STRONG_UNIT_SET.has(a.unit) }))
+  // Reuse extractNumberAtoms' masking + width folding so offsets and values line up with the base pass.
+  const raw = s.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' ')).replace(/\\(?=[.])/g, '')
+  const masked = raw.replace(/\d{1,2}:\d{2}(?::\d{2})?/g, (m) => ' '.repeat(m.length)).replace(/https?:\/\/[^\s]+/g, (m) => ' '.repeat(m.length))
+  const half = masked.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/％/g, '%')
+  const unitAlt = DERIV_MAGNITUDE_UNITS.map(escapeRe).join('|')
+  const numCore = `(?:\\d+(?:\\.\\d+)?(?:\\s*(?:[-~—－]|到|至)\\s*\\d+(?:\\.\\d+)?)?|[${HAN_NUM_CHARS}]+(?:[到至][${HAN_NUM_CHARS}]+)?)`
+  const RE = new RegExp(`(${numCore})\\s*(${unitAlt})`, 'g')
+  const supp = []
+  for (const m of half.matchAll(RE)) {
+    const folded = foldScaleUnit(m[1], m[2])
+    if (!folded) continue
+    supp.push({ value: folded.value, unit: folded.unit, idx: m.index ?? 0, magnitude: true })
+  }
+  const suppIdx = new Set(supp.map((a) => a.idx))
+  return base.filter((a) => !suppIdx.has(a.idx)).concat(supp).sort((a, b) => a.idx - b.idx)
+}
+
+// A derivative atom's value string carries a 4-digit year (2019 / 2019-2020 / 2025-07) → it is a DATE anchor, not
+// a claimed measured quantity. Timelines are built on dates; flagging them would fire on every entry. Weak time
+// units (年/月/日/天) are dropped for the same reason.
+const DERIV_WEAK_TIME = new Set(['年', '月', '日', '天'])
+function derivIsDateAtom(a) {
+  return DERIV_WEAK_TIME.has(a.unit) || /(?:19|20)\d{2}/.test(String(a.value))
+}
+
+// The governing source label of ONE derivative line. 【公开…】 (incl. 【公开+访谈…】) → 'public': the public
+// component is a legitimate reason a figure is absent from the transcript, so it never hard-fails — it is a
+// reporter-verification item. A pure 【访谈】 (no 公开) → 'interview' (hard-fail eligible). Otherwise 'none'.
+function derivLineLabel(line) {
+  const inBrackets = String(line).match(/【[^】]*】/g) || []
+  const joined = inBrackets.join('')
+  if (/公开/.test(joined)) return 'public'
+  if (/访谈/.test(joined)) return 'interview'
+  return 'none'
+}
+
+// Absolute money magnitude span of an atom whose unit is a scale word (万/千万/亿), else null.
+function derivMoneyAbsSpan(a) {
+  const scale = DERIV_MONEY_SCALE[a.unit]
+  if (!scale) return null
+  const span = xfileValueSpan(a.value)
+  return span ? { lo: span.lo * scale, hi: span.hi * scale } : null
+}
+
+// A magnitude atom matches the corpus if its exact value|unit key is present, OR its numeric span overlaps a
+// same-unit corpus span (so a timeline "65 亿"【访谈】 is covered by a source range "60-70 亿", not a fabrication;
+// but "80 亿" against "60-70 亿" stays disjoint → unmatched), OR (money scale words only) its ABSOLUTE amount
+// overlaps a same-family source amount (8000 万 ⇄ 0.8 亿). Reuses xfileValueSpan (range/scalar canonical form).
+function derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) {
+  if (corpusKeys.has(`${a.value}|${a.unit}`)) return true
+  const span = xfileValueSpan(a.value)
+  if (span) for (const cs of corpusByUnit.get(a.unit) || []) if (!(span.hi < cs.lo || cs.hi < span.lo)) return true
+  const abs = derivMoneyAbsSpan(a)
+  if (abs) for (const cs of corpusMoneyAbs || []) if (!(abs.hi < cs.lo || cs.hi < abs.lo)) return true
+  return false
+}
+
+// checkDerivativeAttribution(corpusText, derivativeText):
+//   corpusText = source transcript(s) + refined 成稿 concatenated (the interview's ground-truth figures).
+//   derivativeText = the rendered 时间线 or 访谈总结.
+// Returns { assessed, hardFail[], reporterVerify[], review[] }. Pure and order-stable.
+export function checkDerivativeAttribution(corpusText, derivativeText) {
+  const empty = { assessed: false, hardFail: [], reporterVerify: [], review: [] }
+  const deriv = String(derivativeText || '')
+  if (!deriv.trim()) return empty
+  const corpusAtoms = extractDerivativeAtoms(String(corpusText || ''))
+  const corpusKeys = new Set(corpusAtoms.map((a) => `${a.value}|${a.unit}`))
+  const corpusValues = new Set(corpusAtoms.map((a) => a.value))
+  const corpusByUnit = new Map()
+  const corpusMoneyAbs = []
+  for (const a of corpusAtoms) {
+    if (!a.magnitude) continue
+    const span = xfileValueSpan(a.value)
+    if (!span) continue
+    if (!corpusByUnit.has(a.unit)) corpusByUnit.set(a.unit, [])
+    corpusByUnit.get(a.unit).push(span)
+    const abs = derivMoneyAbsSpan(a)
+    if (abs) corpusMoneyAbs.push(abs)
+  }
+  // Safety valve: with a ZERO-atom corpus (e.g. the source/成稿 failed to load) we cannot verify anything, so we
+  // must not hard-fail every interview figure and spuriously block a whole delivery — downgrade to review instead.
+  const canHardFail = corpusAtoms.length > 0
+  const hardFail = []
+  const reporterVerify = []
+  const review = []
+  const lines = deriv.split(/\r?\n/)
+  for (let li = 0; li < lines.length; li += 1) {
+    const rawLine = lines[li]
+    if (!rawLine || !rawLine.trim()) continue
+    // Skip non-data lines: markdown headings, blockquotes (the 标注 legend / 整理依据 header), HTML comments.
+    if (/^\s*#{1,6}\s/.test(rawLine) || /^\s*>/.test(rawLine) || /^\s*<!--/.test(rawLine)) continue
+    // Strip a leading bullet / list-number marker so "1. …" / "- …" don't yield a phantom "1" atom.
+    const line = rawLine.replace(/^\s*(?:[-*+]|\d+[.)、])\s+/, '')
+    const atoms = extractDerivativeAtoms(line)
+    if (!atoms.length) continue
+    const label = derivLineLabel(rawLine)
+    const snippet = rawLine.trim().slice(0, 80)
+    for (const a of atoms) {
+      if (derivIsDateAtom(a)) continue                     // dates / years / entry anchors are never flagged
+      const unitLabel = a.unit ? `${a.value} ${a.unit}` : a.value
+      if (label === 'public') {
+        reporterVerify.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
+        continue
+      }
+      if (label === 'interview') {
+        if (a.magnitude) {
+          if (!derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs)) {
+            if (canHardFail) hardFail.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
+            else review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注量纲数字，但无可比对语料（复核）' })
+          }
+        } else if (!corpusValues.has(a.value)) {
+          review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注但源文无对应，且非量纲数字（复核）' })
+        }
+        continue
+      }
+      // Unlabeled: surface the ones that carry signal — a magnitude, or a value absent from the interview.
+      if (a.magnitude || !corpusValues.has(a.value)) {
+        review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '未标注来源（复核：访谈？公开？）' })
+      }
+    }
+  }
+  return { assessed: true, hardFail, reporterVerify, review }
+}
+
+// auditDerivative: wrap checkDerivativeAttribution into a file-result shaped like the rest of the audit
+// (status + findings[]), so callers wire it into pass/fail exactly as the other hard detectors.
+export function auditDerivative({ corpusText, derivativeText, kind = 'derivative', derivativeFile = '<derivative>' }) {
+  const r = checkDerivativeAttribution(corpusText, derivativeText)
+  const findings = [
+    { name: 'derivative_attribution', severity: 'hard', count: r.hardFail.length,
+      samples: r.hardFail.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，标【访谈】但源文无此数字——疑炮制）`, line: x.line })) },
+    { name: 'derivative_reporter_verify', severity: 'soft', count: r.reporterVerify.length,
+      samples: r.reporterVerify.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，公开来源·待记者核实）`, line: x.line })) },
+    { name: 'derivative_review', severity: 'soft', count: r.review.length,
+      samples: r.review.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，${x.note}）`, line: x.line })) },
+  ]
+  return { file: derivativeFile, kind, mode: 'derivative', status: r.hardFail.length ? 'fail' : 'ok', assessed: r.assessed, failed: r.hardFail.length ? ['derivative_attribution'] : [], findings, hardFail: r.hardFail, reporterVerify: r.reporterVerify, review: r.review }
+}
+
+// auditDerivativeFile: read the derivative + its interview corpus (source transcripts and/or refined 成稿) from
+// disk and run the guard. corpusPaths are normalised (SRT → turns) so an SRT source's figures still compare.
+export function auditDerivativeFile(derivativePath, corpusPaths = [], { kind = 'derivative' } = {}) {
+  const derivativeText = fs.readFileSync(derivativePath, 'utf8')
+  const corpusText = (corpusPaths || [])
+    .map((p) => { try { return normalizeTranscriptSource(fs.readFileSync(p, 'utf8'), { sourceFile: p }) } catch { return '' } })
+    .join('\n\n')
+  return auditDerivative({ corpusText, derivativeText, kind, derivativeFile: path.resolve(derivativePath) })
+}
+
 function usage() {
   return `用法:
   node scripts/audit_refined.mjs <精校稿.md> [更多.md...]          # 只查输出干净度
@@ -2133,6 +2320,9 @@ function usage() {
                                                                   # 对比源文：查压缩/欠精校/内容缺口/发言人错归/炮制引语；给 --glossary 时另查残留变体/裸写未核实名
                                                                   # --strict 额外开启 entity_substitution_risk（音近实体替换，误报率偏高，默认关闭）
   node scripts/audit_refined.mjs --logic <逻辑稿.md> --refined <成稿.md>   # 逻辑稿体检：同序复制/漏来源为 hard，膨胀/重复段为 soft
+  node scripts/audit_refined.mjs --derivative <时间线|总结.md> --kind timeline|summary --corpus <源稿.md,成稿1.md,…>
+                                                                  # 派生件溯源体检：标【访谈】的量纲数字（金额/吨/公里/%/时长）源文无对应 → hard（疑炮制）；
+                                                                  # 【公开…】/【公开+访谈…】→ 待记者核实（soft 列出）；未标注 → 复核（soft）；纯数字/年份日期不算 hard
   node scripts/audit_refined.mjs --glossary-only <校对表.md>       # 校对表结构体检（条目数/身份线索/变体比例，独立入口，全 soft）
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
   … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
@@ -2162,7 +2352,18 @@ function main() {
   const source = getOpt(argv, '--source')
   const refined = getOpt(argv, '--refined')
   const logic = getOpt(argv, '--logic')
+  const derivative = getOpt(argv, '--derivative')
   const glossaryOnly = getOpt(argv, '--glossary-only')
+  // --derivative audits a 时间线/总结 against the interview corpus (--corpus = comma-joined source transcript(s)
+  // and/or 成稿). Standalone entry: fabricated 访谈 figures → hard (exit 1); 待核/未标注 items are soft (listed).
+  if (derivative) {
+    const corpus = (getOpt(argv, '--corpus') || '').split(',').map((s) => s.trim()).filter(Boolean)
+    const kind = getOpt(argv, '--kind') || 'derivative'
+    const file = auditDerivativeFile(derivative, corpus, { kind })
+    const result = { status: file.status, files: [file] }
+    console.log(JSON.stringify(result, null, 2))
+    return result.status === 'fail' ? 1 : 0
+  }
   // --glossary-only lints a rendered 校对表 on its own (条目数/身份线索/变体比例). Standalone entry, all soft →
   // always exit 0; a caller reads findings[*].count>0 to see which warnings fired.
   if (glossaryOnly) {

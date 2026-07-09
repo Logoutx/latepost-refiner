@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -728,4 +728,95 @@ test('auditGlossary: empty / entity-less input reports 0 entities and only gloss
     assert.equal(r.status, 'ok', 'still never fails')
     assert.equal(grep(r, 'glossary_hints_sparse'), undefined, 'no ratio warning with zero rows')
   }
+})
+
+// ---------- P1: derivative attribution guard (时间线 / 访谈总结) ----------
+// All fixtures fictional (远山物流 / 沈其安 — 仓库既有虚构占位); a logistics fleet, nothing aerospace.
+
+test('derivative guard: an interview-labeled MAGNITUDE figure the source never states → HARD fail (fabricated 访谈)', () => {
+  const corpus = '沈其安：我们主力车型载重 6 吨，融资 2 亿元，毛利率 30%。团队 200 人，覆盖 30 个城市。'
+  const deriv = [
+    '# 远山物流 时间线',
+    '> 标注：【公开】=公开资料可查；【访谈】=访谈口述；【公开+访谈】=两者互证。',
+    '## 时间线',
+    '- **2021 年**【访谈】主力车型载重 6 吨。',
+    '- **2022 年**【访谈】单程配送半径 88 公里。',   // 88 公里 never spoken in the interview
+  ].join('\n')
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'fail')
+  assert.deepEqual(r.failed, ['derivative_attribution'])
+  assert.equal(r.hardFail.length, 1, 'exactly the fabricated magnitude is flagged')
+  assert.equal(r.hardFail[0].value, '88')
+  assert.equal(r.hardFail[0].unit, '公里')
+  assert.equal(r.hardFail[0].line, 5, 'reports the derivative line number')
+  // the legitimate 6 吨 (interview + in source) is NOT a hard fail, and the date anchors 2021/2022 are not flagged
+  assert.ok(!r.hardFail.some((x) => x.value === '6' || /20\d\d/.test(x.value)))
+})
+
+test('derivative guard: a correct interview figure passes — including a full/half-width unit variant (6吨 == 6 吨)', () => {
+  const corpus = '沈其安：载重 6 吨，融资 2 亿元。'
+  // The derivative writes 6吨 (no space) and 2亿元 (no space); both must canonicalise to the spaced source forms.
+  const deriv = '## 时间线\n- **2021 年**【访谈】载重 6吨，本轮融资 2亿元。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.equal(r.hardFail.length, 0, 'width variants match the source, so nothing is fabricated')
+})
+
+test('derivative guard: a 公开·待记者核实 figure never hard-fails — it is listed as a reporter-verification item', () => {
+  const corpus = '沈其安：我们本轮融资 2 亿元。'
+  // 500 亿 is NOT in the interview, but it is labelled public → passes, surfaced for the reporter to verify.
+  const deriv = '## 时间线\n- **2023 年**【公开·待记者核实】行业整体估值约 500 亿元。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok', 'a public figure absent from the interview does not fail the run')
+  assert.equal(r.hardFail.length, 0)
+  assert.equal(r.reporterVerify.length, 1)
+  assert.equal(r.reporterVerify[0].value, '500')
+  assert.equal((r.findings.find((f) => f.name === 'derivative_reporter_verify') || {}).count, 1)
+})
+
+test('derivative guard: an UNLABELED figure absent from the interview → warning tier (复核), never hard', () => {
+  const corpus = '沈其安：本轮融资 2 亿元。'
+  const deriv = '### 分类要点\n- 公司整体毛利率 45%（未标注来源）。'   // 45% has no source label and is not in the interview
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'summary' })
+  assert.equal(r.status, 'ok', 'an unlabeled figure is a review item, not a hard fail (summaries paraphrase)')
+  assert.equal(r.hardFail.length, 0)
+  assert.equal(r.review.length, 1)
+  assert.equal(r.review[0].value, '45')
+  assert.equal((r.findings.find((f) => f.name === 'derivative_review') || {}).count, 1)
+})
+
+test('derivative guard (FP discipline): a bare integer absent from the source stays warning-tier even when 访谈-labeled', () => {
+  const corpus = '沈其安：本轮融资 2 亿元。'
+  const deriv = '## 时间线\n- **2022 年**【访谈】新增 999 个网点。'   // 999 is a bare count, not said — FP-prone class
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok', 'bare integers (counts / ordinals / list numbers) never hard-fail')
+  assert.equal(r.hardFail.length, 0)
+  assert.equal(r.review.length, 1)
+})
+
+test('derivative guard: date/year entry anchors are never flagged; a scalar inside a source range and 汉字↔阿拉伯 twins pass', () => {
+  const corpus = '沈其安：大概六七十亿的盘子，去年营收八千万。'   // 60-70 亿 (range), 8000 万 (hanzi)
+  const deriv = [
+    '## 时间线',
+    '- **2019 年 3 月**【访谈】公司成立。',                 // 2019 / 3 are date anchors — never flagged
+    '- **2020 年**【访谈】规模约 65 亿，营收 8000 万。',    // 65 ⊂ 60-70; 8000 万 == 八千万
+  ].join('\n')
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.equal(r.hardFail.length, 0, 'range-contained scalar + writing-system twin both match; dates are not quantities')
+})
+
+test('derivative guard: a legitimate money-scale conversion (8000 万 ⇄ 0.8 亿) passes; a real fabrication still hard-fails', () => {
+  const corpus = '沈其安：去年营收八千万，今年目标 3 亿元。'   // 8000 万 (=8e7), 3 亿
+  const ok = auditDerivative({ corpusText: corpus, derivativeText: '## 时间线\n- **2023 年**【访谈】营收 0.8 亿元。', kind: 'timeline' })
+  assert.equal(ok.status, 'ok', '0.8 亿 == 八千万 (same absolute amount) is not a fabrication')
+  const bad = auditDerivative({ corpusText: corpus, derivativeText: '## 时间线\n- **2024 年**【访谈】融资 5 亿元。', kind: 'timeline' })
+  assert.equal(bad.status, 'fail', '5 亿 has no equivalent in the interview → fabricated')
+  assert.equal(bad.hardFail[0].value, '5')
+})
+
+test('checkDerivativeAttribution: an empty derivative is not assessed (no findings)', () => {
+  const r = checkDerivativeAttribution('沈其安：融资 2 亿元。', '')
+  assert.equal(r.assessed, false)
+  assert.equal(r.hardFail.length, 0)
 })

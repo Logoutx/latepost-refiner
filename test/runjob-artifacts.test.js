@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { prepareFile, runJob } from '../universal/jobs.js'
+import { computeExitCode } from '../universal/cli.js'
+import { timelineDeliverableName } from '../core/prompts.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-runjob-'))
@@ -302,4 +304,60 @@ test('runJob accepts filesystem path entries and records prepared file metadata'
   assert.equal(manifest.config.files.length, 1)
   assert.equal(manifest.config.files[0].path, src)
   assert.equal(manifest.config.files[0].outPath, path.join(outputDir, 'Transcripts', 'path-fixture.md'))
+})
+
+// P1 end-to-end: the produced 时间线 is audited against the interview corpus (source + 成稿). A 【访谈】-tagged
+// magnitude the interviewee never said surfaces as auditFailed (derivative_attribution) → non-zero exit; a
+// legitimate 成稿 figure passes and a 公开·待记者核实 figure is a reporter-verify item, not a hard fail.
+// Fixtures fictional (远山物流 / 沈其安 — logistics, nothing aerospace).
+function deliverEngine(refinedText) {
+  const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  return {
+    phase() {}, log() {}, usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((t) => t().catch(() => null))),
+    pipeline: async (items) => items.map((f) => {
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, refinedText)
+      return { path: f.outPath, headings: ['## 车型'], key_fixes: [], open_questions: [] }
+    }),
+    // The 时间线 agent "produces" the deliverable (the test pre-writes the file the audit reads, as the other
+    // runJob tests do for the 成稿); every other label returns null.
+    agent: async (_prompt, opts = {}) => { usage.agents++; return opts.label === 'timeline' ? '已写到 远山物流时间线.md\n- 车型' : null },
+  }
+}
+
+test('runJob (P1): a fabricated 访谈 figure in the produced 时间线 → auditFailed (derivative_attribution) + non-zero exit', async () => {
+  const outputDir = tmpdir()
+  const s1 = path.join(outputDir, '远山物流甲.md'), s2 = path.join(outputDir, '远山物流乙.md')
+  const srcText = '# 远山物流\n\n沈其安：我们主力车型载重 6 吨，本轮融资 2 亿元。\n'
+  fs.writeFileSync(s1, srcText, 'utf8'); fs.writeFileSync(s2, srcText, 'utf8')
+  const refined = '# 远山物流\n*访谈*\n\n## 车型\n\n沈其安：我们主力车型载重 6 吨，本轮融资 2 亿元。\n'
+  // Pre-write the 时间线 the timeline agent "produces": 载重 6 吨 is真实（在成稿）; 航程 88 公里【访谈】 was NEVER
+  // said (fabricated); 500 亿元 is【公开·待记者核实】(reporter-verify, not a hard fail).
+  const timelinePath = path.join(outputDir, timelineDeliverableName('远山物流'))
+  fs.writeFileSync(timelinePath, [
+    '# 远山物流 时间线',
+    '## 时间线',
+    '- **2021 年**【访谈】主力车型载重 6 吨。',
+    '- **2022 年**【访谈】单程航程 88 公里。',
+    '- **2023 年**【公开·待记者核实】行业估值约 500 亿元。',
+  ].join('\n'), 'utf8')
+
+  const result = await runJob({
+    __engine: deliverEngine(refined),
+    files: [{ path: s1 }, { path: s2 }],
+    topic: '远山物流', date: '2026-07', outputDir,
+    scope: ['refine', 'timeline'], verifyDepth: 'none', anchors: false,
+  })
+
+  assert.ok(result.derivativeAudit && result.derivativeAudit.status === 'fail', 'the derivative audit ran and failed')
+  assert.ok((result.auditFailed || []).some((x) => x.findings.includes('derivative_attribution')), 'fabricated 访谈 figure → auditFailed')
+  const df = (result.derivativeAudit.files || []).find((f) => f.kind === 'timeline')
+  assert.equal(df.hardFail.length, 1, 'only the fabricated 88 公里 is a hard fail')
+  assert.equal(df.hardFail[0].unit, '公里')
+  assert.ok(df.reporterVerify.length >= 1, 'the 公开·待记者核实 figure is a reporter-verification item, not a hard fail')
+  assert.equal(computeExitCode(result), 1, 'a fabricated interview figure drives a non-zero exit')
+  assert.match(fs.readFileSync(result.reviewPath, 'utf8'), /派生件溯源/, 'review.md surfaces the derivative finding')
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.derivativeAudit.status, 'fail', 'run.json records the derivative audit')
 })

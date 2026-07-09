@@ -162,6 +162,27 @@ export function crossFileConflictItems(result = {}) {
   return (result.crossFileConflicts || []).map(formatCrossFileConflict)
 }
 
+// P1: derivative-attribution review lines. Hard items (fabricated 访谈 figures) are high-priority; reporter-verify
+// (public·待记者核实) and review (unlabeled / non-magnitude) items are medium. Each cites the derivative + line.
+function derivativeItems(result = {}, pick) {
+  const out = []
+  for (const f of (result.derivativeAudit && result.derivativeAudit.files) || []) {
+    const base = path.basename(f.file || '')
+    for (const x of f[pick] || []) out.push(`${base} 第 ${x.line} 行：${x.text}${x.snippet ? `（${x.snippet}）` : ''}`)
+  }
+  return out
+}
+export function derivativeHardItems(result = {}) { return derivativeItems(result, 'hardFail') }
+export function derivativeReporterItems(result = {}) {
+  const out = []
+  for (const f of (result.derivativeAudit && result.derivativeAudit.files) || []) {
+    const base = path.basename(f.file || '')
+    for (const x of f.reporterVerify || []) out.push(`${base} 第 ${x.line} 行：${x.text}（公开来源·待记者核实）`)
+    for (const x of f.review || []) out.push(`${base} 第 ${x.line} 行：${x.text}（${x.note || '复核'}）`)
+  }
+  return out
+}
+
 // M10: one review line per escalated file. Chinese typesetting throughout (全角引号, Arabic numerals,
 // Pangu spacing). 「甲.md — 首档未过（compression_risk）→ 升级 anthropic 已过审，替换成稿」 /
 // 「… → 升级后仍未过（两档均未过审，保留升级档：ending_missing）」 (loud on both-fail).
@@ -200,6 +221,8 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
     { title: '升级重跑（首档未过审 → 升级 provider 从源重跑；两档均未过审的需人工核对）', items: escalationItems(result), priority: 'high' },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
+    { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
+    { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
     { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
@@ -386,6 +409,14 @@ export function buildRunManifest(result = {}, context = {}) {
       // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
       crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),
     },
+    // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
+    derivativeAudit: result.derivativeAudit ? {
+      status: result.derivativeAudit.status,
+      files: (result.derivativeAudit.files || []).map((f) => ({
+        file: f.file, kind: f.kind, status: f.status,
+        hardFail: f.hardFail || [], reporterVerify: f.reporterVerify || [], review: f.review || [],
+      })),
+    } : null,
     audit: result.audit ? {
       status: result.audit.status,
       // M5 sections summary: total flagged vs total ## sections across all audited files (the 逐节复核 headline).

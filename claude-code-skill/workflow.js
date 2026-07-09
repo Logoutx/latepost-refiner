@@ -1669,6 +1669,12 @@ function summaryDeliverableName(topic) {
   return `${safeName(base || raw || '访谈', 40)}访谈总结.md`
 }
 
+// The 时间线 output filename — kept in lockstep with timelinePrompt's write target so a host can locate the
+// produced file on disk (e.g. to run the derivative-attribution audit against it).
+function timelineDeliverableName(topic) {
+  return `${safeName(topic, 40)}时间线.md`
+}
+
 function summaryPrompt(a, refined, sectionMapPath) {
   const list = refined.map((r) => '- ' + (r.outPath || r.path)).join('\n')
   const mapNote = sectionMapPath
@@ -1679,7 +1685,7 @@ function summaryPrompt(a, refined, sectionMapPath) {
 ${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
-三部分：分类要点（### 按主题小节，每条带具体事实或数字）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
+三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要带来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**绝不可把公开资料或你推算/换算的数字标成【访谈】**，拿不准就标待核）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
 
 ${TYPESET}
@@ -1701,11 +1707,11 @@ function timelinePrompt(a, glossary, refined, sectionMapPath) {
 
 步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；${mapNote ? `${mapNote} ` : ''}再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
 ${list}
-抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一；逐条标【访谈】/【公开】/【公开+访谈】；**源头可溯**：凡【访谈】或【公开+访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
+抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一。**每一条、尤其每一个数字/金额/数量/规格都必须带来源标注**，三选一：【访谈】=访谈亲口所述；【公开·待记者核实】=取自公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。**红线：标【访谈】的数字必须确实出自本次成稿原文——绝不可把公开资料、行业常识或你自己推算/换算的数字标成【访谈】**；来源拿不准就标【公开·待记者核实】，宁可标待核也不可冒充访谈。**源头可溯**：凡含【访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
 
 ${TYPESET}
 
-写到 ${a.outputDir}/${safeName(a.topic, 40)}时间线.md（文件名已清洗，勿再改动）。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
+写到 ${a.outputDir}/${timelineDeliverableName(a.topic)}（文件名已清洗，勿再改动）。标题一律不编号。你的最终回复即返回值：输出路径 + 时间线小节清单。`
 }
 
 // Logic-reordered draft: reads the **refined transcript** (not the raw source — names/terms already unified), reordering Q&A from recording order into narrative order.

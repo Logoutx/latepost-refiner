@@ -52,13 +52,13 @@ Structure:
 # <主题> 时间线
 
 > 整理依据：<时间><对象>访谈，结合公开资料交叉校对。
-> 标注：【公开】=公开资料可查；【访谈】=访谈口述；【公开+访谈】=两者互证。
+> 标注：【访谈】=访谈口述；【公开·待记者核实】=公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。每个数字/金额/规格都必须带其中一个标注。
 
 ## 一句话背景
 
 ## 时间线
 ### <年份/阶段>：<小标题>
-- **<年月>**【公开/访谈/公开+访谈】<事件，含具体数字/人物/金额>〔出处：成稿标题 · 小标题〕
+- **<年月>**【访谈｜公开·待记者核实｜公开+访谈·待记者核实】<事件，含具体数字/人物/金额>〔出处：成稿标题 · 小标题〕
 
 ## <采访之后>（公开资料补充）
 
@@ -72,6 +72,7 @@ Rules:
 - If interview and public sources conflict, list both and note the divergence.
 - Do not force a resolution without evidence.
 - Mark not-found real names as `真名未公开`.
+- Source-label EVERY figure. Red line: a figure tagged 【访谈】 must actually appear in the refined 成稿 — never tag a public-source, industry-common, or self-computed/converted number as 【访谈】; when unsure, tag 【公开·待记者核实】. The deterministic audit compares every 访谈-tagged magnitude figure against the 成稿 and hard-fails a fabricated one.
 
 ## Interview Summary
 
@@ -92,7 +93,7 @@ Structure:
 
 ## 分类要点
 ### <主题分类>
-- <要点，带具体事实>
+- <要点，带具体事实；数字/金额标来源——【访谈】须出自成稿原文，公开资料标【公开·待记者核实】>
 
 ## 金句 Quotes
 **<人名（职务）>**
@@ -108,5 +109,6 @@ Structure:
 Rules:
 - Categorize by role/topic.
 - Every key point should carry a concrete fact where possible.
+- Source-label every figure: 【访谈】 (must come from the refined 成稿) or 【公开·待记者核实】 (public, reporter to verify). Never pass a public or self-computed number off as 【访谈】 — the deterministic audit checks each 访谈-tagged figure against the 成稿.
 - Quotes must be faithful to the refined transcript.
 - Insights should show judgment, angle, and risk; do not merely restate the transcript.

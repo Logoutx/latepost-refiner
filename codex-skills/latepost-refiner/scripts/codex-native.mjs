@@ -10,6 +10,8 @@ import {
   singlePassPrompt,
   summaryPrompt,
   timelinePrompt,
+  summaryDeliverableName,
+  timelineDeliverableName,
   logicPlanPrompt,
   logicWritePrompt,
   stitchPrompt,
@@ -50,7 +52,7 @@ import {
   weakDupFlags,
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
-import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, normalizeSrtTranscript, shouldNormalizeSrtSource } from './audit_refined.mjs'
+import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource } from './audit_refined.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -889,6 +891,25 @@ function auditLogicOutputs(A, result) {
   return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
 }
 
+// P1: audit the produced 时间线/总结 for fabricated 访谈-attributed figures against the interview corpus
+// (source transcripts + refined 成稿). Mirrors universal/jobs.js computeDerivativeAudit. Never throws.
+function auditDerivativeOutputs(A, result) {
+  try {
+    const deliverables = []
+    const summaryPath = (result.summary && result.summary.path) || (typeof result.summary === 'string' ? result.summary : null)
+    const timelinePath = (result.timeline && result.timeline.path) || (typeof result.timeline === 'string' ? result.timeline : null)
+    if (A.scope.includes('summary') && result.summary) deliverables.push({ kind: 'summary', path: path.resolve(summaryPath || path.join(A.outputDir, summaryDeliverableName(A.topic))) })
+    if (A.scope.includes('timeline') && result.timeline) deliverables.push({ kind: 'timeline', path: path.resolve(timelinePath || path.join(A.outputDir, timelineDeliverableName(A.topic))) })
+    if (!deliverables.length) return null
+    const corpus = []
+    for (const f of A.files || []) { for (const p of [f.path, f.outPath]) { if (p && fs.existsSync(p) && !corpus.includes(p)) corpus.push(p) } }
+    const files = []
+    for (const d of deliverables) { if (fs.existsSync(d.path)) files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind })) }
+    if (!files.length) return null
+    return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
+  } catch { return null }
+}
+
 export function auditNativeResult(args, result) {
   const A = normalizeArgs(args)
   const refined = Array.isArray(result && result.refined) ? result.refined : []
@@ -947,6 +968,12 @@ export function auditNativeResult(args, result) {
   const logicFailed = logicAudit
     ? logicAudit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file || f.logicFile, findings: f.failed || [] }))
     : []
+  // P1: derivative-attribution guard. A fabricated 访谈 figure in 时间线/总结 joins auditFailed like any hard finding.
+  const derivativeAudit = auditDerivativeOutputs(A, result)
+  const derivativeFailed = derivativeAudit
+    ? derivativeAudit.files.filter((f) => (f.hardFail || []).length).map((f) => ({ path: f.file, findings: ['derivative_attribution'] }))
+    : []
+  const auditFailedAll = [...auditFailed, ...derivativeFailed]
   const auditIncomplete = audit
     ? audit.files
       .filter((f) => (f.failed || []).includes('ending_missing'))
@@ -962,7 +989,8 @@ export function auditNativeResult(args, result) {
     refined: refinedNext,
     outputDir: A.outputDir,
     audit,
-    auditFailed,
+    auditFailed: auditFailedAll,
+    derivativeAudit,
     incomplete: Array.from(incompleteByPath.values()),
     unchecked,
     glossaryLint,
@@ -972,7 +1000,7 @@ export function auditNativeResult(args, result) {
     anchors,
   }
   const resultPath = writeJson(path.join(stateDir(A), 'result-audited.json'), audited)
-  return { resultPath, audit, auditFailed, glossaryLint, logicAudit, logicFailed }
+  return { resultPath, audit, auditFailed: auditFailedAll, derivativeAudit, glossaryLint, logicAudit, logicFailed }
 }
 
 export function writeNativeArtifacts(args, result) {
