@@ -180,6 +180,19 @@ test('audit gate: still hard after one repair → auditFailed + visible marker (
   assert.equal(r.refined[0].audit.status, 'fail')
 })
 
+test('audit gate (P7): a throwing runAudit capability is retried once, then FAILS LOUDLY (universal fs path)', async () => {
+  const labels = []
+  let auditCalls = 0
+  const capabilities = {
+    runAudit: () => { auditCalls += 1; throw new Error('simulated sandbox/fs error') },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ capabilities }), engine(labels))
+  assert.equal(auditCalls, 2, 'the direct audit is retried exactly once before giving up')
+  assert.deepEqual(r.auditUnavailable, [{ path: '/o/Transcripts/A.md', label: 'A' }], 'a persistently-throwing audit fails the run loudly, not silently')
+  assert.equal(r.refined[0].audit.auditUnavailable, true)
+})
+
 test('audit gate: soft-only findings never fail the gate', async () => {
   const labels = []
   const capabilities = { runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
@@ -202,13 +215,16 @@ test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a
   assert.equal(r.refined[0].audit.status, 'ok')
 })
 
-test('audit gate (no capability): unparseable agent output → one retry → degrade to auditUnavailable, never throws', async () => {
+test('audit gate (no capability): unparseable agent output → one retry → FAILS LOUDLY via top-level auditUnavailable, never throws', async () => {
   const labels = []
   const eng = engine(labels, { '^audit': '这不是 JSON，只是一段解释文字。' }) // both the call and the retry fail to parse
   const r = await runPipeline(A(), eng)
   assert.ok(labels.includes('audit:A') && labels.includes('audit-retry:A'), 'audited then retried once')
-  assert.deepEqual(r.auditFailed, [], 'an unavailable audit does not fail the run')
-  assert.equal(r.refined[0].audit.auditUnavailable, true)
+  // P7 fail-loud: an audit that could not run marks the run failed via top-level auditUnavailable — it is NOT a
+  // quiet degrade. The per-file flag still records unavailability; the 成稿 is kept (not destroyed).
+  assert.deepEqual(r.auditUnavailable, [{ path: '/o/Transcripts/A.md', label: 'A' }], 'the unaudited file is surfaced as a loud run-level failure')
+  assert.equal(r.refined[0].audit.auditUnavailable, true, 'the per-file audit is still marked unavailable')
+  assert.deepEqual(r.auditFailed, [], 'auditFailed stays for hard CONTENT findings; unavailability is its own channel')
 })
 
 // ---------- §5 logic missingSections auto-rerun ----------

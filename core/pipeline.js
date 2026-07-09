@@ -193,7 +193,13 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   async function audit() {
     if (typeof cap.runAudit === 'function') {
       // Pass the in-memory glossary so the capability doesn't have to read a not-yet-persisted file (risk a).
-      try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary }), f) } catch { return null }
+      // Fail-loud (P7): a thrown direct audit is retried ONCE (parity with the CC agent path's one retry); still
+      // throwing → null, which the caller turns into a LOUD run failure instead of a quiet "audit unavailable".
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary }), f) }
+        catch { if (attempt >= 1) return null }
+      }
+      return null
     }
     // CC sandbox: no fs here, so hand the in-memory glossary to the agent to stage in a scratch file, then pass it
     // to the CLI via --glossary. Without a memory glossary, fall back to the on-disk path (harmless if it exists).
@@ -216,7 +222,11 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   }
 
   const first = await audit()
-  if (!first) { engine.log(`审计不可用：${f.label}（子代理未能返回可解析 JSON，降级为仅记录，不阻断）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
+  // Fail-loud (P7): the audit could not run after one retry. Previously this "degraded to record-only, non-blocking"
+  // and the run reported success with an "audit unavailable" note — a quality gate that can be skipped silently.
+  // Now the per-file result still carries auditUnavailable (the 成稿 is kept, not destroyed), but the orchestration
+  // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
+  if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
 
   const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
   const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
@@ -293,7 +303,7 @@ const M = Object.assign(
 )
 const scope = A.scope || ['refine']
 const capabilities = A.capabilities || null
-const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, auditFailed: [] })
+const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, auditFailed: [], auditUnavailable: [] })
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
@@ -328,6 +338,7 @@ let dedup = null
 let auditFailed = []    // §2: per-file hard audit findings (content_gap/quote_style) still failing after one repair
 let incomplete = []     // Derived from direct deterministic audit ending_missing failures.
 let unchecked = []      // Refined files lacking a direct audit capability, or whose audit errored.
+let auditUnavailable = []  // P7 fail-loud: files whose audit could NOT run after one retry — the run is marked failed (unaudited, not passed).
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
@@ -535,9 +546,13 @@ if (scope.includes('refine') && pairsToAudit.length) {
     }
     if (a.directAudit && !a.auditUnavailable && endingMissing) incomplete.push({ path: f.outPath, note: 'deterministic audit: ending_missing' })
     if (!a.directAudit || a.auditUnavailable) unchecked.push(f.outPath)
+    // P7: an audit that could NOT run (after one retry) fails the run loudly — distinct from the normal
+    // "no direct audit capability" CC case (where the agent audit DID run). Only auditUnavailable qualifies.
+    if (a.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
     if ((a.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: a.auditFailed })
   })
   if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
+  if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
 }
 
 // Logic-order resequencing (optional): reads each refined transcript and reorders it into narrative order, run concurrently. Completeness is verified by a zero-cost JS check —
@@ -609,6 +624,7 @@ return {
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
+  auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
   logic,
   openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(overrideQuestions).concat(reopenNotes),
   summary,

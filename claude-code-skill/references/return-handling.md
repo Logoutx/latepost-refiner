@@ -2,6 +2,10 @@
 
 The `Workflow({ scriptPath, args })` dispatch returns a result object. Walk these fields, then go straight to **Step 5 (wrap-up)** in `SKILL.md`.
 
+## ⛔ First check `auditUnavailable` — a failed run, not a successful one
+
+If top-level **`auditUnavailable`** (`[{ path, label }]`) is **non-empty**, the deterministic audit **could not run** for those 成稿 even after one retry (e.g. the sandbox audit sub-agent kept returning unparseable output, or a sandbox error). **The run has FAILED.** The refined transcripts — and any 总结/时间线/逻辑稿 derived from them — are **unaudited, therefore unverified, therefore not deliverable as-is**. Do **not** write a success summary. Instead: (1) state plainly that the audit did not run and the deliverables are unaudited/invalid, naming each file; (2) the files are still on disk (work preserved) — run the audit **by hand** for each: `node "<this skill dir>/audit_refined.mjs" --source "<src>" --refined "<out>"`, read its JSON, and only then decide whether each 成稿 (and its derivatives) can be trusted. "Audit unavailable" is never "audit passed"; a gate that is silently skipped is not a gate.
+
 ## If the run partially fails — do NOT re-refine
 
 The pipeline is built so a **cheap gate agent** can never cost the expensive work: refine runs even when scout fails (it reads the source directly), and completeness is judged by the **deterministic source-aware audit** (no separate haiku check agent) — its `ending_missing` gate is what marks a file `incomplete`. But if the **harness itself** drops a long run mid-way (网络卡死等), the refined transcripts — and any deliverables — are **already on disk** under `<output>/Transcripts/` (and `逻辑顺序/`, root). Recover cheaply, never re-refining:

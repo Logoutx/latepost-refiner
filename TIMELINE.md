@@ -46,6 +46,10 @@ The tool learned to read subtitle-style source files: timed caption blocks are t
 
 A handful of files ship in more than one place so each edition is self-contained, and those copies had begun to drift apart when edited by hand. A single sync step now regenerates every copy from one source of truth — each generated copy carries a "do not edit" banner — and one check, run before the tests and in continuous integration, fails the build the moment any copy falls out of sync, replacing the earlier file-by-file comparisons.
 
+## July 2026 — A quality check that can't be silently skipped
+
+A three-engine comparison exposed a quiet failure: on one real run the automatic quality check hit an error and, instead of stopping, the tool delivered the finished documents with a small "check unavailable" note — as if nothing were wrong. A check that can be skipped without anyone noticing is not a check. Now, when the check cannot run even after one retry, the whole run is marked failed: the finished files are kept on disk (the work is not thrown away), but the final report states plainly that they are unaudited and must be verified by hand before they are trusted, and the command exits with an error that the "ship anyway" override cannot mask. "Not checked" is never allowed to read as "passed".
+
 ---
 
 _Milestones are dated to when the work landed. The fuller story — including the dead-ends that shaped these decisions — lives in the private development diary._

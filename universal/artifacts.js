@@ -192,6 +192,7 @@ function glossaryLintItems(result) {
 export function reviewSections(result = {}, warnings = []) {
   const logic = result.logic || []
   const sections = [
+    { title: '审计未能运行——本次运行失败，产物未经审计（不可采信，请人工运行 audit_refined.mjs 核验）', items: (result.auditUnavailable || []).map((x) => `${x.label ? `${x.label} — ` : ''}${x.path || x}`), priority: 'high' },
     { title: '未完成，需要补做', items: result.failed || [], priority: 'high' },
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
@@ -229,7 +230,10 @@ export function qualityScorecard(result = {}) {
     ? (result.glossaryLint.findings || []).filter((f) => f && f.count).map((f) => f.name)
     : []
   const logicFailed = result.logicFailed || []
-  const blocked = hardFiles.size || incomplete.length || logicFailed.length
+  const auditUnavailable = result.auditUnavailable || []
+  // P7: an audit that could not run blocks the run — the deliverables are unaudited, which is worse than a
+  // known hard finding, so it must never grade below "blocked".
+  const blocked = hardFiles.size || incomplete.length || logicFailed.length || auditUnavailable.length
   const reviewNeeded = blocked || unchecked.length || sectionSummary.flagged || networkUnverified.length || openQuestions.length || glossaryWarnings.length
   const status = blocked ? 'blocked' : reviewNeeded ? 'review_needed' : 'ready'
   const label = status === 'ready' ? 'Ready' : status === 'blocked' ? 'Blocked' : 'Review Needed'
@@ -241,6 +245,7 @@ export function qualityScorecard(result = {}) {
       hardFiles: hardFiles.size,
       incomplete: incomplete.length,
       unchecked: unchecked.length,
+      auditUnavailable: auditUnavailable.length,
       flaggedSections: sectionSummary.flagged,
       totalSections: sectionSummary.total,
       networkUnverified: networkUnverified.length,
@@ -369,6 +374,8 @@ export function buildRunManifest(result = {}, context = {}) {
       failed: result.failed || [],
       incomplete: result.incomplete || [],
       unchecked: result.unchecked || [],
+      // P7 fail-loud: files whose audit could not run — the run is failed, products unaudited.
+      auditUnavailable: result.auditUnavailable || [],
       headingConflicts: result.headingConflicts || [],
       scoutSuspect: result.scoutSuspect || [],
       suspectedDuplicates: result.suspectedDuplicates || [],

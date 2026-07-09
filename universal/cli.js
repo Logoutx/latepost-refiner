@@ -180,6 +180,10 @@ const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.
 // auditFailed field, not the exit code, to decide per-file follow-up.
 export function computeExitCode(result, { allowAuditFail = false } = {}) {
   if (result.error) return 1
+  // P7 fail-loud: an audit that could NOT run (deliverables unaudited) always exits 1. This is NOT bypassable
+  // by --allow-audit-fail: that flag means "the audit ran and found a hard issue I accept", a different decision
+  // from "the audit never ran, so nothing was verified". An unverified run must never masquerade as success.
+  if ((result.auditUnavailable || []).length > 0) return 1
   const auditFailed = (result.auditFailed || []).length > 0
   if (!auditFailed) return 0
   const producedOutput = (result.refined || []).length > 0
@@ -211,6 +215,7 @@ export function printRunSummary(r) {
     if (e.bothFailed) console.error(`⚠ 其中 ${e.bothFailed} 份两档均未过审——请对照源文件人工核对（见 review.md「升级重跑」）：` + e.files.filter((f) => f.bothFailed).map((f) => f.label).join('、'))
   }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
+  if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿及其派生的总结/时间线均未经审计，不可视为通过。产物已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {

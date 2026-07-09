@@ -95,3 +95,11 @@ test('computeExitCode: --allow-audit-fail still exits 1 when NO product was gene
   const result = { refined: [], auditFailed: [{ path: '/o/A.md', findings: ['content_gap'] }] }
   assert.equal(computeExitCode(result, { allowAuditFail: true }), 1)
 })
+
+test('computeExitCode (P7): an audit that could not run exits 1 and is NOT bypassable by --allow-audit-fail', () => {
+  // "audit unavailable" (deliverables unaudited) is a distinct, harder failure than "audit ran and found a hard
+  // issue I accept" — --allow-audit-fail covers the latter, never the former.
+  const result = { refined: [{ path: '/o/A.md' }], auditFailed: [], auditUnavailable: [{ path: '/o/A.md', label: 'A' }] }
+  assert.equal(computeExitCode(result), 1, 'default: auditUnavailable → exit 1')
+  assert.equal(computeExitCode(result, { allowAuditFail: true }), 1, '--allow-audit-fail cannot mask an audit that never ran')
+})

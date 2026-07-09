@@ -445,17 +445,20 @@ test('refine runs even when scout fails for a file (scout decoupled; surfaced as
   assert.equal(r.refined.length, 2, 'both files refined')
 })
 
-test('an unavailable audit (no fs capability, fallback agent fails to parse) surfaces the file as unchecked and never blocks deliverables', async () => {
+test('an unavailable audit (no fs capability, fallback agent fails to parse) is kept on disk but FAILS the run loudly', async () => {
   const labels = []
   const file = { path: '/s/A.txt', label: 'A', lines: 500, chars: 5000, title: 'A', subtitle: '*s*', outPath: '/o/Transcripts/A.md' }
   // No capabilities are injected (CC-sandbox shape), so the audit gate falls back to an agent; the mock returns
-  // null for every audit/audit-retry label → the audit degrades to "unavailable" and the file is unchecked.
+  // null for every audit/audit-retry label → the audit is "unavailable".
   const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('audit') }))
-  assert.ok(r.summary, 'the summary deliverable is produced even though the audit was unavailable')
+  // Deliverables are PRESERVED (work not destroyed) …
+  assert.ok(r.summary, 'the summary deliverable is still produced (work is preserved, just marked unaudited)')
   assert.ok(!labels.some((l) => /^check/.test(l)), 'no separate completeness check phase exists anymore')
-  assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'an unavailable audit surfaces the file as unchecked (completeness could not be determined)')
+  assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'an unavailable audit still surfaces the file as unchecked')
   assert.deepEqual(r.incomplete, [], 'unavailable ≠ incomplete: an audit that could not run must not be reported as a truncated ending')
   assert.equal(r.failed.length, 0, 'the refine itself succeeded')
+  // … but P7: the run is now marked FAILED — an unaudited deliverable is not a passed one.
+  assert.deepEqual(r.auditUnavailable, [{ path: '/o/Transcripts/A.md', label: 'A' }], 'the run is marked failed via top-level auditUnavailable')
 })
 
 // ---------- resilience: an oversized merged file can't stall the scout (auto-chunked) ----------
