@@ -149,6 +149,49 @@ test('SRT source still catches a real spoken-number drift', () => {
   assert.ok(drift.samples.some((s) => s.text.includes('增 5')), 'sample cites the spoken fact, not a timestamp')
 })
 
+test('SRT normalization merges consecutive same-speaker cues into one turn', () => {
+  const src = [
+    '1', '00:00:01,000 --> 00:00:03,000', '发言人 1：我们先说第一点，', '',
+    '2', '00:00:03,000 --> 00:00:05,000', '发言人 1：然后是第二点，', '',
+    '3', '00:00:05,000 --> 00:00:07,000', '发言人 1：最后是第三点。', '',
+  ].join('\n')
+  const normalized = normalizeSrtTranscript(src, { sourceFile: '示例字幕.srt' })
+  assert.equal((normalized.match(/<!-- srt:cue=/g) || []).length, 1, 'three same-speaker cues collapse to one turn, not three fragments')
+  const turns = parseSourceTurns(normalized)
+  assert.equal(turns.length, 1)
+  assert.equal(turns[0].speaker, '发言人1')
+  // bodies joined by direct concatenation — no stray whitespace inside the Chinese text
+  assert.ok(normalized.includes('我们先说第一点，然后是第二点，最后是第三点。'), 'cue bodies concatenated directly')
+  assert.ok(!/第一点，\s+然后/.test(normalized), 'no stray space introduced between merged cues')
+})
+
+test('SRT normalization preserves speaker alternation (发言人1 发言人1 发言人2 发言人1 → three turns)', () => {
+  const src = [
+    '1', '00:00:01,000 --> 00:00:02,500', '发言人 1：甲先说了一句，', '',
+    '2', '00:00:02,500 --> 00:00:04,000', '发言人 1：甲又补充一句。', '',
+    '3', '00:00:04,000 --> 00:00:06,000', '发言人 2：乙回应了这个说法。', '',
+    '4', '00:00:06,000 --> 00:00:08,000', '发言人 1：甲最后再讲一点。', '',
+  ].join('\n')
+  const normalized = normalizeSrtTranscript(src, { sourceFile: '示例字幕.srt' })
+  assert.equal((normalized.match(/<!-- srt:cue=/g) || []).length, 3, 'A A B A collapses to three turns')
+  const turns = parseSourceTurns(normalized)
+  assert.deepEqual(turns.map((t) => t.speaker), ['发言人1', '发言人2', '发言人1'])
+  assert.deepEqual(turns.map((t) => t.ts), ['00:00:01', '00:00:04', '00:00:06'])
+  assert.ok(normalized.includes('甲先说了一句，甲又补充一句。'), 'the leading same-speaker run merges into one body')
+  assert.ok(normalized.includes('甲最后再讲一点。'), 'the trailing 发言人 1 turn stays separate across the 发言人 2 turn')
+})
+
+test('SRT normalization keeps the FIRST cue timestamp on a merged turn and spans the cue range in provenance', () => {
+  const src = [
+    '7', '00:01:10,000 --> 00:01:12,000', '发言人 1：这是开头，', '',
+    '8', '00:01:12,000 --> 00:01:15,000', '发言人 1：这是结尾。', '',
+  ].join('\n')
+  const normalized = normalizeSrtTranscript(src, { sourceFile: '示例字幕.srt' })
+  assert.match(normalized, /发言人 1 00:01:10/, 'turn line carries the FIRST cue start time')
+  assert.ok(!normalized.includes('发言人 1 00:01:12'), 'the second cue start time is not emitted as its own turn')
+  assert.match(normalized, /<!-- srt:cue=7-8 ts=00:01:10-00:01:15 -->/, 'provenance comment spans the merged cue index and time range')
+})
+
 test('a faithful refine passes coverage despite 数字 conversion, spelling correction, reordering and a small traced fold', () => {
   // The good refined output: strips filler, converts 汉字数字→阿拉伯, corrects 云舟→云洲,
   // moves one section, and folds the tail chit-chat into a stage direction.

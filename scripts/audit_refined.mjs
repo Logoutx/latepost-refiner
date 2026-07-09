@@ -90,13 +90,31 @@ function splitCueSpeaker(text) {
 export function normalizeSrtTranscript(text, { sourceFile = '' } = {}) {
   const cues = parseSrtCues(text)
   if (!cues.length) return String(text || '')
-  const out = [`<!-- source:srt file=${path.basename(String(sourceFile || 'source.srt'))} cues=${cues.length} -->`, '']
+  // Merge consecutive cues from the SAME speaker into one turn. An SRT splits a single spoken
+  // statement across many short cues; one turn per cue would hand the model a stream of fragmented
+  // one-line turns (a real file collapsed ~1,772 cues → ~295 turns this way). Same-speaker bodies are
+  // concatenated directly (CJK: no separator, no stray spaces); the turn keeps the FIRST cue's
+  // timestamp, and the provenance comment spans the merged cue-index/time range. A speaker change
+  // starts a new turn, so speaker alternation is preserved.
+  const turns = []
   for (const cue of cues) {
     const { speaker, body } = splitCueSpeaker(cue.text)
     if (!body) continue
-    out.push(`<!-- srt:cue=${cue.index} ts=${cue.start}-${cue.end} -->`)
-    out.push(`${speaker} ${cue.start}`)
-    out.push(body)
+    const prev = turns[turns.length - 1]
+    if (prev && prev.speaker === speaker) {
+      prev.body += body
+      prev.endIndex = cue.index
+      prev.end = cue.end
+    } else {
+      turns.push({ speaker, body, start: cue.start, end: cue.end, startIndex: cue.index, endIndex: cue.index })
+    }
+  }
+  const out = [`<!-- source:srt file=${path.basename(String(sourceFile || 'source.srt'))} cues=${cues.length} -->`, '']
+  for (const t of turns) {
+    const cueRange = t.startIndex === t.endIndex ? `${t.startIndex}` : `${t.startIndex}-${t.endIndex}`
+    out.push(`<!-- srt:cue=${cueRange} ts=${t.start}-${t.end} -->`)
+    out.push(`${t.speaker} ${t.start}`)
+    out.push(t.body)
     out.push('')
   }
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n'
