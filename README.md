@@ -13,11 +13,11 @@
 | 你的情况 | 用哪个 | 要 API key 吗 |
 |---|---|---|
 | 在 Claude Code 里常用 | Claude Code 技能 | 不要，走你的订阅 |
-| 在 Codex 里用 | Codex 技能（委托命令行运行时） | 要，填 `OPENAI_API_KEY` |
+| 在 Codex 里用 | Codex 技能（原生订阅运行时） | 不要，走你的 Codex 订阅 |
 | 想用 OpenAI / DeepSeek / GLM / Kimi | 命令行 或 本地网页版 | 要 |
 | 发给不写代码的人 | 单文件 App，双击即用 | 要，填在本机浏览器里 |
 
-> Codex 技能目前委托给命令行运行时（`codex-skills/latepost-refiner/SKILL.md` 的 First Choice: Use The Universal Runtime），因此要一把 `OPENAI_API_KEY`。一个走 Codex 订阅、不要 key 的原生运行时（`codex-native.mjs`：确定性 glue，逐步产出 prompt 交给 Codex 子代理跑）在 **`codex-skill-subscription-runtime` 分支**上，尚未并回 main。
+> Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有在要用 Anthropic / DeepSeek / GLM / Kimi / OpenAI 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”），那时填对应的 key。
 
 ## 安装
 

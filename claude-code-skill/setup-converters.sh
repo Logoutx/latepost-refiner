@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# GENERATED FILE — DO NOT EDIT. Source: scripts/setup-converters.sh. Regenerate: npm run sync:skills
 # setup-converters.sh — install the local document→Markdown converters that
 # LatePost-Refiner's Step-0 preflight uses, so .docx/.pptx/.xlsx/.pdf inputs
 # can be turned into Markdown before refining. Both the Claude Code skill and

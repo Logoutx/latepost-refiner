@@ -1,4 +1,5 @@
 #!/bin/bash
+# GENERATED FILE — DO NOT EDIT. Source: scripts/install-converters.command. Regenerate: npm run sync:skills
 # ── Double-click this file in Finder to install the document converter. ──
 # First time only: macOS may say it is from an "unidentified developer".
 # Right-click (or Control-click) this file → Open → Open. After that, a normal
