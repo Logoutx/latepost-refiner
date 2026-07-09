@@ -1949,6 +1949,9 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   // M7 quote-integrity guard: manufactured-quote detection. refine mode only, SOFT. Reliably quiet on faithful
   // quotes (verified on real pairs), so it is default-on.
   const quoteFab = mode === 'refine' ? checkQuoteFabrication(sourceText, refinedText) : null
+  // P6 within-document numeric consistency: the SAME measured quantity stated twice with conflicting numbers in
+  // the 成稿 itself. Warning tier only (never a gate); cheap + deterministic, so it runs on every refine.
+  const numericConsistency = mode === 'refine' ? checkNumericConsistency(refinedText) : null
 
   const metrics = {
     sourceChars: sChars, refinedChars: rChars, charRatio,
@@ -1959,6 +1962,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
     ...(attribution ? { attribution: { assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
     ...(quoteFab ? { quotes: { assessed: quoteFab.assessed, spansChecked: quoteFab.spansChecked, flagged: quoteFab.flagged } } : {}),
+    ...(numericConsistency ? { numericConsistency: { conflicts: numericConsistency.conflicts.length } } : {}),
   }
 
   // Editorial deterministic checks (typesetting + glossary residue). quote_style is HARD → it opens its own
@@ -2032,11 +2036,20 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...(entitySub && entitySub.assessed ? [
       { name: 'entity_substitution_risk', severity: 'soft', count: entitySub.flagged, samples: entitySub.samples },
     ] : []),
+    // P6 within-document numeric consistency — SOFT ONLY, present only when a conflict is found. The same measured
+    // quantity stated twice with disjoint numbers in the 成稿 (毛利率 30% here / 45% there) → a 复核 review item.
+    ...(numericConsistency && numericConsistency.conflicts.length ? [
+      { name: 'numeric_inconsistency', severity: 'soft', count: numericConsistency.conflicts.length,
+        samples: numericConsistency.conflicts.slice(0, 12).map((c) => ({
+          text: `“${c.keyNoun}”在本文出现互相矛盾的数值：${c.values.map((v) => `第 ${v.line} 行作“${atomLabel({ value: v.value, unit: c.unit })}”`).join('，')}——请对照录音确认`,
+          line: c.values[0] ? c.values[0].line : 1,
+        })) },
+    ] : []),
   ])
   // M5 per-section review checklist: one entry per ## section of the refined doc, flags aggregate everything
   // localizable to it (number_drift / hedge_loss / content_gap_soft / ghost_name / missing_yin / weak_anchor).
   const sections = buildSections(sourceText, refinedText, { atoms, coverage, glossary, attribution })
-  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections }
+  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections, numericConflicts: numericConsistency ? numericConsistency.conflicts : [] }
 }
 
 // Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay reasonably sized, carry source
@@ -2232,6 +2245,76 @@ export function checkCrossFileClaims(files, glossaryCanonicals = []) {
 }
 
 // ============================================================================
+// P6 — within-document numeric consistency (single-file, deterministic, ZERO model calls, WARNING tier only)
+// ----------------------------------------------------------------------------
+// M8 catches the SAME quantity carrying different values ACROSS files. This catches it WITHIN one document: an
+// interviewee (or a derivative) states the same measured quantity twice with conflicting numbers (毛利率 30% here,
+// 毛利率 45% there) and every other gate passes. Deterministic, reuses the M4 number atoms + the M8 disjoint-span
+// conflict rule. Deliberately conservative (a warning that must not drown the 复核清单):
+//   · only EXACT, UNQUALIFIED values compare — an atom carrying ANY polarity/estimate qualifier (约/不到/超过/
+//     左右…) or sitting next to a hedge (大概/可能/估计…) is a bound/estimate, not a stated fact, and is skipped
+//     (so 不到 30% never "conflicts" with 28%).
+//   · a quantity is keyed by (measured-noun, unit): the noun is the trailing 汉字 run right before the number
+//     (a few chars), so a conflict needs the SAME noun AND SAME unit — 毛利率 30% vs 净利率 45% do NOT conflict.
+//   · both sides must carry a unit (a bare count is too ambiguous), and values must be genuinely DISJOINT
+//     (xfileValuesConflict: 30 vs 30.0 / a scalar inside a range are NOT conflicts).
+// NEVER hard-fails; capped at NUMERIC_CONSISTENCY.MAX_CONFLICTS (most-specific noun first). Pure, order-stable.
+// (The considered duration-vs-date-span sub-check — "18 个月" against a start/end date implying 28 — was dropped:
+//  founding years and unrelated durations co-occur constantly, so it was too false-positive-prone to ship. The
+//  repeated-quantity conflict is the reliable core.)
+export const NUMERIC_CONSISTENCY = {
+  KEYNOUN_MAX: 8,      // max 汉字 of the measured-noun context captured before a number
+  KEYNOUN_MIN: 2,      // a noun shorter than this is too generic to group on
+  WINDOW: 12,          // chars before a number scanned for the noun + any hedge/estimate marker
+  MAX_CONFLICTS: 10,   // cap on review items (most-specific noun first) so the 复核清单 can't be drowned
+  SNIPPET: 60,
+}
+// Near a number these mark it as an estimate/bound, not an exact stated fact → the atom is skipped.
+const NUMERIC_APPROX_NEAR = /约|左右|上下|接近|将近|大约|大概|差不多|可能|估计|也许|或许|至少|最多|起码|将近|好几|几十|上百|上千/
+
+// checkNumericConsistency(text): the SAME (measured-noun, unit) carrying DISJOINT exact values ≥2 times in ONE
+// document. Returns { conflicts } where each = { keyNoun, unit, values:[{ value, line, snippet }…] }.
+export function checkNumericConsistency(text) {
+  const lines = String(text || '').split(/\r?\n/)
+  const groups = new Map()   // `${keyNoun} ${unit}` → [{ value, line, snippet }]
+  for (let li = 0; li < lines.length; li += 1) {
+    const raw = lines[li]
+    if (!raw || !raw.trim()) continue
+    if (/^\s*#{1,6}\s|^\s*>|^\s*<!--/.test(raw)) continue        // headings / blockquotes / comments are not prose
+    const line = xfileStripLabel(raw)                            // blank a leading 名字： so a speaker isn't the noun
+    for (const a of extractNumberAtoms(line)) {
+      if (!a.unit) continue                                      // need a unit to compare (a bare count is ambiguous)
+      if (a.polarity) continue                                   // any qualifier → a bound/estimate, not an exact fact
+      const before = line.slice(Math.max(0, a.idx - NUMERIC_CONSISTENCY.WINDOW), a.idx)
+      if (NUMERIC_APPROX_NEAR.test(before)) continue             // hedge/estimate right before → skip
+      // measured-noun = trailing 汉字 run before the number; strip a Pangu space (中文与数字间的半角空格) first so
+      // 毛利率 30% still yields the noun 毛利率.
+      const m = before.replace(/\s+$/, '').match(/[一-龥]+$/)
+      if (!m) continue
+      const keyNoun = m[0].slice(-NUMERIC_CONSISTENCY.KEYNOUN_MAX)
+      if (keyNoun.length < NUMERIC_CONSISTENCY.KEYNOUN_MIN) continue
+      const key = `${keyNoun} ${a.unit}`
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key).push({ value: a.value, line: li + 1, snippet: raw.trim().slice(0, NUMERIC_CONSISTENCY.SNIPPET) })
+    }
+  }
+  const conflicts = []
+  for (const [key, occ] of groups) {
+    if (occ.length < 2) continue
+    let has = false
+    for (let i = 0; i < occ.length && !has; i += 1) for (let j = i + 1; j < occ.length; j += 1) { if (xfileValuesConflict(occ[i].value, occ[j].value)) { has = true; break } }
+    if (!has) continue
+    const [keyNoun, unit] = key.split(' ')
+    const seen = new Map()                                       // one line ref per DISTINCT value (first wins)
+    for (const o of occ) if (!seen.has(o.value)) seen.set(o.value, o)
+    conflicts.push({ keyNoun, unit, values: Array.from(seen.values()).slice(0, XFILE.MAX_VALUES) })
+  }
+  // most-specific (longest) noun first = highest confidence; then fewer distinct values.
+  conflicts.sort((a, b) => b.keyNoun.length - a.keyNoun.length || a.values.length - b.values.length)
+  return { conflicts: conflicts.slice(0, NUMERIC_CONSISTENCY.MAX_CONFLICTS) }
+}
+
+// ============================================================================
 // P1 — derivative attribution guard (时间线 / 访谈总结)
 // ----------------------------------------------------------------------------
 // A derived deliverable can state a figure and attribute it to the interview that the interviewee never actually
@@ -2397,6 +2480,8 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
 // (status + findings[]), so callers wire it into pass/fail exactly as the other hard detectors.
 export function auditDerivative({ corpusText, derivativeText, kind = 'derivative', derivativeFile = '<derivative>' }) {
   const r = checkDerivativeAttribution(corpusText, derivativeText)
+  // P6: a 时间线/总结 can also contradict itself (same measured quantity, two numbers). Cheap, warning tier.
+  const numericConflicts = checkNumericConsistency(derivativeText).conflicts
   const findings = [
     { name: 'derivative_attribution', severity: 'hard', count: r.hardFail.length,
       samples: r.hardFail.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，标【访谈】但源文无此数字——疑炮制）`, line: x.line })) },
@@ -2404,8 +2489,10 @@ export function auditDerivative({ corpusText, derivativeText, kind = 'derivative
       samples: r.reporterVerify.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，公开来源·待记者核实）`, line: x.line })) },
     { name: 'derivative_review', severity: 'soft', count: r.review.length,
       samples: r.review.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，${x.note}）`, line: x.line })) },
+    { name: 'numeric_inconsistency', severity: 'soft', count: numericConflicts.length,
+      samples: numericConflicts.slice(0, 12).map((c) => ({ text: `“${c.keyNoun}”在本件出现互相矛盾的数值：${c.values.map((v) => `第 ${v.line} 行作“${atomLabel({ value: v.value, unit: c.unit })}”`).join('，')}——请对照核对`, line: c.values[0] ? c.values[0].line : 1 })) },
   ]
-  return { file: derivativeFile, kind, mode: 'derivative', status: r.hardFail.length ? 'fail' : 'ok', assessed: r.assessed, failed: r.hardFail.length ? ['derivative_attribution'] : [], findings, hardFail: r.hardFail, reporterVerify: r.reporterVerify, review: r.review }
+  return { file: derivativeFile, kind, mode: 'derivative', status: r.hardFail.length ? 'fail' : 'ok', assessed: r.assessed, failed: r.hardFail.length ? ['derivative_attribution'] : [], findings, hardFail: r.hardFail, reporterVerify: r.reporterVerify, review: r.review, numericConflicts }
 }
 
 // auditDerivativeFile: read the derivative + its interview corpus (source transcripts and/or refined 成稿) from

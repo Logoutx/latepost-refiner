@@ -62,6 +62,10 @@ A close look at the strongest engine run showed that almost every "number change
 
 Matching each answer back to the person who said it gets harder once more than two people are in the room: a cleaned-up transcript merges or splits turns, and the checker can pin a line to the wrong name. On the strongest run of a four-person interview, all four "wrong speaker" alarms turned out to be these alignment slips, not real mistakes. The check now asks for more before it accuses. In a conversation of three or more people it raises a firm "wrong speaker" fault only when a whole answer plainly sits under the wrong name; a single weak match is set aside as a "please double-check" note instead of an accusation. A genuine swap — an entire answer moved under someone else's name — still fails firmly, and two-person interviews, where the check was already reliable, work exactly as before.
 
+## July 2026 — Catching a document that disagrees with itself
+
+A finished document can quietly contradict itself: the same figure — a margin, a headcount, a span of time — is given one number in an early passage and a different number later, and each passage reads as faithful on its own. A human editor caught exactly this once. The tool now reads each finished transcript, and the timeline and summary built from it, for a measured quantity that is named the same way but carries two different exact numbers, and lists both places for a person to check against the recording. It is deliberately cautious: it only pairs the same noun with the same unit, it ignores rough estimates and "up to / no more than" phrasings that are allowed to differ, it never fails a run on its own, and the list is capped so it can never bury the more urgent items.
+
 ---
 
 _Milestones are dated to when the work landed. The fuller story — including the dead-ends that shaped these decisions — lives in the private development diary._

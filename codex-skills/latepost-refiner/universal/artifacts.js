@@ -162,6 +162,26 @@ export function crossFileConflictItems(result = {}) {
   return (result.crossFileConflicts || []).map(formatCrossFileConflict)
 }
 
+// P6: one review line per WITHIN-document numeric conflict (same measured noun + unit, disjoint values in ONE
+// file). Chinese typesetting (“” quotes, Pangu spacing on CJK units). 「成稿.md：“毛利率”自相矛盾——第 3 行作
+// “30%”，第 7 行作“45%”，请对照录音确认」. Reads both the 成稿 audit and the 时间线/总结 derivative audit.
+export function formatNumericConflict(base, c) {
+  const parts = (c.values || []).map((v) => `第 ${v.line} 行作“${xfileUnitLabel(v.value, c.unit)}”`)
+  return `${base ? `${base}：` : ''}“${c.keyNoun}”自相矛盾——${parts.join('，')}，请对照录音确认`
+}
+export function numericConsistencyItems(result = {}) {
+  const out = []
+  for (const f of (result.audit && result.audit.files) || []) {
+    const base = path.basename(f.file || '')
+    for (const c of f.numericConflicts || []) out.push(formatNumericConflict(base, c))
+  }
+  for (const f of (result.derivativeAudit && result.derivativeAudit.files) || []) {
+    const base = path.basename(f.file || '')
+    for (const c of f.numericConflicts || []) out.push(formatNumericConflict(base, c))
+  }
+  return out
+}
+
 // P1: derivative-attribution review lines. Hard items (fabricated 访谈 figures) are high-priority; reporter-verify
 // (public·待记者核实) and review (unlabeled / non-magnitude) items are medium. Each cites the derivative + line.
 function derivativeItems(result = {}, pick) {
@@ -223,6 +243,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
+    { title: '文档内数值自相矛盾（同一量在同一文件里出现两个不同数值——请对照录音确认哪个是对的）', items: numericConsistencyItems(result), priority: 'medium' },
     { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
     { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
@@ -408,6 +429,12 @@ export function buildRunManifest(result = {}, context = {}) {
       // M8: cross-file numeric conflicts (same entity + unit, disjoint values across ≥2 files). Structured so a
       // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
       crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),
+      // P6: within-document numeric conflicts (same measured noun + unit, disjoint values in ONE file), across
+      // both the 成稿 audit and the 时间线/总结 derivative audit — the human-readable lines are in review.md「文档内数值自相矛盾」.
+      numericConflicts: [
+        ...(((result.audit && result.audit.files) || []).flatMap((f) => (f.numericConflicts || []).map((c) => ({ file: path.basename(f.file || ''), keyNoun: c.keyNoun, unit: c.unit, values: (c.values || []).map((v) => ({ value: v.value, line: v.line })) })))),
+        ...(((result.derivativeAudit && result.derivativeAudit.files) || []).flatMap((f) => (f.numericConflicts || []).map((c) => ({ file: path.basename(f.file || ''), keyNoun: c.keyNoun, unit: c.unit, values: (c.values || []).map((v) => ({ value: v.value, line: v.line })) })))),
+      ],
     },
     // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
     derivativeAudit: result.derivativeAudit ? {
