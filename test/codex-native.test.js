@@ -48,6 +48,37 @@ function refinedDoc(title = '示例访谈') {
   ].join('\n')
 }
 
+test('Codex native prepare normalizes SRT sources into local markdown before prompts', () => {
+  const out = tmpdir()
+  const src = path.join(out, '2026-07-01_示例字幕.srt')
+  fs.writeFileSync(src, [
+    '1',
+    '00:00:01,000 --> 00:00:04,500',
+    'Speaker 1: 我们 2026 年做了 3 次试验。',
+    '',
+    '2',
+    '00:00:05,000 --> 00:00:09,000',
+    'Speaker 2: 今天就先聊到这里。',
+    '',
+  ].join('\n'), 'utf8')
+
+  const prepared = prepareNativeRun({
+    topic: '测试项目',
+    outputDir: out,
+    skillDir: path.resolve('codex-skills/latepost-refiner'),
+    scope: ['refine'],
+    verifyDepth: 'none',
+    files: [{ path: src }],
+  })
+  const args = JSON.parse(fs.readFileSync(prepared.argsPath, 'utf8'))
+  assert.equal(args.files[0].sourceKind, 'srt')
+  assert.equal(args.files[0].originalPath, src)
+  assert.match(args.files[0].path, /_codex-native\/sources\/.+\.md$/)
+  const normalized = fs.readFileSync(args.files[0].path, 'utf8')
+  assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(normalized), 'raw timecode arrows are not sent to native prompts')
+  assert.ok(normalized.includes('发言人 1 00:00:01'))
+})
+
 test('Codex native helper runs the no-key staged flow with chunked refine, logic-plan gate, audit, anchors, and artifacts', () => {
   const out = tmpdir()
   const src = path.join(out, 'source.md')

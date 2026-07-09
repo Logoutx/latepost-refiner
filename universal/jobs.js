@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
 import { SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript } from '../scripts/audit_refined.mjs'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
 import { makeApiEngine } from '../engines/api.js'
 import { makeOpenAIEngine } from '../engines/openai.js'
@@ -56,6 +56,13 @@ export const deriveTitle = (src) => path.basename(src, path.extname(src)).replac
 
 export async function convertToMarkdown(src, workDir) {
   const ext = path.extname(src).toLowerCase()
+  if (ext === '.srt') {
+    fs.mkdirSync(workDir, { recursive: true })
+    const dest = path.join(workDir, path.basename(src, ext) + '.md')
+    const normalized = normalizeSrtTranscript(fs.readFileSync(src, 'utf8'), { sourceFile: src })
+    fs.writeFileSync(dest, normalized, 'utf8')
+    return dest
+  }
   if (!CONVERT_EXT.has(ext)) return src // .txt / .md used as-is
   fs.mkdirSync(workDir, { recursive: true })
   const dest = path.join(workDir, path.basename(src, ext) + '.md')
@@ -79,6 +86,7 @@ export async function convertToMarkdown(src, workDir) {
 export async function prepareFile(src, { topic, date, headingPolicy, outputDir, workDir }) {
   const mdPath = await convertToMarkdown(src, workDir)
   const content = fs.readFileSync(mdPath, 'utf8')
+  const sourceKind = path.extname(src).toLowerCase() === '.srt' ? 'srt' : 'text'
   const lines = content.split('\n').length
   const bytes = Buffer.byteLength(content, 'utf8')
   const chars = contentLength(content)   // 正文字数 (汉字 + 英文词/数字)；文档长度以此衡量，行数仅供 Read 分页
@@ -86,6 +94,8 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const title = deriveTitle(src)
   const entry = {
     path: mdPath, label: title, title,
+    originalPath: path.resolve(src),
+    sourceKind,
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
     lines, bytes, chars,

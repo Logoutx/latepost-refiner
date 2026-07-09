@@ -38,7 +38,8 @@ record it in `review.md`; offer the Universal fallback only as an explicit opt-i
 ## Document Converters
 
 If any input is `.docx/.pptx/.xlsx/.pdf`, the Step-0 preflight converts it to Markdown first, then subagents read the
-`.md` (keeps raw bytes out of the main context). This needs `markitdown` (office docs + simple PDF) and `docling`
+`.md` (keeps raw bytes out of the main context). `.srt` inputs are normalized into Markdown speaker turns first;
+cue numbers and timecodes stay as metadata, not prose. Office/PDF conversion needs `markitdown` (office docs + simple PDF) and `docling`
 (complex / multi-column PDF) on PATH. **If either is missing, run the installer once — it is idempotent and installs
 only what is absent, via pipx:**
 

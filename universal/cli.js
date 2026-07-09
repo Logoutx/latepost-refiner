@@ -19,7 +19,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   latepost-refiner --files <文件...> --topic <主题> --date <YYYY-MM> [选项]
 
 必填:
-  --files <路径...>      一或多份转录（.txt/.md/.docx/.pptx/.xlsx/.pdf；docx/pdf 自动转 md）
+  --files <路径...>      一或多份转录（.txt/.md/.srt/.docx/.pptx/.xlsx/.pdf；srt/docx/pdf 自动转 md）
   --topic <主题>         公司/人物主题（用于交付物文件名）
 
 常用:

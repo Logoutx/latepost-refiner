@@ -50,7 +50,7 @@ import {
   weakDupFlags,
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
-import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs } from './audit_refined.mjs'
+import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, normalizeSrtTranscript, shouldNormalizeSrtSource } from './audit_refined.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -187,6 +187,15 @@ function stateDir(A) {
   return path.join(path.resolve(A.outputDir), '_codex-native')
 }
 
+function normalizeNativeSourcePath(filePath, A, index) {
+  const raw = fs.readFileSync(filePath, 'utf8')
+  if (!shouldNormalizeSrtSource(raw, filePath)) return { path: filePath, sourceKind: 'text', originalPath: filePath }
+  const title = titleFromPath(filePath) || `file-${index + 1}`
+  const dest = path.join(stateDir(A), 'sources', `${slug(title, `file-${index + 1}`)}.md`)
+  writeText(dest, normalizeSrtTranscript(raw, { sourceFile: filePath }))
+  return { path: dest, sourceKind: 'srt', originalPath: filePath }
+}
+
 function nowIso() {
   return new Date().toISOString()
 }
@@ -255,11 +264,16 @@ export function normalizeArgs(input) {
     const f = typeof entry === 'string' ? { path: entry } : { ...entry }
     if (!f.path) throw new Error(`args.files[${index}].path is required`)
     f.path = path.resolve(f.path)
-    f.label = f.label || titleFromPath(f.path) || `file-${index + 1}`
+    const originalTitle = titleFromPath(f.path)
+    const source = normalizeNativeSourcePath(f.path, A, index)
+    f.path = source.path
+    f.originalPath = f.originalPath || source.originalPath
+    f.sourceKind = f.sourceKind || source.sourceKind
+    f.label = f.label || originalTitle || titleFromPath(f.path) || `file-${index + 1}`
     f.lines = Number.isFinite(Number(f.lines)) && Number(f.lines) > 0 ? Number(f.lines) : lineCount(f.path)
     f.bytes = Number.isFinite(Number(f.bytes)) && Number(f.bytes) > 0 ? Number(f.bytes) : byteCount(f.path)
     f.chars = Number.isFinite(Number(f.chars)) && Number(f.chars) > 0 ? Number(f.chars) : contentChars(f.path)
-    f.title = f.title || titleFromPath(f.path) || f.label
+    f.title = f.title || originalTitle || titleFromPath(f.path) || f.label
     f.subtitle = f.subtitle || defaultSubtitle(A)
     f.outPath = f.outPath ? path.resolve(f.outPath) : path.join(A.outputDir, 'Transcripts', `${f.title}.md`)
     return f

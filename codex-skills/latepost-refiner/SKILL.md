@@ -39,7 +39,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
 
 ## Runtime Workflow
 
-1. Prepare files: convert supported office/PDF inputs to Markdown, count size, detect existing headings, and choose titles/output paths.
+1. Prepare files: convert supported office/PDF inputs and normalize SRT subtitles to Markdown, count size, detect existing headings, and choose titles/output paths.
 2. Seed from an existing `<out>/校对表.md` unless the user asks for a fresh glossary.
 3. Run the Universal runtime through the web UI or CLI.
 4. Inspect generated artifacts:

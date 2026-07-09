@@ -3,11 +3,42 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { runJob } from '../universal/jobs.js'
+import { prepareFile, runJob } from '../universal/jobs.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-runjob-'))
 }
+
+test('prepareFile normalizes SRT sources before the model sees them', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '2026-07-01_示例字幕.srt')
+  fs.writeFileSync(src, [
+    '1',
+    '00:00:01,000 --> 00:00:04,500',
+    'Speaker 1: 我们 2026 年做了 3 次试验。',
+    '',
+    '2',
+    '00:00:05,000 --> 00:00:09,000',
+    'Speaker 2: 今天就先聊到这里。',
+    '',
+  ].join('\n'), 'utf8')
+
+  const { entry } = await prepareFile(src, {
+    topic: '测试项目',
+    date: '2026-07',
+    headingPolicy: 'none',
+    outputDir,
+    workDir: path.join(outputDir, '.converted'),
+  })
+
+  assert.equal(entry.sourceKind, 'srt')
+  assert.equal(entry.originalPath, src)
+  assert.equal(path.extname(entry.path), '.md')
+  const prepared = fs.readFileSync(entry.path, 'utf8')
+  assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(prepared), 'raw SRT timecode arrow is not sent to prompts')
+  assert.ok(prepared.includes('发言人 1 00:00:01'))
+  assert.ok(prepared.includes('我们 2026 年做了 3 次试验。'))
+})
 
 function mockEngine() {
   const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }

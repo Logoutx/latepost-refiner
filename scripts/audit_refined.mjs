@@ -29,6 +29,86 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+const SRT_TIME_RE = /^\s*(\d{1,2}:\d{2}:\d{2})[,.]\d{1,3}\s*-->\s*(\d{1,2}:\d{2}:\d{2})[,.]\d{1,3}(?:\s+.*)?$/
+
+export function isSrtPath(filePath = '') {
+  return path.extname(String(filePath || '')).toLowerCase() === '.srt'
+}
+
+export function looksLikeSrt(text) {
+  const sample = String(text || '').slice(0, 8000)
+  return /^\s*\d+\s*\r?\n\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/m.test(sample)
+    || (sample.match(/^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/gm) || []).length >= 2
+}
+
+function parseSrtCues(text) {
+  const blocks = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n\s*\r?\n/)
+  const cues = []
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+    if (!lines.length) continue
+    let i = /^\d+$/.test(lines[0]) ? 1 : 0
+    const tm = lines[i] && lines[i].match(SRT_TIME_RE)
+    if (!tm) continue
+    const cueText = lines.slice(i + 1).join('\n').trim()
+    if (!cueText) continue
+    cues.push({
+      index: /^\d+$/.test(lines[0]) ? Number(lines[0]) : cues.length + 1,
+      start: tm[1],
+      end: tm[2],
+      text: cueText,
+    })
+  }
+  return cues
+}
+
+function normalizeCueSpeaker(label, fallback = '字幕') {
+  let s = String(label || '').replace(/^<v\s+|>$/g, '').replace(/\*+/g, '').trim()
+  s = s.replace(/^Speaker\s*([0-9]+)$/i, '发言人 $1')
+       .replace(/^发言人\s*([0-9一二三四五六七八九十]+)$/u, '发言人 $1')
+  if (!s || s.length > 18 || /[。！？!?，,；;、]/.test(s)) return fallback
+  return s
+}
+
+function splitCueSpeaker(text) {
+  const lines = String(text || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+  if (!lines.length) return { speaker: '字幕', body: '' }
+  const first = lines[0]
+  const voice = first.match(/^<v\s+([^>]+)>\s*(.*)$/i)
+  const line = voice ? voice[2].trim() : first
+  const m = line.match(/^([^：:\n]{1,24})[：:]\s*(.*)$/u)
+  if (m) {
+    return {
+      speaker: normalizeCueSpeaker(voice ? voice[1] : m[1], '字幕'),
+      body: [m[2], ...lines.slice(1)].filter(Boolean).join('\n').trim(),
+    }
+  }
+  return { speaker: normalizeCueSpeaker(voice ? voice[1] : '字幕', '字幕'), body: [line, ...lines.slice(1)].filter(Boolean).join('\n').trim() }
+}
+
+export function normalizeSrtTranscript(text, { sourceFile = '' } = {}) {
+  const cues = parseSrtCues(text)
+  if (!cues.length) return String(text || '')
+  const out = [`<!-- source:srt file=${path.basename(String(sourceFile || 'source.srt'))} cues=${cues.length} -->`, '']
+  for (const cue of cues) {
+    const { speaker, body } = splitCueSpeaker(cue.text)
+    if (!body) continue
+    out.push(`<!-- srt:cue=${cue.index} ts=${cue.start}-${cue.end} -->`)
+    out.push(`${speaker} ${cue.start}`)
+    out.push(body)
+    out.push('')
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n'
+}
+
+export function shouldNormalizeSrtSource(text, sourceFile = '') {
+  return isSrtPath(sourceFile) || looksLikeSrt(text)
+}
+
+export function normalizeTranscriptSource(text, { sourceFile = '' } = {}) {
+  return shouldNormalizeSrtSource(text, sourceFile) ? normalizeSrtTranscript(text, { sourceFile }) : String(text || '')
+}
+
 export const HARD_LONG_CHARS = 900
 
 export const REFINE_GATES = {
@@ -580,6 +660,7 @@ export function parseSourceTurns(sourceText) {
     const lineNo = i + 1
     const line = lines[i].trim()
     if (!line) continue
+    if (/^<!--/.test(line)) continue
     const a = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?\s*\*{0,2}$/)
     const b = a ? null : line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*\*{0,2}$/)
     if (a || b) {
@@ -876,7 +957,9 @@ export function extractNumberAtoms(text) {
   // Markdown escaping: a raw ASR/Word export writes decimals as 80\.3 / 4\.8 (backslash before the dot); the
   // refined side un-escapes them to 80.3 / 4.8. Strip a backslash sitting before a dot FIRST so a decimal parses
   // whole and identically on both sides — otherwise 80\.3% splits into 80 + 3% and phantom-drifts against 80.3%.
-  const raw = String(text || '').replace(/\\(?=[.])/g, '')
+  const raw = String(text || '')
+    .replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/\\(?=[.])/g, '')
   // Blank out HH:MM(:SS) timestamps and URLs so their digits never register.
   const masked = raw
     .replace(/\d{1,2}:\d{2}(?::\d{2})?/g, (m) => ' '.repeat(m.length))
@@ -1720,6 +1803,7 @@ export function auditFiles(paths) {
 // glossaryText (optional): a rendered 校对表.md — enables ghost_name / missing_yin. When absent, those
 // two checks are silently skipped (count 0), same leniency contract as the coverage scan.
 export function auditPair({ sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine', glossaryText = null, strict = false }) {
+  sourceText = normalizeTranscriptSource(sourceText, { sourceFile })
   const out = auditText(refinedText, refinedFile) // output-only cleanliness (residual noise / long paras)
 
   const sChars = hanzi(sourceText)

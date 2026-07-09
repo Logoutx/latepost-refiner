@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -87,6 +87,48 @@ test('parseSourceTurns handles all three label formats with line ranges', () => 
   const inline = parseSourceTurns('张三：今天聊聊供应链。\n李四: 好，从原料说起。')
   assert.deepEqual(inline.map((t) => t.speaker), ['张三', '李四'])
   assert.equal(inline[0].text, '今天聊聊供应链。', 'inline remainder captured as content')
+})
+
+const srtSource = () => [
+  '1',
+  '00:00:01,000 --> 00:00:04,500',
+  '发言人 1：我们 2026 年做了 3 次试验，成功率大概 80%，每次都会复盘供应、测试窗口和团队分工，确保下一轮安排更稳。',
+  '',
+  '2',
+  '00:00:05,000 --> 00:00:09,000',
+  '发言人 2：后来又增加到 5 台设备，主要覆盖低温、振动和连续运行场景，今天就先聊到这里。',
+  '',
+].join('\n')
+
+const srtRefined = (tail = '5 台设备') => [
+  '# 字幕访谈',
+  '',
+  '## 开场',
+  '',
+  '发言人 1：我们 2026 年做了 3 次试验，成功率大概 80%，每次都会复盘供应、测试窗口和团队分工，确保下一轮安排更稳。',
+  '',
+  `发言人 2：后来又增加到 ${tail}，主要覆盖低温、振动和连续运行场景，今天就先聊到这里。`,
+  '',
+].join('\n')
+
+test('SRT normalization turns cue blocks into speaker turns without leaking cue/timecode numbers', () => {
+  const normalized = normalizeSrtTranscript(srtSource(), { sourceFile: '示例字幕.srt' })
+  assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(normalized), 'raw SRT timecode arrow is not source prose')
+  const turns = parseSourceTurns(normalized)
+  assert.deepEqual(turns.map((t) => t.speaker), ['发言人1', '发言人2'])
+  assert.deepEqual(turns.map((t) => t.ts), ['00:00:01', '00:00:05'])
+
+  const r = auditPair({ sourceText: srtSource(), sourceFile: '示例字幕.srt', refinedText: srtRefined(), mode: 'refine' })
+  assert.equal(r.status, 'ok')
+  assert.equal(r.findings.find((f) => f.name === 'number_drift').count, 0, 'cue indexes and timestamps do not become drift')
+  assert.equal(r.metrics.atoms.sourceNumbers, 4, 'only spoken facts are counted as source numbers')
+})
+
+test('SRT source still catches a real spoken-number drift', () => {
+  const r = auditPair({ sourceText: srtSource(), sourceFile: '示例字幕.srt', refinedText: srtRefined('6 台设备'), mode: 'refine' })
+  const drift = r.findings.find((f) => f.name === 'number_drift')
+  assert.ok(drift.count >= 1, 'changed spoken number is still flagged')
+  assert.ok(drift.samples.some((s) => s.text.includes('增 5')), 'sample cites the spoken fact, not a timestamp')
 })
 
 test('a faithful refine passes coverage despite 数字 conversion, spelling correction, reordering and a small traced fold', () => {
