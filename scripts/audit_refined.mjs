@@ -859,7 +859,9 @@ export const ATOMS = {
   POLARITY_WINDOW: 6,       // chars before a number scanned for a polarity/bound qualifier (不到/亏损/超过…)
   HEDGE_TURN_MIN: 2,        // source turn needs ≥ this many hedge markers before a total wipe is worth flagging
   DRIFT_SAMPLES: 12,        // cap on number_drift sample texts (total count still reported)
+  NOTE_SAMPLES: 12,         // cap on number_drift_note sample texts (downgraded, garbage/low-confidence)
   WINDOW_LINES: 6,          // refined lines each side of a turn's anchor line = its search window
+  STUTTER_GAP_MAX: 3,       // max chars between two same-value atoms for them to count as ONE stuttered fact
   MIN_ATOM_VALUE_LEN: 1,    // (reserved) minimum canonical-value length to register an atom
 }
 
@@ -1045,7 +1047,7 @@ export function extractNumberAtoms(text) {
     }
     const folded = foldScaleUnit(valueRaw, unit)
     if (!folded) return
-    atoms.push({ value: folded.value, unit: folded.unit, polarity, idx, key: `${folded.value}|${folded.unit}` })
+    atoms.push({ value: folded.value, unit: folded.unit, polarity, idx, end: endIdx, key: `${folded.value}|${folded.unit}` })
   }
   for (const m of half.matchAll(PCT_PREFIX_RE)) {
     const idx = m.index ?? 0
@@ -1098,6 +1100,46 @@ export function atomLabel(a) {
   return a.polarity ? `${a.polarity} ${core}` : core
 }
 
+// ===== P3 number-drift precision helpers =====
+// ASR-garbage spans inside ONE source turn: the union of the exact noise patterns the output-only detectors
+// treat as hard failures (ASR glue 20182018/SaaSAPP, phrase/year repeats 因为因为/2018,2018年, broken fragment
+// starts). A source number ATOM whose index sits inside such a span is噪音 the refine CORRECTLY cleaned — it
+// must NOT read as a "missing" number drift (deleting garbage is the right edit, not a mutation). Returns
+// sorted [start, end) ranges over the turn text; cheap (a handful of matches per turn). Regexes are cloned per
+// call so the shared module-level lastIndex is never disturbed.
+const NUMBER_GARBAGE_RES = [PHRASE_REPEAT, YEAR_REPEAT, BROKEN_FRAGMENT_START, ASR_GLUE]
+function numberGarbageSpans(text) {
+  const s = String(text || '')
+  const spans = []
+  for (const base of NUMBER_GARBAGE_RES) {
+    for (const m of s.matchAll(new RegExp(base.source, base.flags.includes('g') ? base.flags : base.flags + 'g'))) {
+      const i = m.index ?? 0
+      spans.push([i, i + m[0].length])
+    }
+  }
+  return spans.sort((a, b) => a[0] - b[0])
+}
+const inSpans = (idx, spans) => spans.some(([s, e]) => idx >= s && idx < e)
+
+// Stutter dedup: an ASR doubling ("三十 三十" / "30 30" / "百分之六 百分之六") extracts the SAME canonical atom
+// twice in a row. Collapse a run of same-key atoms separated by only a tiny gap (whitespace / a repeated number
+// word, no sentence punctuation) to ONE fact, keeping the first — so the echo can neither inflate the source
+// count nor read as an extra atom the refine "dropped". Two same-value atoms in DIFFERENT clauses (a comma or
+// 。！？ between them) are left as-is: they are a genuine restatement, not a stutter.
+function dedupStutterAtoms(atoms, text) {
+  const s = String(text || '')
+  const out = []
+  for (const a of atoms) {
+    const prev = out[out.length - 1]
+    if (prev && prev.key === a.key && a.idx >= (prev.end ?? prev.idx)) {
+      const gap = s.slice(prev.end ?? prev.idx, a.idx)
+      if (gap.length <= ATOMS.STUTTER_GAP_MAX && !/[，。！？；、,.!?;：:]/.test(gap)) continue
+    }
+    out.push(a)
+  }
+  return out
+}
+
 // Compare source-turn atoms against the refined region. Turn-scoped: each substantive anchored source turn's
 // atoms are looked for in a window of refined lines around its anchor line (± ATOMS.WINDOW_LINES); a miss there
 // falls back to a document-wide check (lower confidence, so it only ever downgrades — never invents — a finding).
@@ -1106,6 +1148,7 @@ export function atomLabel(a) {
 export function checkMeaningAtoms(sourceText, refinedText) {
   const empty = {
     assessed: false, sourceNumbers: 0, refinedNumbers: 0, drifted: 0, driftSamples: [],
+    driftNotes: 0, driftNoteSamples: [],
     hedgeTurnsLost: 0, hedgeSamples: [], assessedTurns: 0, sourceHedges: 0, refinedHedges: 0, perTurn: [],
   }
   const { turns, subs } = anchorTurns(sourceText, refinedText)
@@ -1124,9 +1167,11 @@ export function checkMeaningAtoms(sourceText, refinedText) {
   const refinedHedges = countHedges(refinedText)
 
   const driftSamples = []
+  const driftNoteSamples = []
   const hedgeSamples = []
   const perTurn = []
   let drifted = 0
+  let driftNotes = 0
   let hedgeTurnsLost = 0
   let assessedTurns = 0
 
@@ -1140,14 +1185,24 @@ export function checkMeaningAtoms(sourceText, refinedText) {
     const winValueSet = new Set(winAtoms.map((a) => a.value))
     const winByValue = new Map()
     for (const a of winAtoms) { if (!winByValue.has(a.value)) winByValue.set(a.value, []); winByValue.get(a.value).push(a) }
-    const srcAtoms = extractNumberAtoms(t.text)
+    // Turn-aware pairing precision (P3): stutter-dedup the source atoms (三十 三十 → one), and mark ASR-garbage
+    // atoms + low-confidence (bag-anchored) turns. A bag-anchored turn's refined region is fuzzy — its atoms may
+    // pair against UNRELATED refined content — so a miss there is a note, not a confirmed drift. Confirmed drift
+    // stays reserved for shingle-anchored (high-confidence aligned) turns whose atom is genuine (non-garbage).
+    const srcAtoms = dedupStutterAtoms(extractNumberAtoms(t.text), t.text)
+    const gspans = numberGarbageSpans(t.text)
+    const lowConf = t.matchType !== 'shingle'
     const turnDrift = []
+    const turnNotes = []
     for (const sa of srcAtoms) {
       const inWindow = winValueSet.has(sa.value)
       const inDoc = refValueSet.has(sa.value)
+      // route a would-be drift to the confirmed tier or the downgraded note tier
+      const downgrade = inSpans(sa.idx, gspans) || lowConf
+      const sink = downgrade ? turnNotes : turnDrift
       if (!inWindow && !inDoc) {
         // the number VALUE vanished from the refined output entirely → a changed or dropped number
-        turnDrift.push({ kind: 'missing', atom: sa, foundText: windowText.replace(/\s+/g, ' ').slice(0, 50) })
+        sink.push({ kind: 'missing', atom: sa, downgrade, foundText: windowText.replace(/\s+/g, ' ').slice(0, 50) })
         continue
       }
       // present, but did the polarity/sign qualifier survive nearby? Only assess when the SOURCE carried one
@@ -1158,7 +1213,7 @@ export function checkMeaningAtoms(sourceText, refinedText) {
         // For sign words (亏损/盈利/涨/跌) also accept the qualifier appearing anywhere in the window text.
         const inWindowText = windowText.includes(sa.polarity)
         if (!polarityKept && !inWindowText) {
-          turnDrift.push({ kind: 'polarity', atom: sa, foundText: (cands[0] ? `${cands[0].value}${cands[0].unit}` : windowText.replace(/\s+/g, ' ').slice(0, 40)) })
+          sink.push({ kind: 'polarity', atom: sa, downgrade, foundText: (cands[0] ? `${cands[0].value}${cands[0].unit}` : windowText.replace(/\s+/g, ' ').slice(0, 40)) })
         }
       }
     }
@@ -1187,13 +1242,24 @@ export function checkMeaningAtoms(sourceText, refinedText) {
         }
       }
     }
-    perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, drift: turnDrift, hedgeLost, srcHedge })
+    if (turnNotes.length) {
+      driftNotes += turnNotes.length
+      for (const d of turnNotes) {
+        if (driftNoteSamples.length < ATOMS.NOTE_SAMPLES) {
+          const a = d.atom
+          const why = inSpans(a.idx, gspans) ? '源文该处为 ASR 噪音/粘连，精校已清理' : '所在轮次对齐置信低（改写较多）'
+          driftNoteSamples.push({ text: `源第 ${t.startLine} 行：“${atomLabel(a)}” 未在成稿对应段出现，但${why}——不计漂移，仅复核`, line: t.startLine })
+        }
+      }
+    }
+    perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, drift: turnDrift, notes: turnNotes, hedgeLost, srcHedge })
   }
 
   return {
     assessed: assessedTurns > 0,
     sourceNumbers, refinedNumbers,
     drifted, driftSamples,
+    driftNotes, driftNoteSamples,
     hedgeTurnsLost, hedgeSamples,
     assessedTurns, sourceHedges, refinedHedges,
     perTurn,
@@ -1861,7 +1927,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     sourceEmptyDensity: Number(sEmptyDensity.toFixed(4)), refinedEmptyDensity: Number(rEmptyDensity.toFixed(4)), emptyReduction,
     endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
-    ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
+    ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
     ...(attribution ? { attribution: { assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches } } : {}),
     ...(quoteFab ? { quotes: { assessed: quoteFab.assessed, spansChecked: quoteFab.spansChecked, flagged: quoteFab.flagged } } : {}),
   }
@@ -1911,6 +1977,11 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
       { name: 'number_drift', severity: 'soft', count: atoms.drifted, samples: atoms.driftSamples },
       { name: 'hedge_loss', severity: 'soft', count: atoms.hedgeTurnsLost,
         samples: atoms.hedgeSamples.concat(atoms.hedgeTurnsLost ? [{ text: `全篇不确定语气密度：源 ${atoms.sourceHedges} 处 → 成稿 ${atoms.refinedHedges} 处`, line: 1 }] : []) },
+    ] : []),
+    // P3 downgraded drift: source numbers absent from the成稿 that sit in ASR-garbage spans or low-confidence
+    // aligned turns — the refine likely cleaned噪音 rather than mutating a fact. Listed for review, never a drift.
+    ...(atoms && atoms.assessed && atoms.driftNotes ? [
+      { name: 'number_drift_note', severity: 'soft', count: atoms.driftNotes, samples: atoms.driftNoteSamples },
     ] : []),
     // M6 attribution-tier finding — SOFT ONLY (a mislabeled speaker is a review flag, not a hard gate this pass).
     // attribution_mismatch: a high-confidence anchored turn whose refined-side label contradicts the self-learned

@@ -158,6 +158,51 @@ test('NOT flagged — 两三年 kept as 汉字 in BOTH source and refined does n
   assert.equal(checkMeaningAtoms(src, ref).drifted, 0, 'small oral numbers never enter the atom set → never drift')
 })
 
+// ---------- P3: number-drift precision (garbage discipline, stutter dedup, turn-aware confidence) ----------
+
+test('P3 stutter dedup — an ASR-doubled number (百分之三十 百分之三十) is ONE fact: a drop is one drift, not two', () => {
+  const base = '说到毛利率这个问题，我们这个行业其实普遍都不算高，我们公司去年的毛利率大概就是'
+  const tail = '的样子，比同行确实要稍微好那么一点点，这是实打实跑出来的数据。'
+  const srcDouble = ['沈其安 00:12', base + '百分之三十 百分之三十' + tail].join('\n')
+  const srcSingle = ['沈其安 00:12', base + '百分之三十' + tail].join('\n')
+  // a refine that DROPPED the 30% figure entirely (a real omission, not a garbage clean-up)
+  const dropped = ['## 毛利', '沈其安：说到毛利率这个问题，我们这个行业其实普遍都不算高，我们公司去年的毛利率其实并不算突出，比同行确实要稍微好那么一点点，这是实打实跑出来的数据。'].join('\n')
+  const rd = checkMeaningAtoms(srcDouble, dropped)
+  const rs = checkMeaningAtoms(srcSingle, dropped)
+  assert.equal(rd.drifted, 1, 'the doubled 30% collapses to one → one confirmed drift, not two')
+  assert.equal(rd.drifted, rs.drifted, 'a stuttered source and a single-mention source give the same drift count')
+  assert.ok(rd.driftSamples.some((s) => s.text.includes('30%')))
+})
+
+test('P3 garbage discipline — a number inside an ASR-glue span (20182018) the refine cleaned is a NOTE, never a drift', () => {
+  const src = ['沈其安 00:12', '我记得那个项目很早就启动了，具体年份我印象里大概是 20182018 年前后吧，反正就是那几年，团队规模也就十来个人。'].join('\n')
+  const cleaned = ['## 起步', '沈其安：我记得那个项目很早就启动了，具体年份我印象里大概是 2018 年前后吧，反正就是那几年，团队规模也就十来个人。'].join('\n')
+  const r = checkMeaningAtoms(src, cleaned)
+  assert.equal(r.drifted, 0, 'the ASR-glue number is NOT counted as a missing drift (the refine correctly cleaned噪音)')
+  assert.ok(r.driftNotes >= 1, 'it is surfaced as a downgraded review note instead')
+  assert.ok(r.driftNoteSamples.some((s) => s.text.includes('ASR 噪音')), 'the note explains it is ASR noise')
+})
+
+test('P3 regression — a genuine changed number (2019→2021) stays a CONFIRMED drift, not a downgraded note', () => {
+  const bad = GOOD.replace('2019 年', '2021 年')
+  const r = checkMeaningAtoms(SRC, bad)
+  assert.ok(r.drifted >= 1, 'the changed year is still a confirmed drift')
+  assert.ok(r.driftSamples.some((s) => s.text.includes('2019 年')), 'sample cites the real lost atom')
+  assert.equal(r.driftNotes, 0, 'a clean, non-garbage, shingle-anchored turn produces no downgraded notes')
+})
+
+test('P3 auditPair — number_drift_note rides as a separate SOFT finding, and is absent on a faithful refine', () => {
+  const src = ['沈其安 00:12', '我记得那个项目很早就启动了，具体年份我印象里大概是 20182018 年前后吧，反正就是那几年，团队规模也就十来个人。'].join('\n')
+  const cleaned = ['## 起步', '沈其安：我记得那个项目很早就启动了，具体年份我印象里大概是 2018 年前后吧，反正就是那几年，团队规模也就十来个人。'].join('\n')
+  const r = auditPair({ sourceText: src, refinedText: cleaned, mode: 'refine' })
+  const note = r.findings.find((f) => f.name === 'number_drift_note')
+  assert.ok(note && note.severity === 'soft' && note.count >= 1, 'note finding present and soft')
+  assert.ok(!r.failed.includes('number_drift_note'), 'a note never gates the pair')
+  assert.equal(r.metrics.atoms.driftNotes, note.count, 'metrics carries the note count')
+  const clean = auditPair({ sourceText: SRC, refinedText: GOOD, mode: 'refine' })
+  assert.ok(!clean.findings.some((f) => f.name === 'number_drift_note'), 'no note finding on a faithful refine')
+})
+
 test('leniency — unparseable source (no speaker labels) or zero anchored turns → assessed:false, no findings', () => {
   const r = checkMeaningAtoms('一段没有发言人标签的连续文字，包含数字 2019 和百分之三十。', '# 标题\n\n随便的成稿 2020 年。')
   assert.equal(r.assessed, false)
