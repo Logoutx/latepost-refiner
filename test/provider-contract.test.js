@@ -74,7 +74,7 @@ test('provider registry preserves known per-provider contracts', () => {
 })
 
 test('refineCharBudgetFor: only the two DeepSeek refine models declare a faithful-refine budget; all else unset', () => {
-  assert.equal(refineCharBudgetFor('deepseek', 'deepseek-v4-pro'), 28000)
+  assert.equal(refineCharBudgetFor('deepseek', 'deepseek-v4-pro'), 25000)
   assert.equal(refineCharBudgetFor('deepseek', 'deepseek-v4-flash'), 18000)
   assert.equal(refineCharBudgetFor('deepseek', 'deepseek-chat'), undefined, 'an un-listed DeepSeek id has no budget')
   for (const p of ['glm', 'kimi', 'openai']) {
@@ -88,9 +88,9 @@ test('refineCharBudgetFor: only the two DeepSeek refine models declare a faithfu
 
 test('engine.refineBudget resolves the refine tier to a model id and returns its budget (respects --models)', () => {
   const engine = makeOpenAIEngine({ client: {}, models: PROVIDERS.deepseek.models, refineCharBudget: PROVIDERS.deepseek.refineCharBudget, concurrency: 1 })
-  assert.deepEqual(engine.refineBudget('opus'), { model: 'deepseek-v4-pro', budget: 28000 }, 'the smart/opus tier → v4-pro budget')
+  assert.deepEqual(engine.refineBudget('opus'), { model: 'deepseek-v4-pro', budget: 25000 }, 'the smart/opus tier → v4-pro budget')
   assert.deepEqual(engine.refineBudget('haiku'), { model: 'deepseek-v4-flash', budget: 18000 })
-  assert.deepEqual(engine.refineBudget('deepseek-v4-pro'), { model: 'deepseek-v4-pro', budget: 28000 }, 'a raw --models id resolves too')
+  assert.deepEqual(engine.refineBudget('deepseek-v4-pro'), { model: 'deepseek-v4-pro', budget: 25000 }, 'a raw --models id resolves too')
   assert.equal(engine.refineBudget('deepseek-chat'), undefined, 'a model with no declared budget → undefined')
   const noBudget = makeOpenAIEngine({ client: {}, models: PROVIDERS.kimi.models, concurrency: 1 })
   assert.equal(noBudget.refineBudget('opus'), undefined, 'a provider with no budget map → always undefined')
