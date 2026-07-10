@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  extractNumberAtoms, countHedges, atomLabel, checkMeaningAtoms, buildSections, auditPair,
+  extractNumberAtoms, countHedges, atomLabel, checkMeaningAtoms, buildSections, auditPair, checkDerivativeAttribution,
 } from '../scripts/audit_refined.mjs'
 import { reviewSections, buildReviewMarkdown, sectionReviewItems, sectionReviewSummary, buildRunManifest } from '../universal/artifacts.js'
 
@@ -82,6 +82,41 @@ test('extractNumberAtoms EXCEPTIONS: small oral 汉字 (两三年 / 三五个 / 
   assert.deepEqual(k('时间是 08:00:15 开始'), [], 'HH:MM:SS timestamp masked')
   assert.deepEqual(k('回款一直下不来'), [], '一直 is lexical, not the number 1')
   assert.deepEqual(k('这是第三点'), [], '第三 ordinal in prose does not over-fire as a bare number')
+})
+
+test('extractNumberAtoms: spoken measure-word 大额 (2 个亿 / 1.5 个亿 / 两个亿 / 三个亿 / 3 个千万) folds 个 and canonicalizes to the SAME atom as the bare form (parity, no drift)', () => {
+  const k = (t) => extractNumberAtoms(t).map((a) => a.key)
+  assert.deepEqual(k('那也就是 2 个亿'), ['2|亿'], '2 个亿 → 2 亿')
+  assert.deepEqual(k('那也就是 2 个亿'), k('约 2 亿元'), '2 个亿 == 2 亿 (identical atom, no phantom drift)')
+  assert.deepEqual(k('大概 1.5 个亿'), ['1.5|亿'], '1.5 个亿 decimal → 1.5 亿')
+  assert.deepEqual(k('两个亿'), ['2|亿'], '两个亿 → 2 亿')
+  assert.deepEqual(k('两个亿'), k('2 亿'), '两个亿 == 2 亿')
+  assert.deepEqual(k('三个亿'), ['3|亿'], '三个亿 → 3 亿')
+  assert.deepEqual(k('3 个千万'), ['3|千万'], '3 个千万 → 3 千万')
+})
+
+test('extractNumberAtoms: the 个-fold does NOT touch 个月 (a real duration unit) or 个 + noun (5 个方面 / 三个人)', () => {
+  const k = (t) => extractNumberAtoms(t).map((a) => a.key)
+  assert.deepEqual(k('过了 3 个月'), ['3|个月'], '3 个月 stays the 个月 unit (not folded to 月)')
+  assert.deepEqual(k('干了三个月才做完，投了三个亿'), ['3|个月', '3|亿'], '个月 and 个亿 coexist correctly in one turn')
+  assert.deepEqual(k('就我们三个人'), [], '三个人 vague small count — no atom (unchanged)')
+  assert.deepEqual(k('讲 5 个方面'), ['5|'], '5 个方面 → bare 5, 个 adds no unit atom (unchanged)')
+})
+
+test('checkDerivativeAttribution: a 时间线 "约 2 亿元"【访谈】 is COVERED by a source that says "2 个亿" — no fabrication hard-fail', () => {
+  const corpus = '董锴：那也就是 2 个亿，投了差不多 1.5 个亿。'
+  const timeline = '2021 年完成融资，规模约 2 亿元。【访谈】'
+  const r = checkDerivativeAttribution(corpus, timeline)
+  assert.equal(r.hardFail.length, 0, 'spoken 个亿 form now matches the canonical 亿 atom → no hard fail')
+})
+
+test('extractNumberAtoms: 千万 as the adverb (千万不要 / 千万别 / 千万要) is NOT extracted as 1000 万; a real 一千万 / 千万不止 IS kept', () => {
+  const k = (t) => extractNumberAtoms(t).map((a) => a.key)
+  assert.deepEqual(k('以后千万不要这样'), [], '千万不要 — adverb, not a number')
+  assert.deepEqual(k('千万别忘了'), [], '千万别 — adverb')
+  assert.deepEqual(k('千万要记住'), [], '千万要 — adverb')
+  assert.deepEqual(k('花了一千万不到'), ['1000|万'], '一千万 has a digit prefix → real number kept')
+  assert.deepEqual(k('身价千万不止'), ['1000|万'], '千万不止 is a genuine quantity → kept (excluded from the guard)')
 })
 
 test('countHedges: evidentiality / modality markers counted; a flat assertion has none', () => {

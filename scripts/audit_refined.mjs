@@ -1034,6 +1034,13 @@ export function extractNumberAtoms(text) {
   // optional trailing unit. Full-width digits are folded to half-width first.
   const half = masked.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
                      .replace(/％/g, '%')
+                     // Spoken measure-word form "N 个 + 大额单位" (2 个亿 / 1.5 个亿 / 两个亿): the 个 is a colloquial
+                     // filler between the number and a scale word — semantically identical to 2 亿 / 两亿. Blank the
+                     // 个 to a single space (length-preserving, so idx/claimed offsets stay aligned with `raw`) ONLY
+                     // when it sits between a number char and 亿/万/千万 (the scale words foldScaleUnit knows). The
+                     // tight scale-word lookahead is what keeps 个月 (a real duration unit) and 个 + noun (3 个人 /
+                     // 5 个方面) untouched. Capturing the prefix + re-emitting "$1 " avoids variable-length lookbehind.
+                     .replace(new RegExp(`([\\d${HAN_NUM_CHARS}]\\s*)个(?=\\s*(?:千万|亿|万))`, 'g'), '$1 ')
   const unitAlt = ATOM_UNITS.map(escapeRe).join('|')
   const numCore = `(?:\\d+(?:\\.\\d+)?(?:\\s*(?:[-~—－]|到|至)\\s*\\d+(?:\\.\\d+)?)?|[${HAN_NUM_CHARS}]+(?:[到至][${HAN_NUM_CHARS}]+)?)`
   const NUM_RE = new RegExp(`(${numCore})\\s*(百分之)?\\s*(${unitAlt})?`, 'g')
@@ -1046,6 +1053,11 @@ export function extractNumberAtoms(text) {
       const w = raw.indexOf(idm)
       if (w >= 0 && idx >= w && idx < w + idm.length) return
     }
+    // Idiom guard: 千万 as the adverb "绝对/务必" (千万不要 / 千万别 / 千万要), NOT the number 10,000,000. Fires only
+    // for a BARE 千万 run (value 千, unit 万) hugging 别/要/不X — a real 一千万 / 五千万 carries a digit prefix (run
+    // "一千" / "五千"), so valueRaw is not '千' and it is unaffected; 千万不止 / 千万不等 (a genuine quantity) are
+    // excluded by the explicit follow-set.
+    if (valueRaw === '千' && unit === '万' && /^(?:别|要|不要|不能|不可|不得|不会|不敢|不应)/.test(raw.slice(endIdx, endIdx + 2))) return
     // English magnitude words (billion / million / bn / mn): the refine legitimately converts these to 亿/万
     // (源 1.03 billion → 成稿 10.3 亿美元, 860 million → 8.6 亿), which no value-level comparison can verify. Skip a
     // number immediately followed by one — extracting it only manufactures conversion-shaped false drift.
