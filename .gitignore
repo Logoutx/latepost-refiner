@@ -13,7 +13,7 @@ venv/
 *.egg-info/
 
 # Node (universal/ build)
-node_modules/
+node_modules
 
 # Standalone binary build (generated embed + compiled executables)
 /dist/
