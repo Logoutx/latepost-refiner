@@ -77,19 +77,33 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // engines/providers.js for the per-model budgets and the retention evidence behind them.
   const rb = (typeof engine.refineBudget === 'function') ? engine.refineBudget(M.refine) : null
   const budget = rb ? rb.budget : undefined
-  const chunks = splitForRefine(f, A.chunkMode, budget)
+  // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
+  // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
+  const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
       { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
   }
-  // autoChunk trace: record ONLY when the model budget (not merely opt-in speed mode) drove the split. `off`
-  // suppresses chunking upstream, so it can never reach here; when both speed and budget fired, `parts` is the
-  // final (larger) count. Rides on the returned report → surfaced in run.json + review.md via artifacts.js.
-  const autoChunk = (rb && refineSize(f) > rb.budget)
-    ? { label: f.label, model: rb.model, budget: rb.budget, contentLength: refineSize(f), parts: chunks.length }
+  // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
+  // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
+  // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
+  // (and still carries model/budget when a budgeted provider is in play). Rides on the returned report → run.json +
+  // review.md via artifacts.js.
+  const drivenByChunkSize = typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
+  const drivenByBudget = rb && refineSize(f) > rb.budget
+  const autoChunk = (drivenByChunkSize || drivenByBudget)
+    ? {
+      label: f.label,
+      ...(rb ? { model: rb.model, budget: rb.budget } : {}),
+      contentLength: refineSize(f),
+      parts: chunks.length,
+      ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
+    }
     : null
-  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${autoChunk ? `（自动：约 ${autoChunk.contentLength} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : ''}`)
+  const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
+    : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
+  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>

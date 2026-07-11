@@ -252,7 +252,9 @@ export function glossarySourceItems(result = {}) {
 // 「甲 — 约 53576 字，超过 deepseek-v4-pro 忠实处理长度 28000 字，已按发言轮边界分为 2 段精校」.
 export function autoChunkItems(result = {}) {
   return (result.autoChunk || []).map((a) =>
-    `${a.label || path.basename(a.model || '')} — 约 ${a.contentLength} 字，超过 ${a.model} 忠实处理长度 ${a.budget} 字，已按发言轮边界分为 ${a.parts} 段精校`)
+    (a.requestedChunkSize
+      ? `${a.label || ''} — 约 ${a.contentLength} 字，按显式分块大小 ${a.requestedChunkSize} 字/块，已按发言轮边界分为 ${a.parts} 段精校`
+      : `${a.label || path.basename(a.model || '')} — 约 ${a.contentLength} 字，超过 ${a.model} 忠实处理长度 ${a.budget} 字，已按发言轮边界分为 ${a.parts} 段精校`))
 }
 
 export function reviewSections(result = {}, warnings = []) {
@@ -494,7 +496,7 @@ export function buildRunManifest(result = {}, context = {}) {
     anchors: (result.anchors || []).map((a) => ({ path: a.path, sections: (a.updated || []).length })),
     // Provider-aware auto-chunking: files auto-split because their 字数 exceeded the refine model's faithful
     // length. Empty unless a budgeted provider (e.g. DeepSeek) hit the cap. Human-readable lines in review.md.
-    autoChunk: (result.autoChunk || []).map((a) => ({ label: a.label, model: a.model, budget: a.budget, contentLength: a.contentLength, parts: a.parts })),
+    autoChunk: (result.autoChunk || []).map((a) => ({ label: a.label, model: a.model, budget: a.budget, contentLength: a.contentLength, parts: a.parts, ...(a.requestedChunkSize ? { requestedChunkSize: a.requestedChunkSize } : {}) })),
     usage,
   }
 }

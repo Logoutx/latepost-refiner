@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts, parseTurns } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
@@ -100,6 +100,10 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
     lines, bytes, chars,
+    // Turn map (1-based opening line + does-this-turn-end-on-a-question) so refine chunking can snap boundaries to
+    // real turn edges and never orphan a question from its answer. Empty for label-less text → splitForRefine falls
+    // back to the line-based divider. Cheap: one linear pass already having read the content.
+    turns: parseTurns(content),
   }
   const headingWarning = hasHeadings && headingPolicy === 'none'
     ? `${path.basename(src)} 疑似已带小标题，而 headingPolicy=none——可用 headingPolicy=keep|regenerate 重跑该份`
@@ -605,7 +609,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode,
+    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, chunkSize: params.chunkSize,
     refineMode: refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a: default agentic (byte-equivalent)
     effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
     captureSingleShot: params.captureSingleShot,   // M11b: batch-submit hook — capture single-shot payloads instead of sending (see scripts/batch_refine.mjs)

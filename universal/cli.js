@@ -34,6 +34,9 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --chunk <模式>         speed | cost | off（默认 cost=每份单代理，但对声明了「忠实处理长度」的 provider（如
                          DeepSeek）会在超长时自动按发言轮边界分段精校，防止弱模型把长稿压成摘要；speed 把大文件拆块
                          并行，多文件批量提速、更费额度；off=彻底关闭一切分块，含上面的自动分段）
+  --chunk-size <N>       分块实验旋钮：显式指定每块目标正文字数，块数=ceil(全文字数/N)，覆盖 provider 的忠实处理长度与
+                         speed 的块数；N 须为 ≥2000 的整数（--chunk off 仍优先、不分块）。所有分块都不会把一段问句
+                         切在块尾（问句与其回答留在同一块）
   --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
                          把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
                          审计门禁照跑，兜住单请求的静默压缩风险）
@@ -81,7 +84,7 @@ export function parseArgs(argv) {
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile', '--base-url': 'baseURL',
-    '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
+    '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
     // M10 cheap-first escalation: --escalate names the premium provider for files that fail the audit gate.
     '--escalate': 'escalate', '--escalate-models': 'escalateModels', '--escalate-base-url': 'escalateBaseURL',
     '--refine-mode': 'refineMode', '--effort': 'effort',
@@ -127,6 +130,19 @@ export const parseEffort = (s) => {
   return Object.keys(m).length ? m : undefined
 }
 
+// --chunk-size <N>: explicit 正文字数-per-chunk target for chunk-size experiments. N must be a positive integer
+// ≥ 2000 — below that a "chunk" is smaller than a single sub-heading section and would shred the transcript, so it
+// is rejected loudly (JobConfigError → CLI exits 2 with the message). Absent → undefined (no override).
+export const CHUNK_SIZE_MIN = 2000
+export function parseChunkSize(v) {
+  if (v == null) return undefined
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < CHUNK_SIZE_MIN) {
+    throw new JobConfigError(`--chunk-size 需为 ≥ ${CHUNK_SIZE_MIN} 的整数（每块目标正文字数），收到「${v}」`)
+  }
+  return n
+}
+
 export function buildRunParams(a, { env = process.env } = {}) {
   const topic = a.topic || 'untitled'
   const outputDir = path.resolve(a.outputDir && a.outputDir.trim() ? a.outputDir : `${env.HOME}/Downloads/${topic}`)
@@ -153,6 +169,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     headingPolicy: a.headingPolicy || 'none',
     models: parseModels(a.models),
     chunkMode: a.chunkMode === 'speed' ? 'speed' : (a.chunkMode === 'off' ? 'off' : undefined),   // 'off' disables ALL chunking incl. auto
+    chunkSize: parseChunkSize(a.chunkSize),   // --chunk-size <N>：显式每块目标字数，覆盖 provider budget 与 speed 计数（≥2000 整数）
     refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
     effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
 

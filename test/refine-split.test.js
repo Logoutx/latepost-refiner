@@ -8,6 +8,7 @@ import {
   REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
+  endsWithQuestion, parseTurns,
 } from '../core/spec.js'
 import { checkMissingYin, parseGlossaryLite } from '../scripts/audit_refined.mjs'
 import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt, summaryPrompt } from '../core/prompts.js'
@@ -108,6 +109,110 @@ test('speed + budget: chunk count is the max of the speed cap and the (uncapped)
   assertContiguous(budgetWins, 3000)
   const speedWins = splitForRefine({ lines: 2000, chars: 20000, label: 'A' }, 'speed', 28000) // speedK=2, budgetK=1 (20K ≤ 28K) → 2
   assert.equal(speedWins.length, 2, 'speed cap 2 > budget count 1 → 2 (speed still fires when the budget alone would not)')
+})
+
+// ---------- explicit --chunk-size knob (Feature 1) ----------
+
+// A synthetic ~53K-字 interview: 240 evenly-spaced turns, one opening every 10 lines (startLines 1,11,…,2391),
+// none ending on a question. Fictional-safe: no real names, just the line geometry the splitter reasons about.
+function evenTurns(count, step, { question = () => false } = {}) {
+  return Array.from({ length: count }, (_, t) => ({ startLine: t * step + 1, q: !!question(t) }))
+}
+const BIG = { lines: 2400, chars: 53576, label: 'A', turns: evenTurns(240, 10) }
+
+test('--chunk-size 10000 on a ~53K-字 doc → 6 balanced chunks, every boundary on a turn edge', () => {
+  const chunks = splitForRefine(BIG, undefined, undefined, 10000) // ceil(53576/10000) = 6
+  assert.equal(chunks.length, 6, '53,576 字 at 10,000 字/块 → 6 chunks')
+  assertContiguous(chunks, 2400)
+  const turnStarts = new Set(BIG.turns.map((t) => t.startLine))
+  for (let i = 1; i < chunks.length; i += 1) assert.ok(turnStarts.has(chunks[i].startLine), `chunk ${i} starts on a turn edge (line ${chunks[i].startLine})`)
+  const sizes = chunks.map((c) => c.endLine - c.startLine + 1)
+  assert.ok(Math.max(...sizes) - Math.min(...sizes) <= 10, `balanced: sizes ${sizes.join('/')} within a turn of each other`)
+})
+
+test('--chunk-size OVERRIDES a smaller budget-derived count and a speed-mode count; --chunk off still wins', () => {
+  // budget 28,000 alone → 2 chunks; the explicit 10,000 knob overrides it to 6.
+  assert.equal(splitForRefine(BIG, undefined, 28000, 10000).length, 6, 'chunk-size overrides the provider budget count')
+  // speed mode alone caps at 2; the knob overrides to 6.
+  assert.equal(splitForRefine(BIG, 'speed', undefined, 10000).length, 6, 'chunk-size overrides the speed-mode cap')
+  // both a budget and speed present: still exactly the knob's count.
+  assert.equal(splitForRefine(BIG, 'speed', 28000, 10000).length, 6, 'chunk-size overrides both at once')
+  // off beats everything, including an explicit chunk-size.
+  assert.equal(splitForRefine(BIG, 'off', 28000, 10000).length, 1, '--chunk off suppresses chunking despite --chunk-size')
+})
+
+test('--chunk-size below the content length is a single chunk (ceil = 1, no split)', () => {
+  assert.equal(splitForRefine({ lines: 2000, chars: 8000, label: 'A' }, undefined, undefined, 10000).length, 1, '8,000 字 at 10,000 字/块 → 1')
+})
+
+// ---------- question-boundary rule (Feature 2) ----------
+
+// 5 turns opening at lines 1/21/41/61/81 over a 100-line file; split into 2. The even split point is line 50, whose
+// nearest turn boundaries are the end of turn 1 (line 40) and turn 2 (line 60) — a tie the splitter breaks toward the
+// earlier one (line 40). We drive K=2 with a 字-budget of 10,000 on a 20,000-字 file.
+const QF = (qflags) => ({ lines: 100, chars: 20000, label: 'A', turns: [1, 21, 41, 61, 81].map((startLine, i) => ({ startLine, q: !!qflags[i] })) })
+
+test('question boundary: a non-question split lands on the nominal nearest turn edge (regression baseline)', () => {
+  const chunks = splitForRefine(QF([false, false, false, false, false]), undefined, 10000)
+  assert.equal(chunks.length, 2)
+  assert.equal(chunks[0].endLine, 40, 'no questions → boundary stays at the nominal nearest turn edge (line 40)')
+  assertContiguous(chunks, 100)
+})
+
+test('question boundary: when the chunk-ending turn IS a question, the cut moves earlier so the question keeps its answer', () => {
+  // turn index 1 (lines 21–40) ends on a question → must not end chunk 0; the earlier turn 0 (ends line 20) is eligible.
+  const chunks = splitForRefine(QF([false, true, false, false, false]), undefined, 10000)
+  assert.equal(chunks.length, 2)
+  assert.equal(chunks[0].endLine, 20, 'boundary moved earlier (40 → 20); the question turn stays with its answer in chunk 1')
+  assert.equal(chunks[1].startLine, 21, 'the question turn now opens chunk 1')
+  assertContiguous(chunks, 100)
+})
+
+test('question boundary: falls FORWARD when no earlier eligible boundary exists in the chunk', () => {
+  // turns 0 and 1 both end on questions; the nominal cut (turn 1) and the only earlier candidate (turn 0) are both
+  // questions → fall forward to turn 2 (ends line 60), which is not a question.
+  const chunks = splitForRefine(QF([true, true, false, false, false]), undefined, 10000)
+  assert.equal(chunks.length, 2)
+  assert.equal(chunks[0].endLine, 60, 'no earlier eligible boundary → fall forward to the next non-question edge (line 60)')
+  assertContiguous(chunks, 100)
+})
+
+test('question boundary: pathological all-questions text falls back to the nominal boundary (never a giant chunk)', () => {
+  const chunks = splitForRefine(QF([true, true, true, true, true]), undefined, 10000)
+  assert.equal(chunks.length, 2, 'still two chunks — the fallback does not merge them into one giant chunk')
+  assert.equal(chunks[0].endLine, 40, 'no eligible boundary anywhere → keep the nominal nearest turn edge (line 40)')
+  assertContiguous(chunks, 100)
+})
+
+test('a file without a turn map falls back to the line divider, byte-identical to before', () => {
+  const noTurns = { lines: 2400, chars: 53576, label: 'A' }
+  const chunks = splitForRefine(noTurns, undefined, undefined, 10000)
+  assert.equal(chunks.length, 6, 'still 6 chunks by the line divider')
+  assertContiguous(chunks, 2400)
+})
+
+// ---------- endsWithQuestion / parseTurns (turn-map building blocks) ----------
+
+test('endsWithQuestion ignores trailing whitespace, closing quotes/brackets, and 溯源 HTML comments', () => {
+  assert.ok(endsWithQuestion('这是什么？'))
+  assert.ok(endsWithQuestion('这是什么?  '), 'trailing whitespace ignored')
+  assert.ok(endsWithQuestion('他问“这是什么？”'), 'trailing closing quote ignored')
+  assert.ok(endsWithQuestion('这是什么？<!-- 源 L21-L40 -->'), 'trailing provenance comment ignored')
+  assert.ok(endsWithQuestion('这是什么？）'), 'trailing bracket ignored')
+  assert.ok(!endsWithQuestion('这是一个陈述。'), 'a statement is not a question')
+  assert.ok(!endsWithQuestion('问号在中间？不在末尾。'), 'a mid-text question mark does not count')
+})
+
+test('parseTurns maps each 名字：label line to its opening line and question flag', () => {
+  const content = ['记者：你们怎么定价？', '张三：我们按成本加成。', '记者：为什么不涨价', '张三：客户会跑。'].join('\n')
+  const turns = parseTurns(content)
+  assert.deepEqual(turns, [
+    { startLine: 1, q: true },   // ends on ？
+    { startLine: 2, q: false },
+    { startLine: 3, q: false },  // 「为什么不涨价」 has no trailing ？
+    { startLine: 4, q: false },
+  ])
+  assert.deepEqual(parseTurns('没有任何发言人标签的纯文本'), [], 'label-less text → no turns (line-divider fallback)')
 })
 
 // ---------- splitForScout / mergeScoutChunks (oversized-file scout resilience) ----------
@@ -510,6 +615,19 @@ test('--chunk off suppresses auto-chunk even when the file exceeds the model bud
   )
   assert.ok(labels.includes('refine:A') && !labels.some((l) => /refine:A#/.test(l)), 'off → one agent despite the budget')
   assert.deepEqual(r.autoChunk, [], 'no autoChunk recorded when chunking is off')
+})
+
+test('--chunk-size drives the split and the autoChunk trace carries requestedChunkSize', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', chunkSize: 10000, files: [file] },
+    mockEngine(labels), // no provider budget → the knob alone drives the split
+  )
+  assert.ok(labels.includes('refine:A#1/3') && labels.includes('refine:A#3/3'), '25,000 字 at 10,000 字/块 → 3 chunk agents')
+  assert.equal(r.autoChunk.length, 1, 'one autoChunk record')
+  assert.deepEqual(r.autoChunk[0], { label: 'A', contentLength: 25000, parts: 3, requestedChunkSize: 10000 }, 'record carries requestedChunkSize (and no model/budget, since no budgeted provider)')
+  assert.equal(r.refined.length, 1)
 })
 
 // ---------- resilience: cheap gate agents can't hold the expensive refine hostage ----------

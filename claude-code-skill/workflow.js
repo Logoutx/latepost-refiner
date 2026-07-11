@@ -606,24 +606,115 @@ function evenLineChunks(f, K) {
   for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
   return chunks
 }
+// ---------- turn-boundary quality: never orphan a question from its answer ----------
+// A speaker turn opens with a label line (「名字：」/「记者：」/「张三：」 — same shape as the audit's ATTR_LABEL_RE),
+// so a "turn boundary" is the line before the next label line. parseTurns walks the raw source once and returns one
+// entry per turn: its 1-based opening line and whether the turn's VISIBLE text ends with a question mark. Used by the
+// preflight (universal jobs.prepareFile) to attach f.turns so the orchestrator can snap chunk boundaries to real
+// turns AND avoid ending a chunk on a question (see turnAwareChunks). Editions with no fs (the CC Workflow sandbox)
+// simply don't populate f.turns → splitForRefine falls back to evenLineChunks, byte-identical to before.
+const TURN_LABEL_RE = /^\s*[一-龥A-Za-z0-9·]{1,12}[：:]/
+// A turn "ends with a question" if — after stripping trailing whitespace, closing quotes/brackets, and any trailing
+// HTML-comment provenance marker (<!-- 源 L… -->) — the last visible glyph is ？ or ?. This is what lets us keep a
+// question glued to the answer that follows it. Pure + exported so the rule is unit-testable in isolation.
+function endsWithQuestion(text) {
+  let t = String(text == null ? '' : text)
+  let prev
+  do {
+    prev = t
+    t = t.replace(/<!--[\s\S]*?-->\s*$/, '')            // trailing 溯源 HTML comment marker
+    t = t.replace(/[\s"'’”`」』）)】〕》\]}]+$/, '')      // trailing whitespace / closing quotes / brackets
+  } while (t !== prev)
+  return /[？?]$/.test(t)
+}
+function parseTurns(content) {
+  const lines = String(content == null ? '' : content).split('\n')
+  const idx = []   // 0-based line indices where a turn opens
+  for (let i = 0; i < lines.length; i += 1) if (TURN_LABEL_RE.test(lines[i])) idx.push(i)
+  if (!idx.length) return []
+  const turns = []
+  for (let k = 0; k < idx.length; k += 1) {
+    const start = idx[k]
+    const end = (k + 1 < idx.length) ? idx[k + 1] - 1 : lines.length - 1   // turn spans up to the next label line
+    turns.push({ startLine: start + 1, q: endsWithQuestion(lines.slice(start, end + 1).join('\n')) })
+  }
+  return turns
+}
+// Split a file into K chunks whose boundaries land on real turn edges, then move any boundary that would END a chunk
+// on a question to a nearby non-question turn boundary. Only reached when f.turns is present and has ≥ K turns;
+// otherwise splitForRefine keeps the line-based evenLineChunks divider (unchanged). Returns the same chunk shape
+// {idx,count,startLine,endLine,isFirst,isLast,label}, contiguous over [1, lines].
+function turnAwareChunks(f, K) {
+  const lines = (f && f.lines) || 0
+  const label = f && f.label
+  const turns = f.turns
+  const n = turns.length
+  // Boundary AFTER turn j (j in [0, n-2]) ends a chunk at the line just before turn j+1's label line.
+  const endLineOf = (j) => (j >= n - 1 ? lines : Math.min(lines, turns[j + 1].startLine - 1))
+  const cuts = []   // cuts[i] = index of the LAST turn of chunk i (i = 0 .. K-2 internal boundaries)
+  for (let i = 1; i < K; i += 1) {
+    // Nominal: the turn boundary NEAREST the even split line (earlier turn wins ties → slightly smaller chunk).
+    const target = Math.round((i * lines) / K)
+    let best = 0, bestD = Infinity
+    for (let j = 0; j <= n - 2; j += 1) { const d = Math.abs(endLineOf(j) - target); if (d < bestD) { bestD = d; best = j } }
+    cuts.push(best)
+  }
+  // One left→right pass: clamp each boundary to a strictly-increasing, room-preserving range, then apply the
+  // question rule. lo keeps this chunk non-empty (past the previous boundary); hi reserves one turn for every later
+  // chunk. Prefer the nearest EARLIER non-question boundary (smaller chunk); if none in range, fall FORWARD; if the
+  // whole range is questions (pathological all-questions text), keep the nominal boundary rather than merge chunks.
+  for (let i = 0; i < cuts.length; i += 1) {
+    const lo = (i === 0) ? 0 : cuts[i - 1] + 1
+    const hi = (n - 2) - (cuts.length - 1 - i)
+    let j = Math.max(lo, Math.min(cuts[i], hi))
+    if (turns[j].q) {
+      let found = -1
+      for (let k = j - 1; k >= lo; k -= 1) if (!turns[k].q) { found = k; break }
+      if (found < 0) for (let k = j + 1; k <= hi; k += 1) if (!turns[k].q) { found = k; break }
+      if (found >= 0) j = found
+    }
+    cuts[i] = j
+  }
+  const chunks = []
+  let prevEnd = 0
+  for (let i = 0; i < K; i += 1) {
+    const startLine = (i === 0) ? 1 : prevEnd + 1
+    const endLine = (i === K - 1) ? lines : endLineOf(cuts[i])
+    chunks.push({ idx: i + 1, count: K, startLine, endLine, isFirst: i === 0, isLast: i === K - 1, label })
+    prevEnd = endLine
+  }
+  return chunks
+}
+// Route K (>1) chunks through the turn-aware divider when the preflight supplied usable turns, else the line divider.
+const dividedChunks = (f, K) => ((f && Array.isArray(f.turns) && f.turns.length >= K && f.turns.length >= 2)
+  ? turnAwareChunks(f, K)
+  : evenLineChunks(f, K))
 // N-way balanced split at speaker-turn boundaries. `mode` is 'speed' | 'off' | undefined (cost); `budget` is the
-// resolved model's faithful-refine 字数 cap (undefined = none). Returns 1 chunk (singleChunk) unless a driver
-// fires. Both drivers feed the SAME evenLineChunks divider, so whole turns stay intact and sizes are balanced
-// (not greedy-first). K = max(speed count, budget count); 'off' forces one agent regardless of budget.
-function splitForRefine(f, mode, budget) {
+// resolved model's faithful-refine 字数 cap (undefined = none); `chunkSize` is the explicit --chunk-size experiment
+// knob (正文字数/块, undefined = none). Returns 1 chunk (singleChunk) unless a driver fires. Drivers feed the SAME
+// divider (turn-aware when f.turns is present, else line-based), so whole turns stay intact and sizes are balanced.
+// Precedence: 'off' forces one agent; else an explicit chunkSize OVERRIDES both budget and speed (K = ceil(字数/N));
+// else K = max(speed count, budget count).
+function splitForRefine(f, mode, budget, chunkSize) {
   const lines = (f && f.lines) || 0
   const size = refineSize(f)                 // 字数, not lines
   if (mode === 'off' || lines <= 1) return singleChunk(f)   // escape hatch, or unsplittable → one agent
-  // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
-  const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-    ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
-    : 1
-  // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
-  const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
-    ? Math.max(2, Math.ceil(size / budget))
-    : 1
-  const K = Math.max(speedK, budgetK)
-  return K <= 1 ? singleChunk(f) : evenLineChunks(f, K)   // no driver fired → cost mode (default) → one agent
+  let K
+  if (typeof chunkSize === 'number' && chunkSize > 0) {
+    // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
+    K = Math.max(1, Math.ceil(size / chunkSize))
+  } else {
+    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
+      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      : 1
+    // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
+    const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
+      ? Math.max(2, Math.ceil(size / budget))
+      : 1
+    K = Math.max(speedK, budgetK)
+  }
+  return K <= 1 ? singleChunk(f) : dividedChunks(f, K)   // no driver fired → cost mode (default) → one agent
 }
 
 // Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged
@@ -1923,19 +2014,33 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // engines/providers.js for the per-model budgets and the retention evidence behind them.
   const rb = (typeof engine.refineBudget === 'function') ? engine.refineBudget(M.refine) : null
   const budget = rb ? rb.budget : undefined
-  const chunks = splitForRefine(f, A.chunkMode, budget)
+  // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
+  // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
+  const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
     return engine.agent(refinePrompt(f, glossary, finding, A),
       { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
   }
-  // autoChunk trace: record ONLY when the model budget (not merely opt-in speed mode) drove the split. `off`
-  // suppresses chunking upstream, so it can never reach here; when both speed and budget fired, `parts` is the
-  // final (larger) count. Rides on the returned report → surfaced in run.json + review.md via artifacts.js.
-  const autoChunk = (rb && refineSize(f) > rb.budget)
-    ? { label: f.label, model: rb.model, budget: rb.budget, contentLength: refineSize(f), parts: chunks.length }
+  // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
+  // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
+  // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
+  // (and still carries model/budget when a budgeted provider is in play). Rides on the returned report → run.json +
+  // review.md via artifacts.js.
+  const drivenByChunkSize = typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
+  const drivenByBudget = rb && refineSize(f) > rb.budget
+  const autoChunk = (drivenByChunkSize || drivenByBudget)
+    ? {
+      label: f.label,
+      ...(rb ? { model: rb.model, budget: rb.budget } : {}),
+      contentLength: refineSize(f),
+      parts: chunks.length,
+      ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
+    }
     : null
-  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${autoChunk ? `（自动：约 ${autoChunk.contentLength} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : ''}`)
+  const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
+    : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
+  engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   const partReps = await engine.parallel(chunks.map((c) => () =>

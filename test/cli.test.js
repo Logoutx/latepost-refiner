@@ -64,6 +64,33 @@ test('parseArgs: --prior-glossary is undefined when the flag is absent', () => {
   assert.equal(params.priorGlossaryPath, undefined)
 })
 
+// ---------- --chunk-size validation (Feature 1) ----------
+
+test('--chunk-size parses a valid ≥2000 integer into params.chunkSize', () => {
+  const params = buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '10000']), { env: { HOME: '/tmp' } })
+  assert.equal(params.chunkSize, 10000)
+})
+
+test('--chunk-size is undefined when the flag is absent (no override)', () => {
+  const params = buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T']), { env: { HOME: '/tmp' } })
+  assert.equal(params.chunkSize, undefined)
+})
+
+test('--chunk-size below 2000 is rejected with a clear CONFIG_ERROR', () => {
+  assert.throws(
+    () => buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '500']), { env: { HOME: '/tmp' } }),
+    (e) => e && e.code === 'CONFIG_ERROR' && /chunk-size/.test(e.message) && /2000/.test(e.message),
+    'a sub-2000 chunk size errors out with a message naming the flag and the floor',
+  )
+})
+
+test('--chunk-size rejects a non-integer', () => {
+  assert.throws(
+    () => buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '9000.5']), { env: { HOME: '/tmp' } }),
+    (e) => e && e.code === 'CONFIG_ERROR',
+  )
+})
+
 // ---------- SF-6: --allow-audit-fail exit-code semantics ----------
 
 test('parseArgs recognises --allow-audit-fail as a boolean flag', () => {
