@@ -42,14 +42,16 @@ export const PROVIDERS = {
     // pipeline chunks any file whose 字数 exceeds this, at speaker-turn boundaries (see splitForRefine). Keyed by
     // model id (NOT tier) so a --models override that pins a raw id still resolves the right budget. Evidence from
     // real single-agent refine runs (retention = 成稿字数 ÷ 源正文字数; hard floor 0.55, healthy ≈ 0.79–0.83):
-    //   deepseek-v4-pro — 34,769 字 → 0.827 (healthy); 53,576 字 / 4 speakers → 0.552 (scraped the floor, ~2,665
-    //     字 folded away). Faithful zone ends between ~35K and ~54K, so 25000 (owner-set, 2026-07-09) keeps a
-    //     53.6K file at 3 balanced chunks ≈ 18K, comfortably inside the proven-good zone with extra margin.
+    //   deepseek-v4-pro — 34,769 字 → 0.827 (healthy); 53,576 字 / 4 speakers, single-shot → 0.552 (scraped the
+    //     floor, ~2,665 字 folded away). A controlled chunk-size experiment on that same 53.6K file (2026-07-10):
+    //     3 chunks ≈ 18K → 0.607; 6 chunks ≈ 8.9K via --chunk-size 10000 → 0.729 with only 661 字 lost and no
+    //     sub-heading fragmentation. 10000 (owner-set, 2026-07-10) locks in the winning size; costs ~+31% output
+    //     tokens and ~+40% wall-clock vs 3 chunks — retention is the metric this tool exists for.
     //   deepseek-v4-flash — thinner evidence: at 34,769 字 it kept only 0.714 and silently dropped a section, so a
     //     bigger safety margin → 18000. TUNABLE: raise it as clean-run data accumulates.
     // Every OTHER provider/model is intentionally unset → no cap → zero behaviour change (Anthropic Opus proved
     // faithful at 52.5K, so it needs none). Adjust these two numbers as evidence improves.
-    refineCharBudget: { 'deepseek-v4-pro': 25000, 'deepseek-v4-flash': 18000 },
+    refineCharBudget: { 'deepseek-v4-pro': 10000, 'deepseek-v4-flash': 18000 },
     note: '非思考模式分档：机械/核实档用 deepseek-v4-flash，精校/成稿档用 deepseek-v4-pro（thinking 模式不支持工具调用；旧默认 deepseek-chat 已弃用，可用 --models 覆盖）',
   },
   glm: {
