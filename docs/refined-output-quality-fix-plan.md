@@ -1,5 +1,7 @@
 # Refined Output Quality Fix Plan
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 Date: 2026-06-23
 
 Status note: this plan was written from the pre-`7519636` audit state. Phase 1 landed on `main` with `speakerTurnRatio` intentionally changed to a confirming/reporting signal only, never an independent failure gate. This follow-up branch implements the Phase 2 hard detectors, Phase 5 repair loop, and no-shell checklist while preserving that metric behavior.

@@ -1,5 +1,7 @@
 # Streamlining Proposal
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 ## Summary
 
 The project should read as:

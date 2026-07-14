@@ -1,5 +1,7 @@
 # Handoff — build the no-key Codex skill (Phase 3b)
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 _For Codex. Self-contained; assumes no prior conversation. Work on a branch and coordinate before pushing `main` (the maintainer's edition shares this repo)._
 
 ## Goal

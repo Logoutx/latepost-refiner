@@ -1,5 +1,7 @@
 # LatePost-Refiner — Development Plan: two subscription-native interfaces (Claude + Codex) over one core
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 _Drafted 2026-06-22. Companion to `docs/streamlining-proposal.md` (the collaborator's structure proposal). This is the agreed execution plan._
 
 ## Context

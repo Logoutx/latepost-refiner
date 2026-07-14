@@ -1,5 +1,7 @@
 # Codex subscription capability spike
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 **Goal:** decide whether the **Codex interface** can run the refinement pipeline on your **ChatGPT subscription with no OpenAI API key** — the prerequisite for the no-key Codex edition (Phase 3 of [dual-interface-plan.md](dual-interface-plan.md)).
 
 **How to run:** open Codex inside this repo, **signed in with your ChatGPT plan** and with **`OPENAI_API_KEY` unset** (we're testing the subscription path, not a metered key). Paste this file, or tell Codex: "run `docs/codex-spike.md` and fill in the Results table." Have Codex attempt each test and report.
