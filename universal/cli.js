@@ -36,11 +36,6 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --chunk-size <N>       分块实验旋钮：显式指定每块目标正文字数，块数=ceil(全文字数/N)，覆盖自动分段的字数与 speed
                          的块数；N 须为 ≥2000 的整数（--chunk off 仍优先、不分块）。所有分块都不会把一段问句切在块尾
                          （问句与其回答留在同一块）
-  --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
-                         把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
-                         审计门禁照跑，兜住单请求的静默压缩风险）
-  --effort <映射>        如 refine=medium,summary=low（推理力度，仅 refine/logic/summary/timeline 生效；
-                         档位 low|medium|high|xhigh|max；不设=默认 high）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
@@ -72,7 +67,6 @@ export function parseArgs(argv) {
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile',
     '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
-    '--refine-mode': 'refineMode', '--effort': 'effort',
   }
   let i = 0
   while (i < argv.length) {
@@ -93,21 +87,6 @@ export function parseArgs(argv) {
 }
 
 export const parseScope = (s) => (s ? s.split(',').map((x) => x.trim()).filter(Boolean) : ['refine'])
-// M12: `--effort refine=medium,summary=low`. Only the smart-tier categories (refine/logic/summary/timeline)
-// take effort; unknown keys and unknown levels are dropped (the API engine also guards by model, so a stray
-// value is harmless). Levels mirror the SDK's OutputConfig.effort enum.
-const EFFORT_CATS = new Set(['refine', 'logic', 'summary', 'timeline'])
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
-export const parseEffort = (s) => {
-  if (!s) return undefined
-  const m = {}
-  for (const pair of s.split(',')) {
-    const [k, v] = pair.split('=')
-    const key = k && k.trim(), val = v && v.trim()
-    if (EFFORT_CATS.has(key) && EFFORT_LEVELS.has(val)) m[key] = val
-  }
-  return Object.keys(m).length ? m : undefined
-}
 
 // --chunk-size <N>: explicit 正文字数-per-chunk target for chunk-size experiments. N must be a positive integer
 // ≥ 2000 — below that a "chunk" is smaller than a single sub-heading section and would shred the transcript, so it
@@ -148,8 +127,6 @@ export function buildRunParams(a, { env = process.env } = {}) {
     headingPolicy: a.headingPolicy || 'none',
     chunkMode: a.chunkMode === 'speed' ? 'speed' : (a.chunkMode === 'off' ? 'off' : undefined),   // 'off' disables ALL chunking incl. auto
     chunkSize: parseChunkSize(a.chunkSize),   // --chunk-size <N>：显式每块目标字数，覆盖自动分段字数与 speed 计数（≥2000 整数）
-    refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
-    effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
 
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,

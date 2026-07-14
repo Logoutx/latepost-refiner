@@ -204,25 +204,6 @@ export function derivativeReporterItems(result = {}) {
   return out
 }
 
-// M10: one review line per escalated file. Chinese typesetting throughout (全角引号, Arabic numerals,
-// Pangu spacing). 「甲.md — 首档未过（compression_risk）→ 升级 anthropic 已过审，替换成稿」 /
-// 「… → 升级后仍未过（两档均未过审，保留升级档：ending_missing）」 (loud on both-fail).
-function formatEscalationFile(f, provider) {
-  const label = f.label || path.basename(f.outPath || '')
-  const cheapFailed = (f.cheapAudit && f.cheapAudit.failed) || f.reason || []
-  const head = `${label} — 首档未过审（${cheapFailed.join('/') || 'fail'}）→ 升级 ${provider}`
-  if (f.premiumAudit == null) return `${head} 精校失败，保留首档成稿（仍未过审）`
-  if (!f.bothFailed) return `${head} 已过审，替换成稿`
-  const premiumFailed = (f.premiumAudit.failed || [])
-  const keptLabel = f.kept === 'premium' ? '保留升级档' : '回退首档'
-  return `${head} 后仍未过审——两档均未过审，${keptLabel}（升级档 ${premiumFailed.join('/') || 'fail'}）`
-}
-export function escalationItems(result = {}) {
-  const esc = result.escalation
-  if (!esc || !Array.isArray(esc.files) || !esc.files.length) return []
-  return esc.files.map((f) => formatEscalationFile(f, esc.provider))
-}
-
 // P2b: the source-label findings are listings (one line PER offending row), rendered in their own review section
 // below — so the thin-table lint (one summary line per finding) must not also echo them.
 const GLOSSARY_SOURCE_FINDINGS = new Set(['glossary_source_mislabel', 'glossary_source_unlabeled'])
@@ -266,7 +247,6 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
-    { title: '升级重跑（首档未过审 → 升级 provider 从源重跑；两档均未过审的需人工核对）', items: escalationItems(result), priority: 'high' },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
@@ -484,10 +464,6 @@ export function buildRunManifest(result = {}, context = {}) {
         sections: (f.sections || []).filter((s) => (s.flags || []).length).map((s) => ({ title: s.title, refinedLines: s.refinedLines, sourceRange: s.sourceRange, ts: s.ts, flags: s.flags })),
       })),
     } : null,
-    // M10: cheap-first escalation outcome — the premium provider + per-file records (cheap vs premium audit,
-    // which draft was kept, and whether BOTH tiers failed). Null unless --escalate ran. The shipped 成稿's
-    // final audit is already reflected in `audit` above; this block preserves the cheap-vs-premium comparison.
-    escalation: (context.escalation || result.escalation) ? (context.escalation || result.escalation) : null,
     // E13: 校对表 structural lint (all soft) — metrics + only the warnings that fired.
     glossaryLint: result.glossaryLint ? {
       metrics: result.glossaryLint.metrics || null,

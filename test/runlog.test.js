@@ -25,27 +25,31 @@ test('buildRunLogEntry: shape from a fake result (all fields, worked-example cos
     audit: { status: 'ok', files: [] },
     outputDir: '/out/虚构示例项目',
   }
+  // Real production shape (DEEPSEEK_MODELS): haiku/sonnet on flash, opus on pro — a mixed-tier map.
+  const models = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
 
-  const entry = buildRunLogEntry({ params, result, provider: 'anthropic', models: null })
+  const entry = buildRunLogEntry({ params, result, provider: 'deepseek', models })
 
   assert.equal(entry.finishedAt, '2026-07-08T10:00:00.000Z')
   assert.equal(entry.topic, '虚构示例项目')
   assert.equal(entry.engine, 'universal')
-  assert.equal(entry.provider, 'anthropic')
-  assert.equal(entry.models, null)
+  assert.equal(entry.provider, 'deepseek')
+  assert.deepEqual(entry.models, models)
   assert.deepEqual(entry.scope, ['refine', 'summary'])
   assert.equal(entry.files, 2)
   assert.equal(entry.durationMs, 732000)
   assert.equal(entry.durationMin, 12.2)
   // usage is re-shaped to exactly these 5 fields — engine's `failed` counter is not part of the log entry
   assert.deepEqual(entry.usage, { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, agents: 9 })
-  assert.deepEqual(entry.estCost, { value: 0.018225, currency: 'USD', note: null })
+  // fresh = 1000-200 = 800; cheaper (flash) for input, writing-tier (pro) for output:
+  // (800*0.14 + 200*0.0028 + 500*0.87) / 1e6 = (112 + 0.56 + 435) / 1e6 = 0.000548
+  assert.deepEqual(entry.estCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.equal(entry.auditStatus, 'ok')
   assert.equal(entry.outputDir, '/out/虚构示例项目')
 })
 
 test('buildRunLogEntry: auditStatus is "unavailable" when result.audit is absent, "fail" when audit failed', () => {
-  const base = { params: { topic: 'T', files: [] }, provider: 'anthropic', models: null }
+  const base = { params: { topic: 'T', files: [] }, provider: 'deepseek', models: null }
   assert.equal(buildRunLogEntry({ ...base, result: {} }).auditStatus, 'unavailable')
   assert.equal(buildRunLogEntry({ ...base, result: { audit: { status: 'fail' } } }).auditStatus, 'fail')
   assert.equal(buildRunLogEntry({ ...base, result: { audit: { status: 'ok' } } }).auditStatus, 'ok')
@@ -88,15 +92,9 @@ test('estimateCost: deepseek-chat prices the same as deepseek-v4-flash (legacy a
   assert.deepEqual(chat, flash)
 })
 
-test('estimateCost: anthropic — flat rate ignores the models map, worked example', () => {
-  const usage = { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100 }
-  // cost = (1000*5 + 200*0.5 + 100*6.25 + 500*25) / 1e6 = (5000 + 100 + 625 + 12500) / 1e6 = 0.018225
-  const cost = estimateCost('anthropic', null, usage)
-  assert.deepEqual(cost, { value: 0.018225, currency: 'USD', note: null })
-})
-
-test('estimateCost: unknown provider → null', () => {
+test('estimateCost: unknown provider → null (anthropic pricing was removed with the multi-provider registry)', () => {
   const usage = { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0 }
+  assert.equal(estimateCost('anthropic', null, usage), null, 'anthropic has no price data anymore — only deepseek does')
   assert.equal(estimateCost('glm', { haiku: 'glm-4.7-flash', sonnet: 'glm-4.7-flashx', opus: 'glm-5.2' }, usage), null)
   assert.equal(estimateCost('openai', { haiku: 'gpt-5.4-mini', sonnet: 'gpt-5.4-mini', opus: 'gpt-5.5' }, usage), null)
   assert.equal(estimateCost('router', null, usage), null)
