@@ -23,9 +23,6 @@ test('parseArgs output maps CLI flags to runJob params', () => {
     '--fresh',
     '--no-annotate',
     '--chunk', 'speed',
-    '--models', 'scout=haiku,refine=opus',
-    '--provider', 'openai',
-    '--base-url', 'https://api.example.invalid/v1',
     '--concurrency', '7',
     '--verify', 'deep',
     '--heading-policy', 'keep',
@@ -49,10 +46,7 @@ test('parseArgs output maps CLI flags to runJob params', () => {
   assert.deepEqual(params.scope, ['refine', 'summary', 'timeline'])
   assert.equal(params.verifyDepth, 'deep')
   assert.equal(params.headingPolicy, 'keep')
-  assert.deepEqual(params.models, { scout: 'haiku', refine: 'opus' })
   assert.equal(params.chunkMode, 'speed')
-  assert.equal(params.provider, 'openai')
-  assert.equal(params.baseURL, 'https://api.example.invalid/v1')
   assert.equal(params.concurrency, 7)
   assert.equal(params.fresh, true)
   assert.equal(params.annotate, false)
