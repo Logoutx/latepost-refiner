@@ -2489,16 +2489,27 @@ function derivMoneyAbsSpan(a) {
   return span ? { lo: span.lo * scale, hi: span.hi * scale } : null
 }
 
-// A magnitude atom matches the corpus if its exact value|unit key is present, OR its numeric span overlaps a
-// same-unit corpus span (so a timeline "65 亿"【访谈】 is covered by a source range "60-70 亿", not a fabrication;
-// but "80 亿" against "60-70 亿" stays disjoint → unmatched), OR (money scale words only) its ABSOLUTE amount
-// overlaps a same-family source amount (8000 万 ⇄ 0.8 亿). Reuses xfileValueSpan (range/scalar canonical form).
+// Unit-family fold for derivative matching: the transcript's spoken unit and the derivative's canonical unit are
+// the same quantity (源 “4000块” ⇄ 时间线 “4000 元”, “4 个小时” ⇄ “4 小时” — live FP class, 2026-07-14). The 月
+// family is deliberately NOT folded here: 个月 is a duration magnitude while bare 月 is a weak date unit
+// (derivIsDateAtom) — folding them would silently drop month-durations from the gate.
+const derivUnitKey = (u) => { const f = unitFamily(u); return f === '月' ? (u || '') : f }
+
+// A magnitude atom matches the corpus if its exact value|unit key is present (units folded per derivUnitKey), OR
+// its numeric span overlaps a same-unit corpus span (so a timeline "65 亿"【访谈】 is covered by a source range
+// "60-70 亿", not a fabrication; but "80 亿" against "60-70 亿" stays disjoint → unmatched), OR (money scale words
+// only) its ABSOLUTE amount overlaps a same-family source amount (8000 万 ⇄ 0.8 亿), OR — last resort — the exact
+// value appears in the corpus as a BARE atom. That last rule exists because spoken Chinese units routinely defeat
+// extraction (源 “账上只剩4000块” extracts as a bare 4000; “4 个小时” as a bare 4 — live FP class, 2026-07-14):
+// if the interview states the figure at all, the number itself is not fabricated — whether it was lifted into the
+// wrong CONTEXT is the soft derivative_context_review tier's job, never this hard gate's. Reuses xfileValueSpan.
 function derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) {
-  if (corpusKeys.has(`${a.value}|${a.unit}`)) return true
+  if (corpusKeys.has(`${a.value}|${derivUnitKey(a.unit)}`)) return true
   const span = xfileValueSpan(a.value)
-  if (span) for (const cs of corpusByUnit.get(a.unit) || []) if (!(span.hi < cs.lo || cs.hi < span.lo)) return true
+  if (span) for (const cs of corpusByUnit.get(derivUnitKey(a.unit)) || []) if (!(span.hi < cs.lo || cs.hi < span.lo)) return true
   const abs = derivMoneyAbsSpan(a)
   if (abs) for (const cs of corpusMoneyAbs || []) if (!(abs.hi < cs.lo || cs.hi < abs.lo)) return true
+  if (corpusKeys.has(`${a.value}|`)) return true
   return false
 }
 
@@ -2533,12 +2544,12 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
   if (!deriv.trim()) return empty
   const corpusStr = String(corpusText || '')
   const corpusAtoms = extractDerivativeAtoms(corpusStr)
-  const corpusKeys = new Set(corpusAtoms.map((a) => `${a.value}|${a.unit}`))
+  const corpusKeys = new Set(corpusAtoms.map((a) => `${a.value}|${derivUnitKey(a.unit)}`))
   const corpusValues = new Set(corpusAtoms.map((a) => a.value))
   // exact value+unit → the corpus offsets where that figure occurs (feeds the derivative_context_review windows).
   const corpusOccByKey = new Map()
   for (const a of corpusAtoms) {
-    const k = `${a.value}|${a.unit}`
+    const k = `${a.value}|${derivUnitKey(a.unit)}`
     if (!corpusOccByKey.has(k)) corpusOccByKey.set(k, [])
     corpusOccByKey.get(k).push(a.idx)
   }
@@ -2548,8 +2559,9 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
     if (!a.magnitude) continue
     const span = xfileValueSpan(a.value)
     if (!span) continue
-    if (!corpusByUnit.has(a.unit)) corpusByUnit.set(a.unit, [])
-    corpusByUnit.get(a.unit).push(span)
+    const bu = derivUnitKey(a.unit)
+    if (!corpusByUnit.has(bu)) corpusByUnit.set(bu, [])
+    corpusByUnit.get(bu).push(span)
     const abs = derivMoneyAbsSpan(a)
     if (abs) corpusMoneyAbs.push(abs)
   }
@@ -2584,14 +2596,14 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
           if (!derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs)) {
             if (canHardFail) hardFail.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
             else review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注量纲数字，但无可比对语料（复核）' })
-          } else if (corpusKeys.has(`${a.value}|${a.unit}`)) {
+          } else if (corpusKeys.has(`${a.value}|${derivUnitKey(a.unit)}`)) {
             // Hard gate satisfied by an EXACT value+unit corpus match (range / scale overlaps are skipped — no single
             // occurrence to window around). Corroborate the LOCAL context: is the derivative's measured-noun echoed
             // near the figure in the corpus? If not, raise a SOFT 复核 item — the figure may be lifted off an
             // unrelated corpus number of the same magnitude. Never a hard fail.
             const derivNoun = measuredNounKey(line.slice(0, a.idx))
             if (derivNoun) {
-              const corr = derivContextCorroboration(derivNoun, corpusStr, corpusOccByKey.get(`${a.value}|${a.unit}`))
+              const corr = derivContextCorroboration(derivNoun, corpusStr, corpusOccByKey.get(`${a.value}|${derivUnitKey(a.unit)}`))
               if (!corr.ok) contextReview.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet,
                 note: `标【访谈】、该数值在语料中出现过，但邻近语境“${derivNoun}”与语料对不上（语料邻近：${corr.snippet || '—'}）——请核对是否套用了无关数字` })
             }
