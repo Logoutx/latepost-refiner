@@ -24,7 +24,7 @@
   ],
   "exports": {
     "./core": "./core/pipeline.js",
-    "./engine": "./engines/api.js"
+    "./engine": "./engines/deepseek.js"
   },
   "scripts": {
     "pretest": "node build/sync-skills.mjs --check",
@@ -41,7 +41,6 @@
     "eval:produce": "node eval/produce.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.104.2",
     "mammoth": "^1.12.0",
     "openai": "^6.44.0",
     "p-limit": "^7.3.0"

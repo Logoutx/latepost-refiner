@@ -12,12 +12,8 @@ import { runPipeline } from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts, parseTurns } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
-import { PROVIDERS, PROVIDER_NAMES, resolveKey, jurisdictionNote } from '../engines/providers.js'
-import { makeApiEngine } from '../engines/api.js'
-import { makeOpenAIEngine } from '../engines/openai.js'
-import { makeRouterEngine, CATEGORY_KEYS } from '../engines/router.js'
+import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
-import { runEscalation, escalationGlossaryText, mergeEscalationUsage, HARD_GATES } from './escalate.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -111,8 +107,6 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   return { entry, hasHeadings, headingWarning }
 }
 
-const allTiers = (id) => ({ haiku: id, sonnet: id, opus: id, fable: id })
-
 export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [] }) {
   const outDir = path.resolve(outputDir || process.cwd())
   return {
@@ -123,44 +117,17 @@ export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files
   }
 }
 
-// Select the engine for a provider. apiKey (if given) overrides the env lookup — the web
-// UI passes the key the user typed; the CLI passes nothing and falls back to env vars.
-// modelOverride (if given) pins every tier to one model id (used by per-category routing).
-export function selectEngine({ provider = 'anthropic', baseURL, concurrency, apiKey, modelOverride, filePolicy, env = process.env, onPhase, onLog }) {
-  provider = String(provider).toLowerCase()
-  if (provider === 'anthropic') {
-    const key = apiKey || env.ANTHROPIC_API_KEY
-    if (!key) throw new Error('未设 ANTHROPIC_API_KEY')
-    return { provider, engine: makeApiEngine({ apiKey: key, concurrency, models: modelOverride ? allTiers(modelOverride) : undefined, filePolicy, onPhase, onLog }), info: { label: 'Anthropic', baseURL: 'default', keyVar: 'ANTHROPIC_API_KEY' } }
-  }
-  const cfg = PROVIDERS[provider]
-  if (!cfg) throw new Error(`未知 provider「${provider}」。可选：anthropic, ${PROVIDER_NAMES.join(', ')}`)
-  const found = resolveKey(provider, env)
-  const key = apiKey || found.key
-  if (!key) throw new Error(`未设 ${cfg.keyEnv.join(' / ')}（${cfg.label} 的 API key）`)
-  const url = baseURL || cfg.baseURL
+// Build the DeepSeek engine — the only API provider the Universal edition supports. apiKey (if given)
+// overrides the env lookup: the web UI passes the key the user typed; the CLI passes nothing and falls
+// back to DEEPSEEK_API_KEY. Endpoint and the flash/pro model split are fixed inside makeDeepSeekEngine.
+export function selectEngine({ concurrency, apiKey, filePolicy, env = process.env, onPhase, onLog } = {}) {
+  const key = apiKey || env.DEEPSEEK_API_KEY
+  if (!key) throw new Error('未设 DEEPSEEK_API_KEY（DeepSeek 的 API key）')
   return {
-    provider,
-    engine: makeOpenAIEngine({ apiKey: key, baseURL: url, models: modelOverride ? allTiers(modelOverride) : cfg.models, refineCharBudget: cfg.refineCharBudget, maxTokensParam: cfg.maxTokensParam, forceStructured: cfg.forceStructured, nativeSearch: cfg.nativeSearch, concurrency, filePolicy, onPhase, onLog }),
-    info: { label: cfg.label, baseURL: url, keyVar: apiKey ? cfg.keyEnv[0] : found.varName, note: cfg.note },
+    provider: 'deepseek',
+    engine: makeDeepSeekEngine({ apiKey: key, concurrency, filePolicy, onPhase, onLog }),
+    info: { label: 'DeepSeek', baseURL: DEEPSEEK_BASE_URL, keyVar: 'DEEPSEEK_API_KEY' },
   }
-}
-
-// Build a router engine from a per-category config (web UI's "按类别混合"). Sub-engines with
-// identical (provider, key, baseURL, model) are shared so they also share one concurrency limit.
-// categories: { mechanical:{provider,apiKey,baseURL,modelOverride}, web:{...,tavilyKey}, correction:{...}, smart:{...} }
-export function buildRouterEngine({ categories, concurrency, filePolicy, env = process.env, onPhase, onLog }) {
-  const cache = new Map()
-  const sig = (c) => [c.provider, c.apiKey || '', c.baseURL || '', c.modelOverride || ''].join('')
-  const engines = {}
-  for (const key of CATEGORY_KEYS) {
-    const c = categories && categories[key]
-    if (!c || !c.provider) throw new Error(`类别「${key}」未配置 provider/key`)
-    const s = sig(c)
-    if (!cache.has(s)) cache.set(s, selectEngine({ provider: c.provider, apiKey: c.apiKey, baseURL: c.baseURL, modelOverride: c.modelOverride, concurrency, filePolicy, env, onLog }).engine)
-    engines[key] = cache.get(s)
-  }
-  return makeRouterEngine({ engines, onPhase, onLog })
 }
 
 // Remove the <outPath>.partN intermediate files left by chunked refine (the stitch agent merged them
@@ -232,9 +199,9 @@ export function persistGlossary(result, glossaryPath) {
   return false
 }
 
-// Standalone same-provider audit-repair utility (retry loop). NOTE: as of the M-series merge this is NOT
-// wired into runJob — the headless path deliberately does in-pipeline audit + opt-in escalation instead of
-// auto-rewriting a 成稿 (see runJob below). Kept as an exported, unit-tested helper (test/quality-repair.test.js).
+// Standalone audit-repair utility (retry loop). NOTE: as of the M-series merge this is NOT wired into
+// runJob — the headless path deliberately does in-pipeline audit (mark the gap, let the user decide)
+// instead of auto-rewriting a 成稿 (see runJob below). Kept as an exported, unit-tested helper (test/quality-repair.test.js).
 export const QUALITY_REPAIR_MAX_RETRIES = 2
 
 function auditListForFiles(files = []) {
@@ -374,99 +341,6 @@ async function prepareInputFile(f, { topic, date, headingPolicy, outputDir, uplo
   return null
 }
 
-// M10: build the premium (escalation) engine + drive the escalation pass, then REFRESH the pipeline
-// result's audit-derived fields (auditFailed / incomplete / audit.files / audit.status) to the FINAL
-// on-disk state so the exit code, review.md, and run.json reflect post-escalation truth. Returns
-// { premiumUsage, manifest } where manifest is the run.json「escalation」block (provider + per-file records
-// + counts). escalate = { provider, baseURL?, models? }; params.__escalateEngine injects a mock for tests.
-// Mutates `r` (pipeline result) and `audit` in place — the caller assembles them into `result` afterwards.
-async function runEscalationPass({ escalate, audit, r, A, fileEntries, glossaryPath, concurrency, filePolicy, notice, onPhase, onLog, __escalateEngine }) {
-  // 1) premium engine: an injected mock (tests) OR selectEngine on the named provider. A per-tier
-  //    --escalate-models map pins the refine model via modelOverride (escalation only calls the refine tier,
-  //    so pinning all tiers to that id is harmless). Config errors surface as a notice + skip (never fatal —
-  //    a bad escalate config must not sink an otherwise-good run; the cheap 成稿 already exist on disk).
-  let escalateEngine = __escalateEngine
-  let escProvider = escalate.provider
-  if (!escalateEngine) {
-    const modelOverride = escalate.models && (escalate.models.refine || Object.values(escalate.models)[0])
-    try {
-      const esc = selectEngine({ provider: escalate.provider, baseURL: escalate.baseURL, modelOverride, concurrency, filePolicy, onPhase, onLog })
-      escalateEngine = esc.engine
-      escProvider = esc.provider
-      const jn = jurisdictionNote(esc.provider)
-      notice(`升级 provider=${esc.provider}（${esc.info.label}）· 用于未过审文件的源级重跑`)
-      if (jn) notice(`⚠ 升级链路：${jn}`)
-    } catch (e) {
-      notice(`升级 provider 配置无效，已跳过升级重跑（首档成稿照常落盘）：${e.message}`)
-      return null
-    }
-  }
-
-  const glossaryText = escalationGlossaryText(r, glossaryPath)
-  const failingCount = (audit.files || []).filter((f) => f && f.status === 'fail').length
-  if (!failingCount) return null // nothing failed → no escalation (but keep the structure explicit)
-
-  const outcome = await runEscalation({ auditFiles: audit.files, A, fileEntries, escalateEngine, glossaryText, log: (m) => notice(m) })
-  if (!outcome || !outcome.records.length) return null
-
-  // 2) refresh audit.files to the FINAL per-file audit (the on-disk 成稿's audit), so review.md's
-  //    「成稿质量抽查」, run.json audit, and audit.status all reflect what actually shipped.
-  audit.files = (audit.files || []).map((f) => outcome.finalAuditFor(f.file) || f)
-  audit.status = audit.files.some((f) => f && f.status === 'fail') ? 'fail' : 'ok'
-
-  // 3) recompute the pipeline's hard-gate fields from the FINAL audits: auditFailed keeps only the two hard
-  //    content gates (matching the pipeline's contract → drives the exit code), incomplete keeps ending_missing.
-  const finalOf = (outPath) => outcome.finalAuditFor(outPath)
-  const isEscalated = new Set(outcome.records.map((x) => x.outPath))
-  // auditFailed: preserve non-escalated entries verbatim; for escalated ones, rebuild from the final audit.
-  const rebuiltAuditFailed = []
-  for (const entry of r.auditFailed || []) if (!isEscalated.has(entry.path)) rebuiltAuditFailed.push(entry)
-  for (const outPath of isEscalated) {
-    const fa = finalOf(outPath)
-    const hard = ((fa && fa.failed) || []).filter((k) => HARD_GATES.includes(k))
-    if (hard.length) rebuiltAuditFailed.push({ path: outPath, findings: hard })
-  }
-  r.auditFailed = rebuiltAuditFailed
-  // incomplete: same treatment for the ending_missing signal.
-  const rebuiltIncomplete = []
-  for (const entry of r.incomplete || []) if (!isEscalated.has(entry.path || entry)) rebuiltIncomplete.push(entry)
-  for (const outPath of isEscalated) {
-    const fa = finalOf(outPath)
-    if (fa && (fa.failed || []).includes('ending_missing')) rebuiltIncomplete.push({ path: outPath, note: 'deterministic audit: ending_missing' })
-  }
-  r.incomplete = rebuiltIncomplete
-  // Refresh each refined entry's inline audit summary + completeness so per-file consumers see final state.
-  for (const outPath of isEscalated) {
-    const fa = finalOf(outPath)
-    const rr = (r.refined || []).find((x) => (x.outPath || x.path) === outPath)
-    if (rr && fa) {
-      const hard = (fa.failed || []).filter((k) => HARD_GATES.includes(k))
-      const soft = (fa.failed || []).filter((k) => !HARD_GATES.includes(k))
-      rr.audit = { status: hard.length ? 'fail' : 'ok', hardFindings: hard, softFindings: soft, repaired: false, anchorsAdded: (rr.audit && rr.audit.anchorsAdded) || 0, auditUnavailable: false }
-      rr.complete = !(fa.failed || []).includes('ending_missing')
-      rr.checkNote = (fa.failed || []).includes('ending_missing') ? 'deterministic audit: ending_missing' : ''
-    }
-  }
-
-  // 4) loud open-question line for any file that failed BOTH tiers (surfaces in review.md「收尾待问」 + CLI).
-  const both = outcome.records.filter((x) => x.bothFailed)
-  if (both.length) {
-    r.openQuestions = [...(r.openQuestions || []), `升级重跑：${both.length} 份两档均未过审（${both.map((x) => x.label).join('、')}）——请对照源文件人工核对，详见 review.md「升级重跑」`]
-  }
-  notice(`升级重跑完成：${outcome.escalated} 份未过审已升级 ${escProvider}，${outcome.passed} 份通过${outcome.bothFailed ? `，${outcome.bothFailed} 份两档均未过审` : ''}`)
-
-  return {
-    premiumUsage: outcome.premiumUsage,
-    manifest: {
-      provider: escProvider,
-      escalated: outcome.escalated,
-      passed: outcome.passed,
-      bothFailed: outcome.bothFailed,
-      files: outcome.records.map((x) => ({ outPath: x.outPath, label: x.label, escalated: x.escalated, cheapAudit: x.cheapAudit, premiumAudit: x.premiumAudit, kept: x.kept, bothFailed: x.bothFailed, reason: x.reason })),
-    },
-  }
-}
-
 // One-call run used by the web server and CLI. `files` may be filesystem entries
 // [{ path }] or uploads [{ name, base64 }]. onPhase/onLog stream progress.
 export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
@@ -474,11 +348,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedAt = new Date(startedMs).toISOString()
   const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
-    provider = 'anthropic', apiKey, baseURL, tavilyKey,
+    apiKey, tavilyKey,
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
-    models, outputDir, fresh = false, concurrency,
-    skillDir, escalate, refineMode, effort,
+    outputDir, fresh = false, concurrency,
+    skillDir, refineMode, effort,
   } = params
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
@@ -514,36 +388,26 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     notice(`沿用既有校对表：${priorSource}`)
   }
 
-  // 3. engine. Three modes: an injected engine (tests), per-category routing (web UI's
-  //    "按类别混合"), or a single provider. The web-search backend (Tavily) is set for the
-  //    run from the web category's key (or the top-level tavilyKey).
-  const categories = params.categories
+  // 3. engine: an injected engine (tests) or the DeepSeek engine. The web-search backend (Tavily) is set
+  //    for the run from the top-level tavilyKey (client-side search on verify/timeline; absent → no-verify).
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
-  const webTavily = (categories && categories.web && categories.web.tavilyKey) || tavilyKey
+  const webTavily = tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY
   if (webTavily) process.env.TAVILY_API_KEY = webTavily
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
-  else if (categories) {
+  else {
     try {
-      sel = { provider: 'router', engine: buildRouterEngine({ categories, concurrency, filePolicy, onPhase, onLog }), info: { label: '按类别混合', categories: Object.fromEntries(CATEGORY_KEYS.map((k) => [k, { provider: categories[k] && categories[k].provider, model: (categories[k] && categories[k].modelOverride) || '默认' }])) } }
-    } catch (e) {
-      throw new JobConfigError(e.message)
-    }
-  } else {
-    try {
-      sel = selectEngine({ provider, baseURL, concurrency, apiKey, filePolicy, onPhase, onLog })
+      sel = selectEngine({ concurrency, apiKey, filePolicy, onPhase, onLog })
     } catch (e) {
       throw new JobConfigError(e.message)
     }
   }
-  if (sel.provider !== 'anthropic' && sel.provider !== 'injected' && sel.provider !== 'router') {
+  if (sel.provider === 'deepseek') {
     notice(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
-    if (sel.info.note) notice(`注意：${sel.info.note}`)
-    const jn = jurisdictionNote(sel.provider)
-    if (jn) notice(`⚠ ${jn}`)
+    notice(`⚠ ${SOURCE_PROTECTION_NOTE}`)
     if (!process.env.TAVILY_API_KEY && (scope.includes('timeline') || verifyDepth !== 'none')) {
-      notice('提示：未设 TAVILY_API_KEY——非 anthropic provider 的联网核实/时间线将降级（refine 不受影响）。')
+      notice('提示：未设 TAVILY_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
     }
   }
   notice(`
@@ -609,10 +473,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const A = {
     topic, date, background, outputDir: outDir,
     skillDir: resolvedSkillDir,
-    scope, verifyDepth, headingPolicy, models, chunkMode: params.chunkMode, chunkSize: params.chunkSize,
+    scope, verifyDepth, headingPolicy, chunkMode: params.chunkMode, chunkSize: params.chunkSize,
     refineMode: refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a: default agentic (byte-equivalent)
     effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
-    captureSingleShot: params.captureSingleShot,   // M11b: batch-submit hook — capture single-shot payloads instead of sending (see scripts/batch_refine.mjs)
     priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
     canonicalOverrides: params.canonicalOverrides,
     capabilities,
@@ -630,22 +493,6 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // Assemble the top-level audit/annotations/anchors from what the in-pipeline gate recorded (no re-run).
     const audit = auditFilesAcc.length ? { status: auditFilesAcc.some((f) => f.status === 'fail') ? 'fail' : 'ok', files: auditFilesAcc } : null
     if (anchors.length) notice(`源锚点：${anchors.length} 份成稿的小节已标注源行号${anchors.some((a) => a.updated.some((u) => u.ts)) ? '与录音时间' : ''}（渲染不可见，引文可循此回查源文件）`)
-
-    // M10 cheap-first escalation (OPT-IN): with `escalate` configured, any file whose RAW deterministic
-    // audit FAILED (compression_risk/charRatio, content_gap, ending_missing, quote_style, …) is RE-REFINED
-    // FROM SOURCE on the premium engine and re-audited. Runs BEFORE cross-file consistency so that check
-    // sees the final (post-escalation) 成稿 set. Refreshes r.auditFailed / r.incomplete / audit.files to the
-    // final on-disk state; the cheap+premium audits are kept in `escalation`. No-op unless escalate is set.
-    let escalation = null
-    let escUsage = null
-    if (escalate && audit && !r.error) {
-      escalation = await runEscalationPass({
-        escalate, audit, r, A, fileEntries, glossaryPath,
-        concurrency, filePolicy, notice, onPhase, onLog,
-        __escalateEngine: params.__escalateEngine,
-      })
-      escUsage = escalation ? escalation.premiumUsage : null
-    }
 
     // M8: cross-file numeric consistency over the whole batch (≥2 refined files). Uses this round's rendered
     // 校对表 (in-memory) for entity association, else the on-disk copy. A conflict is attached to the result +
@@ -675,10 +522,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedMs = Date.now()
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
-    // usage: primary engine totals, plus the premium engine's usage merged in (with a separate `escalation`
-    // sub-object) when escalation ran. mergeEscalationUsage is a no-op-merge when escUsage is null.
-    const usage = escUsage ? mergeEscalationUsage(sel.engine.usage(), escUsage) : sel.engine.usage()
-    const result = { ...r, audit, derivativeAudit, escalation: escalation ? escalation.manifest : null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
+    const usage = sel.engine.usage()
+    const result = { ...r, audit, derivativeAudit, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
@@ -693,12 +538,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     })
 
     // Per-run log (time/tokens/estimated cost) — additive, never fatal, opt-out via params.runLog===false
-    // (CLI: --no-run-log). `models` is the provider's tier→model-id default map (needed for DeepSeek's
-    // flash/pro cost split); anthropic prices flat so it needs no map; router/injected engines simply
-    // price as "unknown" (estimateCost → null for any provider it doesn't recognise).
+    // (CLI: --no-run-log). `models` is DeepSeek's tier→model-id map (needed for the flash/pro cost split);
+    // an injected test engine prices as "unknown" (estimateCost → null for any provider it doesn't recognise).
     let runLog = null
     if (params.runLog !== false) {
-      const runLogModels = (PROVIDERS[sel.provider] && PROVIDERS[sel.provider].models) || null
+      const runLogModels = sel.provider === 'deepseek' ? DEEPSEEK_MODELS : null
       const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels })
       const logRes = appendRunLog(entry, { logPath: params.runLogPath })
       if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }
@@ -710,5 +554,3 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
   }
 }
-
-export { PROVIDERS, PROVIDER_NAMES }
