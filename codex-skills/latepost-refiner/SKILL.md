@@ -20,7 +20,7 @@ Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch 
 
 ## Universal Runtime Fallback
 
-Use [references/universal-runtime.md](references/universal-runtime.md) for the local web app or CLI, non-Codex users, provider/API-key routing, or when the user explicitly wants Anthropic/DeepSeek/GLM/Kimi/OpenAI API execution. This fallback is useful, but it is not the primary Codex path.
+Use [references/universal-runtime.md](references/universal-runtime.md) for the local web app or CLI, non-Codex users, or when the user explicitly wants CLI/web execution with a `DEEPSEEK_API_KEY`. This fallback is useful, but it is not the primary Codex path.
 
 ## Opening Questions
 
