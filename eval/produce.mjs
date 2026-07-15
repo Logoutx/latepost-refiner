@@ -1,9 +1,9 @@
-// Produces eval result JSON with the Universal engine. This is intentionally optional:
+// Produces eval result JSON with the Universal engine (DeepSeek). This is intentionally optional:
 // local/CI scorer tests are deterministic, while this script spends model tokens.
 //
 // Usage:
-//   ANTHROPIC_API_KEY=... node eval/produce.mjs --suite golden --out /tmp/golden.json
-//   ANTHROPIC_API_KEY=... node eval/produce.mjs --suite filler --out /tmp/filler.json --provider anthropic
+//   DEEPSEEK_API_KEY=... node eval/produce.mjs --suite golden --out /tmp/golden.json
+//   DEEPSEEK_API_KEY=... node eval/produce.mjs --suite filler --out /tmp/filler.json
 import fs from 'fs'
 import path from 'path'
 import { RULES } from '../core/spec.js'
@@ -12,11 +12,10 @@ import { FIXTURES } from './fixtures.js'
 import { GOLDEN_FIXTURES } from './golden-fixtures.js'
 
 function parseArgs(argv) {
-  const out = { suite: 'golden', provider: 'anthropic', model: 'opus', out: '' }
+  const out = { suite: 'golden', model: 'opus', out: '' }
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i]
     if (tok === '--suite') out.suite = argv[++i]
-    else if (tok === '--provider') out.provider = argv[++i]
     else if (tok === '--model') out.model = argv[++i]
     else if (tok === '--out') out.out = argv[++i]
   }
@@ -47,7 +46,7 @@ ${JSON.stringify(fixtures, null, 2)}`
 }
 
 const args = parseArgs(process.argv.slice(2))
-if (!args.out) { console.error('usage: node eval/produce.mjs --suite golden|filler --out <results.json> [--provider anthropic] [--model opus]'); process.exit(2) }
+if (!args.out) { console.error('usage: node eval/produce.mjs --suite golden|filler --out <results.json> [--model opus]'); process.exit(2) }
 
 const fixtures = fixturesFor(args.suite)
 const schema = {
@@ -60,7 +59,7 @@ const schema = {
   },
 }
 
-const sel = selectEngine({ provider: args.provider, modelOverride: args.model, concurrency: 1 })
+const sel = selectEngine({ concurrency: 1 })
 const result = await sel.engine.agent(promptFor(args.suite, fixtures), { label: `eval:${args.suite}`, model: args.model, schema })
 const outputs = result && result.outputs ? result.outputs : result
 if (!outputs || typeof outputs !== 'object') throw new Error('eval model did not return an outputs object')

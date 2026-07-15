@@ -1966,10 +1966,10 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   }
   const chars = contentLength(sourceText)
   if (chars > SINGLE_SHOT_MAX_CHARS) {
-    engine.log(`单请求精校：${f.label} 约 ${chars} 字，超过单请求上限 ${SINGLE_SHOT_MAX_CHARS} 字——拒绝，请对该份改用 agentic 模式（--refine-mode agentic）`)
+    engine.log(`单请求精校：${f.label} 约 ${chars} 字，超过单请求上限 ${SINGLE_SHOT_MAX_CHARS} 字——拒绝；现已无 --refine-mode 参数，agentic 是默认且唯一的路径，DeepSeek 引擎会在其中按发言轮自动分段处理超长文件`)
     return {
       path: f.outPath, headings: [], key_fixes: [],
-      open_questions: [`「${f.label}」约 ${chars} 字，超过 single-shot 上限 ${SINGLE_SHOT_MAX_CHARS} 字（响应封顶会截断长文）——本份未精校，请改用 agentic 模式（--refine-mode agentic）重跑`],
+      open_questions: [`「${f.label}」约 ${chars} 字，超过 single-shot 上限 ${SINGLE_SHOT_MAX_CHARS} 字（响应封顶会截断长文）——本份未精校；现已无 --refine-mode 参数，agentic 是默认且唯一的路径，重新精校该份即可（DeepSeek 引擎会自动分段处理超长文件）`],
       refused: true,
     }
   }
