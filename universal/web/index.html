@@ -118,8 +118,8 @@
     </div>
     <div class="row3" style="margin-top:12px">
       <div><label>核实范围</label><select id="verify"><option value="key">标准（推荐）</option><option value="deep">深度</option><option value="none">关闭</option></select></div>
-      <div><label>小标题</label><select id="heading"><option value="none">自动生成</option><option value="keep">保留原文</option><option value="regenerate">重新生成</option></select></div>
-      <div><label>并发 <span class="opt">可选</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
+      <div><label>小标题</label><select id="heading"><option value="regenerate">重新生成</option><option value="keep">保留原样</option></select></div>
+      <div><label>同时处理的分块数 <span class="opt">留空自动</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
     </div>
     <p class="hint">标准/深度核实会用于精校稿；关闭适合更快、更省额度或不联网的整理。</p>
     <label>输出位置 <span class="opt">留空用 Downloads/&lt;文件名主题&gt;</span></label>
@@ -350,7 +350,10 @@ function persistField(id, key) {
   const isCheck = el.type === 'checkbox'
   const saved = localStorage.getItem(key)
   if (saved !== null) {
-    if (isCheck) el.checked = saved === '1'; else el.value = saved
+    // 下拉框：旧存值若已不在选项里（比如选项后来改过），忽略它，保住默认值
+    const staleOption = el.tagName === 'SELECT' && ![...el.options].some((o) => o.value === saved)
+    if (isCheck) el.checked = saved === '1'
+    else if (!staleOption) el.value = saved
   }
   const save = () => localStorage.setItem(key, isCheck ? (el.checked ? '1' : '0') : el.value)
   el.addEventListener('change', save)
