@@ -969,6 +969,13 @@ function renderGlossary(merged, verified, dedup, a) {
     sec.push('', '## 确认不同指（勿合并）', '> 人工确认：以下各组写法相近但确为不同对象，dedup 勿再标记为疑似同指。')
     for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
   }
+  // P2c follow-up: verbatim-preserved lines re-emitted under their ORIGINAL section titles, at the end. A block
+  // whose title repeats a section rendered above simply reads as a continuation — parseGlossary reads every
+  // matching block (all()), so these lines round-trip stably (unparseable then, unparseable-but-kept now).
+  for (const p of merged.preserved || []) {
+    if (!p || !p.title || !(p.lines || []).length) continue
+    sec.push('', `## ${p.title}`, ...p.lines)
+  }
   return sec.join('\n')
 }
 
@@ -1036,7 +1043,9 @@ function dedupQuestions(dedup) {
 // any line that doesn't match a known grammar is preserved in `extra` so user free-text is
 // never lost. 补核结论 (re-verify addendum) rows are folded into `verified.resolved`.
 function parseEntityLine(l) {
-  const m = l.match(/^- \*\*(.+?)\*\* ← (.*)$/)
+  // Tolerant of minor whitespace variance around `-` and `←` (a hand-edited `**X**←变体` row used to fail this
+  // match and silently vanish — the P2c-follow-up entity-row loss). The render side still emits ` ← ` exactly.
+  const m = l.match(/^-\s+\*\*(.+?)\*\*\s*←\s*(.*)$/)
   if (!m) return null
   // Peel the machine-readable confidence marker off the tail FIRST, so an unmarked (legacy) line yields exactly
   // the same variants/hint as before — the only difference is the added confidence field (defaults to 'unknown').
@@ -1060,8 +1069,18 @@ function parseResolvedLine(body, out) {
 // preamble) is treated as foreign: its entity-looking rows are rescued into 术语 rather than dropped (see below).
 const KNOWN_SECTION = [/^采访背景/, /^发言人统一标注/, /^发言人登记/, /^人名（写法/, /^品牌.*（写法/, /^术语.*（写法/, /^需特别处理的转写错误/, /^各份特别提醒/, /^本轮重新入队复核/, /^联网核实结论/, /^补核结论/, /^写法统一/, /^疑似同指/, /^确认不同指/]
 function parseGlossary(md) {
-  const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [] }
+  const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [], preserved: [] }
   if (!md || !md.trim()) return g
+  // P2c follow-up — verbatim preservation: any content line no section grammar recognizes is kept as
+  // { title, lines } and re-emitted by renderGlossary under the SAME section title, so a formatting-variant row
+  // or a hand-written section is never silently dropped from the cumulative glossary. Dedup by exact line keeps
+  // repeated round-trips stable (a preserved line re-parses into preserved again, once).
+  const keep = (title, line) => {
+    if (!line || !line.trim()) return
+    let b = g.preserved.find((p) => p.title === title)
+    if (!b) { b = { title, lines: [] }; g.preserved.push(b) }
+    if (!b.lines.includes(line)) b.lines.push(line)
+  }
   const lines = md.split('\n')
   const mh = (lines.find((l) => /统一校对表/.test(l)) || '').match(/^#\s*(.+?)\s*统一校对表（采访时间\s*(.+?)）/)
   if (mh) { g.topic = mh[1]; g.date = mh[2] }
@@ -1071,20 +1090,22 @@ function parseGlossary(md) {
   sections.push(cur)
   const all = (re) => sections.filter((s) => re.test(s.title))
   const get = (re) => all(re)[0]
-  const bg = get(/^采访背景/); if (bg) g.background = bg.body.join('\n').trim()
-  const spk = get(/^发言人统一标注/)
-  if (spk) {
+  // Non-entity sections read EVERY matching block (all()), same as the entity sections since the P2c fix — a
+  // concatenated / hand-merged 校对表 repeating `## 写法统一` etc. used to keep only the first block.
+  g.background = all(/^采访背景/).map((s) => s.body.join('\n').trim()).filter(Boolean).join('\n\n')
+  for (const spk of all(/^发言人统一标注/)) {
     let grp = null
     for (const l of spk.body) {
       const mb = l.match(/^\*\*(.+?)\*\*\s*$/)
       if (mb) { grp = { label: mb[1], speakers: [] }; g.speakersByFile.push(grp); continue }
       const ms = l.match(/^- (.+?) → (.+?)(?:（(.+)）)?$/)
-      if (ms && grp) grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' })
+      if (ms && grp) { grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' }); continue }
+      if (!l.startsWith('> ')) keep(spk.title, l)
     }
   }
   // Parse entity rows from EVERY matching section, not just the first. A concatenated or hand-merged 校对表 can
   // repeat the same `## 术语…` header; `sections.find` silently dropped every later block (reproduced data-loss).
-  const parseEntities = (secs) => { const out = []; for (const sec of secs || []) for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else g.extra.push(l) } return out }
+  const parseEntities = (secs) => { const out = []; for (const sec of secs || []) for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else { g.extra.push(l); keep(sec.title, l) } } return out }
   g.people = parseEntities(all(/^人名（写法/))
   g.brands = parseEntities(all(/^品牌.*（写法/))
   g.terms = parseEntities(all(/^术语.*（写法/))
@@ -1094,31 +1115,63 @@ function parseGlossary(md) {
   // has no such rows (all its sections are recognized), so this is a no-op on a clean render→parse round-trip.
   for (const s of sections) {
     if (s.title !== '__preamble__' && KNOWN_SECTION.some((re) => re.test(s.title))) continue
-    for (const l of s.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) g.terms.push({ ...e, hint: mergeHints(e.hint, HEADERLESS_MARK) }) }
+    for (const l of s.body) {
+      const e = l.startsWith('- ') ? parseEntityLine(l) : null
+      if (e) { g.terms.push({ ...e, hint: mergeHints(e.hint, HEADERLESS_MARK) }); continue }
+      // Preamble: the H1 title line is re-generated by renderGlossary; everything else is user text — keep it.
+      if (s.title === '__preamble__') { if (!/统一校对表/.test(l)) keep('（校对表开头的自由文本）', l); continue }
+      // A foreign (unrecognized) section: rows that aren't rescuable entity lines are user content — keep whole.
+      keep(s.title, l)
+    }
   }
-  const errs = get(/^需特别处理的转写错误/)
-  if (errs) for (const l of errs.body) { const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/); if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] }) }
-  const nt = get(/^各份特别提醒/)
-  if (nt) for (const l of nt.body) { const m = l.match(/^- (.+)$/); if (m) g.notes.push(m[1]) }
-  for (const vsec of [get(/^联网核实结论/), get(/^补核结论/)]) {
-    if (!vsec) continue
+  for (const errs of all(/^需特别处理的转写错误/)) {
+    for (const l of errs.body) {
+      const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/)
+      if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] })
+      else if (!l.startsWith('> ')) keep(errs.title, l)
+    }
+  }
+  for (const nt of all(/^各份特别提醒/)) {
+    for (const l of nt.body) {
+      const m = l.match(/^- (.+)$/)
+      if (m) g.notes.push(m[1])
+      else if (!l.startsWith('> ')) keep(nt.title, l)
+    }
+  }
+  for (const vsec of [...all(/^联网核实结论/), ...all(/^补核结论/)]) {
     for (const l of vsec.body) {
-      if (!l.startsWith('- ')) continue
+      if (!l.startsWith('- ')) { if (!l.startsWith('> ')) keep(vsec.title, l); continue }
       const body = l.slice(2)
       const un = body.match(/^(.+?)：未能核实，保留（音）(?:\s*｜\s*(.*))?$/)
       if (un) { g.verified.unresolved.push({ query: un[1], note: un[2] || '' }); continue }
-      if (!parseResolvedLine(body, g.verified.resolved)) g.extra.push(l)
+      const pk = body.match(/^(.+?)：公开核实不足；按发言人信息使用(?:\s*｜\s*(.*))?$/)
+      if (pk) { g.verified.unresolved.push({ query: pk[1], note: pk[2] || '' }); continue }
+      if (!parseResolvedLine(body, g.verified.resolved)) { g.extra.push(l); keep(vsec.title, l) }
     }
   }
-  const dr = get(/^写法统一/)
-  if (dr) for (const l of dr.body) {
-    const m = l.match(/^- (.+?) → 统一写 \*\*(.+?)\*\*（(.*)）$/)
-    if (m) { const members = m[1].split(' / ').map((x) => x.trim()).filter(Boolean); if (!members.includes(m[2])) members.push(m[2]); g.dedupSuspects.push({ members, kind: 'term', preferred: m[2], why: m[3] }) }
+  for (const dr of all(/^写法统一/)) {
+    for (const l of dr.body) {
+      // The （why） tail is OPTIONAL on parse (render always emits it): a hand-trimmed directive row without a
+      // reason used to fail this match and vanish — the P2c-follow-up 写法统一 section loss.
+      const m = l.match(/^- (.+?) → 统一写 \*\*(.+?)\*\*(?:（(.*)）)?\s*$/)
+      if (m) { const members = m[1].split(' / ').map((x) => x.trim()).filter(Boolean); if (!members.includes(m[2])) members.push(m[2]); g.dedupSuspects.push({ members, kind: 'term', preferred: m[2], why: m[3] || '同一对象的不同写法（沿用往次校对表）' }) }
+      else if (!l.startsWith('> ')) keep(dr.title, l)
+    }
   }
-  const fl = get(/^疑似同指/)
-  if (fl) for (const l of fl.body) { const m = l.match(/^- (.+?)（(.+?)）：(.*)$/); if (m) g.dedupSuspects.push({ members: m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean), kind: m[2], why: m[3] }) }
-  const dn = get(/^确认不同指/)
-  if (dn) for (const l of dn.body) { const m = l.match(/^- (.+)$/); if (m) { const grp = m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean); if (grp.length >= 2) g.doNotMerge.push(grp) } }
+  for (const fl of all(/^疑似同指/)) {
+    for (const l of fl.body) {
+      const m = l.match(/^- (.+?)（(.+?)）：(.*)$/)
+      if (m) g.dedupSuspects.push({ members: m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean), kind: m[2], why: m[3] })
+      else if (!l.startsWith('> ')) keep(fl.title, l)
+    }
+  }
+  for (const dn of all(/^确认不同指/)) {
+    for (const l of dn.body) {
+      const m = l.match(/^- (.+)$/)
+      if (m) { const grp = m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean); if (grp.length >= 2) g.doNotMerge.push(grp); else keep(dn.title, l) }
+      else if (!l.startsWith('> ')) keep(dn.title, l)
+    }
+  }
   // 发言人登记（跨访谈）is a derived view of speakersByFile — re-generated by renderGlossary, so we don't
   // parse it back (its lines are simply never visited, never landing in `extra`).
   return g
@@ -1158,7 +1211,20 @@ function mergeIntoPrior(prior, fresh) {
     speakersByFile: speakers,
     errors: [...(prior.errors || []), ...(fresh.errors || [])],
     notes: Array.from(new Set([...(prior.notes || []), ...(fresh.notes || [])])),
+    preserved: mergePreserved(prior.preserved, fresh.preserved),
   }
+}
+// P2c follow-up: verbatim-preserved lines (see parseGlossary's `keep`) accumulate append-only across batches,
+// deduped by exact line within a section title, so nothing hand-written is ever dropped and nothing multiplies.
+function mergePreserved(a, b) {
+  const out = []
+  for (const p of [...(a || []), ...(b || [])]) {
+    if (!p || !p.title || !(p.lines || []).length) continue
+    let home = out.find((x) => x.title === p.title)
+    if (!home) { home = { title: p.title, lines: [] }; out.push(home) }
+    for (const l of p.lines) if (!home.lines.includes(l)) home.lines.push(l)
+  }
+  return out
 }
 // Carry prior verify conclusions forward; fresh overrides prior for the same query; a resolved query
 // is removed from unresolved.
