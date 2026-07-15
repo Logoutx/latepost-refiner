@@ -7,7 +7,9 @@
 //   node bench/search-api/run-retrieval.mjs --cases <path.json> --providers tavily,serper --k 5 --out <dir>
 //
 // Case file schema (see README):
-//   { cases: [ { id, query, kind:'expect'|'trap'|'unverifiable', expect:[…], traps:[…], hints:[…], note } ] }
+//   { cases: [ { id, query, kind:'expect'|'trap'|'unverifiable', expect:[…], traps:[…], hints:[…], group, note } ] }
+//   group (optional string) buckets cases (e.g. a 敏感词 set) — the summary adds a per-group × provider table,
+//   which is the headline comparison. Missing group → "default".
 //
 // Writes into <dir>:  <provider>.raw.jsonl  (one line per case)  +  summary.md  (tables).
 // Providers run one at a time (serial); within a provider, cases run in parallel capped at 3.
@@ -17,40 +19,45 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pLimit from 'p-limit'
 import { getAdapter, PROVIDERS, KEY_ENV, UNVERIFIED } from './adapters.js'
+import { loadEnvFile } from './env-file.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
-// ---- minimal .env loader (keeps this bench decoupled from the product runtime) --------------------
-function loadDotEnv(file) {
-  if (!fs.existsSync(file)) return
-  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
-    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
-    if (!m || process.env[m[1]] !== undefined) continue
-    let v = m[2].trim()
-    const q = v.match(/^(['"])([\s\S]*)\1$/)
-    process.env[m[1]] = q ? q[2] : v.replace(/\s+#.*$/, '').trim()
-  }
+// Auto-load a repo-root / cwd .env if present (keys not already set). The owner's search-API keys live in a
+// keys.env inside the research vault instead — pass it with --keys-file (handled in main, before adapters run).
+for (const f of [path.join(REPO_ROOT, '.env'), path.join(process.cwd(), '.env')]) {
+  if (fs.existsSync(f)) loadEnvFile(f)
 }
-loadDotEnv(path.join(REPO_ROOT, '.env'))
-loadDotEnv(path.join(process.cwd(), '.env'))
 
 // ---- args ----------------------------------------------------------------------------------------
+// NOTE: the flag is --keys-file, NOT --env-file. `--env-file` is a Node.js BUILT-IN option that Node
+// intercepts even after the script path (aborting on a missing file before our code runs), so we use a
+// collision-free name. --env-file is accepted as a best-effort alias for environments where Node passes
+// it through, but --keys-file is the reliable, documented flag.
 function parseArgs(argv) {
-  const a = { k: 5, providers: null, cases: null, out: null }
+  const a = { k: 5, providers: null, cases: null, out: null, keysFile: null }
   for (let i = 0; i < argv.length; i += 1) {
     const t = argv[i]
     if (t === '--cases') a.cases = argv[++i]
     else if (t === '--providers') a.providers = argv[++i]
     else if (t === '--k') a.k = Number(argv[++i])
     else if (t === '--out') a.out = argv[++i]
+    else if (t === '--keys-file' || t === '--env-file') a.keysFile = argv[++i]
     else if (t === '--help' || t === '-h') a.help = true
   }
   return a
 }
 
-const USAGE = 'usage: node bench/search-api/run-retrieval.mjs --cases <path.json> --providers tavily,serper --k 5 --out <dir>'
+const USAGE = 'usage: node bench/search-api/run-retrieval.mjs --cases <path.json> [--keys-file <keys.env>] --providers tavily,serper --k 5 --out <dir>'
+
+// Load an explicit keys file into process.env. Prints COUNTS and bad LINE NUMBERS only — never any value.
+function applyKeysFile(keysFile) {
+  const p = path.resolve(keysFile)
+  if (!fs.existsSync(p)) { console.error(`--keys-file 不存在：${p}`); process.exit(2) }
+  const { loaded, skipped, badLines } = loadEnvFile(p)
+  if (badLines.length) console.error(`⚠ keys 文件第 ${badLines.join(', ')} 行无法解析（已跳过）`)
+  process.stderr.write(`· keys 文件载入 ${loaded} 个变量（${skipped} 个已存在、未覆盖）\n`) // counts only, no keys/values
+}
 
 // ---- scoring (deterministic) ---------------------------------------------------------------------
 // NFKC folds full-width ASCII/digits to half-width; strip all whitespace (pangu spaces, ASR spacing);
@@ -90,7 +97,7 @@ async function runProvider(name, cases, k, outDir) {
     const results = await adapter(c.query, { k })
     const clean = results.map((x) => ({ title: x.title, url: x.url, snippet: x.snippet }))
     return {
-      id: c.id, query: c.query, kind: c.kind, provider: name,
+      id: c.id, query: c.query, kind: c.kind, group: c.group || 'default', provider: name,
       latencyMs: results.latencyMs, status: results.status, error: results.error,
       shapeError: results.shapeError, score: scoreCase(c, clean), results: clean,
     }
@@ -100,7 +107,7 @@ async function runProvider(name, cases, k, outDir) {
 }
 
 // ---- aggregate + render --------------------------------------------------------------------------
-function aggregate(name, rows) {
+export function aggregate(name, rows) {
   const agg = { provider: name, expect: [0, 0], trap: [0, 0], unv: [0, 0], failures: 0, shapeError: false, missingKey: false, latencies: [] }
   for (const r of rows) {
     if (typeof r.latencyMs === 'number' && r.latencyMs > 0) agg.latencies.push(r.latencyMs)
@@ -117,22 +124,46 @@ function aggregate(name, rows) {
 
 const frac = ([hit, tot]) => (tot ? `${hit}/${tot} (${Math.round((hit / tot) * 100)}%)` : '—')
 
-function renderSummary(caseFile, cases, k, aggs, rowsByProvider) {
-  const counts = { expect: 0, trap: 0, unverifiable: 0 }
-  for (const c of cases) counts[c.kind] = (counts[c.kind] || 0) + 1
-  const L = []
-  L.push('# 搜索 API 检索评测（不带模型，可复现）', '')
-  L.push(`- 用例文件：\`${caseFile}\``)
-  L.push(`- 共 ${cases.length} 条：期望题 ${counts.expect} · 陷阱题 ${counts.trap} · 查不到题 ${counts.unverifiable}`)
-  L.push(`- 每题取前 ${k} 条结果 · 生成时间 ${new Date().toISOString()}`, '')
+// Distinct group labels in first-seen order (missing group → "default").
+export function distinctGroups(cases) {
+  const seen = new Set()
+  const out = []
+  for (const c of cases) { const g = c.group || 'default'; if (!seen.has(g)) { seen.add(g); out.push(g) } }
+  return out
+}
 
-  L.push('## 每家一行汇总', '')
-  L.push('| 搜索源 | 期望命中（该出现的都出现） | 陷阱命中（越低越好） | 查不到题保持诚实 | 平均延迟(ms) | 失败次数 | 备注 |')
-  L.push('|---|---|---|---|---|---|---|')
+// One markdown table (header + a row per provider aggregate). Shared by the overall and per-group tables.
+function aggTable(aggs) {
+  const L = ['| 搜索源 | 期望命中（该出现的都出现） | 陷阱命中（越低越好） | 查不到题保持诚实 | 平均延迟(ms) | 失败次数 | 备注 |', '|---|---|---|---|---|---|---|']
   for (const a of aggs) {
     const note = a.missingKey ? `缺 key（${KEY_ENV[a.provider]}）` : (a.shapeError ? '⚠ 形状不符，需修 adapters.js' : (UNVERIFIED.has(a.provider) ? '形状未证实' : ''))
     L.push(`| ${a.provider} | ${frac(a.expect)} | ${frac(a.trap)} | ${frac(a.unv)} | ${a.meanLatency ?? '—'} | ${a.failures} | ${note} |`)
   }
+  return L
+}
+
+function renderSummary(caseFile, cases, k, providers, aggs, rowsByProvider) {
+  const counts = { expect: 0, trap: 0, unverifiable: 0 }
+  for (const c of cases) counts[c.kind] = (counts[c.kind] || 0) + 1
+  const groups = distinctGroups(cases)
+  const groupCount = (g) => cases.filter((c) => (c.group || 'default') === g).length
+  const L = []
+  L.push('# 搜索 API 检索评测（不带模型，可复现）', '')
+  L.push(`- 用例文件：\`${caseFile}\``)
+  L.push(`- 共 ${cases.length} 条：期望题 ${counts.expect} · 陷阱题 ${counts.trap} · 查不到题 ${counts.unverifiable}`)
+  L.push(`- 分组 ${groups.length} 个：${groups.map((g) => `${g}(${groupCount(g)})`).join(' · ')}`)
+  L.push(`- 每题取前 ${k} 条结果 · 生成时间 ${new Date().toISOString()}`, '')
+
+  // Headline: per-group × provider. This is the comparison that matters (e.g. a 敏感词 group's per-provider deltas).
+  L.push('## 分组对比（各组 × 各家）— headline', '')
+  for (const g of groups) {
+    L.push(`### 组：${g}（${groupCount(g)} 题）`, '')
+    const groupAggs = providers.map((p) => aggregate(p, rowsByProvider[p].filter((r) => r.group === g)))
+    L.push(...aggTable(groupAggs), '')
+  }
+
+  L.push('## 全部用例汇总（每家一行）', '')
+  L.push(...aggTable(aggs))
   L.push('')
 
   // per-case detail: one row per case, one column per provider, a symbol per cell
@@ -165,6 +196,9 @@ async function main() {
   if (args.help || !args.cases || !args.out) { console.log(USAGE); process.exit(args.help ? 0 : 2) }
   if (!Number.isFinite(args.k) || args.k <= 0) { console.error(`--k 需为正整数`); process.exit(2) }
 
+  // Load the owner's keys.env (from the vault) BEFORE any adapter reads a key. Counts/line-numbers only, no values.
+  if (args.keysFile) applyKeysFile(args.keysFile)
+
   const caseText = fs.readFileSync(path.resolve(args.cases), 'utf8')
   const parsed = JSON.parse(caseText)
   const cases = parsed.cases
@@ -172,6 +206,9 @@ async function main() {
   for (const c of cases) {
     if (!c.id || !c.query || !['expect', 'trap', 'unverifiable'].includes(c.kind)) {
       console.error(`用例格式错误（需 id / query / kind∈{expect,trap,unverifiable}）：${JSON.stringify(c)}`); process.exit(2)
+    }
+    if (c.group !== undefined && typeof c.group !== 'string') {
+      console.error(`用例 ${c.id} 的 group 需为字符串`); process.exit(2)
     }
   }
 
@@ -190,7 +227,7 @@ async function main() {
     aggs.push(aggregate(name, rows))
   }
 
-  const summary = renderSummary(path.resolve(args.cases), cases, args.k, aggs, rowsByProvider)
+  const summary = renderSummary(path.resolve(args.cases), cases, args.k, providers, aggs, rowsByProvider)
   const summaryPath = path.join(outDir, 'summary.md')
   fs.writeFileSync(summaryPath, summary, 'utf8')
 

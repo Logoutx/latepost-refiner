@@ -32,6 +32,26 @@
 
 第二层复现还需要 `DEEPSEEK_API_KEY`（精校流水线只用 DeepSeek）。
 
+### 用 `--keys-file` 从密钥文件读 key（推荐）
+
+为了让 key 的值不经过对话，把各家 key 写进研究库里的一份 `keys.env`（不入库），跑的时候用 `--keys-file` 指过去。两个 runner 都支持：
+
+```
+node bench/search-api/run-retrieval.mjs --cases <题库.json> --keys-file ~/研究库/keys.env --providers tavily,bocha,brave --k 5 --out <输出目录>
+```
+
+`keys.env` 格式就是一行一个 `KEY=VALUE`（`#` 开头的行和空行忽略；值两边的引号可留可不留）：
+
+```
+TAVILY_API_KEY=tvly-xxxx
+BOCHA_API_KEY="bo-cha-xxxx"
+BRAVE_API_KEY=brv-xxxx
+```
+
+规则：只给「当前还没设」的变量赋值（shell 里已导出的同名变量优先，不覆盖），且在读到各家 key 之前就载入好。runner 只会打印「载入了几个变量」这样的计数；哪一行解析不了，只报行号，绝不打印任何 key 值。
+
+> 为什么是 `--keys-file` 而不是 `--env-file`：`--env-file` 是 Node.js 自带的启动选项，Node 会抢先处理它（文件不存在时，Node 会在脚本跑起来前就用自己的报错退出），所以这里换了个不冲突的名字。`--env-file` 仍作为别名接受，但请以 `--keys-file` 为准。
+
 ---
 
 ## 第一层：检索评测
@@ -39,12 +59,14 @@
 ```
 node bench/search-api/run-retrieval.mjs \
   --cases <题库.json> \
+  --keys-file <keys.env> \
   --providers tavily,serper,brave \
   --k 5 \
   --out <输出目录>
 ```
 
 - `--cases`：题库文件路径（schema 见下）。样例用 `bench/search-api/cases.sample.json`，真实题库指向研究库里那份不入库的文件。
+- `--keys-file`：密钥文件路径（可选，见上）。
 - `--providers`：逗号分隔的搜索源名；不填则跑全部六家。
 - `--k`：每题取前几条结果，默认 5。
 - `--out`：输出目录（自动创建）。
@@ -53,8 +75,8 @@ node bench/search-api/run-retrieval.mjs \
 
 输出到 `--out`：
 
-- `<搜索源>.raw.jsonl`：每家一份，一行一道题，含原始返回结果、延迟、错误、打分。
-- `summary.md`：两张表——每家一行的汇总，加逐题明细。
+- `<搜索源>.raw.jsonl`：每家一份，一行一道题，含原始返回结果、延迟、错误、打分、所属分组。
+- `summary.md`：分组对比表（headline：每个分组一张「各家一行」的表）、全部用例汇总表、逐题明细。
 
 ### 打分规则（都在前 k 条的标题＋摘要拼起来的文本上判定）
 
@@ -65,6 +87,10 @@ node bench/search-api/run-retrieval.mjs \
 - 查不到题（`unverifiable`）：这类题问的是查不到、不该有答案的细节。诚实=要么返回空结果，要么前 k 条里不出现任何「线索词（hints）」（即没有硬凑出一个像模像样的答案）。「保持诚实率」越高越好。
 
 另外每家还报：平均延迟（毫秒）、失败次数（HTTP 错误／超时／形状不符／缺 key）。
+
+### 分组对比（headline）
+
+题库里每道题可带一个可选的 `group` 字段（字符串，缺省算 `default`）。汇总里除了「全部用例」的总表，还会按分组再出一组表：每个分组一张「各家一行」的表，列还是那五项（期望命中、陷阱命中、诚实、延迟、失败）。这组分组表是这套评测最想看的东西——比如一组「敏感词」用例，重点就是看各家在这一组上的差别。分组表放在汇总最前面。
 
 ---
 
@@ -77,6 +103,7 @@ node bench/search-api/run-retrieval.mjs \
       "id": "唯一编号",
       "query": "实际发给搜索源的中文查询",
       "kind": "expect | trap | unverifiable",   // 题型
+      "group": "分组名",                          // 可选：把用例分组横比，缺省为 default
       "expect": ["期望出现的写法", "..."],        // expect 题用：这些必须全部出现
       "traps":  ["不该被当正名的误写", "..."],    // trap 题用：任一出现即陷阱命中
       "hints":  ["会暴露编造答案的线索词", "..."], // unverifiable 题用：出现即视为不诚实
@@ -86,7 +113,7 @@ node bench/search-api/run-retrieval.mjs \
 }
 ```
 
-三个数组按题型各取所需，用不到的留空数组即可。样例见 `cases.sample.json`。
+三个数组按题型各取所需，用不到的留空数组即可。样例见 `cases.sample.json`（用 `names_brands` 与 `traps_unfindable` 两组演示分组表）。
 
 ---
 
@@ -98,6 +125,7 @@ node bench/search-api/run-retrieval.mjs \
 node bench/search-api/run-verify-replay.mjs \
   --source <访谈转录.md/.txt/.docx…> \
   --background-file <背景.md> \
+  --keys-file <keys.env> \
   --provider tavily \
   --k 5 \
   --verify-depth key \
@@ -106,6 +134,7 @@ node bench/search-api/run-verify-replay.mjs \
 
 - `--source`：一份真实访谈转录（支持 `.md/.txt/.docx/.pdf/.pptx/.xlsx/.srt`，非文本格式会先转成 markdown，和产品里一致）。
 - `--background-file`：一份背景说明 markdown（公司／人物背景，给核实阶段当上下文）；可选。
+- `--keys-file`：密钥文件路径（可选，见上；可同时带 `DEEPSEEK_API_KEY` 和这家搜索源的 key）。
 - `--provider`：用哪家搜索源（六家之一）。
 - `--k`：每次搜索取前几条，默认 5，和第一层对齐才好比。
 - `--verify-depth`：`key`（只核关键实体，默认）或 `deep`（全核）。
@@ -135,6 +164,7 @@ node bench/search-api/run-verify-replay.mjs \
 ## 文件一览
 
 - `adapters.js`：六家搜索源的归一化适配器。统一契约 `search(query, { k }) → [{ title, url, snippet }]`；失败返回空数组，并在数组上挂 `.latencyMs / .status / .error / .shapeError`（不影响 JSON 序列化）。仅供评测用，不进产品路径。
+- `env-file.js`：`--keys-file` 的密钥文件加载器（只给未设变量赋值；只报计数和坏行行号，绝不打印 key 值）。
 - `run-retrieval.mjs`：第一层，检索评测。
 - `run-verify-replay.mjs`：第二层，核实复现。
-- `cases.sample.json`：5 条虚构样例题。
+- `cases.sample.json`：5 条虚构样例题（两组）。

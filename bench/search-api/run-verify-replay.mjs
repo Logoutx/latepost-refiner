@@ -24,12 +24,15 @@ import { runPipeline } from '../../core/pipeline.js'
 import { makeDeepSeekEngine } from '../../engines/deepseek.js'
 import { ONE_PASS_CHARS } from '../../core/spec.js'
 import { getAdapter, PROVIDERS, KEY_ENV, UNVERIFIED } from './adapters.js'
+import { loadEnvFile } from './env-file.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-const USAGE = 'usage: node bench/search-api/run-verify-replay.mjs --source <transcript> [--background-file <md>] --provider <name> [--k 5] [--verify-depth key|deep] --out <dir>'
+const USAGE = 'usage: node bench/search-api/run-verify-replay.mjs --source <transcript> [--background-file <md>] [--keys-file <keys.env>] --provider <name> [--k 5] [--verify-depth key|deep] --out <dir>'
 
+// NOTE: the flag is --keys-file, NOT --env-file — `--env-file` is a Node.js BUILT-IN option Node intercepts
+// (it aborts on a missing file before our code runs). --env-file is accepted as a best-effort alias only.
 function parseArgs(argv) {
-  const a = { k: 5, verifyDepth: 'key', topic: 'verify-replay', date: '' }
+  const a = { k: 5, verifyDepth: 'key', topic: 'verify-replay', date: '', keysFile: null }
   for (let i = 0; i < argv.length; i += 1) {
     const t = argv[i]
     if (t === '--source') a.source = argv[++i]
@@ -40,9 +43,19 @@ function parseArgs(argv) {
     else if (t === '--topic') a.topic = argv[++i]
     else if (t === '--date') a.date = argv[++i]
     else if (t === '--out') a.out = argv[++i]
+    else if (t === '--keys-file' || t === '--env-file') a.keysFile = argv[++i]
     else if (t === '--help' || t === '-h') a.help = true
   }
   return a
+}
+
+// Load an explicit keys file into process.env. Prints COUNTS and bad LINE NUMBERS only — never any value.
+function applyKeysFile(keysFile) {
+  const p = path.resolve(keysFile)
+  if (!fs.existsSync(p)) { console.error(`--keys-file 不存在：${p}`); process.exit(2) }
+  const { loaded, skipped, badLines } = loadEnvFile(p)
+  if (badLines.length) console.error(`⚠ keys 文件第 ${badLines.join(', ')} 行无法解析（已跳过）`)
+  process.stderr.write(`· keys 文件载入 ${loaded} 个变量（${skipped} 个已存在、未覆盖）\n`) // counts only, no keys/values
 }
 
 async function main() {
@@ -51,6 +64,9 @@ async function main() {
   if (!PROVIDERS.includes(args.provider)) { console.error(`未知 provider：${args.provider}（可选：${PROVIDERS.join(', ')}）`); process.exit(2) }
   if (!['key', 'deep'].includes(args.verifyDepth)) { console.error(`--verify-depth 需为 key 或 deep（none 无核实可复现）`); process.exit(2) }
   if (!Number.isFinite(args.k) || args.k <= 0) { console.error('--k 需为正整数'); process.exit(2) }
+
+  // Load the owner's keys.env (from the vault) BEFORE any key read. Only-if-unset; counts/line-numbers only.
+  if (args.keysFile) applyKeysFile(args.keysFile)
 
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) { console.error('未设 DEEPSEEK_API_KEY（精校流水线只用 DeepSeek）'); process.exit(2) }
