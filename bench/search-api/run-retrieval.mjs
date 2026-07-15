@@ -43,6 +43,7 @@ function parseArgs(argv) {
     else if (t === '--k') a.k = Number(argv[++i])
     else if (t === '--out') a.out = argv[++i]
     else if (t === '--keys-file' || t === '--env-file') a.keysFile = argv[++i]
+    else if (t === '--concurrency') a.concurrency = Number(argv[++i])
     else if (t === '--help' || t === '-h') a.help = true
   }
   return a
@@ -90,11 +91,25 @@ export function scoreCase(c, results) {
 }
 
 // ---- per-provider run ----------------------------------------------------------------------------
-async function runProvider(name, cases, k, outDir) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Retry a rate-limited call (HTTP 429) with backoff — some providers (博查) throttle hard even at
+// 3-concurrent. Waits 1.5s / 4s / 10s between attempts; returns the last result either way.
+async function searchWithRetry(adapter, query, k) {
+  let results = await adapter(query, { k })
+  for (const wait of [1500, 4000, 10000]) {
+    if (results.status !== 429) return results
+    await sleep(wait)
+    results = await adapter(query, { k })
+  }
+  return results
+}
+
+async function runProvider(name, cases, k, outDir, concurrency) {
   const adapter = getAdapter(name)
-  const limit = pLimit(3) // cases in parallel, capped at 3
+  const limit = pLimit(concurrency) // cases in parallel
   const rows = await Promise.all(cases.map((c) => limit(async () => {
-    const results = await adapter(c.query, { k })
+    const results = await searchWithRetry(adapter, c.query, k)
     const clean = results.map((x) => ({ title: x.title, url: x.url, snippet: x.snippet }))
     return {
       id: c.id, query: c.query, kind: c.kind, group: c.group || 'default', provider: name,
@@ -222,7 +237,7 @@ async function main() {
   const rowsByProvider = {}
   for (const name of providers) { // serial per provider
     process.stderr.write(`▸ ${name} …\n`)
-    const rows = await runProvider(name, cases, args.k, outDir)
+    const rows = await runProvider(name, cases, args.k, outDir, Math.max(1, args.concurrency || 3))
     rowsByProvider[name] = rows
     aggs.push(aggregate(name, rows))
   }

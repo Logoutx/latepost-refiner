@@ -123,7 +123,7 @@ async function bocha(query, { k = 5 } = {}) {
   if (!key) return missingKey('bocha')
   const t0 = Date.now()
   try {
-    const r = await fetch('https://open.bochaai.com/v1/web-search', {
+    const r = await fetch('https://api.bochaai.com/v1/web-search', {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, count: k, summary: true }),
