@@ -168,3 +168,7 @@ node bench/search-api/run-verify-replay.mjs \
 - `run-retrieval.mjs`：第一层，检索评测。
 - `run-verify-replay.mjs`：第二层，核实复现。
 - `cases.sample.json`：5 条虚构样例题（两组）。
+
+## 第一轮结论（2026-07-15，owner 拍板）
+
+47 题三组实测（常规中文 / 敏感词 / 英文 AI）：Tavily 纯检索综合最高（86%，常规中文满分、延迟 508ms、无失败），**继续作为 DeepSeek 版的默认搜索**。博查 81% 且最快（105ms），敏感词组无过滤迹象，可作后备；Brave 83%。Claude 会话搜索合计 93%（敏感词组 88% 领先 25 个百分点），但单次约 17-19 秒、每次约 6,000 tokens 订阅额度——留在 Claude Code 版自用，不引入 API 版。完整数据在研究库 `_search-bench/round1/summary.md`。
