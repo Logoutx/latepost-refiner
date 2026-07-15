@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, REFINE_CHAR_BUDGET, SOURCE_PROTECTION_NOTE } from '../engines/deepseek.js'
+import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, REFINE_CHAR_BUDGET, SOURCE_PROTECTION_NOTE, formatSearchResults } from '../engines/deepseek.js'
 
 // The Universal edition supports exactly ONE API provider — DeepSeek — with two FIXED models: v4-flash for the
 // mechanical tiers (scout/check/dedup/stitch → haiku/sonnet) and v4-pro for the writing tiers (refine/logic/
@@ -150,6 +150,60 @@ test('Tavily web tools are only exposed to online (verify/timeline) labels', asy
   const tlEngine = makeDeepSeekEngine({ client: tlClient, concurrency: 1 })
   await tlEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'timeline:company' })
   assert.equal(toolNames(tlClient.calls[0]).includes('web_search'), true)
+})
+
+// ---- searchFn override (bench/tests): swap the web_search backend, Tavily default unchanged --------------
+// The Universal edition ships Tavily-only, but makeDeepSeekEngine takes a programmatic `searchFn` override so
+// the bench can drive verify against an alternative adapter. It is NOT wired to any CLI flag or env var.
+
+test('searchFn override: online web_search routes to the injected adapter with (query, {k}); results reach the model', async () => {
+  const calls = []
+  const searchFn = async (query, opts) => {
+    calls.push({ query, opts })
+    return [{ title: '沈其安', url: 'https://example.com/team', snippet: '云洲仪器 创始人 沈其安 简介' }]
+  }
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '沈其安 云洲仪器' })] }),
+    completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, searchFn, searchK: 5 })
+
+  const result = await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
+  assert.deepEqual(result, { ok: true })
+  assert.equal(calls.length, 1, 'searchFn called exactly once')
+  assert.deepEqual(calls[0], { query: '沈其安 云洲仪器', opts: { k: 5 } }, 'searchFn got the query and {k}')
+  // The adapter's normalized result is formatted and fed back to the model as the web_search tool result.
+  const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
+  assert.match(toolMsg.content, /沈其安/, 'the adapter snippet reached the model')
+  assert.match(toolMsg.content, /example\.com\/team/, 'the adapter url is rendered')
+})
+
+test('default (no searchFn): web_search uses the built-in Tavily path — proven by its no-key message, no network', async () => {
+  const prev = process.env.TAVILY_API_KEY
+  delete process.env.TAVILY_API_KEY   // force Tavily's graceful no-key branch (returns before any fetch)
+  try {
+    const client = mockClient([
+      completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
+      completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
+    ])
+    const engine = makeDeepSeekEngine({ client, concurrency: 1 })   // no searchFn
+    await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
+    const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
+    assert.match(toolMsg.content, /未配置 TAVILY_API_KEY/, 'default routed to Tavily (its no-key message), so searchFn did not intercept')
+  } finally {
+    if (prev === undefined) delete process.env.TAVILY_API_KEY
+    else process.env.TAVILY_API_KEY = prev
+  }
+})
+
+test('formatSearchResults renders the normalized adapter shape like the Tavily branch (empty → 无结果)', () => {
+  assert.equal(formatSearchResults([]), '无结果')
+  assert.equal(formatSearchResults(null), '无结果')
+  const txt = formatSearchResults([{ title: 'T1', url: 'https://a', snippet: 'S1' }, { title: 'T2', url: 'https://b', snippet: 'S2' }])
+  assert.match(txt, /^1\. T1\n   https:\/\/a\n   S1\n2\. T2\n   https:\/\/b\n   S2$/, 'numbered title/url/snippet block')
+  // snippet is capped at 500 chars, matching the Tavily branch
+  assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(500)), true)
+  assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(501)), false)
 })
 
 test('DeepSeek forces structured_output via tool_choice after two nudges', async () => {

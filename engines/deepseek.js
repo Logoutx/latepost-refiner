@@ -9,8 +9,10 @@
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
 //               Non-thinking tiers on purpose: DeepSeek's thinking mode disables function calling.
-//   • Web       Tavily ONLY (TAVILY_API_KEY), a CLIENT-side web_search + web_fetch pair injected on
-//               the online stages (verify/timeline). Absent key → graceful degrade to no-verify.
+//   • Web       Tavily by default (TAVILY_API_KEY): a CLIENT-side web_search + web_fetch pair injected on
+//               the online stages (verify/timeline). Absent key → graceful degrade to no-verify. An optional
+//               programmatic `searchFn` override (bench/tests only — NO CLI flag, NO env switch) swaps the
+//               web_search backend for a normalized adapter; web_fetch is unchanged. See makeDeepSeekEngine.
 //   • Structured output via a forced function call (tool_choice), which DeepSeek supports.
 //
 // Client tools Read/Write/Edit share fileops.js. Offline stages never receive web tools.
@@ -118,6 +120,17 @@ async function webFetch(url) {
   } catch (e) { return `web_fetch 出错：${e.message}` }
 }
 
+// Render normalized adapter results ([{title,url,snippet}]) into the same text block webSearch returns for
+// Tavily, so the online agents see an identical tool-result contract whichever backend produced them. Pure +
+// exported for unit testing. (Adapters carry no synthesized answer, so there is no 摘要 line — snippets only.)
+export function formatSearchResults(results) {
+  const list = Array.isArray(results) ? results : []
+  const text = list
+    .map((x, i) => `${i + 1}. ${(x && x.title) || ''}\n   ${(x && x.url) || ''}\n   ${String((x && x.snippet) || '').slice(0, 500)}`)
+    .join('\n')
+  return text || '无结果'
+}
+
 // Tier word / raw id → DeepSeek model id. Unknown tier → v4-pro (the safe, faithful writing model).
 const resolveModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
 
@@ -127,6 +140,8 @@ export function makeDeepSeekEngine(opts = {}) {
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     filePolicy,
     onPhase, onLog,
+    searchFn,        // optional programmatic web_search override (bench/tests only) — replaces Tavily on online stages
+    searchK = 5,     // k passed to searchFn; 5 matches Tavily's max_results default
   } = opts
   if (!opts.client && !apiKey) throw new Error('makeDeepSeekEngine: 缺少 DEEPSEEK_API_KEY')
 
@@ -150,10 +165,23 @@ export function makeDeepSeekEngine(opts = {}) {
     return comp
   }
 
+  // web_search backend: the injected searchFn override (bench/tests) or the built-in Tavily path. The override
+  // receives (query, {k}) and returns the normalized adapter shape [{title,url,snippet}]; we format it exactly
+  // like the Tavily branch so the online agents' tool-result contract is unchanged. web_fetch is never overridden
+  // (adapters are search-only). Default (no searchFn) → webSearch, byte-for-byte the prior behaviour.
+  async function runWebSearch(query) {
+    if (!searchFn) return await webSearch(query)
+    try {
+      return formatSearchResults(await searchFn(query, { k: searchK }))
+    } catch (e) {
+      return `web_search 出错：${e.message}`
+    }
+  }
+
   async function execTool(call) {
     const name = call.function && call.function.name
     const args = parseJSON(call.function && call.function.arguments) || {}
-    if (name === 'web_search') return await webSearch(args.query || '')
+    if (name === 'web_search') return await runWebSearch(args.query || '')
     if (name === 'web_fetch') return await webFetch(args.url || '')
     return runFileTool(name, args, safeFilePolicy).text // Read / Write / Edit
   }
