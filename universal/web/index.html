@@ -33,6 +33,7 @@
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
   label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 5px; }
   label .opt { color: var(--muted); font-weight: 400; }
+  label a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
   input[type=text], input[type=password], input[type=number], select, textarea {
     width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
     background: var(--bg); color: var(--ink); font: inherit; font-size: 14px;
@@ -79,16 +80,16 @@
     <h2>密钥</h2>
     <div class="row">
       <div>
-        <label>DeepSeek API Key</label>
+        <label><a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">DeepSeek API Key</a></label>
         <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
       <div>
-        <label>Tavily API Key <span class="opt">联网核实/时间线用，可留空</span></label>
-        <input type="password" id="tavilyKey" placeholder="留空则不联网核实" autocomplete="off">
+        <label><a href="https://app.tavily.com/home" target="_blank" rel="noopener">Tavily API Key</a> <span class="opt">联网核实/时间线用</span></label>
+        <input type="password" id="tavilyKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
     </div>
     <p class="hint">DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。涉敏感话题或需保护信源的访谈请慎用。</p>
-    <p class="hint">未填 Tavily 时，标准/深度核实会降级为不联网（精校不受影响）。</p>
+    <p class="hint">Tavily 如不填，无法联网核实：名词校准质量会严重下降，也无法生成时间线。</p>
   </div>
 
   <div class="card">
@@ -104,7 +105,7 @@
       <div><label>采访时间 <span class="opt">YYYY-MM-DD</span></label><input type="date" id="date"></div>
     </div>
     <label>背景 <span class="opt">给模型一点上下文；文件名会自动用作主题</span></label>
-    <textarea id="background" placeholder="例如：示例公司跨部门访谈，受访者负责渠道运营。"></textarea>
+    <textarea id="background" placeholder="跟什么公司的什么人，聊了什么内容（你能想起来的主题、重要人名、事件等）"></textarea>
   </div>
 
   <div class="card">
