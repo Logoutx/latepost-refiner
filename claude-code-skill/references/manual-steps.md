@@ -1,4 +1,4 @@
-# Manual pipeline (when the Workflow tool is unavailable, e.g. claude.ai)
+# Manual pipeline (when the Workflow tool is unavailable)
 
 Run these by hand after Step 0 when there's no Workflow tool. On Claude Code, use the fast-path dispatch in `SKILL.md` instead. The **cost lever** still applies throughout: heavy text (raw transcripts, web pages) stays only in subagent contexts; the main agent holds only the distilled glossary, file list, and output paths — it never reads a whole transcript or a full page of search results into its own context. When done, return to **Step 5 (wrap-up)** in `SKILL.md`.
 

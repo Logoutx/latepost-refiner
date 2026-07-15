@@ -4,19 +4,16 @@
 
 一条原则贯穿始终：**精校不是改写，更不是摘要**。说话人的语气、观点、每一个事实都留着，只去噪音、修错字、补结构。
 
-> 不写代码、只想把它跑起来？看 [给非技术同事的安装指南](docs/install-for-non-coders.md)。
+## 同一个逻辑，三个模型
 
-## 选哪个版本
-
-一套逻辑，三种装法。按你的情况挑：
-
-| 你的情况 | 用哪个 | 要 API key 吗 |
+| 模型 | 用哪个 | 订阅/API |
 |---|---|---|
-| 在 Claude Code 里常用 | Claude Code 技能 | 不要，走你的订阅 |
-| 在 Codex 里用 | Codex 技能（原生订阅运行时） | 不要，走你的 Codex 订阅 |
-| 用命令行、本地网页，或发给不写代码的同事 | DeepSeek API（命令行 / 本地网页 / 单文件 App） | 要——`DEEPSEEK_API_KEY`，建议再加 `TAVILY_API_KEY` |
+| Claude | Claude Code 技能 | 走 Claude 订阅 |
+| Codex | Codex 技能 | 走 Codex 订阅 |
+| DeepSeek | 命令行 或 本地网页版 | DeepSeek API（`DEEPSEEK_API_KEY`，建议再加 `TAVILY_API_KEY`） |
+| 发给不写代码的人 | 单文件 App，双击即用（[安装指南](docs/install-for-non-coders.md)） | 要 DeepSeek API key，填在本机浏览器里 |
 
-> Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按流水线步骤产出 prompt，交给 Codex 子代理执行）。只有要用 DeepSeek 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”）。
+> Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有要用 DeepSeek 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”）。
 
 ## 安装
 
