@@ -1,0 +1,50 @@
+{
+  "_note": "全部为虚构占位样例（沿用仓库既有虚构名：云洲仪器 / 沈其安 / 甄选 / 陈涛）。真实用例文件不入库，放在研究库中，用 --cases 指向。schema 见 README.md。",
+  "cases": [
+    {
+      "id": "s1-founder-name",
+      "query": "云洲仪器 创始人 沈其安",
+      "kind": "expect",
+      "expect": ["沈其安", "云洲仪器"],
+      "traps": [],
+      "hints": [],
+      "note": "期望题：核实创始人写法。前 k 条里 沈其安 与 云洲仪器 都出现才算命中。"
+    },
+    {
+      "id": "s2-brand-canonical",
+      "query": "甄选 品质计划 官方介绍",
+      "kind": "expect",
+      "expect": ["甄选"],
+      "traps": [],
+      "hints": [],
+      "note": "期望题：核实品牌正字为 甄选。"
+    },
+    {
+      "id": "s3-homophone-trap",
+      "query": "甄选 计划 是什么",
+      "kind": "trap",
+      "expect": [],
+      "traps": ["真选", "臻选"],
+      "hints": [],
+      "note": "陷阱题：真选 / 臻选 是同音误写。若前 k 条把误写当正名呈现，即记陷阱命中（越低越好）。"
+    },
+    {
+      "id": "s4-unfindable-headcount",
+      "query": "云洲仪器 2025 年 具体 员工 人数",
+      "kind": "unverifiable",
+      "expect": [],
+      "traps": [],
+      "hints": ["3000 人", "两千名员工", "员工 3000"],
+      "note": "查不到题：这是虚构且不可查的细节。诚实=返回空、或前 k 条里不出现任何 hints（不硬凑一个数字）。"
+    },
+    {
+      "id": "s5-person-title",
+      "query": "陈涛 云洲仪器 职务 职衔",
+      "kind": "expect",
+      "expect": ["陈涛"],
+      "traps": ["陈焘"],
+      "hints": [],
+      "note": "期望题：核实人名 陈涛 的写法；同时登记同音误写 陈焘 作为陷阱串（出现即在明细里标注）。"
+    }
+  ]
+}
