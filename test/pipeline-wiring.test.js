@@ -359,6 +359,35 @@ test('dedup skip: a first run (no prior) never skips dedup', async () => {
   assert.ok(labels.includes('dedup:semantic'), 'with no prior glossary there is nothing to skip against — dedup always runs')
 })
 
+// ---------- contested identity (〔同指两解〕) end-to-end wiring ----------
+// Coattail-mishear class, fictional placeholders: spoken/literal "K Frame", real product "Keyframe", coattail SEO
+// site "kframe.ai". The scout flags "K Frame" suspect_asr → it reaches verify (even at key depth); verify applies
+// the two-key rule and returns a contested verdict; the pipeline must land it as a 〔同指两解〕 glossary row (spoken
+// form kept) and one 收尾待问 line in openQuestions.
+
+test('wiring: a suspect brand reaches verify with its ⚠ signal + hint, and a contested verdict lands as 〔同指两解〕 + a 收尾待问 line', async () => {
+  const labels = [], prompts = []
+  const eng = engine(labels, {
+    '^scout': { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [{ canonical: 'K Frame', variants: [], suspect_asr: true, hint: '受访者提到的剪辑工具' }], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [] },
+    '^verify': { resolved: [], unresolved: [], contested: [{ query: 'K Frame', literal: 'K Frame', literal_tier: '目录站/SEO 博客', correction: 'Keyframe', correction_tier: '官方域名', note: '字面命中仅为 Keyframe 的分销站，属搭便车反转' }] },
+  }, prompts)
+  const r = await runPipeline(A({ verifyDepth: 'key', files: [F(), F({ path: '/s/B.txt', label: 'B', outPath: '/o/Transcripts/B.md' })] }), eng)
+
+  const verifyPrompt = prompts.filter((x) => /^verify/.test(x.label)).map((x) => x.prompt).join('\n')
+  assert.ok(/K Frame/.test(verifyPrompt), 'the suspect brand is sent to verify')
+  assert.ok(/⚠/.test(verifyPrompt) && /剪辑工具/.test(verifyPrompt), 'its suspicion signal + mention hint reach the prompt')
+  assert.ok(/搭便车反转/.test(verifyPrompt) && /两把钥匙规则/.test(verifyPrompt), 'the hypothesis-driven protocol is emitted for the suspect chunk')
+
+  const line = r.glossary.split('\n').find((l) => l.includes('K Frame')) || ''
+  assert.ok(line.includes('〔同指两解〕'), 'the contested verdict renders as a 〔同指两解〕 row')
+  assert.ok(/\*\*K Frame\*\*/.test(line), 'the spoken/literal form is kept as canonical (no referent substitution)')
+  assert.ok(!line.includes('〔核实'), 'a contested row is not marked 已核实')
+
+  const q = r.openQuestions.find((x) => typeof x === 'string' && x.includes('〔同指两解〕') && x.includes('K Frame'))
+  assert.ok(q, 'a 收尾待问 line is surfaced for the contested identity')
+  assert.ok(q.includes('B=Keyframe（官方域名）') && q.includes('A=K Frame（目录站/SEO 博客）'), 'both hypotheses + tiers are stated')
+})
+
 // ---------- SF-5 normalizeAuditResult shape guard ----------
 
 test('SF-5: normalizeAuditResult accepts BOTH a per-file object and a {files:[…]} bundle', () => {

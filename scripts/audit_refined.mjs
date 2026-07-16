@@ -380,6 +380,82 @@ export function checkMissingYin(refinedText, glossary) {
   return findings
 }
 
+// ===== Wholesale-substitution tripwire (entity merge review) =====
+// A 校对表 variant→canonical mapping is usually a pure ASR-spelling fix ("K-Frame" → "K Frame": same
+// entity, different写法). But the SAME unify-writing mechanism can also silently MERGE two distinct
+// source entities that happen to share a canonical spelling — variant A really named one person/thing,
+// canonical B another, and every A got rewritten to B. This check can't tell the two apart on its own (that
+// needs a human re-reading the source); it only surfaces the raw signal for review:
+//   Tier 1 (unificationList, always present when a glossary is given): every mapping that was globally
+//     replaced — countSource(variant) >= ENTITY_MERGE.SOURCE_FROM_MIN and countRefined(variant) <=
+//     ENTITY_MERGE.REFINED_FROM_MAX. Informational only, never a finding by itself.
+//   Tier 2 (entity_merge_review, soft): the same mapping PLUS the canonical already stood on its own in
+//     the source (countSource(canonical) >= ENTITY_MERGE.SOURCE_TO_MIN) — the sharper signal that two
+//     pre-existing source entities may now be indistinguishable in the refined prose.
+// Limitation: countSource/countRefined are naive non-overlapping substring counts on the raw document text
+// (no normalization, no word-boundary check, no code/table/heading exclusion). A variant that happens to be
+// a substring of an unrelated word will over-count, and a mention inside a heading or table row counts the
+// same as one in prose. This is deliberately cheap and directional — a tripwire prompting a second look, not
+// a verifier — so it must under-report rather than mis-fire; treat all counts as approximate.
+export const ENTITY_MERGE = {
+  SOURCE_FROM_MIN: 3,   // variant must appear this many+ times in source to call it "globally replaced"
+  REFINED_FROM_MAX: 1,  // …and be reduced to at most this many occurrences in the refined output
+  SOURCE_TO_MIN: 2,     // Tier 2 additionally requires the canonical already independent in source this many+ times
+}
+
+// normalize = lowercase, strip spaces/hyphens/middle dots — pure写法 differences (case, spacing, "-" vs " ",
+// "·" separators) collapse to the same token and are skipped entirely (not a substitution, nothing to flag).
+function normalizeEntityToken(s) {
+  return String(s || '').toLowerCase().replace(/[\s\-·]/g, '')
+}
+
+// Plain non-overlapping substring count. See the limitation note above.
+function countSubstring(haystack, needle) {
+  if (!needle) return 0
+  const hay = String(haystack || '')
+  let count = 0
+  let idx = 0
+  while ((idx = hay.indexOf(needle, idx)) !== -1) {
+    count += 1
+    idx += needle.length
+  }
+  return count
+}
+
+export function checkEntityMergeReview(sourceText, refinedText, glossary) {
+  const entries = (glossary && glossary.entries) || []
+  const unificationList = []
+  const findings = { name: 'entity_merge_review', severity: 'soft', count: 0, samples: [] }
+  if (!entries.length) return { unificationList, findings }
+  const src = String(sourceText || '')
+  const ref = String(refinedText || '')
+  const seen = new Set()
+  for (const e of entries) {
+    for (const v of e.variants || []) {
+      if (!v || normalizeEntityToken(v) === normalizeEntityToken(e.canonical)) continue // pure写法 fix, not a merge risk
+      const key = `${v} ${e.canonical}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const sourceFrom = countSubstring(src, v)
+      const refinedFrom = countSubstring(ref, v)
+      if (sourceFrom < ENTITY_MERGE.SOURCE_FROM_MIN || refinedFrom > ENTITY_MERGE.REFINED_FROM_MAX) continue
+      const sourceTo = countSubstring(src, e.canonical)
+      const refinedTo = countSubstring(ref, e.canonical)
+      unificationList.push({ from: v, to: e.canonical, sourceFrom, sourceTo, refinedFrom, refinedTo })
+      if (sourceTo >= ENTITY_MERGE.SOURCE_TO_MIN) {
+        const estimate = Math.max(sourceFrom - refinedFrom, 0)
+        findings.count += 1
+        findings.samples.push({
+          text: `全篇替换 ${v}→${e.canonical} ×${estimate}（源文中 ${e.canonical} 本就独立出现 ${sourceTo} 次）——请确认二者同指，勿被统一写法机制放大实体错并`,
+          line: 1,
+        })
+      }
+    }
+  }
+  findings.samples = findings.samples.slice(0, 12)
+  return { unificationList, findings }
+}
+
 // ===== 校对表 structural lint (E13) =====
 // The 校对表 is the pipeline's cross-file归一 + 身份/依据 record. A *thin* one — very few named entities, most
 // without any identity clue, or barely any variant写法 recorded — usually means scout under-extracted, verify
@@ -2050,6 +2126,8 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   const speakerFindings = checkSpeakerLabelStyle(refinedText)
   const ghostFinding = checkGhostName(refinedText, glossary)
   const yinFinding = checkMissingYin(refinedText, glossary)
+  // wholesale-substitution tripwire: unificationList (Tier 1, informational) + entity_merge_review (Tier 2, soft)
+  const entityMerge = checkEntityMergeReview(sourceText, refinedText, glossary)
   const quoteHard = quoteFindings.find((f) => f.name === 'quote_style')
   // M7 entity-substitution guard: the 小米→智谱 class. FP-prone on real transcripts (heavy ASR garbling +
   // merged turns make the source-region check unreliable), so it is OPT-IN behind `strict` (default off) per the
@@ -2080,6 +2158,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...speakerFindings,    // speaker_label_style (soft)
     ghostFinding,          // ghost_name (soft; empty when no glossary)
     yinFinding,            // missing_yin (soft; empty when no glossary)
+    entityMerge.findings,  // entity_merge_review (soft; empty when no glossary or no qualifying mapping)
     // M4 mutation-tier findings — SOFT ONLY this pass (deliberately NOT added to gates/failed[]; promotion to
     // hard waits until real-world FP data accumulates). number_drift: a source number atom absent from the
     // refined region (changed / dropped) or present with its polarity qualifier stripped (不到 30%→30%, 亏 2 亿→
@@ -2127,7 +2206,9 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   // M5 per-section review checklist: one entry per ## section of the refined doc, flags aggregate everything
   // localizable to it (number_drift / hedge_loss / content_gap_soft / ghost_name / missing_yin / weak_anchor).
   const sections = buildSections(sourceText, refinedText, { atoms, coverage, glossary, attribution })
-  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections, numericConflicts: numericConsistency ? numericConsistency.conflicts : [] }
+  // unificationList (全局统一清单): every glossary variant→canonical mapping that was globally replaced —
+  // see checkEntityMergeReview above. Informational (Tier 1), present regardless of whether Tier 2 fired.
+  return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections, numericConflicts: numericConsistency ? numericConsistency.conflicts : [], unificationList: entityMerge.unificationList }
 }
 
 // Compare the logic-ordered draft (逻辑稿) against the refined 成稿: it must stay reasonably sized, carry source

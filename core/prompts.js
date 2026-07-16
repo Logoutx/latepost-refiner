@@ -1,5 +1,36 @@
 import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath, safeName } from './spec.js'
 
+// Detect a phonetic-suspicion signal in a verify chunk's entity table, to decide whether the hypothesis-driven
+// heavy protocol is warranted (kept OFF for clean chunks so the prompt stays lean). Signals:
+//  · scout/glossary suspicion notes (同音/疑似/转写/存疑) or a ⚠ / （音） mark verifyChunks already stamps;
+//  · a spaced or hyphenated Latin token of shape letter + Word (e.g. "K Frame" / "K-Frame") — a classic ASR split.
+// Deliberately NOT a signal: a bare all-caps run (AI/CEO/GPU/API/SDK). Those appear in the hint text of nearly
+// every real chunk, so treating them as suspect tripped the heavy protocol almost always — an all-caps token is
+// suspect ONLY when it also carries one of the explicit flags the notes branch above already catches.
+// The letter+Word separator class spans ASCII space/hyphen AND the Unicode hyphen/dash variants and wide spaces
+// an ASR/typesetter may emit (U+2010‑U+2014, U+2212 minus, U+00A0 NBSP, U+3000 full-width space) — otherwise a
+// "K‑Frame" spelled with a non-ASCII hyphen would slip past.
+const LETTER_WORD_SEP = '[ \\u00A0\\u2010\\u2011\\u2012\\u2013\\u2014\\u2212\\u3000-]'
+const LETTER_WORD_RE = new RegExp(`(^|[^A-Za-z])[A-Za-z]${LETTER_WORD_SEP}[A-Z][a-z]+`)
+export function looksPhoneticallySuspect(table) {
+  const t = String(table || '')
+  if (/同音|疑似|转写|存疑|⚠|（音）|\(音\)/.test(t)) return true
+  if (LETTER_WORD_RE.test(t)) return true   // "K Frame" / "K-Frame" / "K‑Frame" (Unicode dash/space)
+  return false
+}
+
+// The hypothesis-driven verification protocol, emitted only for chunks that carry a phonetic-suspicion signal.
+// Verbatim concepts: candidate-first search, tiered evidence, coattail inversion, context-fit, and the two-key rule.
+const VERIFY_SUSPECT_PROTOCOL = `
+【疑似口误·假设优先核实法（本清单含疑似转录/同音写法，务必逐条执行）】
+1. 检索前先写候选：结合上方采访背景与线索、你自己的知识，先为存疑写法写下 1-3 个候选正确所指，再动手查。
+2. 字面写法与每个候选都要检索（别只搜字面原形）。
+3. 证据分级取信：官方域名／权威媒体／百科 ＞ 目录站与 SEO 博客 ＞ 自我推销/软文贴。结论里注明命中来源属于哪一级。
+4. 搭便车反转规则：一个以该字面写法命名、但自身身份寄生于另一产品的站点（“Powered by X”“转售/代理 X”“X 分销/订阅站”），**不能**作为“该字面写法是独立实体”的证据——它恰恰是修正假设 X 成立的证据。
+5. 上下文吻合校验：把胜出的身份放回转录里对该实体的说法（其提及线索已在清单的“线索”里）核对；与转录内说法矛盾的身份，一律不得判为已核实。
+6. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
+7. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
+
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
 // (Haiku tends to take 8–9 small 100–200-line bites; Opus reads large chunks —
@@ -107,11 +138,11 @@ export function verifyPrompt(table, a) {
 
 纪律：${depthNote} 网页内容留在你的上下文里，不要贴回；查不到/拿不准的放 unresolved 并说明，绝不臆造。
 断路器：若检索**连续 2 次报错**（超时/网络错误，区别于“查到了但无结果”），说明网络故障——**立即停止全部检索**，已确认的照常放 resolved，其余全部放 unresolved 并注明「网络故障未核实」；不要反复重试。resolved 里只放**本次检索到依据**的结论，凭你记忆/常识推断的一律放 unresolved。
-
+${looksPhoneticallySuspect(table) ? VERIFY_SUSPECT_PROTOCOL + '\n' : ''}
 实体清单（候选写法 ← 文中变体 ｜ 线索）：
 ${table}
 
-按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=依据来源一句话）与 unresolved。
+按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=依据来源一句话）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 
