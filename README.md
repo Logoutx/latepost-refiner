@@ -8,10 +8,6 @@
 - 联网核实修正音转写弄错的人名、术语；
 - （可选）根据逻辑重排 QA、做访谈总结、结合公开信息生成时间线。
 
-### 运行逻辑
-
-
-
 ## 同一个逻辑，三个模型
 
 | 模型 | 用哪个 | 订阅/API |
@@ -20,9 +16,10 @@
 | Codex | Codex 技能 | 走 Codex 订阅 |
 | DeepSeek | 命令行 或 本地网页版 | DeepSeek API |
 
-> Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有在要用 Anthropic / DeepSeek / GLM / Kimi / OpenAI 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”），那时填对应的 key。
 
 ## 安装
+
+最简单的就是让 Claude Code 和 Codex 直接访问项目网页安装。
 
 ### Claude Code 技能
 
