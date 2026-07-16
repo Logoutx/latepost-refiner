@@ -1,8 +1,16 @@
 # LatePost-Refiner
 
-把粗糙的访谈转录稿（语音转写或人工速记）整理成可读、可信、可检索的研究稿。它删口头禅、理顺口语、按主题加小标题、修语音转写弄错的人名和术语、统一发言人标注；要的话再产出逻辑重排稿、访谈总结和时间线。
+为《晚点 LatePost》日常工作需求制作，把粗糙的访谈转录稿（语音转写或人工速记）整理成可读、可信、可检索的研究稿。
 
-一条原则贯穿始终：**精校不是改写，更不是摘要**。说话人的语气、观点、每一个事实都留着，只去噪音、修错字、补结构。
+原则：**精校不是改写，更不是摘要**。说话人的语气、观点、每一个事实都留着，只去噪音、修错字、补结构。
+
+- 删口头禅、理顺口语；
+- 联网核实修正音转写弄错的人名、术语；
+- （可选）根据逻辑重排 QA、做访谈总结、结合公开信息生成时间线。
+
+### 运行逻辑
+
+
 
 ## 同一个逻辑，三个模型
 
@@ -11,7 +19,6 @@
 | Claude | Claude Code 技能 | 走 Claude 订阅 |
 | Codex | Codex 技能 | 走 Codex 订阅 |
 | DeepSeek | 命令行 或 本地网页版 | DeepSeek API |
-| 发给不写代码的人 | 单文件 App，双击即用 | 要，填在本机浏览器里 |
 
 > Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有在要用 Anthropic / DeepSeek / GLM / Kimi / OpenAI 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”），那时填对应的 key。
 
@@ -49,42 +56,34 @@ node universal/cli.js \
 - 每次还写 `<out>/review.md`（人工收尾清单）和 `<out>/run.json`（配置、输入哈希、产物、用量），便于交接和 resume。
 - 不带参数跑会打印完整用法。
 
-### 单文件 App（发给别人，免装 Node）
+### 单文件
 
 ```bash
 npm run build:binary                       # 需先 brew install bun；产出 dist/latepost-refiner-web（约 60MB，arm64）
 TARGET=bun-darwin-x64 npm run build:binary # Intel Mac
 ```
 
-网页和模板都内嵌进可执行文件。对方下载后右键“打开”过一次签名拦截，浏览器访问 `http://127.0.0.1:8765`。docx 用内置 mammoth 解析；pptx/xlsx/pdf 仍需 markitdown（用 `scripts/setup-converters.sh` 装）。
+网页和模板都内嵌进可执行文件。下载后右键“打开”过一次签名拦截，浏览器访问 `http://127.0.0.1:8765`。docx 用内置 mammoth 解析；pptx/xlsx/pdf 仍需 markitdown（用 `scripts/setup-converters.sh` 装）。
 
-## 跑完得到什么
-
-一次正式产出，都在你 `--out` 指定的目录下：
-
-- `校对表.md`——人名、品牌、术语的统一写法 + 联网核实结论
-- `Transcripts/<标题>.md`——精校稿
-- `逻辑顺序/<标题>.md`——逻辑重排稿（可选）
-- `<主题>访谈总结.md`、`<主题>时间线.md`（可选）
-- `review.md`——待人工确认、补做的收尾清单
-- `run.json`——本次运行清单：配置、输入哈希、产物路径、提醒、用量
 
 ## 如何工作
 
 精校不是把全文喂给一个大模型，而是拆成几步，每步配一个够用的模型：
 
-| 步骤 | 做什么 | 默认模型 |
-|---|---|---|
-| 侦察 | 每份转录并行读一遍，抽人名、品牌、术语、发言人 | haiku |
-| 合并聚类 | 纯 JS——按真名合并，“X 总”这类敬称不乱并 | 不调模型 |
-| 联网核实 | 分批查公开资料，定关键人名和公司的写法 | sonnet |
-| 同指去重 | 找写法不同、其实指同一个的（同音人名、口号的不同转写） | sonnet |
-| 精校 | 逐份精校：删口癖、加小标题、按校对表统一写法 | opus |
-| 源比对审计 | 纯 JS 比对源文与成稿：查压缩、内容缺口、结尾是否漏（完整性即由此判定，不再单跑核对代理） | 不调模型 |
-| 逻辑重排（可选） | 把问答从录音顺序重排成叙事顺序，一字不改 | opus |
-| 总结 / 时间线（可选） | 分类要点、金句、判断；对公开资料拉发展线 | opus |
+| 步骤 | 做什么 | Claude 版 | Codex 版 | DeepSeek 版 |
+|---|---|---|---|---|
+| 侦察 | 每份转录并行读一遍，抽取人名、品牌、术语、发言人与待核实项 | Haiku | gpt-5.6-luna（low） | deepseek-v4-flash |
+| 合并聚类 | 纯 JS 按真名合并；“X 总”等敬称不与未经确认的同名对象乱并 | 不调模型 | 不调模型 | 不调模型 |
+| 联网核实 | 分批查询公开资料，核实关键人名、公司、产品和术语的标准写法 | Sonnet | gpt-5.6-luna（low）检索，gpt-5.6-terra（medium）裁定 | deepseek-v4-flash，搜索走 Tavily |
+| 同指去重 | 找出写法不同但实际指向同一对象的实体，例如同音人名、简称和口号的不同转写 | Sonnet | gpt-5.6-terra（medium） | deepseek-v4-flash |
+| 精校 | 逐份精校：删除口癖和无意义重复、修复 ASR 噪声、增加小标题，并按校对表统一写法 | Opus | gpt-5.6-sol（high） | deepseek-v4-pro；超过 10,000 字自动分块 |
+| 源比对审计 | 纯 JS 比对源文与精校稿，检查压缩、内容缺口、数字漂移和结尾遗漏；完整性由此判定 | 不调模型 | 不调模型 | 不调模型 |
+| 局部修复 | 针对审计标出的重复、断句、残留噪声和局部缺口进行定点修复，不改动未标记内容 | Sonnet | gpt-5.6-terra（medium） | deepseek-v4-flash |
+| 完整性重跑 | 出现压缩风险、结尾遗漏或大段内容缺失时，重新从源稿生成，最多重试 2 次 | Opus | gpt-5.6-sol（high） | deepseek-v4-pro |
+| 逻辑重排（可选） | 在不改写正文的前提下，把问答从录音顺序重排为叙事顺序，并通过逐段对应审计 | Opus | gpt-5.6-sol（high） | deepseek-v4-pro |
+| 总结（可选） | 从精校稿生成分类要点、核心判断和金句，不以总结替代完整精校稿 | Opus | gpt-5.6-terra（medium）；Deep 使用 gpt-5.6-sol（high） | deepseek-v4-pro |
+| 时间线（可选） | 结合精校稿和公开资料，整理人物、公司、产品与事件的发展时间线 | Opus | gpt-5.6-luna（low）检索，gpt-5.6-terra（medium）整理与裁定 | deepseek-v4-pro |
 
-这是默认分层。谁来跑这些子代理，看版本：Claude 版跑在你的 Claude 会话上，用 haiku/sonnet/opus；命令行和网页版按 provider 把这三档映射到对应模型；Codex 版跑在 ChatGPT 订阅上，用 OpenAI 对应档。三档都能用 `--models scout=haiku,refine=opus` 覆盖。
 
 ## 架构
 
@@ -117,39 +116,9 @@ universal/           命令行 + 网页 + 单文件 App
 
 ### 切换 provider（命令行版）
 
-`--provider` 选模型来源；除 anthropic 外都是 OpenAI 兼容 API，共用一个引擎。
+DeepSeek 没有内置搜索，经过测试选择 TAVILY 联网核实信息、生成时间线，需要填写 TAVILY API（每月有免费额度）。
 
-| `--provider` | key 环境变量 | 默认 endpoint | 联网核实 |
-|---|---|---|---|
-| `anthropic`（默认） | `ANTHROPIC_API_KEY` | — | 内置服务端搜索 |
-| `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com` | 需 `TAVILY_API_KEY` |
-| `glm` | `ZHIPUAI_API_KEY` / `ZAI_API_KEY` | `open.bigmodel.cn/api/paas/v4`（国际站 `--base-url https://api.z.ai/api/paas/v4`） | 自带搜索 |
-| `kimi` | `MOONSHOT_API_KEY` | `api.moonshot.ai/v1`（国内 `--base-url https://api.moonshot.cn/v1`） | 自带搜索 |
-| `openai` | `OPENAI_API_KEY` | `api.openai.com/v1` | 需 `TAVILY_API_KEY` |
-
-DeepSeek 和 OpenAI 没有内置搜索：设了 `TAVILY_API_KEY` 才能让标准/深度核实和时间线联网。核实结论会在精校前进入校对表，用来校正人名、公司、产品、日期和疑似 ASR 错词；不设 Tavily 时精校仍会运行，但少用联网校正。
-
-模型特点——DeepSeek 思考模式禁工具调用、GLM 不收 `temperature:0`、Kimi 不支持强制函数调用、OpenAI 用 `max_completion_tokens`——都在 `engines/providers.js` 里处理。
-
-**自动分段精校（防弱模型把长稿压成摘要）**：偏弱但便宜的模型在正常长度的访谈上没问题，但稿子一长就会开始「无声压缩」——为塞进篇幅悄悄折掉真实细节。所以每个模型可以在 `engines/providers.js` 里声明一个「忠实处理长度」（以正文字数计）；当某份转录超过这个长度时，命令行/网页版会**自动**沿发言轮边界把它切成几段大小均衡的块、并行精校、再拼回，让每一段都落在该模型的忠实区间内，不丢内容。切块尽量切大（一次切太碎会打散小标题），段数不设上限。只有声明了上限的模型才受影响——默认的 Anthropic 模型在长稿上本就忠实，行为完全不变。目前只有 DeepSeek 的两个精校档声明了上限（`deepseek-v4-pro` → 25000 字、`deepseek-v4-flash` → 18000 字，均可调）。每次自动分段都会在 `review.md` 里写一行说明、在 `run.json` 的 `autoChunk` 里留结构化记录。想彻底关掉一切分块（含这项自动分段），用 `--chunk off`。
-
-### 便宜档优先 + 升级重跑（`--escalate`，可选）
-
-常规访谈用便宜 provider 精校，靠现有的确定性审计门禁（charRatio 压缩、内容缺口、结尾缺失、引号等）逐份判决；**未过审的文件自动用高档 provider 从源文件重跑精校、再复审**。质量由门禁保证，不靠对某个 provider 的信任。
-
-```sh
-node universal/cli.js --files 访谈.md --topic 试跑 \
-  --provider deepseek --escalate anthropic --verify none
-```
-
-- `--provider` 是第一遍（便宜）档；`--escalate <名>` 指定高档 provider。给了 `--escalate` 才启用；不给则与既有行为逐字节等价。
-- `--escalate-base-url` / `--escalate-models`（如 `refine=claude-opus-4-8`）覆盖高档 provider 的 endpoint / 模型（只用 refine 档）。
-- 结果落盘：`review.md` 有「升级重跑」小节逐份说明（首档失败项 → 升级是否过审）；`run.json` 的 `escalation` 块记录每份的便宜档审计、高档审计、保留了哪一档；两档都没过的文件会**显式标注「两档均未过审」**并保留过审项更少的那一档（持平取高档）。
-- 退出码反映**最终**状态：若升级后不再有 hard 内容门禁失败（内容缺口/引号），即退出 0。
-- 重跑**只从原始源文件**做，绝不拿可能被压缩的便宜档成稿去“恢复”细节。
-- ⚠ **信源提醒**：升级会把**源文件原文**也发送给高档 provider。所以两个 provider 都要有意识地选——尤其当便宜档或高档任一为境内运营方时（见下一节）。本工具不做“敏感话题自动识别”（那是不可靠的承诺），用不用升级由你判断。
-
-（v1 仅命令行支持；网页版参数通道已能透传 `escalate` 对象，但界面暂无对应字段。）
+**自动分段精校（防弱模型把长稿压成摘要）**：偏弱但便宜的模型在正常长度的访谈上没问题，但稿子一长就会开始「无声压缩」——为塞进篇幅悄悄折掉真实细节。所以每个模型可以在 `engines/providers.js` 里声明一个「忠实处理长度」（以正文字数计）；当某份转录超过这个长度时，命令行/网页版会**自动**沿发言轮边界把它切成几段大小均衡的块、并行精校、再拼回，让每一段都落在该模型的忠实区间内，不丢内容。切块尽量切大（一次切太碎会打散小标题），段数不设上限。只有声明了上限的模型才受影响——默认的 Anthropic 模型在长稿上本就忠实，行为完全不变。目前只有 DeepSeek 的两个精校档声明了上限（deepseek-v4-pro → 25000 字、deepseek-v4-flash → 18000 字，均可调）。每次自动分段都会在 `review.md` 里写一行说明、在 `run.json` 的 `autoChunk` 里留结构化记录。想彻底关掉一切分块（含这项自动分段），用 `--chunk off`。
 
 ### 精校模式：agentic（默认）与 single-shot
 
