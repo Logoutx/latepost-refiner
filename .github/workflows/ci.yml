@@ -64,6 +64,11 @@ jobs:
     runs-on: macos-14
     permissions:
       contents: write
+    env:
+      # The runner's default C locale makes bash 3.2 mis-parse $VAR expansions that sit
+      # directly against full-width CJK punctuation in our build scripts ("unbound variable").
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
 
     steps:
       - name: Check out repository
