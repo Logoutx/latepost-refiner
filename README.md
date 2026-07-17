@@ -14,20 +14,21 @@
 |---|---|---|
 | Claude | Claude Code 技能 | 走 Claude 订阅 |
 | Codex | Codex 技能 | 走 Codex 订阅 |
-| DeepSeek | 命令行 或 本地网页版 | DeepSeek API |
+| DeepSeek | 命令行 或 本地网页版 | DeepSeek API(建议加 TAVILY API) |
 
 
 ## 安装
 
 最简单的就是把仓库地址发给 Claude Code / Codex，说“安装这个技能”。手动方式如下。
 
-**Claude Code 技能**（走订阅，不用 key）
-git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
-不想 clone：下载 [Releases](…) 的 zip 解压到 `~/.claude/skills/`。
+**Claude Code 技能**
+下载 [Releases](…) 的 zip 解压到 `~/.claude/skills/`
+或 git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
 
-**Codex 技能**（走 ChatGPT 订阅）：技能目录 `codex-skills/latepost-refiner/`，接入方式见其 SKILL.md。
+**Codex 技能**
+技能目录 `codex-skills/latepost-refiner/`，接入方式见其 SKILL.md。
 
-**DeepSeek 版·命令行 / 本地网页**（要 `DEEPSEEK_API_KEY`，建议加 `TAVILY_API_KEY`）
+**DeepSeek 版·命令行 / 本地网页**
 npm install；cp .env.example .env 填 key；`node universal/cli.js --files … --topic …` 或 `npm run web`。
 docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.sh`。
 
