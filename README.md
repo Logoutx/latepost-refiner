@@ -18,11 +18,12 @@
 
 ## 安装
 
-最简单的就是把仓库地址发给 Claude Code / Codex，说“安装这个技能”。手动方式如下。
+最简单的就是把仓库地址发给 Claude Code / Codex，说“安装这个技能”。
+
+或者下载 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 的 `latepost-refiner.zip`——里面就是三个文件夹：**Claude Code Skill** 拖进 `~/.claude/skills/`，**Codex Skill** 拖进 Codex 的技能目录，**DeepSeek Edition** 放任意位置进目录 `npm install` 后用（详见包内 README）。手动方式如下。
 
 **Claude Code 技能**
-下载 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 的 zip 解压到 `~/.claude/skills/`
-或 git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
+git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
 
 **Codex 技能**
 技能目录 `codex-skill/latepost-refiner/`，接入方式见其 SKILL.md。

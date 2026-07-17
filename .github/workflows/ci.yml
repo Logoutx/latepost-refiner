@@ -79,15 +79,15 @@ jobs:
       - name: Rebuild Claude Code workflow
         run: npm run build:cc
 
-      - name: Build the skill zip
-        run: bash claude-code-skill/build-zips.sh "$PWD/dist-zips"
+      - name: Build the all-in-one release zip
+        run: bash build/build-release-zip.sh "$PWD/dist-zips"
 
       - name: Publish to the rolling "latest" release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create latest \
-            --title "Latest skill build" \
-            --notes "Auto-built from main on every push — download latepost-refiner.zip below." \
+            --title "Latest build" \
+            --notes "Auto-built from main on every push — latepost-refiner.zip contains three folders: Claude Code Skill (drag into ~/.claude/skills/), Codex Skill (drag into the Codex skills dir), DeepSeek Edition (npm install, then CLI or local web)." \
             2>/dev/null || true
           gh release upload latest dist-zips/latepost-refiner.zip --clobber
