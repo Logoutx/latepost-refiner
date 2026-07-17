@@ -18,7 +18,7 @@
    Concrete scenario: `scripts/setup-converters.sh` is byte-identical to `claude-code-skill/setup-converters.sh`, and `scripts/install-converters.command` is byte-identical to `claude-code-skill/install-converters.command`, but neither pair appears in the manifest at `build/sync-skills.mjs:36-47`.
 
 6. LOW, `README.md:16`: the merge left README Codex-runtime guidance stale and contradictory to the committed Codex skill entry point.
-   Concrete scenario: README says the Codex skill delegates to the Universal CLI and needs `OPENAI_API_KEY`, while `codex-skills/latepost-refiner/SKILL.md:10-12` says the first choice is the no-key native subscription runtime now committed in this branch.
+   Concrete scenario: README says the Codex skill delegates to the Universal CLI and needs `OPENAI_API_KEY`, while `codex-skill/latepost-refiner/SKILL.md:10-12` says the first choice is the no-key native subscription runtime now committed in this branch.
 
 ## Hunt Category Coverage
 

@@ -13,7 +13,7 @@ The eval harness turns "the prompt feels right" into measured regression checks.
 - `golden-fixtures.js` — golden property fixtures with `mustContain` and `mustNotContain`.
 - `golden-score.js` — golden pure scorer: containment, forbidden-text absence, fixture pass rate.
 - `golden-run.mjs` — scores a golden results file `{ "<id>": "<refined text>" }`.
-- `produce.mjs` — optional model-backed producer using the Universal engine. It spends tokens and requires provider credentials.
+- `produce.mjs` — optional model-backed producer using the Universal engine (DeepSeek). It spends tokens and requires `DEEPSEEK_API_KEY`.
 
 ## Running
 
@@ -27,8 +27,8 @@ node eval/golden-run.mjs /tmp/golden.json
 Producing outputs with the Universal engine:
 
 ```bash
-ANTHROPIC_API_KEY=... node eval/produce.mjs --suite filler --out /tmp/filler.json
-ANTHROPIC_API_KEY=... node eval/produce.mjs --suite golden --out /tmp/golden.json
+DEEPSEEK_API_KEY=... node eval/produce.mjs --suite filler --out /tmp/filler.json
+DEEPSEEK_API_KEY=... node eval/produce.mjs --suite golden --out /tmp/golden.json
 ```
 
 Then score:
@@ -42,7 +42,7 @@ Exit code is non-zero if protected words are over-deleted in the filler suite or
 
 ## Periodic evals
 
-`.github/workflows/evals.yml` runs weekly and on manual dispatch. It skips safely when `ANTHROPIC_API_KEY` is not configured as a repository secret. When the secret exists, it produces and scores both filler and golden outputs, then uploads the JSON outputs as a workflow artifact.
+`.github/workflows/evals.yml` runs weekly and on manual dispatch. It skips safely when `DEEPSEEK_API_KEY` is not configured as a repository secret. When the secret exists, it produces and scores both filler and golden outputs, then uploads the JSON outputs as a workflow artifact.
 
 ## Baseline (2026-06, opus refine)
 

@@ -1,5 +1,7 @@
 # Handoff — build the no-key Codex skill (Phase 3b)
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 _For Codex. Self-contained; assumes no prior conversation. Work on a branch and coordinate before pushing `main` (the maintainer's edition shares this repo)._
 
 ## Goal
@@ -10,7 +12,7 @@ Make the **Codex skill installable in Codex and usable with NO API key** — it 
 
 ## Current state (what to change)
 
-`codex-skills/latepost-refiner/` already exists (SKILL.md + `references/` + `agents/openai.yaml`), but its current SKILL.md **delegates to the Node CLI** (`node universal/cli.js --provider openai`), which calls the OpenAI API and **requires `OPENAI_API_KEY` (metered)**. That does not meet the no-key goal. Keep the CLI delegation only as a documented *fallback*; the **primary path must be native to the subscription.**
+`codex-skill/latepost-refiner/` already exists (SKILL.md + `references/` + `agents/openai.yaml`), but its current SKILL.md **delegates to the Node CLI** (`node universal/cli.js --provider openai`), which calls the OpenAI API and **requires `OPENAI_API_KEY` (metered)**. That does not meet the no-key goal. Keep the CLI delegation only as a documented *fallback*; the **primary path must be native to the subscription.**
 
 ## Step 1 — run the capability spike first
 
@@ -36,7 +38,7 @@ Split the pipeline by what needs a model vs. what doesn't:
 
 ## Reuse, don't reinvent
 
-- **Editorial rules:** `codex-skills/latepost-refiner/references/editorial-spec.md` (identical to the Claude skill's — keep them in sync, don't fork). Refine ≠ summarize; filler tiers; unnumbered `##` headings; unify names/brands/terms strictly per `校对表.md`; never fabricate names (keep `（音）`); Chinese typesetting (full-width punctuation, 弯引号 “”, Arabic numerals, Pangu spacing); large-block writes for long files.
+- **Editorial rules:** `codex-skill/latepost-refiner/references/editorial-spec.md` (identical to the Claude skill's — keep them in sync, don't fork). Refine ≠ summarize; filler tiers; unnumbered `##` headings; unify names/brands/terms strictly per `校对表.md`; never fabricate names (keep `（音）`); Chinese typesetting (full-width punctuation, 弯引号 “”, Arabic numerals, Pangu spacing); large-block writes for long files.
 - **Deliverable structures:** `references/deliverables.md` (logical-order rewrite / timeline / summary).
 - **Glossary template:** `references/glossary-template.md`.
 - **Output layout** (match the Universal runtime): `<out>/Transcripts/*.md`, `<out>/校对表.md`, optional `<out>/逻辑顺序/*.md`, `<out>/<topic>访谈总结.md`, `<out>/<topic>时间线.md`, plus the **review queue** `<out>/review.md` and **run manifest** `<out>/run.json` (see `universal/artifacts.js`).
@@ -55,6 +57,6 @@ Split the pipeline by what needs a model vs. what doesn't:
 - `docs/codex-spike.md` — the capability spike (run first).
 - `claude-code-skill/SKILL.md` — the Claude no-key counterpart to mirror.
 - `core/` — shared pipeline, prompts, schemas, deterministic logic.
-- `codex-skills/latepost-refiner/` — the skill to evolve, and its `references/`.
+- `codex-skill/latepost-refiner/` — the skill to evolve, and its `references/`.
 
 When the spike results are in, report them and the chosen design; then build the native path, keep CLI delegation as the documented fallback, and verify a full no-key run end-to-end.

@@ -4,7 +4,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { API_TOKEN_HEADER, createAppServer, fetchProviderModels, sanitizeRunParams } from '../universal/server.js'
+import { API_TOKEN_HEADER, createAppServer, sanitizeRunParams } from '../universal/server.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-server-'))
@@ -39,13 +39,13 @@ test('sanitizeRunParams drops web-only dangerous fields', () => {
   const params = sanitizeRunParams({
     skillDir: '/',
     __engine: { anything: true },
-    categories: {
-      web: { provider: 'openai', apiKey: 'k', modelOverride: 'm', tavilyKey: 't', baseURL: 'http://attacker.test', extra: 'x' },
-    },
+    apiKey: 'deepseek-key',
+    tavilyKey: 't',
   })
-  assert.equal(params.skillDir, undefined)
-  assert.equal(params.__engine, undefined)
-  assert.deepEqual(params.categories.web, { provider: 'openai', apiKey: 'k', modelOverride: 'm', tavilyKey: 't' })
+  assert.equal(params.skillDir, undefined, 'skillDir cannot be set over the wire')
+  assert.equal(params.__engine, undefined, 'the test-only engine injection cannot be set over the wire')
+  assert.equal(params.apiKey, 'deepseek-key', 'the DeepSeek key passes through')
+  assert.equal(params.tavilyKey, 't', 'the Tavily key passes through')
 })
 
 test('served HTML embeds the per-session API token', async () => {
@@ -116,137 +116,6 @@ test('API rejects untokened, non-JSON, and cross-origin run requests', async () 
   }
 })
 
-test('fetchProviderModels calls OpenAI-compatible /models and picks cost-effective defaults', async () => {
-  let called
-  const result = await fetchProviderModels({
-    provider: 'openai',
-    apiKey: 'sk-test',
-    fetchImpl: async (url, options) => {
-      called = { url, options }
-      return {
-        ok: true,
-        json: async () => ({
-          object: 'list',
-          data: [
-            { id: 'text-embedding-3-large', object: 'model' },
-            { id: 'gpt-5.5', object: 'model', created: 200 },
-            { id: 'gpt-5.4-mini', object: 'model', created: 100 },
-          ],
-        }),
-      }
-    },
-  })
-
-  assert.equal(called.url, 'https://api.openai.com/v1/models')
-  assert.equal(called.options.headers.Authorization, 'Bearer sk-test')
-  assert.deepEqual(result.models.map((m) => m.id), ['gpt-5.5', 'gpt-5.4-mini'])
-  // smart (精校与总结) must land on the provider's strong chat tier (opus = gpt-5.5), not the
-  // cheaper gpt-5.4-mini — cheap tiers over-compress long transcripts in the refine stage.
-  assert.equal(result.defaults.stage.refine, 'gpt-5.5')
-  assert.equal(result.defaults.category.smart, 'gpt-5.5')
-})
-
-test('fetchProviderModels uses Anthropic model-list headers', async () => {
-  let called
-  const result = await fetchProviderModels({
-    provider: 'anthropic',
-    apiKey: 'anthropic-key',
-    fetchImpl: async (url, options) => {
-      called = { url, options }
-      return {
-        ok: true,
-        json: async () => ({
-          data: [
-            { id: 'claude-opus-4-8', display_name: 'Claude Opus' },
-            { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet' },
-            { id: 'claude-haiku-4-5', display_name: 'Claude Haiku' },
-          ],
-        }),
-      }
-    },
-  })
-
-  assert.equal(called.url, 'https://api.anthropic.com/v1/models')
-  assert.equal(called.options.headers['x-api-key'], 'anthropic-key')
-  assert.equal(called.options.headers['anthropic-version'], '2023-06-01')
-  assert.equal(result.defaults.stage.scout, 'claude-haiku-4-5')
-  // smart must be the strong tier (opus = claude-opus-4-8), never the cheaper sonnet pick.
-  assert.equal(result.defaults.stage.refine, 'claude-opus-4-8')
-  assert.equal(result.defaults.category.smart, 'claude-opus-4-8')
-})
-
-test('built-in cost-effective defaults keep cheap GLM flash separate from flashx', async () => {
-  const result = await fetchProviderModels({ provider: 'glm' })
-
-  assert.equal(result.source, 'fallback')
-  assert.equal(result.defaults.stage.scout, 'glm-4.7-flash')
-  // smart (精校与总结) must never default to the cheapest/flash-class pick when a stronger chat
-  // model (the provider registry's opus tier, glm-5.2) is present in the catalog — this is the
-  // regression this fix targets: 更新默认模型 used to fill smart with the cheapest flash tier.
-  assert.equal(result.defaults.stage.refine, 'glm-5.2')
-  assert.equal(result.defaults.category.smart, 'glm-5.2')
-  assert.notEqual(result.defaults.category.smart, result.defaults.stage.scout)
-})
-
-test('smart-category default picks the stronger chat model over a flash-class model in a live catalog', async () => {
-  // A live/fetched catalog containing both a flash-class model and a stronger chat model: the
-  // smart default must resolve to the stronger one, never the cheapest pick — this is the core
-  // regression check for the 更新默认模型 bug (mixed/按任务分配 mode filled all four categories,
-  // including 精校与总结, with the provider's cheapest flash tier).
-  const result = await fetchProviderModels({
-    provider: 'glm',
-    apiKey: 'test-key',
-    fetchImpl: async () => ({
-      ok: true,
-      json: async () => ({
-        data: [
-          { id: 'glm-4.7-flash', object: 'model' },
-          { id: 'glm-4.7-flashx', object: 'model' },
-          { id: 'glm-5.2', object: 'model' },
-        ],
-      }),
-    }),
-  })
-
-  assert.equal(result.source, 'provider')
-  assert.equal(result.defaults.category.mechanical, 'glm-4.7-flash')
-  assert.equal(result.defaults.category.smart, 'glm-5.2')
-  assert.notEqual(result.defaults.category.smart, result.defaults.category.mechanical)
-})
-
-test('API exposes protected model catalog without leaking keys', async () => {
-  const token = 'secret-token'
-  let sawAuth
-  const server = createAppServer({
-    token,
-    fetchImpl: async (_url, options) => {
-      sawAuth = options.headers.Authorization
-      return {
-        ok: true,
-        json: async () => ({ data: [{ id: 'deepseek-v4-flash', object: 'model' }, { id: 'deepseek-v4-pro', object: 'model' }] }),
-      }
-    },
-  })
-  const port = await listen(server)
-  const headers = { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${port}` }
-  try {
-    const blocked = await request(port, 'POST', '/api/models', { headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    assert.equal(blocked.status, 403)
-
-    const ok = await request(port, 'POST', '/api/models', {
-      headers,
-      body: JSON.stringify({ provider: 'deepseek', apiKey: 'deepseek-key' }),
-    })
-    assert.equal(ok.status, 200)
-    const body = JSON.parse(ok.body)
-    assert.equal(sawAuth, 'Bearer deepseek-key')
-    assert.equal(body.defaults.stage.refine, 'deepseek-v4-pro') // registry default since 2026-07-07: writing stages ride v4-pro
-    assert.equal(ok.body.includes('deepseek-key'), false)
-  } finally {
-    await close(server)
-  }
-})
-
 test('API accepts same-origin tokened run requests and only opens returned output paths', async () => {
   const token = 'secret-token'
   const outputDir = tmpdir()
@@ -279,12 +148,12 @@ test('API accepts same-origin tokened run requests and only opens returned outpu
   try {
     const run = await request(port, 'POST', '/api/run', {
       headers,
-      body: JSON.stringify({ topic: 'T', skillDir: '/', categories: { web: { provider: 'openai', apiKey: 'k', baseURL: 'http://attacker.test' } } }),
+      body: JSON.stringify({ topic: 'T', skillDir: '/', apiKey: 'deepseek-key' }),
     })
     assert.equal(run.status, 200)
     assert.match(run.body, /event: result/)
     assert.equal(capturedParams.skillDir, undefined)
-    assert.equal(capturedParams.categories.web.baseURL, undefined)
+    assert.equal(capturedParams.apiKey, 'deepseek-key')
 
     const blockedOpen = await request(port, 'POST', '/api/open', { headers, body: JSON.stringify({ path: otherDir }) })
     assert.equal(blockedOpen.status, 400)

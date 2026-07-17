@@ -13,7 +13,7 @@ export { deriveTitle, HEADING_RE } from './jobs.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
 
-export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Anthropic SDK 版）
+export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（DeepSeek 版）
 
 用法:
   latepost-refiner --files <文件...> --topic <主题> --date <YYYY-MM> [选项]
@@ -30,15 +30,12 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
-  --models <映射>        如 scout=haiku,refine=opus（覆盖默认分层）
-  --chunk <模式>         speed | cost | off（默认 cost=每份单代理，但对声明了「忠实处理长度」的 provider（如
-                         DeepSeek）会在超长时自动按发言轮边界分段精校，防止弱模型把长稿压成摘要；speed 把大文件拆块
-                         并行，多文件批量提速、更费额度；off=彻底关闭一切分块，含上面的自动分段）
-  --refine-mode <模式>   agentic | single-shot（默认 agentic=Read/Write 工具循环精校；single-shot 每份一次成型：
-                         把源文整篇塞进 prompt、模型一次返回成稿，更省更快，仅适合 ≤45000 字的文件、超限会被拒；
-                         审计门禁照跑，兜住单请求的静默压缩风险）
-  --effort <映射>        如 refine=medium,summary=low（推理力度，仅 refine/logic/summary/timeline 生效、仅 opus/
-                         sonnet/fable 支持；档位 low|medium|high|xhigh|max；不设=默认 high）
+  --chunk <模式>         speed | cost | off（默认 cost=每份单代理，但对超长稿会自动按发言轮边界分段精校，防止把长稿
+                         压成摘要；speed 把大文件拆块并行，多文件批量提速、更费额度；off=彻底关闭一切分块，含上面的
+                         自动分段）
+  --chunk-size <N>       分块实验旋钮：显式指定每块目标正文字数，块数=ceil(全文字数/N)，覆盖自动分段的字数与 speed
+                         的块数；N 须为 ≥2000 的整数（--chunk off 仍优先、不分块）。所有分块都不会把一段问句切在块尾
+                         （问句与其回答留在同一块）
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
@@ -51,23 +48,11 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Ant
   --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
                          （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
 
-模型来源:
-  --provider <名>        anthropic（默认）| deepseek | glm | kimi | openai
-  --base-url <URL>       覆盖 provider 默认 endpoint（如 GLM 国际站 api.z.ai、Kimi 国内 .cn）
-  key 环境变量           anthropic→ANTHROPIC_API_KEY · deepseek→DEEPSEEK_API_KEY ·
-                         glm→ZHIPUAI_API_KEY/ZAI_API_KEY · kimi→MOONSHOT_API_KEY · openai→OPENAI_API_KEY
-  联网核实              Anthropic/GLM/Kimi 用 provider 原生搜索；DeepSeek/OpenAI 需 TAVILY_API_KEY
-
-升级重跑（cheap-first，可选、默认关闭）:
-  --escalate <名>        指定「升级」provider。给出后即启用便宜档优先：--provider 做第一遍（便宜）精校，
-                         凡审计门禁未过（压缩/charRatio、内容缺口、结尾缺失、引号等）的文件，用本 provider
-                         从【源文件】重跑精校再复审。质量由确定性门禁判定，不靠对 provider 的信任。
-                         不给 --escalate 时行为与既有完全一致（逐字节等价）。
-  --escalate-base-url <URL>  升级 provider 的 endpoint 覆盖
-  --escalate-models <映射>   升级 provider 的模型覆盖（如 refine=claude-opus-4-8；只用 refine 档）
-  ⚠ 信源提醒            升级会把【源文件原文】也发送给升级 provider。两个 provider 都要有意识地选择——
-                         尤其当便宜档或升级档任一为中国境内运营方时（见启动时的信源保护提示）。
-                         本工具不做“敏感话题自动识别”（那是不可靠的承诺）——用不用升级由你判断。
+密钥（环境变量，或仓库根目录 .env）:
+  DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
+  TAVILY_API_KEY         建议——标准/深度核实与时间线的联网搜索用；未设时联网核实降级为不联网（refine 不受影响）
+  ⚠ 信源提示            DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。
+                         涉敏感话题或需保护信源的访谈请慎用。
 `
 
 // ---------- argv ----------
@@ -80,11 +65,8 @@ export function parseArgs(argv) {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
-    '--background-file': 'backgroundFile', '--base-url': 'baseURL',
-    '--chunk': 'chunkMode', '--prior-glossary': 'priorGlossaryPath',
-    // M10 cheap-first escalation: --escalate names the premium provider for files that fail the audit gate.
-    '--escalate': 'escalate', '--escalate-models': 'escalateModels', '--escalate-base-url': 'escalateBaseURL',
-    '--refine-mode': 'refineMode', '--effort': 'effort',
+    '--background-file': 'backgroundFile',
+    '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
   }
   let i = 0
   while (i < argv.length) {
@@ -105,26 +87,18 @@ export function parseArgs(argv) {
 }
 
 export const parseScope = (s) => (s ? s.split(',').map((x) => x.trim()).filter(Boolean) : ['refine'])
-export const parseModels = (s) => {
-  if (!s) return undefined
-  const m = {}
-  for (const pair of s.split(',')) { const [k, v] = pair.split('='); if (k && v) m[k.trim()] = v.trim() }
-  return m
-}
-// M12: `--effort refine=medium,summary=low`. Only the smart-tier categories (refine/logic/summary/timeline)
-// take effort; unknown keys and unknown levels are dropped (the API engine also guards by model, so a stray
-// value is harmless). Levels mirror the SDK's OutputConfig.effort enum.
-const EFFORT_CATS = new Set(['refine', 'logic', 'summary', 'timeline'])
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
-export const parseEffort = (s) => {
-  if (!s) return undefined
-  const m = {}
-  for (const pair of s.split(',')) {
-    const [k, v] = pair.split('=')
-    const key = k && k.trim(), val = v && v.trim()
-    if (EFFORT_CATS.has(key) && EFFORT_LEVELS.has(val)) m[key] = val
+
+// --chunk-size <N>: explicit 正文字数-per-chunk target for chunk-size experiments. N must be a positive integer
+// ≥ 2000 — below that a "chunk" is smaller than a single sub-heading section and would shred the transcript, so it
+// is rejected loudly (JobConfigError → CLI exits 2 with the message). Absent → undefined (no override).
+export const CHUNK_SIZE_MIN = 2000
+export function parseChunkSize(v) {
+  if (v == null) return undefined
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < CHUNK_SIZE_MIN) {
+    throw new JobConfigError(`--chunk-size 需为 ≥ ${CHUNK_SIZE_MIN} 的整数（每块目标正文字数），收到「${v}」`)
   }
-  return Object.keys(m).length ? m : undefined
+  return n
 }
 
 export function buildRunParams(a, { env = process.env } = {}) {
@@ -151,10 +125,8 @@ export function buildRunParams(a, { env = process.env } = {}) {
     scope: parseScope(a.scope),
     verifyDepth: a.verifyDepth || 'key',
     headingPolicy: a.headingPolicy || 'none',
-    models: parseModels(a.models),
     chunkMode: a.chunkMode === 'speed' ? 'speed' : (a.chunkMode === 'off' ? 'off' : undefined),   // 'off' disables ALL chunking incl. auto
-    refineMode: a.refineMode === 'single-shot' ? 'single-shot' : undefined,   // M11a; default agentic
-    effort: parseEffort(a.effort),                                            // M12: per-category reasoning effort
+    chunkSize: parseChunkSize(a.chunkSize),   // --chunk-size <N>：显式每块目标字数，覆盖自动分段字数与 speed 计数（≥2000 整数）
 
     fresh: !!a.fresh,
     annotate: a.noAnnotate ? false : undefined,
@@ -162,12 +134,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     runLog: a.noRunLog ? false : undefined,     // default on: appends one line to ~/.config/latepost-refiner/runs.jsonl
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
-    provider: a.provider,
-    baseURL: a.baseURL,
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
-    // M10: presence of --escalate enables cheap-first semantics — the normal --provider does the first
-    // (cheap) pass; this names the premium engine re-run on files that FAIL the deterministic audit gate.
-    escalate: a.escalate ? { provider: a.escalate, baseURL: a.escalateBaseURL, models: parseModels(a.escalateModels) } : undefined,
   }
 }
 
@@ -210,18 +177,12 @@ export function printRunSummary(r) {
     for (const f of r.audit.files) { const ss = f.sections || []; total += ss.length; flagged += ss.filter((s) => (s.flags || []).length).length }
     if (flagged > 0) console.error(`\n逐节复核：${flagged} 节需人工对照（共 ${total} 节）——见 review.md「逐节复核清单」`)
   }
-  // M10: cheap-first escalation summary. 「升级重跑：N 份未过审已升级 <provider>，M 份通过」 + a loud both-fail line.
-  if (r.escalation && r.escalation.escalated) {
-    const e = r.escalation
-    console.error(`\n升级重跑：${e.escalated} 份未过审已升级 ${e.provider}，${e.passed} 份通过`)
-    if (e.bothFailed) console.error(`⚠ 其中 ${e.bothFailed} 份两档均未过审——请对照源文件人工核对（见 review.md「升级重跑」）：` + e.files.filter((f) => f.bothFailed).map((f) => f.label).join('、'))
-  }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
   if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿及其派生的总结/时间线均未经审计，不可视为通过。产物已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {
-      console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或换 provider 重精校该段')
+      console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或重精校该段')
     }
   }
 
@@ -258,7 +219,6 @@ export function printRunSummary(r) {
 
   const u = r.usage || { agents: 0, input: 0, output: 0, cacheRead: 0, failed: 0 }
   console.error(`\n用量：${u.agents} 个代理调用${u.failed ? `（${u.failed} 失败）` : ''} · 输入 ${u.input.toLocaleString()} / 输出 ${u.output.toLocaleString()} tok · 缓存读 ${(u.cacheRead || 0).toLocaleString()}`)
-  if (u.escalation) { const e = u.escalation; console.error(`  其中升级重跑：${e.agents || 0} 个代理调用 · 输入 ${(e.input || 0).toLocaleString()} / 输出 ${(e.output || 0).toLocaleString()} tok`) }
 
   if (r.runLog && r.runLog.path) console.error(`运行日志：已追加 ${r.runLog.path}（第 ${r.runLog.lineCount} 行）`)
 }

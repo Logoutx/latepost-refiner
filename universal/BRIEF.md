@@ -1,5 +1,7 @@
 # LatePost-Refiner Universal — Build Brief
 
+> **历史文档**：这是最初的建造简报，当时的目标是直连 Anthropic API。2026-07-14 起 API 版收敛为 DeepSeek 单一引擎（`engines/deepseek.js`）+ Tavily 搜索，Anthropic/多 provider 相关内容仅作历史记录，现状见仓库根 README。
+
 ## One-line goal
 
 Turn this repo's interview-transcript refinement pipeline into a **standalone Node CLI that calls the Anthropic API directly** — anyone with an API key can run it on any machine, with no dependency on Claude Code's Workflow tooling and no need to upload a skill to claude.ai.

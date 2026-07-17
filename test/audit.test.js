@@ -762,6 +762,26 @@ test('derivative guard: a correct interview figure passes — including a full/h
   assert.equal(r.hardFail.length, 0, 'width variants match the source, so nothing is fabricated')
 })
 
+test('derivative guard: spoken unit variants match their canonical form (4000块 ⇄ 4000 元, 4 个小时 ⇄ 4 小时)', () => {
+  // Live FP class (2026-07-14): the interviewee says the colloquial unit, the derivative writes the canonical one.
+  const corpus = '沈其安：最惨的时候账上只剩4000块，第二天到账才缓过来。那天全员花了 4 个小时把邮件回完。'
+  const deriv = [
+    '## 时间线',
+    '- **2023 年**【访谈】账上仅剩 4000 元时下一笔投资到账。',
+    '- **2023 年**【访谈】全员用 4 小时回完积压邮件。',
+  ].join('\n')
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.hardFail.length, 0, '块⇄元 and 个小时⇄小时 are the same quantity, not fabrications')
+})
+
+test('derivative guard: the 月 family is NOT folded — a duration 个月 claim is not covered by a bare date 月', () => {
+  const corpus = '沈其安：我们 3 月启动了新线路。'   // 3 月 = March, a date — not a 3-month duration
+  const deriv = '## 时间线\n- **2023 年**【访谈】首期改造耗时 3 个月。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.hardFail.length, 1, 'a spoken date must not legitimise a fabricated duration')
+  assert.equal(r.hardFail[0].unit, '个月')
+})
+
 test('derivative guard: a 公开·待记者核实 figure never hard-fails — it is listed as a reporter-verification item', () => {
   const corpus = '沈其安：我们本轮融资 2 亿元。'
   // 500 亿 is NOT in the interview, but it is labelled public → passes, surfaced for the reporter to verify.

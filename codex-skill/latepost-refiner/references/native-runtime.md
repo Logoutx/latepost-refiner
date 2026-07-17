@@ -84,7 +84,7 @@ To override a stage for one run, add `codexModels` to Step 0 args, for example:
 }
 ```
 
-The OpenAI API model profile in `universal-runtime.md` applies only to the Universal fallback.
+The DeepSeek model profile in `universal-runtime.md` applies only to the Universal fallback.
 
 ## Step 0 Args
 

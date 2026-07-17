@@ -10,20 +10,13 @@ import path from 'node:path'
 export const DEFAULT_LOG_PATH = path.join(os.homedir(), '.config', 'latepost-refiner', 'runs.jsonl')
 
 // ---------- cost estimation ----------
-// Prices are per 1,000,000 tokens, USD. Sources (retrieved 2026-07-08):
+// Prices are per 1,000,000 tokens, USD. Source (retrieved 2026-07-08):
 //   DeepSeek   https://api-docs.deepseek.com/quick_start/pricing
-//   Anthropic  https://platform.claude.com/docs/en/about-claude/pricing
 //
-// DeepSeek accounting (CRITICAL): engines/openai.js reports usage.input INCLUDING cacheRead as a subset
+// DeepSeek accounting (CRITICAL): engines/deepseek.js reports usage.input INCLUDING cacheRead as a subset
 // (OpenAI-style prompt_tokens accounting) — so "fresh" (cache-miss) input = usage.input − usage.cacheRead.
 //   cost = fresh × inMiss + cacheRead × inHit + output × out          (all ÷ 1e6)
 // DeepSeek does not bill cache writes, so usage.cacheWrite has no term in this formula.
-//
-// Anthropic accounting: engines/api.js reports usage.input EXCLUDING cache reads/writes — they are
-// separate counters. The rates below already bake in Anthropic's standard 5-minute cache multipliers
-// (cacheRead ≈ 0.1× base input, cacheWrite ≈ 1.25× base input) on top of one flat per-token rate, because
-// this provider's row is not tier-specific (see note on PRICES.anthropic below).
-//   cost = input × in + cacheRead × cacheRead_rate + cacheWrite × cacheWrite_rate + output × out   (÷ 1e6)
 export const PRICES = {
   deepseek: {
     'deepseek-v4-flash': { inMiss: 0.14, inHit: 0.0028, out: 0.28 },
@@ -31,9 +24,6 @@ export const PRICES = {
     // Legacy default model id (deprecated 2026-07-24 per engines/providers.js); same price as v4-flash.
     'deepseek-chat': { inMiss: 0.14, inHit: 0.0028, out: 0.28 },
   },
-  // Not tier-specific: one flat rate regardless of which Claude model (haiku/sonnet/opus/fable) a given
-  // tier actually resolved to — so the `models` map passed to estimateCost() is simply unused here.
-  anthropic: { in: 5, out: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 }
 
 const round6 = (n) => Math.round(n * 1e6) / 1e6 // 6dp — sub-cent runs would otherwise show as 0
@@ -41,8 +31,8 @@ const round1 = (n) => Math.round(n * 10) / 10
 
 const deepseekPrice = (modelId) => (PRICES.deepseek && PRICES.deepseek[modelId]) || null
 
-// provider: 'anthropic' | 'deepseek' | ... ; models: tier→model-id map (e.g. PROVIDERS.deepseek.models)
-// or null; usage: {input, output, cacheRead, cacheWrite, ...}.
+// provider: 'deepseek' | ... (only 'deepseek' has price data — anything else returns null); models:
+// tier→model-id map (e.g. DEEPSEEK_MODELS) or null; usage: {input, output, cacheRead, cacheWrite, ...}.
 // Returns {value, currency:'USD', note} — note is null for an exact per-model computation, or a short
 // string (e.g. 'mixed-tier approximation') when the number is a documented approximation — or returns
 // plain `null` when there is no price data at all for this provider/model.
@@ -51,13 +41,6 @@ export function estimateCost(provider, models, usage) {
   const input = u.input || 0
   const output = u.output || 0
   const cacheRead = u.cacheRead || 0
-  const cacheWrite = u.cacheWrite || 0
-
-  if (provider === 'anthropic') {
-    const p = PRICES.anthropic
-    const value = round6((input * p.in + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite + output * p.out) / 1e6)
-    return { value, currency: 'USD', note: null }
-  }
 
   if (provider === 'deepseek') {
     if (!models || typeof models !== 'object') return null
@@ -84,15 +67,15 @@ export function estimateCost(provider, models, usage) {
     return { value, currency: 'USD', note: 'mixed-tier approximation' }
   }
 
-  return null // no price data for this provider (glm/kimi/openai/router/injected/unknown)
+  return null // no price data for this provider (anthropic/glm/kimi/openai/router/injected/unknown)
 }
 
 // ---------- entry shape ----------
 // Pure — builds the JSON-line entry recorded per run. `params` is runJob()'s raw input, `result` is its
 // return value (already carries finishedAt/durationMs/usage/audit/outputDir by the time this is called).
 // `provider`/`models` describe what actually served the run: `models` is the tier→model-id map used for
-// cost estimation (e.g. PROVIDERS.deepseek.models) — null when it doesn't apply (anthropic's flat rate,
-// or a router/injected engine where a single provider/model map isn't meaningful).
+// cost estimation (e.g. DEEPSEEK_MODELS) — null when it doesn't apply (e.g. an injected test engine with
+// no real provider/model map).
 export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null } = {}) {
   const durationMs = result.durationMs || 0
   const usageSrc = result.usage || {}

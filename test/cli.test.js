@@ -23,9 +23,6 @@ test('parseArgs output maps CLI flags to runJob params', () => {
     '--fresh',
     '--no-annotate',
     '--chunk', 'speed',
-    '--models', 'scout=haiku,refine=opus',
-    '--provider', 'openai',
-    '--base-url', 'https://api.example.invalid/v1',
     '--concurrency', '7',
     '--verify', 'deep',
     '--heading-policy', 'keep',
@@ -49,10 +46,7 @@ test('parseArgs output maps CLI flags to runJob params', () => {
   assert.deepEqual(params.scope, ['refine', 'summary', 'timeline'])
   assert.equal(params.verifyDepth, 'deep')
   assert.equal(params.headingPolicy, 'keep')
-  assert.deepEqual(params.models, { scout: 'haiku', refine: 'opus' })
   assert.equal(params.chunkMode, 'speed')
-  assert.equal(params.provider, 'openai')
-  assert.equal(params.baseURL, 'https://api.example.invalid/v1')
   assert.equal(params.concurrency, 7)
   assert.equal(params.fresh, true)
   assert.equal(params.annotate, false)
@@ -62,6 +56,33 @@ test('parseArgs output maps CLI flags to runJob params', () => {
 test('parseArgs: --prior-glossary is undefined when the flag is absent', () => {
   const params = buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T']), { env: { HOME: '/tmp' } })
   assert.equal(params.priorGlossaryPath, undefined)
+})
+
+// ---------- --chunk-size validation (Feature 1) ----------
+
+test('--chunk-size parses a valid ≥2000 integer into params.chunkSize', () => {
+  const params = buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '10000']), { env: { HOME: '/tmp' } })
+  assert.equal(params.chunkSize, 10000)
+})
+
+test('--chunk-size is undefined when the flag is absent (no override)', () => {
+  const params = buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T']), { env: { HOME: '/tmp' } })
+  assert.equal(params.chunkSize, undefined)
+})
+
+test('--chunk-size below 2000 is rejected with a clear CONFIG_ERROR', () => {
+  assert.throws(
+    () => buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '500']), { env: { HOME: '/tmp' } }),
+    (e) => e && e.code === 'CONFIG_ERROR' && /chunk-size/.test(e.message) && /2000/.test(e.message),
+    'a sub-2000 chunk size errors out with a message naming the flag and the floor',
+  )
+})
+
+test('--chunk-size rejects a non-integer', () => {
+  assert.throws(
+    () => buildRunParams(parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--chunk-size', '9000.5']), { env: { HOME: '/tmp' } }),
+    (e) => e && e.code === 'CONFIG_ERROR',
+  )
 })
 
 // ---------- SF-6: --allow-audit-fail exit-code semantics ----------

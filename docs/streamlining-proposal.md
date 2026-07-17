@@ -1,5 +1,7 @@
 # Streamlining Proposal
 
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+
 ## Summary
 
 The project should read as:
@@ -38,7 +40,7 @@ Today the project already has a strong shared `core/`, but the interface/runtime
    - `claude-code-skill/SKILL.md`
 
 2. Codex skill
-   - `codex-skills/latepost-refiner/SKILL.md`
+   - `codex-skill/latepost-refiner/SKILL.md`
 
 3. CLI
    - `latepost-refiner`
@@ -131,7 +133,7 @@ Move user-facing skill packages into one folder:
 
 ```text
 claude-code-skill/                  -> interfaces/claude/
-codex-skills/latepost-refiner/      -> interfaces/codex/latepost-refiner/
+codex-skill/latepost-refiner/      -> interfaces/codex/latepost-refiner/
 ```
 
 This clarifies that these are entry layers, not separate engines.

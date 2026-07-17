@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build the release zip from this directory (claude-code-skill/) for manual upload
-# to claude.ai. The zip's top-level dir is named latepost-refiner/ (= the deployed
-# name, matching ~/.claude/skills/latepost-refiner).
+# Build the release zip from this directory (claude-code-skill/) — a no-clone install path
+# for the Claude Code skill: download from GitHub Releases (or build this locally) and unzip
+# into ~/.claude/skills/, no `git clone` required. The zip's top-level dir is named
+# latepost-refiner/ (= the deployed name, matching ~/.claude/skills/latepost-refiner).
 # The skill now asks the user for the output folder on every run, so there is no
 # longer a personal-vs-share path variant — just one zip.
 # Usage: claude-code-skill/build-zips.sh [output dir, default ~/Downloads]

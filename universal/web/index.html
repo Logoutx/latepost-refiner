@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>访谈转录精校 · 本地版</title>
+<title>LatePost-Refiner · 本地版</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <link rel="manifest" href="/manifest.webmanifest">
@@ -33,6 +33,7 @@
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
   label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 5px; }
   label .opt { color: var(--muted); font-weight: 400; }
+  label a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
   input[type=text], input[type=password], input[type=number], select, textarea {
     width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
     background: var(--bg); color: var(--ink); font: inherit; font-size: 14px;
@@ -65,98 +66,46 @@
   #result ul { margin: 4px 0; padding-left: 20px; } #result li { margin: 2px 0; }
   code { font-family: var(--mono); font-size: 12.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
   .pill { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); margin-left: 8px; }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
-  .segbtn { background: var(--bg); color: var(--muted); border: none; padding: 7px 16px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
-  .segbtn.on { background: var(--accent); color: var(--accent-ink); }
-  .modelbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
-  .modelbar .hint { margin: 0; flex: 1 1 220px; }
-  .catrow { display: grid; grid-template-columns: 200px 1fr; gap: 10px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }
-  .catrow:first-child { border-top: none; }
-  .catlabel { font-size: 13px; font-weight: 600; padding-top: 8px; }
-  .catlabel .opt { display: block; font-weight: 400; font-size: 11px; }
-  .catfields { display: grid; gap: 8px; }
   .hidden { display: none; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>访谈转录精校 <span class="pill">本地</span></h1>
+    <h1>LatePost-Refiner <span class="pill">本地</span></h1>
     <p>清理口语、统一名词、保留事实。</p>
   </header>
 
   <div class="card">
-    <h2>模型</h2>
-    <div class="seg">
-      <button type="button" class="segbtn on" data-mode="single">单一服务商</button>
-      <button type="button" class="segbtn" data-mode="mixed">按任务分配</button>
-    </div>
-
-    <div id="paneSingle">
-      <div class="row">
-        <div>
-          <label>服务商</label>
-          <select id="provider"></select>
-          <p class="hint" id="providerNote"></p>
-          <p class="hint" id="providerRisk" style="color:var(--warn)"></p>
-        </div>
-        <div>
-          <label>API Key <span class="opt" id="keyHint"></span></label>
-          <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
-        </div>
+    <h2>密钥</h2>
+    <div class="row">
+      <div>
+        <label><a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">DeepSeek API Key</a></label>
+        <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
-      <label style="margin-top:14px">联网核实密钥 <span class="opt">标准/深度核实时使用</span></label>
-      <input type="password" id="tavilyKey" placeholder="Tavily API Key" autocomplete="off">
-      <p class="hint" id="searchNote"></p>
-      <details style="margin-top:12px">
-        <summary>高级设置</summary>
-        <label>Endpoint <span class="opt">可选</span></label>
-        <input type="text" id="baseURL" placeholder="">
-        <label>模型分层 <span class="opt">自动填入，可编辑</span></label>
-        <input type="text" id="models" placeholder="">
-        <div class="modelbar">
-          <button type="button" class="ghost" id="fetchModels">更新模型</button>
-          <span class="hint" id="modelFetchStatus"></span>
-        </div>
-        <p class="hint" id="modelHint"></p>
-      </details>
-    </div>
-
-    <div id="paneMixed" class="hidden">
-      <p class="hint">按任务分配不同服务商。留空的任务使用默认设置。</p>
-      <p class="hint">标准/深度核实会在精校前校正人名、公司、产品、日期和疑似 ASR 错词；DeepSeek / OpenAI 需要 Tavily。</p>
-      <div class="row">
-        <div><label>默认服务商</label><select id="defProvider"></select></div>
-        <div><label>默认 API Key</label><input type="password" id="defKey" placeholder="用于留空任务" autocomplete="off"></div>
+      <div>
+        <label><a href="https://app.tavily.com/home" target="_blank" rel="noopener">Tavily API Key</a> <span class="opt">联网核实/时间线用</span></label>
+        <input type="password" id="tavilyKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
-      <div class="modelbar">
-        <button type="button" class="ghost" id="fetchMixedModels">更新默认模型</button>
-        <span class="hint" id="mixModelHint"></span>
-      </div>
-      <div id="catRows" style="margin-top:8px"></div>
-      <details style="margin-top:10px">
-        <summary>联网核实密钥</summary>
-        <label>Tavily API Key <span class="opt">DeepSeek / OpenAI 需要</span></label>
-        <input type="password" id="mixTavily" placeholder="Tavily API Key" autocomplete="off">
-      </details>
     </div>
+    <p class="hint">DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。涉敏感话题或需保护信源的访谈请慎用。</p>
+    <p class="hint">Tavily 如不填，无法联网核实：名词校准质量会严重下降，也无法生成时间线。</p>
   </div>
 
   <div class="card">
     <h2>输入</h2>
     <div class="filebox" id="filebox" tabindex="0">
-      选择转录文件<br><span class="opt">.txt / .md / .srt / .docx / .pptx / .xlsx / .pdf</span>
+      选择转录文件<br><span class="opt">.txt / .md / .srt / .docx / .pdf</span>
     </div>
     <input type="file" id="files" multiple class="hidden"
-           accept=".txt,.md,.srt,.docx,.pptx,.xlsx,.pdf,text/plain,text/markdown">
+           accept=".txt,.md,.srt,.docx,.pdf,text/plain,text/markdown">
     <ul id="fileList"></ul>
     <p class="hint" id="fileEstimate"></p>
     <div class="row" style="margin-top:8px">
-      <div><label>主题 <span class="opt">用于文件名</span></label><input type="text" id="topic" placeholder="示例公司"></div>
-      <div><label>采访时间 <span class="opt">YYYY-MM</span></label><input type="text" id="date" placeholder="2025-02"></div>
+      <div><label>采访时间 <span class="opt">YYYY-MM-DD</span></label><input type="date" id="date"></div>
     </div>
-    <label>背景 <span class="opt">给模型一点上下文</span></label>
-    <textarea id="background" placeholder="例如：示例公司跨部门访谈，受访者负责渠道运营。"></textarea>
+    <label>背景 <span class="opt">给模型一点上下文；文件名会自动用作主题</span></label>
+    <textarea id="background" placeholder="跟什么公司的什么人，聊了什么内容（你能想起来的主题、重要人名、事件等）"></textarea>
   </div>
 
   <div class="card">
@@ -170,13 +119,14 @@
     </div>
     <div class="row3" style="margin-top:12px">
       <div><label>核实范围</label><select id="verify"><option value="key">标准（推荐）</option><option value="deep">深度</option><option value="none">关闭</option></select></div>
-      <div><label>小标题</label><select id="heading"><option value="none">自动生成</option><option value="keep">保留原文</option><option value="regenerate">重新生成</option></select></div>
-      <div><label>并发 <span class="opt">可选</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
+      <div><label>小标题</label><select id="heading"><option value="regenerate">重新生成</option><option value="keep">保留原样</option></select></div>
+      <div><label>同时处理的分块数 <span class="opt">留空自动</span></label><input type="number" id="concurrency" min="1" placeholder="自动"></div>
     </div>
     <p class="hint">标准/深度核实会用于精校稿；关闭适合更快、更省额度或不联网的整理。</p>
-    <label>输出位置 <span class="opt">留空用 Downloads/&lt;主题&gt;</span></label>
-    <input type="text" id="out" placeholder="留空则保存到 ~/Downloads/<主题>">
-    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label><label title="把超过约 12000 字的文件拆成 2 块并行精校。多文件批量更快，但更费额度；单文件提升有限。"><input type="checkbox" id="chunkSpeed"> 大文件分块并行（提速·更费额度）</label></div>
+    <label>输出位置 <span class="opt">留空用 Downloads/&lt;文件名主题&gt;</span></label>
+    <input type="text" id="out" placeholder="留空则保存到 ~/Downloads/<文件名主题>">
+    <div class="checks" style="margin-top:10px"><label><input type="checkbox" id="fresh"> 重新生成校对表</label></div>
+    <p class="opt" style="margin:8px 0 0">自动分块：超过 10,000 字的文件会自动按发言轮边界切块并行精校（问句与回答不拆开），无需设置；要完全关闭分块请用命令行 <code>--chunk off</code>。</p>
   </div>
 
   <div class="actions">
@@ -199,190 +149,12 @@
 const $ = (id) => document.getElementById(id)
 const API_TOKEN = window.__TRANSCRIBER_TOKEN__ || ''
 const jsonHeaders = () => ({ 'Content-Type': 'application/json', 'X-Transcriber-Token': API_TOKEN })
-let PROVIDERS = [], CATEGORIES = []
 let picked = [] // {name, base64}
-let mode = 'single'
-
-const provOptions = (withDefault) => (withDefault ? '<option value="">默认</option>' : '') + PROVIDERS.map(p => `<option value="${p.name}">${p.label}</option>`).join('')
-const hintModel = (tier) => tier === 'opus' ? 'claude-opus-4-8 / gpt-5.5' : tier === 'haiku' ? 'claude-haiku-4-5 / deepseek-chat' : 'claude-sonnet-4-6'
-const STAGE_ORDER = ['scout', 'verify', 'dedup', 'refine', 'logic', 'summary', 'timeline']
-const providerByName = (name) => PROVIDERS.find(p => p.name === name)
-const uniq = (xs) => Array.from(new Set(xs.filter(Boolean)))
-const modelIdsFor = (p) => uniq(((p && p.catalog) || []).map(m => m.id).concat(Object.values((p && p.models) || {})))
-const stageMapping = (defaults) => STAGE_ORDER.map(k => defaults && defaults[k] ? `${k}=${defaults[k]}` : '').filter(Boolean).join(',')
-const CAT_LABELS = { mechanical: '基础处理', web: '联网核实', correction: '术语去重', smart: '精校与总结' }
-const STAGE_LABELS = { scout: '侦察', check: '核对', verify: '核实', dedup: '去重', refine: '精校', logic: '逻辑稿', summary: '总结', timeline: '时间线' }
-const categoryTitle = (c) => CAT_LABELS[c.key] || c.label
-const stageText = (stages) => (stages || []).map(s => STAGE_LABELS[s] || s).join(' · ')
-
-function optionListFor(p) {
-  return modelIdsFor(p).map(id => `<option value="${escAttr(id)}"></option>`).join('')
-}
-
-async function loadConfig() {
-  const r = await fetch('/api/providers'); const j = await r.json()
-  PROVIDERS = j.providers; CATEGORIES = j.categories || []
-  $('provider').innerHTML = provOptions(false); $('provider').onchange = onProvider; onProvider()
-  $('defProvider').innerHTML = provOptions(false)
-  $('defProvider').onchange = () => { fetchDefaultMixedModels(false); refreshCategoryDefaults(true, true) }
-  $('defKey').onblur = () => fetchDefaultMixedModels(false)
-  $('apiKey').onblur = () => fetchSingleModels(false)
-  $('baseURL').onblur = () => fetchSingleModels(false)
-  $('models').oninput = () => { $('models').dataset.touched = '1' }
-  $('fetchModels').onclick = () => fetchSingleModels(true)
-  $('fetchMixedModels').onclick = () => fetchDefaultMixedModels(true)
-  buildCatRows()
-  document.querySelectorAll('.segbtn').forEach(b => b.onclick = () => setMode(b.dataset.mode))
-}
-function onProvider() {
-  const p = PROVIDERS.find(x => x.name === $('provider').value) || {}
-  $('keyHint').textContent = '（' + (p.keyEnv || []).join(' / ') + '）'
-  $('providerNote').textContent = p.note || ''
-  $('providerRisk').textContent = p.riskNote || ''   // 信源保护提示（境内运营商）
-  $('baseURL').placeholder = p.baseURL || '默认'
-  $('tavilyKey').style.display = p.nativeSearch ? 'none' : 'block'
-  $('searchNote').textContent = p.nativeSearch
-    ? '标准/深度核实会使用服务商自带搜索，并用于精校稿。'
-    : '标准/深度核实需要 Tavily，并会用于精校稿。'
-  $('modelHint').textContent = modelSuggest(p)
-  $('modelFetchStatus').textContent = p.modelWarning || ''
-  setSingleModelDefaults(false)
-}
-function modelSuggest(p) {
-  if (!p.models && !p.costEffective) return ''
-  const d = (p.costEffective && p.costEffective.stage) || {}
-  const s = '推荐：精校/总结 ' + (d.refine || p.models.opus) + '；机械 ' + (d.scout || p.models.haiku) + '；核实 ' + (d.verify || p.models.sonnet) + '。'
-  return p.modelNote ? (s + p.modelNote) : s
-}
-function setSingleModelDefaults(force) {
-  const input = $('models')
-  if (!force && input.dataset.touched) return
-  const p = providerByName($('provider').value) || {}
-  const mapping = stageMapping(p.costEffective && p.costEffective.stage)
-  if (mapping) input.value = mapping
-}
-async function fetchModelsFor(providerName, apiKey, baseURL, statusEl) {
-  const p = providerByName(providerName)
-  if (!p) return null
-  statusEl.textContent = apiKey ? '正在更新模型...' : '未填 API Key，使用内置推荐。'
-  try {
-    const resp = await fetch('/api/models', {
-      method: 'POST',
-      headers: jsonHeaders(),
-      body: JSON.stringify({ provider: providerName, apiKey, baseURL }),
-    })
-    const data = await resp.json()
-    if (!resp.ok) throw new Error(data.error || '更新失败')
-    p.catalog = data.models || []
-    p.costEffective = data.defaults || p.costEffective
-    p.modelSource = data.source
-    p.modelWarning = data.warning || ''
-    statusEl.textContent = data.warning || ('已更新 ' + p.catalog.length + ' 个模型。')
-    return p
-  } catch (e) {
-    statusEl.textContent = '模型更新失败：' + e.message
-    return p
-  }
-}
-async function fetchSingleModels(force) {
-  const p = providerByName($('provider').value)
-  if (!p) return
-  await fetchModelsFor(p.name, $('apiKey').value.trim(), $('baseURL').value.trim(), $('modelFetchStatus'))
-  $('modelHint').textContent = modelSuggest(p)
-  setSingleModelDefaults(force)
-}
-async function fetchDefaultMixedModels(force) {
-  const p = providerByName($('defProvider').value)
-  if (!p) return
-  await fetchModelsFor(p.name, $('defKey').value.trim(), '', $('mixModelHint'))
-  refreshCategoryDefaults(force, true)
-}
-async function fetchCatModels(cat, force) {
-  const explicitProvider = document.querySelector('.catProvider[data-cat="' + cat + '"]').value
-  const provider = explicitProvider || $('defProvider').value
-  const key = explicitProvider
-    ? document.querySelector('.catKey[data-cat="' + cat + '"]').value.trim()
-    : $('defKey').value.trim()
-  if (!provider) return
-  await fetchModelsFor(provider, key, '', $('mixModelHint'))
-  setCategoryModelDefault(cat, force)
-}
-function setMode(m) {
-  mode = m
-  document.querySelectorAll('.segbtn').forEach(b => b.classList.toggle('on', b.dataset.mode === m))
-  $('paneSingle').classList.toggle('hidden', m !== 'single')
-  $('paneMixed').classList.toggle('hidden', m !== 'mixed')
-}
-function buildCatRows() {
-  $('catRows').innerHTML = CATEGORIES.map(c => `
-    <div class="catrow">
-      <div class="catlabel">${categoryTitle(c)}<span class="opt">${stageText(c.stages)}</span></div>
-      <div class="catfields">
-        <select class="catProvider" data-cat="${c.key}">${provOptions(true)}</select>
-        <input class="catKey hidden" data-cat="${c.key}" type="password" placeholder="该任务 API Key" autocomplete="off">
-        <input class="catModel" data-cat="${c.key}" type="text" list="modelList-${c.key}" placeholder="自动选择模型">
-        <datalist id="modelList-${c.key}"></datalist>
-      </div>
-    </div>`).join('')
-  document.querySelectorAll('.catProvider').forEach(sel => sel.onchange = () => {
-    const cat = sel.dataset.cat
-    document.querySelector('.catKey[data-cat="' + cat + '"]').classList.toggle('hidden', !sel.value)
-    fetchCatModels(cat, true)
-  })
-  document.querySelectorAll('.catKey').forEach(input => input.onblur = () => fetchCatModels(input.dataset.cat, false))
-  document.querySelectorAll('.catModel').forEach(input => input.oninput = () => { input.dataset.touched = '1' })
-  refreshCategoryDefaults(true, false)
-}
-function categoryMeta(cat) {
-  return CATEGORIES.find(c => c.key === cat) || {}
-}
-function categoryProvider(cat) {
-  return document.querySelector('.catProvider[data-cat="' + cat + '"]').value || $('defProvider').value
-}
-function setCategoryModelDefault(cat, force) {
-  const input = document.querySelector('.catModel[data-cat="' + cat + '"]')
-  if (!input || (!force && input.dataset.touched)) return
-  const meta = categoryMeta(cat)
-  const p = providerByName(categoryProvider(cat)) || {}
-  const suggestion = p.costEffective && p.costEffective.category && p.costEffective.category[cat]
-    ? p.costEffective.category[cat]
-    : p.models && p.models[meta.tierHint]
-  const dl = $('modelList-' + cat)
-  if (dl) dl.innerHTML = optionListFor(p)
-  input.placeholder = suggestion
-    ? ('默认 ' + suggestion)
-    : ('自动选择，如 ' + hintModel(meta.tierHint))
-  if (suggestion) input.value = suggestion
-}
-function refreshCategoryDefaults(force, onlyDefaultProvider) {
-  for (const c of CATEGORIES) {
-    const explicit = document.querySelector('.catProvider[data-cat="' + c.key + '"]').value
-    if (onlyDefaultProvider && explicit) continue
-    setCategoryModelDefault(c.key, force)
-  }
-}
 
 function collectModel() {
-  if (mode === 'single') {
-    const apiKey = $('apiKey').value.trim()
-    if (!apiKey) throw new Error('请填写 API Key。')
-    return { provider: $('provider').value, apiKey, baseURL: $('baseURL').value.trim() || undefined, tavilyKey: $('tavilyKey').value.trim() || undefined, models: parseModels($('models').value) }
-  }
-  const defProvider = $('defProvider').value, defKey = $('defKey').value.trim()
-  const categories = {}
-  for (const c of CATEGORIES) {
-    const provSel = document.querySelector('.catProvider[data-cat="' + c.key + '"]').value
-    const keyVal = document.querySelector('.catKey[data-cat="' + c.key + '"]').value.trim()
-    const modelOverride = document.querySelector('.catModel[data-cat="' + c.key + '"]').value.trim() || undefined
-    const provider = provSel || defProvider
-    const apiKey = provSel ? keyVal : defKey
-    if (!provider) throw new Error('请选择「' + categoryTitle(c) + '」的服务商。')
-    if (!apiKey) throw new Error('请填写「' + categoryTitle(c) + '」的 API Key。')
-    categories[c.key] = { provider, apiKey, modelOverride }
-  }
-  const t = $('mixTavily').value.trim()
-  if (t && categories.web) categories.web.tavilyKey = t
-  return { categories }
+  const apiKey = $('apiKey').value.trim()
+  if (!apiKey) throw new Error('请填写 DeepSeek API Key。')
+  return { apiKey, tavilyKey: $('tavilyKey').value.trim() || undefined }
 }
 
 // file picking → base64
@@ -461,11 +233,6 @@ function getScope() {
   document.querySelectorAll('.scopeChk').forEach(c => { if (c.checked) scope.push(c.value) })
   return scope
 }
-function parseModels(s) {
-  s = (s || '').trim(); if (!s) return undefined
-  const m = {}; for (const pair of s.split(',')) { const [k, v] = pair.split('='); if (k && v) m[k.trim()] = v.trim() }
-  return Object.keys(m).length ? m : undefined
-}
 
 const log = (msg, cls) => { const c = $('console'); const span = document.createElement('div'); if (cls) span.className = cls; span.textContent = msg; c.appendChild(span); c.scrollTop = c.scrollHeight; return span }
 
@@ -484,9 +251,14 @@ function markPhase(title) { freezePhase(); phaseTitle = title; phaseStart = Date
 function stopClock() { freezePhase(); clearInterval(clockTick); clockTick = null; const el = $('elapsed'); if (el && runStart) el.textContent = '总用时 ' + fmtDur(Date.now() - runStart); runStart = 0; phaseEl = null }
 
 $('run').onclick = run
+// 主题不再单独填写：取第一份文件的文件名（去扩展名、去路径非法字符），用于输出目录与交付物命名。
+function deriveTopic() {
+  const name = picked[0] ? picked[0].name : ''
+  const base = name.replace(/\.[^.]+$/, '').replace(/[\/\\:*?"<>|]/g, ' ').trim()
+  return base || 'untitled'
+}
 async function run() {
   if (!picked.length) return setStatus('请先选择文件。', true)
-  if (!$('topic').value.trim()) return setStatus('请填写主题。', true)
   const outVal = $('out').value.trim()
   if (outVal) localStorage.setItem('lpr_out', outVal)   // 记住上次的输出位置
   let modelParams
@@ -495,7 +267,7 @@ async function run() {
   const params = {
     ...modelParams,
     files: picked,
-    topic: $('topic').value.trim(),
+    topic: deriveTopic(),
     date: $('date').value.trim(),
     background: $('background').value.trim(),
     scope: getScope(),
@@ -503,7 +275,6 @@ async function run() {
     headingPolicy: $('heading').value,
     outputDir: outVal || undefined,
     fresh: $('fresh').checked,
-    chunkMode: $('chunkSpeed').checked ? 'speed' : undefined,
     concurrency: $('concurrency').value ? Number($('concurrency').value) : undefined,
   }
 
@@ -569,13 +340,10 @@ function renderResult(r) {
   const ob = $('openBtn'); if (ob) ob.onclick = () => fetch('/api/open', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ path: r.outputDir }) })
 }
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) }
-function escAttr(s) { return esc(s).replace(/"/g, '&quot;') }
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
 
 // --- persist non-secret settings across reloads (localStorage, lpr_ prefix) ---
-// Never persist: apiKey / tavilyKey / defKey / mixTavily or any input[type=password] — those
-// stay in-memory only for the run. Restoring the provider selects must happen AFTER loadConfig()
-// populates their <option>s, or the saved value has nothing to match against.
+// Never persist: apiKey / tavilyKey or any input[type=password] — those stay in-memory only for the run.
 function persistField(id, key) {
   const el = $(id)
   if (!el) return
@@ -583,10 +351,10 @@ function persistField(id, key) {
   const isCheck = el.type === 'checkbox'
   const saved = localStorage.getItem(key)
   if (saved !== null) {
-    if (isCheck) el.checked = saved === '1'; else el.value = saved
-    // #models carries a restored override; mark it touched so onProvider()'s auto-fill
-    // (setSingleModelDefaults) doesn't clobber it right after restore.
-    if (id === 'models' && saved) el.dataset.touched = '1'
+    // 下拉框：旧存值若已不在选项里（比如选项后来改过），忽略它，保住默认值
+    const staleOption = el.tagName === 'SELECT' && ![...el.options].some((o) => o.value === saved)
+    if (isCheck) el.checked = saved === '1'
+    else if (!staleOption) el.value = saved
   }
   const save = () => localStorage.setItem(key, isCheck ? (el.checked ? '1' : '0') : el.value)
   el.addEventListener('change', save)
@@ -605,22 +373,11 @@ function saveScope() {
 }
 function wirePersistence() {
   { const lastOut = localStorage.getItem('lpr_out'); if (lastOut && !$('out').value) $('out').value = lastOut }   // 回填上次的输出位置（既有逻辑，key 名保持不变）
-  ;['verify', 'heading', 'topic', 'date', 'background', 'baseURL', 'models', 'chunkSpeed'].forEach(id => persistField(id, 'lpr_' + id))
+  ;['verify', 'heading', 'date', 'background'].forEach(id => persistField(id, 'lpr_' + id))
   restoreScope()
   document.querySelectorAll('.scopeChk').forEach(c => c.addEventListener('change', saveScope))
 }
-function wireProviderPersistence() {
-  // provider selects only exist to restore into once loadConfig() has populated their <option>s.
-  // Setting .value via JS does not fire 'change', so re-run each select's own refresh logic
-  // after restoring — same calls their onchange handlers already make.
-  persistField('provider', 'lpr_provider')
-  onProvider()
-  persistField('defProvider', 'lpr_defProvider')
-  if ($('defProvider').value) { fetchDefaultMixedModels(false); refreshCategoryDefaults(true, true) }
-}
-
 wirePersistence()
-loadConfig().then(wireProviderPersistence)
 </script>
 </body>
 </html>

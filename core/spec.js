@@ -47,10 +47,25 @@ export const VERIFY_SCHEMA = {
       canonical: { type: 'string', description: '核实后的正确写法' },
       identity: { type: 'string', description: '身份/title' },
       source: { type: 'string', description: '依据来源一句话' },
+      // OPTIONAL (all existing consumers survive its absence): the agent attests BOTH keys held for a decisive
+      // conclusion on a phonetically-suspect / contested entity — a 高级别来源（官方域名/大媒体/百科）AND 语境吻合.
+      // Only two_key===true may retire a 〔同指两解〕 row (see confidenceMark); a coattail/SEO/分销站 never sets it.
+      two_key: { type: 'boolean', description: '对存疑/两解实体下决定性结论时，高级别来源与语境吻合两项同时成立才置 true；搭便车/SEO 站永不可置 true' },
     } } },
     unresolved: { type: 'array', items: { type: 'object', properties: {
       query: { type: 'string' },
       note: { type: 'string' },
+    } } },
+    // Contested (两把钥匙未满足): a referent substitution the two-key rule blocked — keep the spoken/literal form,
+    // record BOTH hypotheses + each side's evidence tier. Separate from resolved/unresolved so existing consumers
+    // are untouched; the pipeline lands these as 〔同指两解〕 rows and one 收尾待问 line each.
+    contested: { type: 'array', items: { type: 'object', properties: {
+      query: { type: 'string', description: '清单中的候选写法（口播/字面原形），维持不改' },
+      literal: { type: 'string', description: '假设 A：字面/口播形若真为独立实体，它是什么（可与 query 相同）' },
+      literal_tier: { type: 'string', description: 'A 命中的最强证据级别：官方/权威媒体/百科 ＞ 目录站/SEO 博客 ＞ 自我推销贴' },
+      correction: { type: 'string', description: '假设 B：更可能的正确写法/所指' },
+      correction_tier: { type: 'string', description: 'B 命中的最强证据级别（同上分级）' },
+      note: { type: 'string', description: '一句说明为何两解未决（如：字面命中仅为 X 的分销站，属搭便车反转）' },
     } } },
   },
 }
@@ -196,14 +211,22 @@ export const effortFor = (A, category) => (A && A.effort && A.effort[category]) 
 export const CONFIDENCE_VERIFIED = '核实'
 export const CONFIDENCE_USER = '用户钦定'
 export const CONFIDENCE_RECHECK = '待复核'
-// Trailing-token matcher: 〔用户钦定〕 / 〔待复核〕 / 〔核实〕 / 〔核实·2025-07〕 at the very end of an entry line.
+// 〔同指两解〕 — contested: verify could NOT satisfy the two-key rule (a high-tier source AND context-fit) for a
+// referent substitution, so the spoken/literal written form is KEPT and BOTH hypotheses are recorded on the row.
+// This is the coattail-inversion guard: an SEO site named after the misheard string does not license overwriting
+// the entity's identity. A contested row is re-adjudicated next batch (excludeVerified treats it like recheck) and
+// only a later two_key verdict (a resolved hit with two_key===true, the agent attesting high-tier source AND
+// context-fit) that ACTUALLY applies (not blocked by the name-guard) may upgrade it to 〔核实〕. Bare concreteness
+// never does — that was the coattail hole (an SEO domain reads "concrete" yet proves nothing about identity).
+export const CONFIDENCE_CONTESTED = '同指两解'
+// Trailing-token matcher: 〔用户钦定〕 / 〔待复核〕 / 〔核实〕 / 〔核实·2025-07〕 / 〔同指两解〕 at the very end of an entry line.
 // SF-1: the marker must be preceded by a whitespace char or a ｜ separator (captured group 1) — the render side
 // always emits exactly one leading space before it (see confidenceMark), so a *legitimate* hint that happens to
 // END with the literal string 〔核实〕 (no separating space, e.g. 正文…核实〔核实〕) is NOT mistaken for metadata
 // and stays in the body. Anchored to $ so it can only ever consume a real trailing marker.
 // Residual edge (documented, not handled): a hint deliberately ending with a SPACE + a literal 〔核实〕 token
 // (“… 〔核实〕”) is indistinguishable from a real marker and will be stripped — an extreme collision we accept.
-const CONFIDENCE_RE = new RegExp(`(^|[\\s｜])〔(${CONFIDENCE_USER}|${CONFIDENCE_RECHECK}|${CONFIDENCE_VERIFIED})(?:·([0-9]{4}-[0-9]{2}))?〕\\s*$`)
+const CONFIDENCE_RE = new RegExp(`(^|[\\s｜])〔(${CONFIDENCE_USER}|${CONFIDENCE_RECHECK}|${CONFIDENCE_VERIFIED}|${CONFIDENCE_CONTESTED})(?:·([0-9]{4}-[0-9]{2}))?〕\\s*$`)
 
 // ---------- provenance guard (M3): 核实 requires a CONCRETE source ----------
 // The gap this closes: excludeVerified treats confidence:'verified' as PERMANENTLY settled — such an entry is
@@ -245,24 +268,47 @@ export function isConcreteSource(s) {
 // every call site is guaranteed the SF-1 space without duplicating the rule. Priority (BLOCKER — confidence must
 // round-trip across batches):
 //   1. locked (in-memory 用户钦定 cluster) OR a prior entry parsed back as confidence:'user' → 〔用户钦定〕
-//   2. re-verified THIS round (a writing is in resolvedMap) AND its source is CONCRETE (isConcreteSource) →
-//      〔核实·<thisDate>〕 (date omitted when absent); re-verified but source is NOT concrete → 〔待复核〕
-//      instead (machine-assigned provenance guard — see above; the resolution itself is still applied to the
-//      entry body by applyVerifiedEntry, only the confidence marker is withheld)
+//   1b. a contested row (fresh or carried): retire to 〔核实〕 ONLY if the hit has two_key===true AND applied (not
+//      in `rejected`); otherwise stay 〔同指两解〕. Bare concreteness never retires a contested row.
+//   2. a NON-contested row re-verified THIS round (a writing is in resolvedMap) with a CONCRETE source
+//      (isConcreteSource) AND actually applied (not name-guard-rejected) → 〔核实·<thisDate>〕 (date omitted when
+//      absent); re-verified but source NOT concrete, OR the rename was rejected → 〔待复核〕 instead
+//      (machine-assigned provenance guard — see above; a rejected rename is also kept out of the entry body by
+//      applyVerifiedEntry, so body and marker never contradict)
 //   3. a prior entry parsed back as confidence:'verified' but NOT re-checked this round → its ORIGINAL marker
 //      preserved verbatim, original date段 and all (this is what was silently lost before)
 //   4. a prior entry parsed back as confidence:'recheck' but NOT re-verified this round → 〔待复核〕 preserved, so
 //      next round's excludeVerified still force-re-verifies it (Finding 4: this marker was silently dropped before)
 //   5. unknown with no fresh verification → no marker
-export function confidenceMark(e0, resolvedMap, date) {
+// contestedMap (optional 4th arg): query→contested item from THIS round's verify. A fresh contested verdict, or a
+// prior entry parsed back as confidence:'contested', renders 〔同指两解〕. A contested row may ONLY be retired when
+// the fresh resolved hit carries two_key===true (the verify agent attests high-tier source AND context-fit) AND the
+// rename was actually APPLIED (not blocked by the name-guard). Bare concreteness — even a real-looking domain — can
+// NEVER retire a contested row (the coattail failure). A two_key self-confirmation (canonical === a spoken form) is
+// a legitimate retirement toward the literal.
+// rejected (optional 5th arg): the Set applyVerifiedEntry populated THIS render pass with the hits it refused
+// (contested referent-substitution guard OR the张冠李戴 person name-guard). confidenceMark re-derives the SAME hit
+// object from the same names, so `rejected.has(hit)` tells it whether the rename actually landed. This closes the
+// contradiction "row body says 未采用/张冠李戴 while marker says 〔核实〕": a rejected hit never yields 〔核实〕 — a
+// contested row stays contested, a non-contested row falls to 〔待复核〕. Omitting the arg (direct callers/tests)
+// means "nothing was rejected", preserving prior behaviour for hits that were applied.
+export function confidenceMark(e0, resolvedMap, date, contestedMap, rejected) {
   if (!e0) return ''
   if (e0.locked || e0.confidence === 'user') return ` 〔${CONFIDENCE_USER}〕`
   const names = [e0.canonical, ...(e0.variants || [])]
   const hit = resolvedMap && names.map((n) => resolvedMap.get(n)).find(Boolean)
-  if (hit) {
-    if (isConcreteSource(hit.source)) return date ? ` 〔${CONFIDENCE_VERIFIED}·${date}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
-    return ` 〔${CONFIDENCE_RECHECK}〕`   // resolved this round, but no concrete evidence — applied, not永久信任
+  const hitRejected = !!(hit && rejected && rejected.has(hit))
+  const applied = !!hit && !hitRejected   // the rename actually landed in the entry body this pass
+  const verifiedMark = () => (date ? ` 〔${CONFIDENCE_VERIFIED}·${date}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`)
+  // Contested row (fresh this round OR carried forward): retire ONLY on a two_key, actually-applied verdict.
+  const freshContested = contestedMap && names.map((n) => contestedMap.get(n)).find(Boolean)
+  if (freshContested || e0.confidence === 'contested') {
+    if (hit && hit.two_key === true && applied) return verifiedMark()   // sanctioned two-key upgrade / self-confirm
+    return ` 〔${CONFIDENCE_CONTESTED}〕`                                  // no two_key, or rename rejected → stay contested
   }
+  // Non-contested row: a concrete-source hit that actually landed earns 〔核实〕 — a rejected (张冠李戴) hit does not.
+  if (hit && isConcreteSource(hit.source) && applied) return verifiedMark()
+  if (hit) return ` 〔${CONFIDENCE_RECHECK}〕`   // resolved this round, but not concrete-and-applied — applied?不永久信任
   if (e0.confidence === 'verified') return e0.confidenceDate ? ` 〔${CONFIDENCE_VERIFIED}·${e0.confidenceDate}〕` : ` 〔${CONFIDENCE_VERIFIED}〕`
   // Finding 4: a prior 〔待复核〕 entry with no fresh verification hit this round must RE-EMIT its marker — dropping it
   // (the old behavior) lost the flag excludeVerified relies on to force-re-verify the entry next batch.
@@ -278,7 +324,10 @@ function stripConfidence(rhs) {
   const s = String(rhs == null ? '' : rhs)
   const m = s.match(CONFIDENCE_RE)
   if (!m) return { rhs: s, confidence: 'unknown', confidenceDate: '' }
-  const conf = m[2] === CONFIDENCE_USER ? 'user' : m[2] === CONFIDENCE_RECHECK ? 'recheck' : 'verified'
+  const conf = m[2] === CONFIDENCE_USER ? 'user'
+    : m[2] === CONFIDENCE_RECHECK ? 'recheck'
+    : m[2] === CONFIDENCE_CONTESTED ? 'contested'
+    : 'verified'
   return { rhs: s.slice(0, m.index).replace(/\s+$/, ''), confidence: conf, confidenceDate: m[3] || '' }
 }
 
@@ -578,24 +627,115 @@ function evenLineChunks(f, K) {
   for (const c of chunks) c.count = chunks.length // count reflects ACTUAL chunks (a slice may have been dropped)
   return chunks
 }
+// ---------- turn-boundary quality: never orphan a question from its answer ----------
+// A speaker turn opens with a label line (「名字：」/「记者：」/「张三：」 — same shape as the audit's ATTR_LABEL_RE),
+// so a "turn boundary" is the line before the next label line. parseTurns walks the raw source once and returns one
+// entry per turn: its 1-based opening line and whether the turn's VISIBLE text ends with a question mark. Used by the
+// preflight (universal jobs.prepareFile) to attach f.turns so the orchestrator can snap chunk boundaries to real
+// turns AND avoid ending a chunk on a question (see turnAwareChunks). Editions with no fs (the CC Workflow sandbox)
+// simply don't populate f.turns → splitForRefine falls back to evenLineChunks, byte-identical to before.
+const TURN_LABEL_RE = /^\s*[一-龥A-Za-z0-9·]{1,12}[：:]/
+// A turn "ends with a question" if — after stripping trailing whitespace, closing quotes/brackets, and any trailing
+// HTML-comment provenance marker (<!-- 源 L… -->) — the last visible glyph is ？ or ?. This is what lets us keep a
+// question glued to the answer that follows it. Pure + exported so the rule is unit-testable in isolation.
+export function endsWithQuestion(text) {
+  let t = String(text == null ? '' : text)
+  let prev
+  do {
+    prev = t
+    t = t.replace(/<!--[\s\S]*?-->\s*$/, '')            // trailing 溯源 HTML comment marker
+    t = t.replace(/[\s"'’”`」』）)】〕》\]}]+$/, '')      // trailing whitespace / closing quotes / brackets
+  } while (t !== prev)
+  return /[？?]$/.test(t)
+}
+export function parseTurns(content) {
+  const lines = String(content == null ? '' : content).split('\n')
+  const idx = []   // 0-based line indices where a turn opens
+  for (let i = 0; i < lines.length; i += 1) if (TURN_LABEL_RE.test(lines[i])) idx.push(i)
+  if (!idx.length) return []
+  const turns = []
+  for (let k = 0; k < idx.length; k += 1) {
+    const start = idx[k]
+    const end = (k + 1 < idx.length) ? idx[k + 1] - 1 : lines.length - 1   // turn spans up to the next label line
+    turns.push({ startLine: start + 1, q: endsWithQuestion(lines.slice(start, end + 1).join('\n')) })
+  }
+  return turns
+}
+// Split a file into K chunks whose boundaries land on real turn edges, then move any boundary that would END a chunk
+// on a question to a nearby non-question turn boundary. Only reached when f.turns is present and has ≥ K turns;
+// otherwise splitForRefine keeps the line-based evenLineChunks divider (unchanged). Returns the same chunk shape
+// {idx,count,startLine,endLine,isFirst,isLast,label}, contiguous over [1, lines].
+function turnAwareChunks(f, K) {
+  const lines = (f && f.lines) || 0
+  const label = f && f.label
+  const turns = f.turns
+  const n = turns.length
+  // Boundary AFTER turn j (j in [0, n-2]) ends a chunk at the line just before turn j+1's label line.
+  const endLineOf = (j) => (j >= n - 1 ? lines : Math.min(lines, turns[j + 1].startLine - 1))
+  const cuts = []   // cuts[i] = index of the LAST turn of chunk i (i = 0 .. K-2 internal boundaries)
+  for (let i = 1; i < K; i += 1) {
+    // Nominal: the turn boundary NEAREST the even split line (earlier turn wins ties → slightly smaller chunk).
+    const target = Math.round((i * lines) / K)
+    let best = 0, bestD = Infinity
+    for (let j = 0; j <= n - 2; j += 1) { const d = Math.abs(endLineOf(j) - target); if (d < bestD) { bestD = d; best = j } }
+    cuts.push(best)
+  }
+  // One left→right pass: clamp each boundary to a strictly-increasing, room-preserving range, then apply the
+  // question rule. lo keeps this chunk non-empty (past the previous boundary); hi reserves one turn for every later
+  // chunk. Prefer the nearest EARLIER non-question boundary (smaller chunk); if none in range, fall FORWARD; if the
+  // whole range is questions (pathological all-questions text), keep the nominal boundary rather than merge chunks.
+  for (let i = 0; i < cuts.length; i += 1) {
+    const lo = (i === 0) ? 0 : cuts[i - 1] + 1
+    const hi = (n - 2) - (cuts.length - 1 - i)
+    let j = Math.max(lo, Math.min(cuts[i], hi))
+    if (turns[j].q) {
+      let found = -1
+      for (let k = j - 1; k >= lo; k -= 1) if (!turns[k].q) { found = k; break }
+      if (found < 0) for (let k = j + 1; k <= hi; k += 1) if (!turns[k].q) { found = k; break }
+      if (found >= 0) j = found
+    }
+    cuts[i] = j
+  }
+  const chunks = []
+  let prevEnd = 0
+  for (let i = 0; i < K; i += 1) {
+    const startLine = (i === 0) ? 1 : prevEnd + 1
+    const endLine = (i === K - 1) ? lines : endLineOf(cuts[i])
+    chunks.push({ idx: i + 1, count: K, startLine, endLine, isFirst: i === 0, isLast: i === K - 1, label })
+    prevEnd = endLine
+  }
+  return chunks
+}
+// Route K (>1) chunks through the turn-aware divider when the preflight supplied usable turns, else the line divider.
+const dividedChunks = (f, K) => ((f && Array.isArray(f.turns) && f.turns.length >= K && f.turns.length >= 2)
+  ? turnAwareChunks(f, K)
+  : evenLineChunks(f, K))
 // N-way balanced split at speaker-turn boundaries. `mode` is 'speed' | 'off' | undefined (cost); `budget` is the
-// resolved model's faithful-refine 字数 cap (undefined = none). Returns 1 chunk (singleChunk) unless a driver
-// fires. Both drivers feed the SAME evenLineChunks divider, so whole turns stay intact and sizes are balanced
-// (not greedy-first). K = max(speed count, budget count); 'off' forces one agent regardless of budget.
-export function splitForRefine(f, mode, budget) {
+// resolved model's faithful-refine 字数 cap (undefined = none); `chunkSize` is the explicit --chunk-size experiment
+// knob (正文字数/块, undefined = none). Returns 1 chunk (singleChunk) unless a driver fires. Drivers feed the SAME
+// divider (turn-aware when f.turns is present, else line-based), so whole turns stay intact and sizes are balanced.
+// Precedence: 'off' forces one agent; else an explicit chunkSize OVERRIDES both budget and speed (K = ceil(字数/N));
+// else K = max(speed count, budget count).
+export function splitForRefine(f, mode, budget, chunkSize) {
   const lines = (f && f.lines) || 0
   const size = refineSize(f)                 // 字数, not lines
   if (mode === 'off' || lines <= 1) return singleChunk(f)   // escape hatch, or unsplittable → one agent
-  // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
-  const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-    ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
-    : 1
-  // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
-  const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
-    ? Math.max(2, Math.ceil(size / budget))
-    : 1
-  const K = Math.max(speedK, budgetK)
-  return K <= 1 ? singleChunk(f) : evenLineChunks(f, K)   // no driver fired → cost mode (default) → one agent
+  let K
+  if (typeof chunkSize === 'number' && chunkSize > 0) {
+    // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
+    K = Math.max(1, Math.ceil(size / chunkSize))
+  } else {
+    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
+      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      : 1
+    // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
+    const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
+      ? Math.max(2, Math.ceil(size / budget))
+      : 1
+    K = Math.max(speedK, budgetK)
+  }
+  return K <= 1 ? singleChunk(f) : dividedChunks(f, K)   // no driver fired → cost mode (default) → one agent
 }
 
 // Scout chunking is a RESILIENCE measure, not a speed lever: a single scout agent over an oversized merged
@@ -702,6 +842,17 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
+  // Contested entry: a referent substitution (a DIFFERENT written form) is FORBIDDEN unless the fresh verdict
+  // carries two_key===true — the verify agent attesting BOTH a high-tier source AND context-fit. Bare
+  // concreteness, even a real-looking domain, never licenses it (the coattail failure: verify "confirms" the
+  // misheard string off an SEO/分销 site named after it). Refuse → keep the spoken form, stay contested; the hit is
+  // recorded in `rejected` so confidenceMark also withholds 〔核实〕. A two_key hit (or a self-confirmation whose
+  // canonical equals a spoken form) falls through and applies.
+  if (e.confidence === 'contested' && hit.canonical
+      && !names.map(stripDesc).includes(stripDesc(hit.canonical)) && hit.two_key !== true) {
+    rejected.add(hit)
+    return e
+  }
   const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
   if (isPerson && hit.canonical && ownStrong.length
       && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
@@ -716,6 +867,64 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
   const idTag = hit.identity ? `${hit.identity}（已核实）` : ''
   const hint = (idTag && e.hint && e.hint.includes(idTag)) ? e.hint : [idTag, e.hint].filter(Boolean).join('；')
   return Object.assign({}, e, { canonical: hit.canonical, variants, hint })
+}
+
+// ---------- contested identity (〔同指两解〕) ----------
+// One plain-text hint clause carrying BOTH hypotheses, so the state survives render→parse→render with no separate
+// persisted section (the entity row IS the source of truth). No '；' or ' ｜ ' inside — those are field/clause
+// separators mergeHints/parseEntityLine split on; using 「」（），· keeps it a single indivisible clause.
+export const CONTESTED_TAG = '同指两解·'
+export function contestedClause(c) {
+  const lit = (c && c.literal) || '口播原形'
+  const lt = (c && c.literal_tier) || '级别未标'
+  const cor = (c && c.correction) || '待定'
+  const ct = (c && c.correction_tier) || '级别未标'
+  return `${CONTESTED_TAG}字面「${lit}」（${lt}），更可能「${cor}」（${ct}）`
+}
+const CONTESTED_HINT_RE = /同指两解·字面「(.*?)」（(.*?)），更可能「(.*?)」（(.*?)）/
+// Build query→item lookup from a verify result's contested list (fresh this round).
+export function contestedMapOf(verified) {
+  const m = new Map()
+  for (const c of (verified && verified.contested) || []) if (c && c.query) m.set(c.query, c)
+  return m
+}
+// Merge the both-hypotheses clause into an entry's hint when it is freshly contested this round. Idempotent: a
+// prior contested entry already carries the clause (round-tripped in its hint), so it is left byte-identical.
+export function applyContestedEntry(e, contestedMap) {
+  if (!e || !contestedMap || !contestedMap.size) return e
+  if (String(e.hint || '').includes(CONTESTED_TAG)) return e   // already annotated (prior carry-forward or re-apply)
+  const names = [e.canonical, ...(e.variants || [])]
+  const cont = names.map((n) => contestedMap.get(n)).find(Boolean)
+  if (!cont) return e
+  return Object.assign({}, e, { hint: mergeHints(e.hint, contestedClause(cont)) })
+}
+// Resolve the contested hypotheses for an entry, from THIS round's verify (fresh) or from a prior row's hint clause
+// (carried forward). Returns null when the entry is not contested. Single accessor used by both the refine-glossary
+// no-substitution section and the 收尾待问 line, so fresh and prior contested surface identically.
+export function contestedInfoFor(e0, contestedMap) {
+  const names = [e0.canonical, ...(e0.variants || [])]
+  const fresh = contestedMap ? names.map((n) => contestedMap.get(n)).find(Boolean) : null
+  if (fresh) return { spoken: e0.canonical, literal: fresh.literal || e0.canonical, literalTier: fresh.literal_tier || '级别未标', correction: fresh.correction || '待定', correctionTier: fresh.correction_tier || '级别未标' }
+  if (e0.confidence === 'contested') {
+    const m = String(e0.hint || '').match(CONTESTED_HINT_RE)
+    if (m) return { spoken: e0.canonical, literal: m[1], literalTier: m[2], correction: m[3], correctionTier: m[4] }
+    return { spoken: e0.canonical, literal: e0.canonical, literalTier: '级别未标', correction: '待定', correctionTier: '级别未标' }
+  }
+  return null
+}
+// Every contested entity (fresh or carried), in glossary order — drives the refine no-substitution list + wrap-up.
+export function contestedEntities(merged, contestedMap) {
+  const out = []
+  for (const list of [merged.people, merged.brands, merged.terms]) {
+    for (const e of list || []) { const info = contestedInfoFor(e, contestedMap); if (info) out.push(info) }
+  }
+  return out
+}
+// 收尾待问 lines: one per contested entity, both hypotheses + evidence tiers, spelled out for a human to settle.
+export function contestedQuestions(merged, verified) {
+  const cm = contestedMapOf(verified)
+  return contestedEntities(merged, cm).map((c) =>
+    `〔${CONFIDENCE_CONTESTED}〕${c.spoken}：A=${c.literal}（${c.literalTier}）；B=${c.correction}（${c.correctionTier}）——正文已保留口播形并标注，请定夺`)
 }
 
 // Keep a hint short for the condensed refine glossary: the first clause (truncated) plus any ⚠ warnings
@@ -738,6 +947,7 @@ function trimHint(h) {
 export function renderRefineGlossary(merged, verified, dedup, a) {
   const resolvedMap = new Map()
   for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
+  const contestedMap = contestedMapOf(verified)
   const applied = new Set(), rejected = new Set()
   const sec = [`# ${a.topic} 写法对照（精校用·摘自校对表）`]
   const spk = []
@@ -747,15 +957,22 @@ export function renderRefineGlossary(merged, verified, dedup, a) {
   const block = (title, list, isPerson) => {
     const rows = []
     for (const e0 of list) {
-      const e = applyVerifiedEntry(e0, isPerson, resolvedMap, applied, rejected)
+      const e = applyContestedEntry(applyVerifiedEntry(e0, isPerson, resolvedMap, applied, rejected), contestedMap)
       const hint = trimHint(e.hint)
-      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}${confidenceMark(e0, resolvedMap, a.date)}`)
+      rows.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${hint ? ` ｜ ${hint}` : ''}${confidenceMark(e0, resolvedMap, a.date, contestedMap, rejected)}`)
     }
     if (rows.length) { sec.push('', `## ${title}`); sec.push(...rows) }
   }
   block('人名', merged.people, true)
   block('品牌 / 公司 / 产品', merged.brands)
   block('术语 / 专名', merged.terms)
+  // Contested rows get an explicit no-substitution directive for the refiner: keep the spoken written form,
+  // annotate the first occurrence per file, and NEVER write the candidate name into the prose.
+  const contested = contestedEntities(merged, contestedMap)
+  if (contested.length) {
+    sec.push('', '## 同指两解（口播形存疑·务必保留原形、勿替换）', '> 下列写法核实未决：正文一律保留口播原形；每份文件首次出现处标注（音，存疑：或为 <候选>）；**绝不可把候选名替换进正文**。')
+    for (const c of contested) sec.push(`- ${c.spoken} ｜ 保留原形，首次出现标注（音，存疑：或为 ${c.correction}）——绝不写成 ${c.correction}`)
+  }
   const { directives, flags } = splitSuspects(dedup)
   if (directives.length) { sec.push('', '## 写法统一（初次落笔即写对，勿事后回改）'); for (const s of directives) sec.push(`- ${(s.members || []).filter((x) => x !== s.preferred).join(' / ')} → **${s.preferred}**`) }
   if (flags.length) { sec.push('', '## 疑似同指（勿自动合并）'); for (const s of flags) sec.push(`- ${(s.members || []).join(' ／ ')}（${s.kind}）`) }
@@ -769,9 +986,10 @@ export function renderGlossary(merged, verified, dedup, a) {
   // and merge the identity into hint — the archived glossary body is authoritative; no footnote corrections.
   const resolvedMap = new Map()
   for (const r of (verified && verified.resolved) || []) resolvedMap.set(r.query, r)
+  const contestedMap = contestedMapOf(verified)
   const applied = new Set()   // verified conclusions actually applied into the table body
   const rejected = new Set()  // verified conclusions blocked by the person-name guard
-  const applyVerified = (e, isPerson) => applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected)
+  const applyVerified = (e, isPerson) => applyContestedEntry(applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected), contestedMap)
   const sec = []
   sec.push(`# ${a.topic} 统一校对表（采访时间 ${a.date}）`, '', '## 采访背景', a.background, '')
   sec.push('## 发言人统一标注')
@@ -804,9 +1022,12 @@ export function renderGlossary(merged, verified, dedup, a) {
       // cluster was scout-flagged; it renders clean with 〔用户钦定〕 (via confidenceMark) instead.
       const forms = [e0.canonical, ...(e0.variants || [])]
       const speakerTrusted = forms.some((n) => trustedSpeakerNames.has(stripDesc(n)))
-      const susp = !speakerTrusted && !e0.locked && e0.suspect_asr && !forms.some((n) => resolvedMap.has(n))
+      // A contested entity already carries 〔同指两解〕 + both hypotheses — the suspect-ASR ⚠ line would be
+      // redundant (and, since suspect_asr is not re-parsed, would break the render→parse→render round-trip).
+      const isContested = e0.confidence === 'contested' || forms.some((n) => contestedMap.has(n))
+      const susp = !speakerTrusted && !e0.locked && !isContested && e0.suspect_asr && !forms.some((n) => resolvedMap.has(n))
         ? ' ｜ ⚠ 侦察疑为转录误写、未能核实——请人工确认正确写法' : ''
-      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}${confidenceMark(e0, resolvedMap, a.date)}`)
+      sec.push(`- **${e.canonical}** ← ${e.variants.join(' / ') || '—'}${e.hint ? ` ｜ ${e.hint}` : ''}${e.crossFile ? ' ｜ 多份互证' : ''}${susp}${confidenceMark(e0, resolvedMap, a.date, contestedMap, rejected)}`)
     }
   }
   block('人名', merged.people, true)
@@ -849,6 +1070,13 @@ export function renderGlossary(merged, verified, dedup, a) {
   if (a.doNotMerge && a.doNotMerge.length) {
     sec.push('', '## 确认不同指（勿合并）', '> 人工确认：以下各组写法相近但确为不同对象，dedup 勿再标记为疑似同指。')
     for (const pair of a.doNotMerge) sec.push(`- ${(pair || []).join(' ／ ')}`)
+  }
+  // P2c follow-up: verbatim-preserved lines re-emitted under their ORIGINAL section titles, at the end. A block
+  // whose title repeats a section rendered above simply reads as a continuation — parseGlossary reads every
+  // matching block (all()), so these lines round-trip stably (unparseable then, unparseable-but-kept now).
+  for (const p of merged.preserved || []) {
+    if (!p || !p.title || !(p.lines || []).length) continue
+    sec.push('', `## ${p.title}`, ...p.lines)
   }
   return sec.join('\n')
 }
@@ -917,7 +1145,9 @@ export function dedupQuestions(dedup) {
 // any line that doesn't match a known grammar is preserved in `extra` so user free-text is
 // never lost. 补核结论 (re-verify addendum) rows are folded into `verified.resolved`.
 function parseEntityLine(l) {
-  const m = l.match(/^- \*\*(.+?)\*\* ← (.*)$/)
+  // Tolerant of minor whitespace variance around `-` and `←` (a hand-edited `**X**←变体` row used to fail this
+  // match and silently vanish — the P2c-follow-up entity-row loss). The render side still emits ` ← ` exactly.
+  const m = l.match(/^-\s+\*\*(.+?)\*\*\s*←\s*(.*)$/)
   if (!m) return null
   // Peel the machine-readable confidence marker off the tail FIRST, so an unmarked (legacy) line yields exactly
   // the same variants/hint as before — the only difference is the added confidence field (defaults to 'unknown').
@@ -941,8 +1171,18 @@ function parseResolvedLine(body, out) {
 // preamble) is treated as foreign: its entity-looking rows are rescued into 术语 rather than dropped (see below).
 const KNOWN_SECTION = [/^采访背景/, /^发言人统一标注/, /^发言人登记/, /^人名（写法/, /^品牌.*（写法/, /^术语.*（写法/, /^需特别处理的转写错误/, /^各份特别提醒/, /^本轮重新入队复核/, /^联网核实结论/, /^补核结论/, /^写法统一/, /^疑似同指/, /^确认不同指/]
 export function parseGlossary(md) {
-  const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [] }
+  const g = { topic: '', date: '', background: '', speakersByFile: [], people: [], brands: [], terms: [], errors: [], notes: [], verified: { resolved: [], unresolved: [] }, dedupSuspects: [], doNotMerge: [], extra: [], preserved: [] }
   if (!md || !md.trim()) return g
+  // P2c follow-up — verbatim preservation: any content line no section grammar recognizes is kept as
+  // { title, lines } and re-emitted by renderGlossary under the SAME section title, so a formatting-variant row
+  // or a hand-written section is never silently dropped from the cumulative glossary. Dedup by exact line keeps
+  // repeated round-trips stable (a preserved line re-parses into preserved again, once).
+  const keep = (title, line) => {
+    if (!line || !line.trim()) return
+    let b = g.preserved.find((p) => p.title === title)
+    if (!b) { b = { title, lines: [] }; g.preserved.push(b) }
+    if (!b.lines.includes(line)) b.lines.push(line)
+  }
   const lines = md.split('\n')
   const mh = (lines.find((l) => /统一校对表/.test(l)) || '').match(/^#\s*(.+?)\s*统一校对表（采访时间\s*(.+?)）/)
   if (mh) { g.topic = mh[1]; g.date = mh[2] }
@@ -952,20 +1192,22 @@ export function parseGlossary(md) {
   sections.push(cur)
   const all = (re) => sections.filter((s) => re.test(s.title))
   const get = (re) => all(re)[0]
-  const bg = get(/^采访背景/); if (bg) g.background = bg.body.join('\n').trim()
-  const spk = get(/^发言人统一标注/)
-  if (spk) {
+  // Non-entity sections read EVERY matching block (all()), same as the entity sections since the P2c fix — a
+  // concatenated / hand-merged 校对表 repeating `## 写法统一` etc. used to keep only the first block.
+  g.background = all(/^采访背景/).map((s) => s.body.join('\n').trim()).filter(Boolean).join('\n\n')
+  for (const spk of all(/^发言人统一标注/)) {
     let grp = null
     for (const l of spk.body) {
       const mb = l.match(/^\*\*(.+?)\*\*\s*$/)
       if (mb) { grp = { label: mb[1], speakers: [] }; g.speakersByFile.push(grp); continue }
       const ms = l.match(/^- (.+?) → (.+?)(?:（(.+)）)?$/)
-      if (ms && grp) grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' })
+      if (ms && grp) { grp.speakers.push({ label: ms[1], role: ms[2], identity: ms[3] || '' }); continue }
+      if (!l.startsWith('> ')) keep(spk.title, l)
     }
   }
   // Parse entity rows from EVERY matching section, not just the first. A concatenated or hand-merged 校对表 can
   // repeat the same `## 术语…` header; `sections.find` silently dropped every later block (reproduced data-loss).
-  const parseEntities = (secs) => { const out = []; for (const sec of secs || []) for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else g.extra.push(l) } return out }
+  const parseEntities = (secs) => { const out = []; for (const sec of secs || []) for (const l of sec.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) out.push(e); else { g.extra.push(l); keep(sec.title, l) } } return out }
   g.people = parseEntities(all(/^人名（写法/))
   g.brands = parseEntities(all(/^品牌.*（写法/))
   g.terms = parseEntities(all(/^术语.*（写法/))
@@ -975,31 +1217,63 @@ export function parseGlossary(md) {
   // has no such rows (all its sections are recognized), so this is a no-op on a clean render→parse round-trip.
   for (const s of sections) {
     if (s.title !== '__preamble__' && KNOWN_SECTION.some((re) => re.test(s.title))) continue
-    for (const l of s.body) { if (!l.startsWith('- ')) continue; const e = parseEntityLine(l); if (e) g.terms.push({ ...e, hint: mergeHints(e.hint, HEADERLESS_MARK) }) }
+    for (const l of s.body) {
+      const e = l.startsWith('- ') ? parseEntityLine(l) : null
+      if (e) { g.terms.push({ ...e, hint: mergeHints(e.hint, HEADERLESS_MARK) }); continue }
+      // Preamble: the H1 title line is re-generated by renderGlossary; everything else is user text — keep it.
+      if (s.title === '__preamble__') { if (!/统一校对表/.test(l)) keep('（校对表开头的自由文本）', l); continue }
+      // A foreign (unrecognized) section: rows that aren't rescuable entity lines are user content — keep whole.
+      keep(s.title, l)
+    }
   }
-  const errs = get(/^需特别处理的转写错误/)
-  if (errs) for (const l of errs.body) { const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/); if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] }) }
-  const nt = get(/^各份特别提醒/)
-  if (nt) for (const l of nt.body) { const m = l.match(/^- (.+)$/); if (m) g.notes.push(m[1]) }
-  for (const vsec of [get(/^联网核实结论/), get(/^补核结论/)]) {
-    if (!vsec) continue
+  for (const errs of all(/^需特别处理的转写错误/)) {
+    for (const l of errs.body) {
+      const m = l.match(/^- \[(.+?)\]\s*(.+?)：(.*)$/)
+      if (m) g.errors.push({ file: m[1], kind: m[2], examples: m[3] ? m[3].split('；') : [] })
+      else if (!l.startsWith('> ')) keep(errs.title, l)
+    }
+  }
+  for (const nt of all(/^各份特别提醒/)) {
+    for (const l of nt.body) {
+      const m = l.match(/^- (.+)$/)
+      if (m) g.notes.push(m[1])
+      else if (!l.startsWith('> ')) keep(nt.title, l)
+    }
+  }
+  for (const vsec of [...all(/^联网核实结论/), ...all(/^补核结论/)]) {
     for (const l of vsec.body) {
-      if (!l.startsWith('- ')) continue
+      if (!l.startsWith('- ')) { if (!l.startsWith('> ')) keep(vsec.title, l); continue }
       const body = l.slice(2)
       const un = body.match(/^(.+?)：未能核实，保留（音）(?:\s*｜\s*(.*))?$/)
       if (un) { g.verified.unresolved.push({ query: un[1], note: un[2] || '' }); continue }
-      if (!parseResolvedLine(body, g.verified.resolved)) g.extra.push(l)
+      const pk = body.match(/^(.+?)：公开核实不足；按发言人信息使用(?:\s*｜\s*(.*))?$/)
+      if (pk) { g.verified.unresolved.push({ query: pk[1], note: pk[2] || '' }); continue }
+      if (!parseResolvedLine(body, g.verified.resolved)) { g.extra.push(l); keep(vsec.title, l) }
     }
   }
-  const dr = get(/^写法统一/)
-  if (dr) for (const l of dr.body) {
-    const m = l.match(/^- (.+?) → 统一写 \*\*(.+?)\*\*（(.*)）$/)
-    if (m) { const members = m[1].split(' / ').map((x) => x.trim()).filter(Boolean); if (!members.includes(m[2])) members.push(m[2]); g.dedupSuspects.push({ members, kind: 'term', preferred: m[2], why: m[3] }) }
+  for (const dr of all(/^写法统一/)) {
+    for (const l of dr.body) {
+      // The （why） tail is OPTIONAL on parse (render always emits it): a hand-trimmed directive row without a
+      // reason used to fail this match and vanish — the P2c-follow-up 写法统一 section loss.
+      const m = l.match(/^- (.+?) → 统一写 \*\*(.+?)\*\*(?:（(.*)）)?\s*$/)
+      if (m) { const members = m[1].split(' / ').map((x) => x.trim()).filter(Boolean); if (!members.includes(m[2])) members.push(m[2]); g.dedupSuspects.push({ members, kind: 'term', preferred: m[2], why: m[3] || '同一对象的不同写法（沿用往次校对表）' }) }
+      else if (!l.startsWith('> ')) keep(dr.title, l)
+    }
   }
-  const fl = get(/^疑似同指/)
-  if (fl) for (const l of fl.body) { const m = l.match(/^- (.+?)（(.+?)）：(.*)$/); if (m) g.dedupSuspects.push({ members: m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean), kind: m[2], why: m[3] }) }
-  const dn = get(/^确认不同指/)
-  if (dn) for (const l of dn.body) { const m = l.match(/^- (.+)$/); if (m) { const grp = m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean); if (grp.length >= 2) g.doNotMerge.push(grp) } }
+  for (const fl of all(/^疑似同指/)) {
+    for (const l of fl.body) {
+      const m = l.match(/^- (.+?)（(.+?)）：(.*)$/)
+      if (m) g.dedupSuspects.push({ members: m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean), kind: m[2], why: m[3] })
+      else if (!l.startsWith('> ')) keep(fl.title, l)
+    }
+  }
+  for (const dn of all(/^确认不同指/)) {
+    for (const l of dn.body) {
+      const m = l.match(/^- (.+)$/)
+      if (m) { const grp = m[1].split(' ／ ').map((x) => x.trim()).filter(Boolean); if (grp.length >= 2) g.doNotMerge.push(grp); else keep(dn.title, l) }
+      else if (!l.startsWith('> ')) keep(dn.title, l)
+    }
+  }
   // 发言人登记（跨访谈）is a derived view of speakersByFile — re-generated by renderGlossary, so we don't
   // parse it back (its lines are simply never visited, never landing in `extra`).
   return g
@@ -1039,15 +1313,32 @@ export function mergeIntoPrior(prior, fresh) {
     speakersByFile: speakers,
     errors: [...(prior.errors || []), ...(fresh.errors || [])],
     notes: Array.from(new Set([...(prior.notes || []), ...(fresh.notes || [])])),
+    preserved: mergePreserved(prior.preserved, fresh.preserved),
   }
+}
+// P2c follow-up: verbatim-preserved lines (see parseGlossary's `keep`) accumulate append-only across batches,
+// deduped by exact line within a section title, so nothing hand-written is ever dropped and nothing multiplies.
+function mergePreserved(a, b) {
+  const out = []
+  for (const p of [...(a || []), ...(b || [])]) {
+    if (!p || !p.title || !(p.lines || []).length) continue
+    let home = out.find((x) => x.title === p.title)
+    if (!home) { home = { title: p.title, lines: [] }; out.push(home) }
+    for (const l of p.lines) if (!home.lines.includes(l)) home.lines.push(l)
+  }
+  return out
 }
 // Carry prior verify conclusions forward; fresh overrides prior for the same query; a resolved query
 // is removed from unresolved.
 export function mergeVerified(priorV, freshV) {
-  const r = new Map(), u = new Map()
-  for (const v of [priorV, freshV]) { if (!v) continue; for (const x of v.resolved || []) if (x && x.query) r.set(x.query, x); for (const x of v.unresolved || []) if (x && x.query) u.set(x.query, x) }
-  for (const q of r.keys()) u.delete(q)
-  return { resolved: Array.from(r.values()), unresolved: Array.from(u.values()) }
+  const r = new Map(), u = new Map(), c = new Map()
+  for (const v of [priorV, freshV]) { if (!v) continue; for (const x of v.resolved || []) if (x && x.query) r.set(x.query, x); for (const x of v.unresolved || []) if (x && x.query) u.set(x.query, x); for (const x of v.contested || []) if (x && x.query) c.set(x.query, x) }
+  // A query that got a DECISIVE (resolved) verdict this round is no longer contested/unresolved — the sanctioned
+  // upgrade path (fresh always follows prior in the loop, so a fresh resolved overrides a prior contested for the
+  // same query). A still-contested query is likewise removed from unresolved.
+  for (const q of r.keys()) { u.delete(q); c.delete(q) }
+  for (const q of c.keys()) u.delete(q)
+  return { resolved: Array.from(r.values()), unresolved: Array.from(u.values()), contested: Array.from(c.values()) }
 }
 // Carry prior dedup suspects forward, de-duped by member-set + kind signature.
 export function mergeDedup(priorSuspects, freshSuspects) {
@@ -1083,8 +1374,9 @@ export function excludeVerified(merged, prior, forceReopen) {
   const writingsOf = (e) => [e.canonical, ...(e.variants || [])].map(stripDesc).filter(Boolean)
   // Entries the prior glossary marks as settled (verified/user) seed the skip set directly.
   for (const e of priorEntries) { if (e.confidence === 'verified' || e.confidence === 'user') for (const n of writingsOf(e)) done.add(n) }
-  // recheck overrides everything: force this batch to re-verify those writings.
-  for (const e of priorEntries) { if (e.confidence === 'recheck') for (const n of writingsOf(e)) done.delete(n) }
+  // recheck AND contested override everything: force this batch to re-verify those writings. A contested row is
+  // still unsettled (only a decisive verdict can retire it), so it must never be skipped as if already confirmed.
+  for (const e of priorEntries) { if (e.confidence === 'recheck' || e.confidence === 'contested') for (const n of writingsOf(e)) done.delete(n) }
   // M9 force-reopen: same treatment as recheck, applied AFTER the settled-seed pass so it always wins.
   for (const n of forceReopen || []) { const k = stripDesc(n); if (k) done.delete(k) }
   if (!done.size) return merged
