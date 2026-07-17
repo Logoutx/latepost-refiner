@@ -21,7 +21,7 @@ mkdir -p dist
 echo "→ 内嵌静态资源（index.html + references）…"
 node build/embed-assets.mjs
 
-echo "→ 编译单文件可执行（$TARGET）…"
+echo "→ 编译单文件可执行（${TARGET}）…"
 bun build universal/bin-web.js --compile --target="$TARGET" --outfile "$OUT"
 
 rm -f .*.bun-build 2>/dev/null || true   # tidy Bun's compile intermediates
@@ -31,7 +31,7 @@ codesign --force --sign - "$OUT" 2>/dev/null || true
 
 SIZE="$(du -h "$OUT" | cut -f1)"
 echo ""
-echo "✓ 完成：$HERE/$OUT（$SIZE）"
+echo "✓ 完成：${HERE}/${OUT}（${SIZE}）"
 echo ""
 echo "分发说明（下载后首次运行，macOS 会拦一次未签名程序）："
 echo "  · 右键点它 → 打开（只需一次），或"
