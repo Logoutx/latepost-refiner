@@ -56,10 +56,12 @@ jobs:
         run: git diff --exit-code
 
   package:
-    name: Package skill zip
+    name: Package release zips
     needs: verify
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    # macOS runner is load-bearing: build-binary.sh ad-hoc codesigns the compiled binaries
+    # (arm64 Macs kill unsigned executables) and codesign only exists on macOS.
+    runs-on: macos-14
     permissions:
       contents: write
 
@@ -73,13 +75,16 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install dependencies
         run: npm ci
 
       - name: Rebuild Claude Code workflow
         run: npm run build:cc
 
-      - name: Build the all-in-one release zip
+      - name: Build the per-edition release zips
         run: bash build/build-release-zip.sh "$PWD/dist-zips"
 
       # The release page's auto-generated "Source code" archives (and the commit shown in its header)
@@ -91,8 +96,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create latest \
+          gh release create latest --title "Latest build" --notes placeholder 2>/dev/null || true
+          gh release edit latest \
             --title "Latest build" \
-            --notes "Auto-built from main on every push — latepost-refiner.zip contains three folders: Claude Code Skill (drag into ~/.claude/skills/), Codex Skill (drag into the Codex skills dir), DeepSeek Edition (npm install, then CLI or local web)." \
-            2>/dev/null || true
-          gh release upload latest dist-zips/latepost-refiner.zip --clobber
+            --notes "Auto-built from main on every push. 按模型下载：latepost-refiner-claude-skill.zip（拖进 ~/.claude/skills/）；latepost-refiner-codex-skill.zip（拖进 Codex 技能目录）；latepost-refiner-deepseek-mac.zip（Mac 免安装：解压后右键打开 启动.command，Apple Silicon / Intel 自动适配，不需要 Node/Homebrew）。"
+          gh release upload latest \
+            dist-zips/latepost-refiner-claude-skill.zip \
+            dist-zips/latepost-refiner-codex-skill.zip \
+            dist-zips/latepost-refiner-deepseek-mac.zip \
+            --clobber
+          # retire the old single all-in-one asset
+          gh release delete-asset latest latepost-refiner.zip --yes 2>/dev/null || true

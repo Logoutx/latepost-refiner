@@ -2,7 +2,7 @@
 
 为《晚点 LatePost》日常工作需求制作，把粗糙的访谈转录稿（语音转写或人工速记）整理成可读、可信、可检索的研究稿。
 
-原则：保留说话人的语气、观点、每一个事实，只去噪音、修错字、补结构。
+原则：**精校不是改写，更不是摘要**。说话人的语气、观点、每一个事实都留着，只去噪音、修错字、补结构。
 
 - 删口头禅、理顺口语；
 - 联网核实修正音转写弄错的人名、术语；
@@ -20,7 +20,15 @@
 
 最简单的就是把仓库地址发给 Claude Code / Codex，说“安装这个技能”。
 
-或者下载 [Releases](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner.zip) 的 `latepost-refiner.zip`——里面就是三个文件夹：**Claude Code Skill** 拖进 `~/.claude/skills/`，**Codex Skill** 拖进 Codex 的技能目录，**DeepSeek Edition** 放任意位置进目录 `npm install` 后用（详见包内 README）。手动方式如下。
+或者从 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 按模型下载：
+
+| 下载 | 怎么用 |
+|---|---|
+| `latepost-refiner-claude-skill.zip` | 解压出的 `latepost-refiner/` 拖进 `~/.claude/skills/` |
+| `latepost-refiner-codex-skill.zip` | 解压出的 `latepost-refiner/` 拖进 Codex 的技能目录 |
+| `latepost-refiner-deepseek-mac.zip` | Mac 免安装：解压后**右键打开** `启动.command`（只第一次要右键），浏览器自动打开本地页面；Apple Silicon / Intel 自动适配，不需要 Node、不需要 Homebrew，key 填在网页里不落盘 |
+
+开发者手动方式：
 
 **Claude Code 技能**
 git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
@@ -28,11 +36,9 @@ git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refi
 **Codex 技能**
 技能目录 `codex-skill/latepost-refiner/`，接入方式见其 SKILL.md。
 
-**DeepSeek 版·命令行 / 本地网页**
+**DeepSeek 版·命令行 / 本地网页（源码跑，需 Node 20+）**
 npm install；cp .env.example .env 填 key；`node universal/cli.js --files … --topic …` 或 `npm run web`。
 docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.sh`。
-
-**发给不写代码的同事**：`npm run build:binary` 打一个单文件 App，收件人照 [安装指南](docs/install-for-non-coders.md) 用。
 
 ## 如何工作
 
