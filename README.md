@@ -24,9 +24,9 @@
 
 | 下载 | 怎么用 |
 |---|---|
-| `latepost-refiner-claude-skill.zip` | 解压出的 `latepost-refiner/` 拖进 `~/.claude/skills/` |
-| `latepost-refiner-codex-skill.zip` | 解压出的 `latepost-refiner/` 拖进 Codex 的技能目录 |
-| `latepost-refiner-deepseek-mac.zip` | Mac 免安装：解压后**右键打开** `启动.command`（只第一次要右键），浏览器自动打开本地页面；Apple Silicon / Intel 自动适配，不需要 Node、不需要 Homebrew，key 填在网页里不落盘 |
+| [latepost-refiner-claude-skill.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-claude-skill.zip) | 解压出的 `latepost-refiner/` 拖进 `~/.claude/skills/` |
+| [latepost-refiner-codex-skill.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-codex-skill.zip) | 解压出的 `latepost-refiner/` 拖进 Codex 的技能目录 |
+| [latepost-refiner-deepseek-mac.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-deepseek-mac.zip) | Mac 免安装：解压后**右键打开** `启动.command`（只第一次要右键），浏览器自动打开本地页面；Apple Silicon / Intel 自动适配，不需要 Node、不需要 Homebrew，key 填在网页里不落盘 |
 
 开发者手动方式：
 
