@@ -82,6 +82,11 @@ jobs:
       - name: Build the all-in-one release zip
         run: bash build/build-release-zip.sh "$PWD/dist-zips"
 
+      # The release page's auto-generated "Source code" archives (and the commit shown in its header)
+      # come from the tag, not the uploaded asset — move the rolling tag to this commit so they match.
+      - name: Move the rolling "latest" tag to this commit
+        run: git push origin +HEAD:refs/tags/latest
+
       - name: Publish to the rolling "latest" release
         env:
           GH_TOKEN: ${{ github.token }}
