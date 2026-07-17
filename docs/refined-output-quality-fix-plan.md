@@ -46,7 +46,7 @@ It is not yet sufficient for the two observed failures:
    `universal/jobs.js` audits web/server runs, but `universal/cli.js` still writes artifacts directly after `runPipeline()`.
 
 5. **Codex standalone install path is inconsistent.**
-   `506b46b` tells Codex to run `node scripts/audit_refined.mjs`, but the installed Codex skill folder only contains `codex-skills/latepost-refiner/`. The shared audit lives at repo root `scripts/audit_refined.mjs`, so a pinned standalone skill copy cannot run it unless the whole repo is present.
+   `506b46b` tells Codex to run `node scripts/audit_refined.mjs`, but the installed Codex skill folder only contains `codex-skill/latepost-refiner/`. The shared audit lives at repo root `scripts/audit_refined.mjs`, so a pinned standalone skill copy cannot run it unless the whole repo is present.
 
 6. **No repair loop exists yet.**
    Audit failures are surfaced, but the system does not automatically repair failed spans or rerun the audit before delivery.
@@ -150,7 +150,7 @@ Universal CLI:
 
 Codex native skill:
 
-- Put an audit entrypoint inside `codex-skills/latepost-refiner/scripts/`, or add `codex-native.mjs audit`.
+- Put an audit entrypoint inside `codex-skill/latepost-refiner/scripts/`, or add `codex-native.mjs audit`.
 - Do not reference repo-root `scripts/audit_refined.mjs` from a standalone installed skill unless the skill installation also includes that script.
 - Update `native-runtime.md` to call the bundled/pinned path.
 

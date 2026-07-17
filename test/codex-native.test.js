@@ -13,8 +13,8 @@ import {
   deliverPrompts,
   prepareNativeRun,
   writeNativeArtifacts,
-} from '../codex-skills/latepost-refiner/scripts/codex-native.mjs'
-import { partPath, safeName } from '../codex-skills/latepost-refiner/core/spec.js'
+} from '../codex-skill/latepost-refiner/scripts/codex-native.mjs'
+import { partPath, safeName } from '../codex-skill/latepost-refiner/core/spec.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'lpr-codex-native-'))
@@ -65,7 +65,7 @@ test('Codex native prepare normalizes SRT sources into local markdown before pro
   const prepared = prepareNativeRun({
     topic: '测试项目',
     outputDir: out,
-    skillDir: path.resolve('codex-skills/latepost-refiner'),
+    skillDir: path.resolve('codex-skill/latepost-refiner'),
     scope: ['refine'],
     verifyDepth: 'none',
     files: [{ path: src }],
@@ -87,7 +87,7 @@ test('Codex native helper runs the no-key staged flow with chunked refine, logic
     topic: '测试项目',
     date: '2026-07',
     outputDir: out,
-    skillDir: path.resolve('codex-skills/latepost-refiner'),
+    skillDir: path.resolve('codex-skill/latepost-refiner'),
     scope: ['refine', 'logic', 'summary', 'timeline'],
     verifyDepth: 'none',
     files: [{ path: src, label: '示例访谈', title: '示例访谈', lines: 16, chars: 24000 }],
@@ -200,7 +200,7 @@ test('Codex native retry does not treat its own generated glossary as prior inpu
     topic: '测试项目',
     date: '2026-07',
     outputDir: out,
-    skillDir: path.resolve('codex-skills/latepost-refiner'),
+    skillDir: path.resolve('codex-skill/latepost-refiner'),
     scope: ['refine'],
     verifyDepth: 'none',
     files: [{ path: src, label: '示例访谈', title: '示例访谈', lines: 20, chars: 24000, speakerHints: '方岑=受访者' }],
@@ -242,7 +242,7 @@ test('Codex native logic-plan audit rejects same-order fake reorder before writi
   const args = {
     topic: '测试项目',
     outputDir: out,
-    skillDir: path.resolve('codex-skills/latepost-refiner'),
+    skillDir: path.resolve('codex-skill/latepost-refiner'),
     scope: ['refine', 'logic'],
     verifyDepth: 'none',
     files: [{ path: src, label: '示例访谈', title: '示例访谈', lines: 16, chars: 10000 }],

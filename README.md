@@ -13,7 +13,7 @@
 | DeepSeek | 命令行 或 本地网页版 | DeepSeek API（`DEEPSEEK_API_KEY`，建议再加 `TAVILY_API_KEY`） |
 | 发给不写代码的人 | 单文件 App，双击即用（[安装指南](docs/install-for-non-coders.md)） | 要 DeepSeek API key，填在本机浏览器里 |
 
-> Codex 技能首选原生订阅运行时（见 `codex-skills/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有要用 DeepSeek 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”）。
+> Codex 技能首选原生订阅运行时（见 `codex-skill/latepost-refiner/SKILL.md` 的 “First Choice In Codex: Native Subscription Runtime”）：走已登录的 Codex 订阅、不要 key，用原生子代理加本地 Node 脚本（`codex-native.mjs`：确定性地按步产出 prompt，交给 Codex 子代理跑）。只有要用 DeepSeek 的 API key 执行时，才回退到命令行运行时（SKILL.md 的 “Universal Runtime Fallback”）。
 
 ## 安装
 
@@ -35,7 +35,7 @@
 
 走 ChatGPT 订阅，不用填 API key。核心是“确定性胶水 + Codex 子代理”：本地 Node 脚本（`codex-native.mjs`）按流水线步骤把 prompt 确定性地拼好，交给 Codex 的原生子代理去跑——脚本管流程和拼装，模型只管每一步该做的判断，长文本留在子代理里，不进主上下文。
 
-技能目录在 `codex-skills/latepost-refiner/`，具体接入方式以你的 Codex 客户端为准；行为细节见该目录下的 `SKILL.md`。命令行 / DeepSeek 版只作为需要用 API key 执行时的回退。
+技能目录在 `codex-skill/latepost-refiner/`，具体接入方式以你的 Codex 客户端为准；行为细节见该目录下的 `SKILL.md`。命令行 / DeepSeek 版只作为需要用 API key 执行时的回退。
 
 ### DeepSeek API（命令行 / 本地网页 / 单文件 App）
 
@@ -114,7 +114,7 @@ engines/             DeepSeek 版（命令行/网页/二进制）的引擎（Cla
   fileops.js         Read/Write/Edit 工具实现，带沙箱限制
 build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 workflow.js
 claude-code-skill/   Claude Code 版（workflow.js 是 build 产物，别手改）
-codex-skills/        Codex 版（latepost-refiner/ 下自带一份 core/ 同步副本）
+codex-skill/         Codex 版（latepost-refiner/ 下自带一份 core/ 同步副本）
 universal/           命令行 + 网页 + 单文件 App（DeepSeek 版）
 ```
 

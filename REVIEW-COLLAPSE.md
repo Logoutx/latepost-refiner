@@ -11,7 +11,7 @@ Bottom line up front: the **code** is a clean prune — no dangling runtime refe
 ## Findings (numbered)
 
 ### 1. HIGH-for-docs / MEDIUM — Codex edition's fallback runtime doc still sells 5 providers and removed flags
-`codex-skills/latepost-refiner/references/universal-runtime.md` (whole file) + `codex-skills/latepost-refiner/SKILL.md:23`
+`codex-skill/latepost-refiner/references/universal-runtime.md` (whole file) + `codex-skill/latepost-refiner/SKILL.md:23`
 
 The Codex-native edition is one of the three shipping editions. Its `SKILL.md:23` routes users to this doc for the CLI/web fallback:
 > "Use references/universal-runtime.md … or when the user explicitly wants **Anthropic/DeepSeek/GLM/Kimi/OpenAI API execution**."
@@ -53,7 +53,7 @@ Post-collapse `selectEngine({ concurrency, apiKey, filePolicy, env, onPhase, onL
 `jobs.js:355` destructures `refineMode, effort` from params and `:477-478` forwards them into `A`. No shipping edition sets either for the DeepSeek path, and the DeepSeek engine reads neither. Inert, but it's leftover surface from the multi-provider era that a future reader will mistake for a live knob.
 
 ### Noted, but honoring the exclusion list (not re-reported as new)
-`claude-code-skill/workflow.js:532,2014` and `codex-skills/latepost-refiner/core/spec.js:505` contain the same `engines/providers.js` comment leftovers the task pre-flagged in `core/spec.js`/`core/pipeline.js`. They are the **generated/vendored mirrors** of those exact comments (`build-cc.mjs` bundles `core/*`; `sync-skills` vendors `core/spec.js` into codex-skills), kept byte-identical by the sync gate. Same root cause; fixing the three source comments clears all mirrors.
+`claude-code-skill/workflow.js:532,2014` and `codex-skill/latepost-refiner/core/spec.js:505` contain the same `engines/providers.js` comment leftovers the task pre-flagged in `core/spec.js`/`core/pipeline.js`. They are the **generated/vendored mirrors** of those exact comments (`build-cc.mjs` bundles `core/*`; `sync-skills` vendors `core/spec.js` into codex-skill), kept byte-identical by the sync gate. Same root cause; fixing the three source comments clears all mirrors.
 
 ---
 
