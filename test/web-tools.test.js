@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeWebRuntime, normalizeSearchQuery, canonicalWebUrl, isPublicIp, validateUrlShape, WEB_TELEMETRY_FIELDS } from '../engines/web.js'
+import { makeWebRuntime, normalizeSearchQuery, canonicalWebUrl, isPublicIp, validateUrlShape, trustedDohLookup, WEB_TELEMETRY_FIELDS } from '../engines/web.js'
 
 function headers(values = {}) {
   const map = new Map(Object.entries(values).map(([k, v]) => [k.toLowerCase(), String(v)]))
@@ -150,6 +150,61 @@ test('Jina failure falls back once to local fetch; failures are not cached', asy
   assert.equal(empty, 2, 'failed fetch is not cached')
 })
 
+test('Clash fake-IP DNS uses trusted DoH for SSRF validation without allowing reserved addresses', async () => {
+  let dohCalls = 0
+  let jinaCalls = 0
+  const rt = makeWebRuntime({
+    searchFn: async () => [{ title: 'A', url: 'https://example.com/a', snippet: '' }],
+    dnsLookup: async () => [{ address: '198.18.0.42', family: 4 }],
+    dohLookup: async (host) => {
+      dohCalls++
+      assert.equal(host, 'example.com')
+      return [{ address: '93.184.216.34', family: 4 }]
+    },
+    fetchImpl: async (url) => {
+      jinaCalls++
+      assert.equal(url, 'https://r.jina.ai/https://example.com/a')
+      return response({ text: 'Reader 正文' })
+    },
+  })
+  await rt.search('q')
+  assert.match(await rt.fetch('https://example.com/a'), /Reader 正文/)
+  assert.equal(dohCalls, 1)
+  assert.equal(jinaCalls, 1)
+  assert.equal(rt.telemetry().fetchJinaSuccess, 1)
+
+  const blocked = makeWebRuntime({
+    searchFn: async () => [{ title: 'A', url: 'https://example.com/a', snippet: '' }],
+    dnsLookup: async () => [{ address: '198.18.0.43', family: 4 }],
+    dohLookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    fetchImpl: async () => { throw new Error('Jina must not run') },
+  })
+  await blocked.search('q')
+  assert.match(await blocked.fetch('https://example.com/a'), /DNS|公网/)
+  assert.equal(blocked.telemetry().fetchJinaAttempts, 0)
+})
+
+test('trusted DoH request returns only A/AAAA addresses and rejects malformed answers', async () => {
+  const calls = []
+  const rows = await trustedDohLookup('example.com', async (url, init) => {
+    calls.push({ url, init })
+    const type = new URL(url).searchParams.get('type')
+    return response({ json: type === 'A'
+      ? { Status: 0, Answer: [{ type: 5, data: 'alias.example.' }, { type: 1, data: '93.184.216.34' }] }
+      : { Status: 0, Answer: [{ type: 28, data: '2606:2800:220:1:248:1893:25c8:1946' }] } })
+  })
+  assert.deepEqual(rows, [
+    { address: '93.184.216.34', family: 4 },
+    { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+  ])
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every((x) => x.init.headers.Accept === 'application/dns-json'))
+  await assert.rejects(
+    () => trustedDohLookup('example.com', async () => response({ json: { Status: 0, Answer: [{ type: 1, data: 'not-an-ip' }] } })),
+    /有效公网地址|地址/,
+  )
+})
+
 test('SSRF guards reject credentials, local names, private/reserved literals, and DNS rebinding targets', async () => {
   assert.throws(() => validateUrlShape('https://u:p@example.com/a'), /账号|http/)
   assert.throws(() => validateUrlShape('http://localhost/a'), /本地/)
@@ -159,8 +214,10 @@ test('SSRF guards reject credentials, local names, private/reserved literals, an
   assert.equal(isPublicIp('8.8.8.8'), true)
   assert.equal(isPublicIp('2606:4700:4700::1111'), true)
 
-  const rt = makeWebRuntime({ searchFn: async () => [{ title: 'bad', url: 'https://evil.example/a', snippet: '' }], dnsLookup: async () => [{ address: '127.0.0.1', family: 4 }], fetchImpl: async () => response({ text: 'should not run' }) })
+  let dohCalls = 0
+  const rt = makeWebRuntime({ searchFn: async () => [{ title: 'bad', url: 'https://evil.example/a', snippet: '' }], dnsLookup: async () => [{ address: '127.0.0.1', family: 4 }], dohLookup: async () => { dohCalls++; return publicDns() }, fetchImpl: async () => response({ text: 'should not run' }) })
   await rt.search('q')
   assert.match(await rt.fetch('https://evil.example/a'), /DNS|公网/)
+  assert.equal(dohCalls, 0, 'only Clash 198.18/15 may use DoH; ordinary private DNS stays blocked')
   assert.equal(rt.telemetry().fetchJinaAttempts, 0, 'private DNS is rejected before Jina can launder it')
 })
