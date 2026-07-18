@@ -18,6 +18,7 @@ import {
 } from '../core/prompts.js'
 import {
   DEDUP_SCHEMA,
+  BODY_FIDELITY_GATES,
   LOGIC_PLAN_SCHEMA,
   LOGIC_REPORT_SCHEMA,
   ONE_PASS_CHARS,
@@ -723,7 +724,9 @@ export function deliverPrompts(args, state) {
   const dir = stateDir(A)
   const refined = (state.refined || state.resultSeed?.refined || []).filter(Boolean)
   const prompts = []
-  if (A.scope.includes('logic')) {
+  const bodyGate = auditNativeBodies(A, refined)
+  const derivativesSkipped = bodyGate.status === 'ok' ? [] : requestedDerivativeSkips(A)
+  if (bodyGate.status === 'ok' && A.scope.includes('logic')) {
     A.files.forEach((f, index) => {
       const refinedFile = asRefinedPromptFile(f)
       prompts.push(promptEntry(A, 'logic-plan', {
@@ -733,22 +736,22 @@ export function deliverPrompts(args, state) {
       }))
     })
   }
-  if (A.scope.includes('summary') && refined.length) {
+  if (bodyGate.status === 'ok' && A.scope.includes('summary') && refined.length) {
     prompts.push(promptEntry(A, 'summary', {
       label: 'summary',
       path: writeText(path.join(dir, 'prompts', 'summary.txt'), summaryPrompt(A, refined, state.sectionMapPath)),
     }))
   }
-  if (A.scope.includes('timeline') && refined.length) {
+  if (bodyGate.status === 'ok' && A.scope.includes('timeline') && refined.length) {
     prompts.push(promptEntry(A, 'timeline', {
       label: 'timeline',
       timeoutMs: A.timelineTimeoutMs || 180000,
       path: writeText(path.join(dir, 'prompts', 'timeline.txt'), timelinePrompt(A, state.glossary || '', refined, state.sectionMapPath)),
     }))
   }
-  const manifestPath = writeJson(path.join(dir, 'deliver-prompt-manifest.json'), { prompts })
-  markStage(A, 'deliver-prompts', 'end', { prompts: prompts.length })
-  return { manifestPath, prompts }
+  const manifestPath = writeJson(path.join(dir, 'deliver-prompt-manifest.json'), { prompts, bodyGate, derivativesSkipped })
+  markStage(A, 'deliver-prompts', 'end', { prompts: prompts.length, bodyGate: bodyGate.status, skipped: derivativesSkipped.length })
+  return { manifestPath, prompts, bodyGate, derivativesSkipped }
 }
 
 export function afterLogicPlan(args, state, plansRaw) {
@@ -813,8 +816,11 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     if (!chk) return r
     return { ...r, complete: chk.complete, checkNote: chk.note || '' }
   })
-  const logicByLabel = new Map((state.resultSeed?.logic || []).filter((l) => l && l.label).map((l) => [l.label, l]))
+  const bodyGate = auditNativeBodies(A, refined)
+  const derivativesSkipped = bodyGate.status === 'ok' ? [] : requestedDerivativeSkips(A)
+  const logicByLabel = new Map((bodyGate.status === 'ok' ? (state.resultSeed?.logic || []) : []).filter((l) => l && l.label).map((l) => [l.label, l]))
   A.files.forEach((f) => {
+    if (bodyGate.status !== 'ok') return
     const rep = reportFor(logicItems, [f.label, path.join(A.outputDir, '逻辑顺序', `${safeName(f.title)}.md`)])
     if (!rep) return
     const outPath = path.resolve(rep.path || path.join(A.outputDir, '逻辑顺序', `${safeName(f.title)}.md`))
@@ -829,8 +835,8 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     })
   })
   const logic = A.files.map((f) => logicByLabel.get(f.label)).filter(Boolean)
-  const summary = summaryRaw ? (typeof summaryRaw === 'string' ? { path: summaryRaw } : summaryRaw) : (state.resultSeed?.summary || null)
-  const timeline = timelineRaw ? (typeof timelineRaw === 'string' ? { path: timelineRaw } : timelineRaw) : (state.resultSeed?.timeline || null)
+  const summary = bodyGate.status === 'ok' ? (summaryRaw ? (typeof summaryRaw === 'string' ? { path: summaryRaw } : summaryRaw) : (state.resultSeed?.summary || null)) : null
+  const timeline = bodyGate.status === 'ok' ? (timelineRaw ? (typeof timelineRaw === 'string' ? { path: timelineRaw } : timelineRaw) : (state.resultSeed?.timeline || null)) : null
   const result = {
     ...(state.resultSeed || {}),
     refined,
@@ -840,7 +846,9 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     logic,
     summary,
     timeline,
-    openQuestions: (state.resultSeed?.openQuestions || []).concat(logic.flatMap((l) => l.open_questions || [])),
+    bodyGate,
+    derivativesSkipped,
+    openQuestions: (state.resultSeed?.openQuestions || []).concat(logic.flatMap((l) => l.open_questions || [])).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),
   }
   const resultPath = writeJson(path.join(stateDir(A), 'result.json'), result)
   markStage(A, 'deliver', 'end', { logic: logic.filter((l) => l.path).length, summary: !!summary, timeline: !!timeline })
@@ -862,6 +870,27 @@ function glossaryTextForAudit(A) {
     }
   }
   return null
+}
+
+function requestedDerivativeSkips(A) {
+  return ['logic', 'summary', 'timeline']
+    .filter((kind) => A.scope.includes(kind))
+    .map((kind) => ({ kind, reason: '正文未完成或忠实性审计未通过' }))
+}
+
+function auditNativeBodies(A, refined = []) {
+  const paths = new Set(refined.map(refinedPathOf).filter(Boolean).map((p) => path.resolve(p)))
+  const missing = A.files.filter((f) => !paths.has(path.resolve(f.outPath)) || !fs.existsSync(f.outPath)).map((f) => ({ label: f.label, path: f.outPath }))
+  const pairs = A.files
+    .filter((f) => paths.has(path.resolve(f.outPath)) && fs.existsSync(f.outPath))
+    .map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText: glossaryTextForAudit(A) }))
+  const audit = pairs.length ? auditPairs(pairs) : null
+  const files = ((audit && audit.files) || []).map((f) => {
+    const failed = (f.failed || []).filter((kind) => BODY_FIDELITY_GATES.includes(kind))
+    return { file: f.file || f.refinedFile, status: failed.length ? 'fail' : 'ok', failed }
+  })
+  const status = missing.length || pairs.length !== A.files.length || files.some((f) => f.status === 'fail') ? 'fail' : 'ok'
+  return { status, files, missing }
 }
 
 function logicPathOf(A, f, entry) {

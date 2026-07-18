@@ -252,7 +252,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
     { title: '文档内数值自相矛盾（同一量在同一文件里出现两个不同数值——请对照录音确认哪个是对的）', items: numericConsistencyItems(result), priority: 'medium' },
     { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
-    { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
+    { title: '已在成稿中插入内容缺口标记（本轮派生产物已暂停；补回内容并复检通过后再生成）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '校对表偏薄，建议人工复核（条目数/身份线索/变体比例）', items: glossaryLintItems(result), priority: 'medium' },
     { title: '校对表来源标注（公开/外部事实勿当访谈亲述；未标来源的行请补标【访谈】或【公开·待记者核实】）', items: glossarySourceItems(result), priority: 'medium' },
@@ -404,7 +404,10 @@ export function buildRunManifest(result = {}, context = {}) {
       verifyDepth: A.verifyDepth || null,
       headingPolicy: A.headingPolicy || null,
       fresh: !!A.fresh,
-      models: A.models || null,
+      // Effective stage→provider-model routing, not merely the caller's sparse override. This makes the
+      // manifest auditable even when defaults supplied most stages.
+      models: A.effectiveModels || result.modelRouting || A.models || null,
+      modelOverrides: A.modelOverrides || {},
       outputDir,
       skillDir: A.skillDir || null,
       backgroundLength: A.background ? String(A.background).length : 0,
@@ -428,6 +431,7 @@ export function buildRunManifest(result = {}, context = {}) {
       failed: result.failed || [],
       incomplete: result.incomplete || [],
       unchecked: result.unchecked || [],
+      auditFailed: result.auditFailed || [],
       // P7 fail-loud: files whose audit could not run — the run is failed, products unaudited.
       auditUnavailable: result.auditUnavailable || [],
       headingConflicts: result.headingConflicts || [],
@@ -435,6 +439,7 @@ export function buildRunManifest(result = {}, context = {}) {
       suspectedDuplicates: result.suspectedDuplicates || [],
       networkUnverified: result.networkUnverified || [],
       openQuestions: result.openQuestions || [],
+      derivativesSkipped: result.derivativesSkipped || [],
       // M8: cross-file numeric conflicts (same entity + unit, disjoint values across ≥2 files). Structured so a
       // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
       crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),

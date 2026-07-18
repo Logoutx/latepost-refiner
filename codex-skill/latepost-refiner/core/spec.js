@@ -1,4 +1,11 @@
 // GENERATED FILE — DO NOT EDIT. Source: core/spec.js. Regenerate: npm run sync:skills
+// Failures that make a refined interview body unsafe as the source for logic/summary/timeline. Shared by the
+// core Workflow/Universal pipeline and the independent Codex-native helper so edition-specific orchestration
+// cannot drift on what "final body" means.
+export const BODY_FIDELITY_GATES = Object.freeze([
+  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'quote_style',
+])
+
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
 // (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent
@@ -799,8 +806,50 @@ export const partPath = (outPath, idx) => `${outPath}.part${idx}`
 // Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
 // join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
 // testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
-// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
-// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
+// line. Besides an exact-duplicate `##` heading, remove only a HIGH-CONFIDENCE duplicated prose block at
+// the seam: same speaker (when labelled), >=60 normalized chars, and either containment at near-equal length
+// or >=0.92 bigram Dice similarity. Short/common replies are deliberately never deduplicated.
+function seamNorm(text) {
+  return String(text || '')
+    .replace(/^\s*#{1,6}\s+.*$/gm, '')
+    .replace(/^\s*[一-龥A-Za-z0-9·]{1,16}[：:]\s*/, '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function seamSpeaker(text) {
+  const m = String(text || '').trim().match(/^([一-龥A-Za-z0-9·]{1,16})[：:]/)
+  return m ? m[1] : null
+}
+
+function bigramDice(a, b) {
+  const grams = (s) => {
+    const m = new Map()
+    for (let i = 0; i + 1 < s.length; i += 1) {
+      const g = s.slice(i, i + 2)
+      m.set(g, (m.get(g) || 0) + 1)
+    }
+    return m
+  }
+  const ga = grams(a), gb = grams(b)
+  let overlap = 0
+  for (const [g, n] of ga) overlap += Math.min(n, gb.get(g) || 0)
+  const total = Array.from(ga.values()).reduce((s, n) => s + n, 0) + Array.from(gb.values()).reduce((s, n) => s + n, 0)
+  return total ? (2 * overlap) / total : 0
+}
+
+export function isDuplicateSeamBlock(left, right) {
+  const a = seamNorm(left), b = seamNorm(right)
+  if (Math.min(a.length, b.length) < 60) return false
+  const sa = seamSpeaker(left), sb = seamSpeaker(right)
+  if (sa && sb && sa !== sb) return false
+  const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+  if (ratio < 0.82) return false
+  if (a.includes(b) || b.includes(a)) return true
+  return bigramDice(a, b) >= 0.88
+}
+
 export function stitchParts(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
   if (!parts.length) return ''
@@ -811,6 +860,17 @@ export function stitchParts(texts) {
     const nextFirst = (next.split('\n')[0] || '').trim()
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
+    }
+    // A model may repeat the previous chunk's final turn at the start of the next part even though source
+    // ownership is disjoint. Compare prose BLOCKS (not arbitrary suffixes) and remove at most two duplicated
+    // leading blocks. This keeps the operation deterministic and avoids deleting legitimate later repetition.
+    for (let pass = 0; pass < 2; pass += 1) {
+      const leftBlocks = out.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+      const rightBlocks = next.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+      const ri = rightBlocks.findIndex((x) => !/^#{1,6}\s/.test(x))
+      if (!leftBlocks.length || ri < 0 || !isDuplicateSeamBlock(leftBlocks[leftBlocks.length - 1], rightBlocks[ri])) break
+      rightBlocks.splice(ri, 1)
+      next = rightBlocks.join('\n\n')
     }
     out = `${out}\n\n${next}`
   }
@@ -855,8 +915,16 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
     return e
   }
   const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  // Authority order is explicit:
+  //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
+  // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
+  // exact failure it was meant to fix permanent: Scout flags 姚顺宇 as suspect_asr, Verify finds 姚顺雨, then the
+  // "strong name" guard keeps 姚顺宇. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
+  const scoutCorrection = e.confidence !== 'verified' && e.suspect_asr === true && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
-      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
+      && !scoutCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })

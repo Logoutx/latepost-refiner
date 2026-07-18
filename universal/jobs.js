@@ -8,11 +8,11 @@ import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
-import { runPipeline } from '../core/pipeline.js'
+import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts, parseTurns } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
-import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE } from '../engines/deepseek.js'
+import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 
@@ -25,6 +25,19 @@ export class JobConfigError extends Error {
     this.name = 'JobConfigError'
     this.code = 'CONFIG_ERROR'
   }
+}
+
+const MODEL_VALUES = new Set(['haiku', 'sonnet', 'opus', ...DEEPSEEK_MODEL_IDS])
+export function normalizeModelOverrides(models) {
+  if (models == null) return {}
+  if (!models || typeof models !== 'object' || Array.isArray(models)) throw new JobConfigError('models 必须是 stage→model 对象')
+  const out = {}
+  for (const [stage, model] of Object.entries(models)) {
+    if (!Object.hasOwn(DEFAULT_STAGE_MODELS, stage)) throw new JobConfigError(`未知模型阶段「${stage}」`)
+    if (!MODEL_VALUES.has(model)) throw new JobConfigError(`阶段 ${stage} 的模型「${model}」无效；仅支持 haiku/sonnet/opus 或 DeepSeek v4 flash/pro`)
+    out[stage] = model
+  }
+  return out
 }
 
 export function loadDotEnv(filePath = path.join(REPO_ROOT, '.env'), env = process.env) {
@@ -233,6 +246,7 @@ function auditPromptSummary(auditFile = {}) {
   return JSON.stringify({
     failed: auditFile.failed || [],
     metrics: auditFile.metrics || {},
+    gaps: (auditFile.gaps || []).filter((g) => g.severity === 'hard').slice(0, 12),
     hard,
     long_paragraphs: (auditFile.long_paragraphs || []).slice(0, 8),
   }, null, 2)
@@ -244,7 +258,11 @@ function qualityRepairPrompt(A, f, auditFile, attemptNo) {
     ? '本次属于压缩/结尾缺失风险：不要试图从当前成稿补回丢失内容。重新从源文件完整精校，当前成稿最多只作标题/结构参考。'
     : action === 'full_cleanup'
       ? '本次属于欠精校风险：读取源文件与当前成稿，对整份成稿做一轮完整清噪和顺句，保持覆盖与对话体。'
-      : '本次属于局部质量问题：优先修复 audit 标出的残留口癖、重复、乱码粘连或超长段；如需判断是否改义，再对照源文件。'
+      : (auditFile.failed || []).includes('content_gap')
+        ? '本次属于定向内容缺口：按 gaps 的源行区间逐段 Read 原稿，在前后锚点之间补回全部实质内容；不要重写已经通过审计的段落。'
+        : (auditFile.failed || []).includes('attribution_mismatch')
+          ? '本次属于发言人串位：按 finding 样本与源行核对，只调整对应轮次的标签和段落归属，不改写发言内容。'
+          : '本次属于局部质量问题：优先修复 audit 标出的残留口癖、重复、乱码粘连或超长段；如需判断是否改义，再对照源文件。'
   return `你是访谈精校质量修复代理。目标不是总结，而是让既有精校稿通过质量审计，同时保留全部事实细节与对话体。
 
 【第 ${attemptNo} 次修复】
@@ -348,12 +366,15 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedAt = new Date(startedMs).toISOString()
   const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
-    apiKey, tavilyKey,
+    apiKey, tavilyKey, models,
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     outputDir, fresh = false, concurrency,
     skillDir, refineMode, effort,
   } = params
+  const modelOverrides = normalizeModelOverrides(models)
+  const stageModels = { ...DEFAULT_STAGE_MODELS, ...modelOverrides }
+  const effectiveModels = resolveDeepSeekRouting(stageModels)
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
   const uploadDir = path.join(outDir, '.uploads')
@@ -419,11 +440,18 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   // results into the accumulators below, so the top-level result.audit / annotations / anchors keep the exact
   // shape writeRunArtifacts (+ cli/server) already consume. runAudit returns an auditPair file-result so the
   // gate can read failed/gaps; annotate writes the visible 缺口 marker (only when the gate hits a still-hard
-  // gap); annotateAnchors writes the invisible source anchors. We deliberately do NOT inject `repair` — the
-  // headless API path keeps today's behaviour (mark the gap, let the user decide), never auto-rewriting a 成稿.
+  // gap); annotateAnchors writes the invisible source anchors. Universal also injects one TARGETED repair pass:
+  // the prompt carries exact source ranges/findings, the agent must edit the existing body, and the pipeline
+  // immediately re-audits. A null response or byte-identical file is treated as a failed repair.
   const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
   const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
   const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
+  const qualityRepairAttempts = []
+  const recordAuditFile = (file) => {
+    const i = auditFilesAcc.findIndex((x) => x && file && path.resolve(x.file) === path.resolve(file.file))
+    if (i >= 0) auditFilesAcc[i] = file
+    else auditFilesAcc.push(file)
+  }
   const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
   const capabilities = {
     readFile: (p) => fs.readFileSync(p, 'utf8'),
@@ -438,8 +466,22 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
       const res = auditPairs([{ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText }])
       const file = res.files[0]
-      auditFilesAcc.push(file)
+      recordAuditFile(file)
       return file
+    },
+    repair: async (f, opts = {}) => {
+      const auditFile = opts.audit || { file: f.outPath, status: 'fail', failed: opts.hard || [], gaps: opts.gaps || [], findings: [] }
+      const action = repairAction(auditFile.failed || [])
+      const model = stageModels.repair || stageModels.refine || 'opus'
+      const before = fs.readFileSync(f.outPath, 'utf8')
+      const response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, 1), {
+        label: `repair:${f.label || path.basename(f.outPath)}`, phase: 'Audit', model,
+      })
+      const after = fs.readFileSync(f.outPath, 'utf8')
+      const ok = !!response && after !== before
+      qualityRepairAttempts.push({ file: f.outPath, attempt: 1, action, model: effectiveModels.repair, failedBefore: auditFile.failed || [], ok })
+      if (!ok) throw new Error('定向修复未写回任何变化')
+      return { ok: true, action, model: effectiveModels.repair }
     },
     annotate: (f, gaps) => {
       if (params.annotate === false) return { inserted: [], skipped: [] }
@@ -478,6 +520,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
     priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
     canonicalOverrides: params.canonicalOverrides,
+    models: stageModels,
+    modelOverrides,
+    effectiveModels,
     capabilities,
     fresh, annotate: params.annotate, files: fileEntries,
   }
@@ -523,7 +568,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
     const usage = sel.engine.usage()
-    const result = { ...r, audit, derivativeAudit, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
@@ -542,7 +587,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // an injected test engine prices as "unknown" (estimateCost → null for any provider it doesn't recognise).
     let runLog = null
     if (params.runLog !== false) {
-      const runLogModels = sel.provider === 'deepseek' ? DEEPSEEK_MODELS : null
+      const runLogModels = sel.provider === 'deepseek' ? effectiveModels : null
       const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels })
       const logRes = appendRunLog(entry, { logPath: params.runLogPath })
       if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }

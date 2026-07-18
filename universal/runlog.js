@@ -43,6 +43,19 @@ export function estimateCost(provider, models, usage) {
   const cacheRead = u.cacheRead || 0
 
   if (provider === 'deepseek') {
+    const byModel = u.byModel && typeof u.byModel === 'object' ? u.byModel : null
+    if (byModel && Object.keys(byModel).length) {
+      let value = 0
+      for (const [modelId, row0] of Object.entries(byModel)) {
+        const price = deepseekPrice(modelId)
+        if (!price) return null
+        const row = row0 || {}
+        const rowInput = row.input || 0
+        const rowCache = row.cacheRead || 0
+        value += (Math.max(0, rowInput - rowCache) * price.inMiss + rowCache * price.inHit + (row.output || 0) * price.out) / 1e6
+      }
+      return { value: round6(value), currency: 'USD', note: null }
+    }
     if (!models || typeof models !== 'object') return null
     const ids = [...new Set(Object.values(models).filter(Boolean))]
     if (!ids.length) return null
@@ -85,6 +98,7 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     cacheRead: usageSrc.cacheRead || 0,
     cacheWrite: usageSrc.cacheWrite || 0,
     agents: usageSrc.agents || 0,
+    byModel: usageSrc.byModel || {},
   }
   const audit = result.audit
   const auditStatus = !audit ? 'unavailable' : (audit.status === 'fail' ? 'fail' : 'ok')

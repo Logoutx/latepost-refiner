@@ -202,16 +202,47 @@ test('annotate:false leaves the refined files untouched (still audited and repor
   }
 })
 
-// §2: with fs (Universal), jobs.js injects runAudit/annotate/annotateAnchors but NOT repair — so a hard
-// content_gap that jobs can't auto-fix surfaces as result.auditFailed (→ non-zero CLI exit) and each refined
-// entry carries an audit summary. This is the in-pipeline gate replacing the old post-run wrapper.
+// Universal injects one targeted repair. This mock deliberately returns null and leaves the file byte-identical,
+// so the attempt is rejected and the hard gap still surfaces.
 test('runJob surfaces an un-repairable hard gap as auditFailed and attaches a per-file audit summary', async () => {
   const result = await runGapJob()
   assert.ok((result.auditFailed || []).length >= 1, 'a still-hard gap is recorded in auditFailed')
   assert.ok(result.auditFailed.every((x) => x.findings.includes('content_gap')), 'the finding is content_gap')
   const r0 = result.refined.find((r) => (result.auditFailed[0].path === (r.outPath || r.path)))
   assert.ok(r0 && r0.audit && r0.audit.status === 'fail', 'the refined entry carries audit.status=fail')
-  assert.equal(r0.audit.repaired, false, 'no repair capability injected in the Universal path → not repaired')
+  assert.equal(r0.audit.repaired, false, 'a null/byte-identical repair is not counted as repaired')
+  assert.ok(result.qualityRepair.attempts.length >= 1 && result.qualityRepair.attempts.every((x) => !x.ok))
+})
+
+function repairableGapEngine() {
+  const e = gapEngine()
+  e.agent = async (prompt, opts = {}) => {
+    if (opts.label && opts.label.startsWith('repair:')) {
+      const m = prompt.match(/【当前成稿】([^\n]+)/)
+      assert.ok(m, 'repair prompt names the exact output file')
+      assert.match(prompt, /"startLine"/, 'repair prompt carries exact gap ranges')
+      fs.writeFileSync(m[1].trim(), covFixture('coverage-refined-good.md'), 'utf8')
+      return `已写回 ${m[1].trim()}`
+    }
+    return null
+  }
+  return e
+}
+
+test('runJob targeted repair closes content_gap, replaces the first audit result, and avoids annotation', async () => {
+  const outputDir = tmpdir()
+  const src64 = Buffer.from(covFixture('coverage-source.md')).toString('base64')
+  const result = await runJob({
+    __engine: repairableGapEngine(),
+    files: [{ name: '甲.md', base64: src64 }, { name: '乙.md', base64: src64 }],
+    topic: '定向修复测试', date: '2026-07', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+  assert.deepEqual(result.auditFailed, [])
+  assert.equal(result.audit.files.length, 2, 'one latest audit record per file, not fail+pass duplicates')
+  assert.ok(result.audit.files.every((f) => f.status === 'ok'))
+  assert.ok(result.refined.every((r) => r.audit.repaired === true))
+  assert.ok(result.qualityRepair.attempts.every((x) => x.ok))
+  assert.equal(result.annotations.length, 0, 'a repaired gap needs no visible failure marker')
 })
 
 // A clean refine (no gap) must not populate auditFailed, and each refined entry gets audit.status='ok'.
@@ -240,6 +271,22 @@ test('runJob: a faithful refine leaves auditFailed empty and marks each entry au
   assert.deepEqual(result.auditFailed, [], 'no hard findings → auditFailed empty')
   assert.ok(result.refined.every((r) => r.audit && r.audit.status === 'ok'), 'every refined entry audited ok')
   assert.ok((result.anchors || []).length >= 1, 'anchors still ran on the clean 成稿')
+})
+
+test('runJob preserves models override and run.json records the complete effective routing', async () => {
+  const outputDir = tmpdir()
+  const src64 = Buffer.from(covFixture('coverage-source.md')).toString('base64')
+  const result = await runJob({
+    __engine: cleanEngine(),
+    files: [{ name: '甲.md', base64: src64 }, { name: '乙.md', base64: src64 }],
+    topic: '模型契约', date: '2026-07', outputDir, scope: ['refine'], verifyDepth: 'none',
+    models: { refine: 'deepseek-v4-flash', repair: 'deepseek-v4-pro' },
+  })
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.config.models.refine, 'deepseek-v4-flash')
+  assert.equal(manifest.config.models.repair, 'deepseek-v4-pro')
+  assert.equal(manifest.config.models.scout, 'deepseek-v4-flash', 'defaults are expanded, not silently absent')
+  assert.deepEqual(manifest.config.modelOverrides, { refine: 'deepseek-v4-flash', repair: 'deepseek-v4-pro' })
 })
 
 // §1 + §4 through runJob: canonicalOverrides reach the pipeline (glossary carries 〔用户钦定〕) and an explicit

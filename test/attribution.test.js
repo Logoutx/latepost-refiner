@@ -309,9 +309,9 @@ test('micro-fix headings: < 3 ## but ≥ 3 of a deeper level → densest deeper 
   assert.equal(detectHeadingRegex(doc).source, /^#{3}\s+/.source, '1 ## vs 4 ### → ###')
 })
 
-// ---------- integration: auditPair surfaces M6 + M7a metrics/findings, all SOFT ----------
+// ---------- integration: calibrated speaker swaps gate; ambiguous review and quote risks stay soft ----------
 
-test('auditPair: attribution + quotes ride as SOFT findings and metrics; a swap never fails the gate', () => {
+test('auditPair: a calibrated attribution swap is a body-fidelity gate', () => {
   const source = buildSource()
   const refined = buildRefined({ swapTurnIndex: 4, swapTo: '沈其安' })
   const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
@@ -319,9 +319,9 @@ test('auditPair: attribution + quotes ride as SOFT findings and metrics; a swap 
   assert.equal(r.metrics.attribution.mismatches, 1)
   assert.ok('quotes' in r.metrics, 'quotes metric present in refine mode')
   const am = r.findings.find((f) => f.name === 'attribution_mismatch')
-  assert.equal(am.severity, 'soft')
+  assert.equal(am.severity, 'hard')
   assert.equal(am.count, 1)
-  assert.ok(!r.failed.includes('attribution_mismatch'), 'attribution is SOFT — never a gate this pass')
+  assert.ok(r.failed.includes('attribution_mismatch'), 'a high-confidence speaker swap blocks final-body status')
 })
 
 test('auditPair: entity_substitution_risk is absent by default and present only under strict', () => {

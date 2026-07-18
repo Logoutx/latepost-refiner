@@ -275,3 +275,36 @@ test('Codex native logic-plan audit rejects same-order fake reorder before writi
   const next = JSON.parse(fs.readFileSync(res.statePath, 'utf8'))
   assert.equal(next.resultSeed.logic[0].failedPlan, true)
 })
+
+test('Codex native withholds every derivative prompt and ignores injected derivative results when the body gate fails', () => {
+  const out = tmpdir()
+  const src = path.join(out, 'source.md')
+  fs.writeFileSync(src, sourceLines(32), 'utf8')
+  const outPath = path.join(out, 'Transcripts', '缺口样本.md')
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, '# 缺口样本\n\n记者：只保留了开头一句。\n', 'utf8')
+  const args = {
+    topic: '缺口测试', outputDir: out, skillDir: path.resolve('codex-skill/latepost-refiner'),
+    scope: ['refine', 'logic', 'summary', 'timeline'], verifyDepth: 'none',
+    files: [{ path: src, label: '缺口样本', title: '缺口样本', lines: 32, chars: 20000, outPath }],
+  }
+  const state = {
+    refined: [{ label: '缺口样本', path: outPath, outPath }],
+    resultSeed: { refined: [{ label: '缺口样本', path: outPath, outPath }], logic: [], summary: null, timeline: null, openQuestions: [] },
+    sectionMapPath: path.join(out, '_codex-native', 'section-map.json'),
+  }
+  const deliver = deliverPrompts(args, state)
+  assert.equal(deliver.bodyGate.status, 'fail')
+  assert.deepEqual(deliver.prompts, [])
+  assert.deepEqual(deliver.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+
+  const guarded = afterDeliver(args, state, {
+    logicRaw: [{ label: '缺口样本', path: path.join(out, '逻辑顺序', '不应采信.md') }],
+    summaryRaw: { path: path.join(out, '不应采信总结.md') },
+    timelineRaw: { path: path.join(out, '不应采信时间线.md') },
+  }).result
+  assert.deepEqual(guarded.logic, [])
+  assert.equal(guarded.summary, null)
+  assert.equal(guarded.timeline, null)
+  assert.deepEqual(guarded.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+})

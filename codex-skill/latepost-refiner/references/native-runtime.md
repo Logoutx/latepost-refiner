@@ -258,6 +258,14 @@ node "<this skill dir>/scripts/codex-native.mjs" deliver-prompts \
   --state <out>/_codex-native/state-after-refine.json
 ```
 
+`deliver-prompts` first runs the same deterministic body-fidelity gate used by the shared pipeline. It generates
+logic/summary/timeline prompts only when every requested refined body is present and has no hard
+`content_gap`, `compression_risk`, `ending_missing`, high-confidence `attribution_mismatch`, or `quote_style`
+finding. Otherwise `deliver-prompt-manifest.json` contains an empty prompt list plus `bodyGate` and
+`derivativesSkipped`; repair the named body against its source, re-audit, and rerun this command. `after-deliver`
+repeats the guard and ignores externally supplied derivative reports while the body is still hard, so bypassing
+the prompt step cannot make a stale derivative look valid.
+
 The `logic` lane is two-step:
 
 1. Run `logic-plan` prompts first. They write audited JSON plans to
@@ -297,10 +305,10 @@ When `logic` was not requested, use `state-after-refine.json` for `--state` and 
 Assemble the final result object. Start from `state-after-verify.json`'s `resultSeed`, then fill in `refined`, `logic`,
 `summary`, `timeline`, `failed`, `incomplete`, and `unchecked`.
 
-Run the deterministic quality audit before writing `review.md` / `run.json`, so hard findings are captured in the
-same handoff artifacts. The helper pairs each source file with its refined output, passes the current `校对表.md`
-or one-pass glossary to the audit, inserts visible content-gap markers when needed, adds invisible source anchors
-under refined `##` headings, audits logic-order drafts against refined transcripts, and writes
+Run the deterministic final audit before writing `review.md` / `run.json`, so the pre-deliver body-gate result,
+source anchors, and derivative checks are captured in the same handoff artifacts. The helper pairs each source
+file with its refined output, passes the current `校对表.md` or one-pass glossary to the audit, inserts visible
+content-gap markers when needed, adds invisible source anchors under refined `##` headings, audits logic-order drafts against refined transcripts, and writes
 `<out>/_codex-native/result-audited.json`.
 
 ```bash
@@ -336,6 +344,7 @@ node "<this skill dir>/scripts/audit_refined.mjs" --source <源稿.md> --refined
 - `compression_risk` — refine became a summary (refined/source 汉字 ratio < 0.55). **Rerun that file from source**, don't try to recover detail from the short output.
 - `under_refined` — coverage kept but filler barely removed.
 - `ending_missing` — the source's last turn isn't reflected in the output.
+- `attribution_mismatch` — a high-confidence source turn appears under the wrong speaker in the refined body.
 - residual pure filler (嗯/呃, 对对对/是是是, 我我/就就) or a dialogue paragraph over ~900 characters.
 
 啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete. (Output-only form `node …/audit_refined.mjs <file.md>` still works when no source is at hand, but it cannot detect compression.)
@@ -347,6 +356,7 @@ Always read `review.md` before the final user handoff.
 - If a scout result is garbled, rerun that file once. If it remains garbled, continue refine but mark the glossary risk.
 - If verify search fails twice in a row, stop that verify chunk and mark unresolved; do not retry indefinitely.
 - If a file's ending check is incomplete or unchecked, surface it in `review.md`.
+- If the body-fidelity gate fails, do not spawn or accept logic/summary/timeline output; repair the body first and rerun `deliver-prompts`.
 - If native subagents are unavailable, run serially in the main Codex session for small jobs or ask before using the
   Universal API-key fallback.
 - Never paste full raw transcripts or full web pages into the main chat. Keep the main context to paths, prompts,

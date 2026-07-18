@@ -5,7 +5,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { JobConfigError, runJob } from './jobs.js'
+import { JobConfigError, runJob, normalizeModelOverrides } from './jobs.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -39,14 +39,17 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
+  --models <映射>        阶段模型覆盖，如 refine=deepseek-v4-pro,repair=deepseek-v4-pro；也接受 JSON 对象。
+                         未指定的阶段沿用默认 flash/pro 路由；只允许 DeepSeek v4 flash/pro 与三档别名
   --fresh                忽略既有 校对表.md，从零重建
   --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
   --no-anchors           不往成稿各小节插源锚点注释（默认会插：<!-- 源 L25-L38 · 08:00-12:05 -->，
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
   --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
                          时间/token 用量/估算成本）
-  --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
-                         （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
+  --allow-audit-fail     正文忠实性门禁未过（缺口/压缩/结尾/说话人/引号，定点修复后仍 hard）时，若成稿已生成，
+                         仍以退出码 0 结束（默认退出 1）。主成稿照样落盘、派生产物暂停；请查 review.md / run.json
+                         的 auditFailed 与 derivativesSkipped 字段逐份核对
 
 密钥（环境变量，或仓库根目录 .env）:
   DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
@@ -101,6 +104,24 @@ export function parseChunkSize(v) {
   return n
 }
 
+export function parseModels(v) {
+  if (v == null || v === '') return undefined
+  if (typeof v === 'object') return normalizeModelOverrides(v)
+  const raw = String(v).trim()
+  let obj
+  if (raw.startsWith('{')) {
+    try { obj = JSON.parse(raw) } catch (e) { throw new JobConfigError(`--models JSON 无法解析：${e.message}`) }
+  } else {
+    obj = {}
+    for (const item of raw.split(',').map((x) => x.trim()).filter(Boolean)) {
+      const at = item.indexOf('=')
+      if (at <= 0 || at === item.length - 1) throw new JobConfigError(`--models 条目须为 stage=model，收到「${item}」`)
+      obj[item.slice(0, at).trim()] = item.slice(at + 1).trim()
+    }
+  }
+  return normalizeModelOverrides(obj)
+}
+
 export function buildRunParams(a, { env = process.env } = {}) {
   const topic = a.topic || 'untitled'
   const outputDir = path.resolve(a.outputDir && a.outputDir.trim() ? a.outputDir : `${env.HOME}/Downloads/${topic}`)
@@ -135,6 +156,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
+    models: parseModels(a.models),
   }
 }
 
@@ -178,7 +200,7 @@ export function printRunSummary(r) {
     if (flagged > 0) console.error(`\n逐节复核：${flagged} 节需人工对照（共 ${total} 节）——见 review.md「逐节复核清单」`)
   }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
-  if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿及其派生的总结/时间线均未经审计，不可视为通过。产物已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
+  if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿未经审计，不可视为通过；请求的总结/时间线/逻辑稿已暂停。主成稿已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {

@@ -284,6 +284,19 @@ test('stitchParts collapses an exact-duplicate heading straddling a seam', () =>
   assert.ok(merged.includes('李明：上。') && merged.includes('王某：下。'))
 })
 
+test('stitchParts removes a high-confidence semantic duplicate at a chunk seam', () => {
+  const repeated = '周砚：我们在东南亚先后设立了本地团队，并在中东建设区域中转仓，欧洲则通过跨境电商做小规模验证；这套路径的共同点是先验证需求，再逐步增加固定投入。'
+  const paraphrase = '周砚：我们在东南亚先后设立本地团队，也在中东建设区域中转仓；欧洲主要通过跨境电商做小规模验证。这套路径共同点是先验证需求，再逐步增加固定投入。'
+  const merged = stitchParts([`## 海外\n\n${repeated}`, `## 下一块\n\n${paraphrase}\n\n记者：后来进展如何？`])
+  assert.equal((merged.match(/先验证需求/g) || []).length, 1, 'near-identical repeated turn appears once')
+  assert.match(merged, /记者：后来进展如何/)
+})
+
+test('stitchParts keeps short or differently attributed repetition', () => {
+  const merged = stitchParts(['## 甲\n\n记者：这个结论很重要。', '## 乙\n\n受访者：这个结论很重要。'])
+  assert.equal((merged.match(/这个结论很重要/g) || []).length, 2, 'short common wording is never deleted')
+})
+
 test('stitchParts ignores empty parts and returns "" for none', () => {
   assert.equal(stitchParts([]), '')
   assert.equal(stitchParts(['', '   ', null]), '')
@@ -651,8 +664,10 @@ test('an unavailable audit (no fs capability, fallback agent fails to parse) is 
   // No capabilities are injected (CC-sandbox shape), so the audit gate falls back to an agent; the mock returns
   // null for every audit/audit-retry label → the audit is "unavailable".
   const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('audit') }))
-  // Deliverables are PRESERVED (work not destroyed) …
-  assert.ok(r.summary, 'the summary deliverable is still produced (work is preserved, just marked unaudited)')
+  // The main body is preserved, but a derivative must never treat an unaudited body as final.
+  assert.equal(r.refined.length, 1, 'the main transcript is preserved')
+  assert.equal(r.summary, null, 'summary is withheld until the body has a valid audit')
+  assert.deepEqual(r.derivativesSkipped, [{ kind: 'summary', reason: '正文未完成或忠实性审计未通过' }])
   assert.ok(!labels.some((l) => /^check/.test(l)), 'no separate completeness check phase exists anymore')
   assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'an unavailable audit still surfaces the file as unchecked')
   assert.deepEqual(r.incomplete, [], 'unavailable ≠ incomplete: an audit that could not run must not be reported as a truncated ending')

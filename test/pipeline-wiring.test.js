@@ -180,6 +180,21 @@ test('audit gate: still hard after one repair → auditFailed + visible marker (
   assert.equal(r.refined[0].audit.status, 'fail')
 })
 
+test('known-bad body is delivered but logic/summary/timeline are withheld', async () => {
+  const labels = []
+  const capabilities = {
+    runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] }),
+    repair: () => {}, annotate: () => {}, annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'logic', 'summary', 'timeline'], capabilities }), engine(labels))
+  assert.equal(r.refined.length, 1, 'the blocked main transcript is still returned')
+  assert.deepEqual(r.logic, [])
+  assert.equal(r.summary, null)
+  assert.equal(r.timeline, null)
+  assert.deepEqual(r.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+  assert.ok(!labels.some((l) => /^(logic|summary|timeline)/.test(l)), 'no derivative agent reads the known-bad body')
+})
+
 test('audit gate (P7): a throwing runAudit capability is retried once, then FAILS LOUDLY (universal fs path)', async () => {
   const labels = []
   let auditCalls = 0
@@ -229,6 +244,8 @@ test('audit gate (no capability): unparseable agent output → one retry → FAI
 
 // ---------- §5 logic missingSections auto-rerun ----------
 
+const PASS_AUDIT = { runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
+
 test('logic: a first-pass missing section triggers exactly one rerun that clears it', async () => {
   const labels = []
   const eng = engine(labels, {
@@ -236,7 +253,7 @@ test('logic: a first-pass missing section triggers exactly one rerun that clears
     '^logic-rerun': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['某节', '另一节'] }], open_questions: [] },
     '^logic:': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['另一节'] }], open_questions: [] }, // omits 某节
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
   assert.ok(labels.includes('logic:A'), 'first logic pass ran')
   assert.ok(labels.includes('logic-rerun:A'), 'the rerun ran (cap 1)')
   assert.deepEqual(r.logic[0].missingSections, [], 'the rerun covered the omitted heading')
@@ -249,7 +266,7 @@ test('logic: if the rerun still misses, the residual stays in the return (no inf
     '^refine': { path: 'x', headings: ['某节', '另一节'], key_fixes: [], open_questions: [] },
     '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['另一节'] }], open_questions: [] }, // both pass + rerun omit 某节
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
   assert.equal(labels.filter((l) => /^logic-rerun/.test(l)).length, 1, 'still only one rerun')
   assert.deepEqual(r.logic[0].missingSections, ['某节'], 'the still-missing heading is surfaced for a Step-5 spot-check')
 })
@@ -259,7 +276,7 @@ test('logic: safeName is applied to the 逻辑顺序 output path (a slash/colon 
   const eng = engine(labels, {
     '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['某节'] }], open_questions: [] },
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'], files: [F({ title: 'A/B:2025' })] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT, files: [F({ title: 'A/B:2025' })] }), eng)
   assert.equal(r.logic[0].path, '/o/逻辑顺序/A B 2025.md', 'slash and colon scrubbed out of the filename')
 })
 

@@ -52,10 +52,14 @@ docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.
 | 同指去重 | 找出写法不同但实际指向同一对象的实体，例如同音人名、简称和口号的不同转写 | Sonnet | gpt-5.4（medium） | deepseek-v4-flash |
 | 精校 | 逐份精校：删除口癖和无意义重复、修复 ASR 噪声、增加小标题，并按校对表统一写法 | Opus | gpt-5.5（high） | deepseek-v4-pro；超过 10,000 字自动分块 |
 | 源比对审计 | 纯 JS 比对源文与精校稿，检查压缩、内容缺口、数字漂移和结尾遗漏；完整性由此判定 | 不调模型 | 不调模型 | 不调模型 |
-| 审计修复 | 审计标出硬问题（内容缺口/引号）时自动定点修复一次，只改点名位置、不重写全文；修不好就在成稿插入可见的内容缺口标记、写进 review.md | Opus | gpt-5.5（high） | deepseek-v4-pro |
+| 审计修复 | 审计标出正文忠实性硬问题（内容缺口、压缩、结尾遗漏、说话人错配、引号）时自动定点修复一次，只改点名位置、不重写全文；修不好就写进 review.md，有具体缺口时在成稿插入可见标记 | Opus | gpt-5.5（high） | deepseek-v4-pro |
 | 逻辑重排（可选） | 在不改写正文的前提下，把问答从录音顺序重排为叙事顺序，并通过逐段对应审计 | Opus | gpt-5.5（high） | deepseek-v4-pro |
 | 总结（可选） | 从精校稿生成分类要点、核心判断和金句，不以总结替代完整精校稿 | Opus | gpt-5.4（medium） | deepseek-v4-pro |
 | 时间线（可选） | 结合精校稿和公开资料，整理人物、公司、产品与事件的发展时间线 | Opus | gpt-5.4（high） | deepseek-v4-pro |
+
+可选的逻辑稿、总结和时间线只会在所有正文完成精校、定点修复并通过忠实性复检后生成。正文仍有硬问题时，主成稿和 `review.md` 照常交付，派生产物暂停，并在 `run.json` 的 `derivativesSkipped` 里说明原因。
+
+DeepSeek 版默认仍按上表使用 flash/pro。CLI 与 `runJob()` 只为受控测试提供显式阶段覆盖（`--models stage=model`）；未指定阶段沿用默认值，`run.json` 记录完整的实际阶段→模型路由和本次稀疏覆盖，避免配置与真实调用不一致。
 
 ## 架构
 
@@ -68,7 +72,7 @@ core/                所有逻辑的唯一出处
   pipeline.js        runPipeline(A, engine)：流水线主体，只依赖一个 engine 接口
   meta.js            Workflow 元信息
 engines/             DeepSeek 版（命令行/网页/二进制）的引擎（Claude Code 版的引擎是 Workflow 全局，见 build/bootstrap-cc.js）
-  deepseek.js        DeepSeek 引擎：endpoint、模型分层（flash/pro）、忠实处理长度都写死在这一个文件里，没有可选项
+  deepseek.js        DeepSeek 引擎：endpoint、默认模型分层（flash/pro）与忠实处理长度集中在这里；仅 CLI/runJob 可显式覆盖阶段模型
   fileops.js         Read/Write/Edit 工具实现，带沙箱限制
 build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 workflow.js
 claude-code-skill/   Claude Code 版（workflow.js 是 build 产物，别手改）

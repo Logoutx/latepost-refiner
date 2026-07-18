@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Scout', detail: '每份转录一个侦察代理（超大文件自动拆段并行、防单代理卡死），返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },
     { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接；侦察失败也照常精校，默认 opus；Workflow 拼接 fallback 为 haiku）' },
-    { title: 'Audit', detail: '源比对审计（ending_missing / content_gap / 引号 hard；Universal 直接跑确定性脚本）' },
+    { title: 'Audit', detail: '正文忠实性审计（缺口 / 压缩 / 结尾 / 说话人 / 引号 hard；定点修复一次，仍未过则暂停派生产物）' },
     { title: 'Logic', detail: '逐份逻辑顺序重排稿（按主线把问答重排成叙事顺序，默认 opus）' },
     { title: 'Deliver', detail: '访谈总结 / 时间线（默认 opus）' },
   ],
@@ -16,7 +16,7 @@ export const meta = {
 // { topic, date, background, outputDir, skillDir,
 //   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
-//   models?: {scout,verify,refine,stitch,summary,timeline},  (stitch = chunk-merge agent for large files, default haiku)
+//   models?: {scout,verify,dedup,refine,repair,stitch,logic,summary,timeline},  (repair defaults to opus)
 //   priorGlossaryText?: full text of an existing <outputDir>/校对表.md (per-company persistent glossary, P1) —
 //     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
 //   fresh?: true to ignore any prior glossary and rebuild from scratch.
@@ -25,6 +25,13 @@ export const meta = {
 //    lines/bytes are for Read pagination only (readPlan). If chars is absent it's estimated from bytes, then lines.)
 
 // ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====
+
+// Failures that make a refined interview body unsafe as the source for logic/summary/timeline. Shared by the
+// core Workflow/Universal pipeline and the independent Codex-native helper so edition-specific orchestration
+// cannot drift on what "final body" means.
+const BODY_FIDELITY_GATES = Object.freeze([
+  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'quote_style',
+])
 
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
@@ -826,8 +833,50 @@ const partPath = (outPath, idx) => `${outPath}.part${idx}`
 // Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
 // join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
 // testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
-// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
-// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
+// line. Besides an exact-duplicate `##` heading, remove only a HIGH-CONFIDENCE duplicated prose block at
+// the seam: same speaker (when labelled), >=60 normalized chars, and either containment at near-equal length
+// or >=0.92 bigram Dice similarity. Short/common replies are deliberately never deduplicated.
+function seamNorm(text) {
+  return String(text || '')
+    .replace(/^\s*#{1,6}\s+.*$/gm, '')
+    .replace(/^\s*[一-龥A-Za-z0-9·]{1,16}[：:]\s*/, '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function seamSpeaker(text) {
+  const m = String(text || '').trim().match(/^([一-龥A-Za-z0-9·]{1,16})[：:]/)
+  return m ? m[1] : null
+}
+
+function bigramDice(a, b) {
+  const grams = (s) => {
+    const m = new Map()
+    for (let i = 0; i + 1 < s.length; i += 1) {
+      const g = s.slice(i, i + 2)
+      m.set(g, (m.get(g) || 0) + 1)
+    }
+    return m
+  }
+  const ga = grams(a), gb = grams(b)
+  let overlap = 0
+  for (const [g, n] of ga) overlap += Math.min(n, gb.get(g) || 0)
+  const total = Array.from(ga.values()).reduce((s, n) => s + n, 0) + Array.from(gb.values()).reduce((s, n) => s + n, 0)
+  return total ? (2 * overlap) / total : 0
+}
+
+function isDuplicateSeamBlock(left, right) {
+  const a = seamNorm(left), b = seamNorm(right)
+  if (Math.min(a.length, b.length) < 60) return false
+  const sa = seamSpeaker(left), sb = seamSpeaker(right)
+  if (sa && sb && sa !== sb) return false
+  const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+  if (ratio < 0.82) return false
+  if (a.includes(b) || b.includes(a)) return true
+  return bigramDice(a, b) >= 0.88
+}
+
 function stitchParts(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
   if (!parts.length) return ''
@@ -838,6 +887,17 @@ function stitchParts(texts) {
     const nextFirst = (next.split('\n')[0] || '').trim()
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
+    }
+    // A model may repeat the previous chunk's final turn at the start of the next part even though source
+    // ownership is disjoint. Compare prose BLOCKS (not arbitrary suffixes) and remove at most two duplicated
+    // leading blocks. This keeps the operation deterministic and avoids deleting legitimate later repetition.
+    for (let pass = 0; pass < 2; pass += 1) {
+      const leftBlocks = out.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+      const rightBlocks = next.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+      const ri = rightBlocks.findIndex((x) => !/^#{1,6}\s/.test(x))
+      if (!leftBlocks.length || ri < 0 || !isDuplicateSeamBlock(leftBlocks[leftBlocks.length - 1], rightBlocks[ri])) break
+      rightBlocks.splice(ri, 1)
+      next = rightBlocks.join('\n\n')
     }
     out = `${out}\n\n${next}`
   }
@@ -882,8 +942,16 @@ function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
     return e
   }
   const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  // Authority order is explicit:
+  //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
+  // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
+  // exact failure it was meant to fix permanent: Scout flags 姚顺宇 as suspect_asr, Verify finds 姚顺雨, then the
+  // "strong name" guard keeps 姚顺宇. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
+  const scoutCorrection = e.confidence !== 'verified' && e.suspect_asr === true && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
-      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
+      && !scoutCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })
@@ -2170,6 +2238,15 @@ ${TYPESET}
 
 
 
+const DEFAULT_STAGE_MODELS = Object.freeze({
+  scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', repair: 'opus',
+  stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus',
+})
+
+// These failures mean the interview body is not a trustworthy final source for derivatives. Other audit
+// findings (cleanup density, paragraph length, etc.) remain review-tier and do not trigger a model rewrite.
+{ BODY_FIDELITY_GATES } from './spec.js'
+
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
 // 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
 // when the host injects fs capability, or by a cheap stitch agent in the Workflow sandbox. Returns a
@@ -2275,13 +2352,26 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
-  const partReps = await engine.parallel(chunks.map((c) => () =>
+  let partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
       { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
+  const missing = chunks.map((c, i) => (!partReps[i] ? i : -1)).filter((i) => i >= 0)
+  if (missing.length) {
+    engine.log(`精校分块：${f.label} 首轮 ${missing.length}/${chunks.length} 块未返回——只重试缺失块一次`)
+    const retries = await engine.parallel(missing.map((i) => {
+      const c = chunks[i]
+      return () => engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
+        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
+    }))
+    partReps = partReps.slice()
+    missing.forEach((i, k) => { if (retries[k]) partReps[i] = retries[k] })
+  }
+  const stillMissing = chunks.filter((c, i) => !partReps[i])
+  if (stillMissing.length) {
+    engine.log(`精校分块：${f.label} 重试后仍缺 ${stillMissing.map((c) => `${c.idx}（源第 ${c.startLine}-${c.endLine} 行）`).join('、')}——拒绝拼接残缺正文`)
+    return null
+  }
   const good = partReps.filter(Boolean)
-  if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
-  const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
-  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，审计会进一步标记`)
   const cap = (A && A.capabilities) || {}
   if (typeof cap.stitch === 'function') {
     try {
@@ -2300,7 +2390,7 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     path: f.outPath,
     headings: good.flatMap((r) => r.headings || []),
     key_fixes: good.flatMap((r) => r.key_fixes || []),
-    open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
+    open_questions: good.flatMap((r) => r.open_questions || []),
     chunked: chunks.length,
     ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
   }
@@ -2370,7 +2460,7 @@ function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
-// JSON. content_gap(hard) or quote_style(hard) → optionally auto-repair once (capabilities.repair, or a refine
+// JSON. Any BODY_FIDELITY_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
 // subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
@@ -2425,8 +2515,8 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
   if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
-  const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
+  const hardOf = (r) => (r.failed || []).filter((k) => BODY_FIDELITY_GATES.includes(k))
+  const softOf = (r) => (r.failed || []).filter((k) => !BODY_FIDELITY_GATES.includes(k))
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
@@ -2437,11 +2527,14 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
     let didRepair = false
     if (typeof cap.repair === 'function') {
-      try { await cap.repair(f, { gaps, hard }); didRepair = true } catch { didRepair = false }
+      try { await cap.repair(f, { gaps, hard, audit: cur }); didRepair = true } catch { didRepair = false }
     } else if (typeof cap.runAudit !== 'function') {
       // CC path: a refine-tier subagent with Read/Edit patches ONLY the flagged spots in the on-disk 成稿.
       const parts = []
       if (hard.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
+      if (hard.includes('compression_risk')) parts.push('· 全文压缩：从源文件重新逐轮核对，把被概括掉的事实、数字、例子、判断与限定语补回；保持说话人归属。')
+      if (hard.includes('ending_missing')) parts.push('· 结尾缺失：读取源文件尾部，把尚未进入成稿的最后几轮发言补回对应位置。')
+      if (hard.includes('attribution_mismatch')) parts.push('· 发言人串位：按审计 finding 的源行与成稿行，只修正这些轮次的发言人标签/段落归属，不能改写内容。')
       if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
@@ -2455,7 +2548,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   }
 
   const auditFailed = hard.length ? hard.slice() : []
-  // Still hard after (at most one) repair → drop a visible 内容缺口/引号 marker so the document shows the defect.
+// Still hard after (at most one) repair → annotate any concrete source gaps so the document shows the defect.
   // Risk (b): fall back to the agent whenever the annotate CAPABILITY specifically is missing — not only in the
   // all-agent CC path. A host that injects runAudit but not annotate still gets the marker via the agent.
   if (auditFailed.length && (cur.gaps || []).some((g) => g.severity === 'hard')) {
@@ -2495,7 +2588,7 @@ function dedupCoverage(prior, merged) {
 
 async function runPipeline(A, engine) {
 const M = Object.assign(
-  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus' },
+  {}, DEFAULT_STAGE_MODELS,
   A.models || {}
 )
 const scope = A.scope || ['refine']
@@ -2533,10 +2626,11 @@ let headingConflicts = []
 let scoutSuspect = []
 let scoutFailed = []   // files whose scout returned nothing (stalled) — refined anyway (glossary degraded), surfaced for re-scout
 let dedup = null
-let auditFailed = []    // §2: per-file hard audit findings (content_gap/quote_style) still failing after one repair
+let auditFailed = []    // per-file body-fidelity findings still failing after one targeted repair
 let incomplete = []     // Derived from direct deterministic audit ending_missing failures.
 let unchecked = []      // Refined files lacking a direct audit capability, or whose audit errored.
 let auditUnavailable = []  // P7 fail-loud: files whose audit could NOT run after one retry — the run is marked failed (unaudited, not passed).
+let derivativesSkipped = [] // requested derivatives withheld because their source body was not final/audited
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 
@@ -2716,7 +2810,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 }
 
 // §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch and
-// BEFORE logic/summary/timeline. A hard content_gap or quote_style triggers one auto-repair +
+// BEFORE logic/summary/timeline. Any body-fidelity gate triggers one targeted auto-repair +
 // one re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
 // Anchors run on the (possibly repaired) 成稿. With fs the host injects capabilities.runAudit/annotateAnchors/
 // repair; without (CC sandbox) a subagent runs audit_refined.mjs. Skipped for a scope with no refine output.
@@ -2725,7 +2819,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（content_gap / 引号 hard → 自动修复一次 → 复检；仍 hard 记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（缺口/压缩/结尾/说话人/引号 hard → 自动定点修复一次 → 复检；仍 hard 记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
@@ -2757,12 +2851,27 @@ if (scope.includes('refine') && pairsToAudit.length) {
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
 }
 
+// Derivatives may only read FINAL bodies. The main transcript is still delivered when blocked (with review /
+// visible markers), but logic/summary/timeline are withheld rather than fossilising a known gap or speaker swap.
+const derivativesRequested = ['logic', 'summary', 'timeline'].filter((x) => scope.includes(x))
+const finalBodiesReady = refined.length > 0
+  && failed.length === 0
+  && auditFailed.length === 0
+  && auditUnavailable.length === 0
+  && pairsToAudit.length === refinedPairs.length
+  && refined.every((r) => r.audit && r.audit.status === 'ok')
+if (derivativesRequested.length && !finalBodiesReady) {
+  derivativesSkipped = derivativesRequested.map((kind) => ({ kind, reason: '正文未完成或忠实性审计未通过' }))
+  engine.log(`派生产物暂停：${derivativesRequested.join('、')}——正文未完成或忠实性审计未通过；主成稿与 review 仍照常交付`)
+}
+const derivativePairs = finalBodiesReady ? refinedPairs : []
+
 // Logic-order resequencing (optional): reads each refined transcript and reorders it into narrative order, run concurrently. Completeness is verified by a zero-cost JS check —
 // diff the headings in the refine report against threads[].source_sections in the logic report; any headings not covered go into missingSections.
 let logic = []
-if (scope.includes('logic') && refinedPairs.length) {
+if (scope.includes('logic') && derivativePairs.length) {
   engine.phase('Logic')
-  engine.log(`▶ 4/5 逻辑顺序 Logic：${refinedPairs.length} 份按主线重排为叙事顺序`)
+  engine.log(`▶ 4/5 逻辑顺序 Logic：${derivativePairs.length} 份按主线重排为叙事顺序`)
   // Build one logic entry from a (report, refine-report) pair. safeName(f.title) so a title with a slash / colon
   // can't fabricate a nested directory under 逻辑顺序/ (§3). missingSections = refine小标题 not covered by threads.
   const toEntry = (lrep, f, rep) => {
@@ -2772,9 +2881,9 @@ if (scope.includes('logic') && refinedPairs.length) {
     const missing = srcHeadings.filter((h) => !covered.has(h))
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
-  const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
+  const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
     engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
-  logic = lreps.map((lrep, k) => toEntry(lrep, refinedPairs[k].f, refinedPairs[k].rep))
+  logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
   // two) entry — the residual missing stays in the return for a Step-5 spot-check (current behaviour preserved).
@@ -2782,32 +2891,32 @@ if (scope.includes('logic') && refinedPairs.length) {
   if (rerunIdx.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
-      const { f } = refinedPairs[k]
+      const { f } = derivativePairs[k]
       return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
       if (!re) return // rerun failed → keep the first-pass entry
-      const entry = toEntry(re, refinedPairs[k].f, refinedPairs[k].rep)
+      const entry = toEntry(re, derivativePairs[k].f, derivativePairs[k].rep)
       // Adopt the rerun only if it covers at least as many headings (fewer missing); otherwise keep the first pass.
       if (entry.path && entry.missingSections.length <= logic[k].missingSections.length) logic[k] = entry
     })
   }
   const failedLogic = logic.filter((l) => !l.path).map((l) => l.label)
   const missLogic = logic.filter((l) => l.missingSections && l.missingSections.length)
-  engine.log(`逻辑顺序稿完成 ${logic.filter((l) => l.path).length}/${refinedPairs.length} 份${failedLogic.length ? `（${failedLogic.join('、')} 失败）` : ''}`)
+  engine.log(`逻辑顺序稿完成 ${logic.filter((l) => l.path).length}/${derivativePairs.length} 份${failedLogic.length ? `（${failedLogic.join('、')} 失败）` : ''}`)
   if (missLogic.length) engine.log(`逻辑顺序稿疑漏小标题（重跑后仍疑漏，按精校稿小标题覆盖核对，需抽查）：${missLogic.map((l) => `${l.label}:${l.missingSections.join('/')}`).join('；')}`)
 }
 
 engine.phase('Deliver')
-if (refined.length && (scope.includes('summary') || scope.includes('timeline'))) {
+if (finalBodiesReady && (scope.includes('summary') || scope.includes('timeline'))) {
   engine.log(`▶ 交付 Deliver：${[scope.includes('summary') && '访谈总结', scope.includes('timeline') && '时间线'].filter(Boolean).join(' + ')}`)
 }
 const [summary, timeline] = await engine.parallel([
-  () => (scope.includes('summary') && refined.length
+  () => (scope.includes('summary') && finalBodiesReady
     ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
     : Promise.resolve(null)),
-  () => (scope.includes('timeline') && refined.length
+  () => (scope.includes('timeline') && finalBodiesReady
     ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
     : Promise.resolve(null)),
 ])
@@ -2829,7 +2938,8 @@ return {
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
   autoChunk: refined.map((r) => r.autoChunk).filter(Boolean),   // provider-budget auto-split records → run.json + review.md
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes),
+  derivativesSkipped,
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),
   summary,
   timeline,
 }

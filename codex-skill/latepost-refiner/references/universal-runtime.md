@@ -30,7 +30,7 @@ API keys are used in memory for the local run; do not write them to output files
 
 ## CLI
 
-Models are fixed — there is no selection. Mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, logic, summary, timeline) run `deepseek-v4-pro`.
+The default profile is fixed: mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, repair, logic, summary, timeline) run `deepseek-v4-pro`. For controlled tests, `--models stage=model` may override individual stages with either supported DeepSeek v4 model (or the `haiku` / `sonnet` / `opus` aliases). `run.json` records the complete effective stage routing plus the sparse override, so the manifest reflects what actually ran.
 
 ```bash
 node universal/cli.js \
@@ -52,7 +52,8 @@ Useful flags:
 - `--fresh` to ignore an existing `校对表.md` and rebuild from zero
 - `--prior-glossary <path>` to seed from an external `校对表.md`
 - `--concurrency <N>` to cap parallel model calls
-- `--allow-audit-fail` to exit 0 when the only failure is a still-hard audit gate and products were already written
+- `--models refine=deepseek-v4-pro,repair=deepseek-v4-pro` for an explicit per-stage test override; omitted stages keep defaults
+- `--allow-audit-fail` to exit 0 when the only failure is a still-hard audit gate and main transcripts were written (derivatives remain withheld)
 
 Run `node universal/cli.js --help` for the complete, current flag list — treat it as the source of truth over this doc.
 
@@ -82,17 +83,13 @@ Read `run.json` when auditing a run or explaining exactly what files, models, pr
 
 ## Exit Code And `auditFailed`
 
-The in-pipeline audit gate runs per file after refine. When a file is still **hard** (`content_gap` / `quote_style`) after one auto-repair, it is recorded in the run's top-level **`auditFailed`** (`[{ path, findings }]`, mirrored in `review.md` and `run.json`). By default the CLI then **exits 1** — but the 成稿 and every other product are **already written to disk**; the non-zero code flags "one or more files need a manual look", not "the run failed". A calling script must therefore check the **`auditFailed` field in `run.json` / `review.md`** to decide per-file follow-up, rather than treating a non-zero exit as a whole-run failure and discarding the output.
+The in-pipeline audit gate runs per file after refine. When a body is still **hard** (`content_gap`, `compression_risk`, `ending_missing`, high-confidence `attribution_mismatch`, or `quote_style`) after one targeted repair, it is recorded in top-level **`auditFailed`**. The main transcript and review artifacts are still written, but requested logic/summary/timeline products are withheld and listed in **`derivativesSkipped`** so no derivative can fossilize a known body defect. By default the CLI exits 1; callers should inspect both fields in `run.json` / `review.md` and retain the main transcript for targeted follow-up.
 
-Pass **`--allow-audit-fail`** to make the CLI exit **0** when products were generated and the only problem is `auditFailed` (a pipeline error still exits 1). Use it in CI/batch drivers that want to consume the produced transcripts and act on `auditFailed` out-of-band instead of gating on the exit code.
+Pass **`--allow-audit-fail`** to make the CLI exit **0** when main transcripts were generated and the only problem is `auditFailed` (a pipeline error or unavailable audit still exits 1). This changes process control only; it never unblocks derivatives.
 
-The runtime now runs a source-aware quality audit for refined transcripts. It records compression risk, under-refinement, ending coverage, hard residual noise, phrase repeats, ASR glue, broken fragment starts, and long paragraphs. When a refined file fails, the runtime can retry up to 2 repair rounds:
-- compression or missing ending -> rerun that file from the source;
-- under-refined output -> full cleanup against source plus current output;
-- local residual noise -> targeted repair of flagged spans.
-Full-file repair uses the same fixed `refine` model as the original refine (`deepseek-v4-pro`) — there is no separate repair model to configure.
+The runtime runs a source-aware quality audit for each refined transcript, then gives body-fidelity failures exactly one targeted repair and one re-audit. The repair prompt receives the audit's exact source ranges, speaker mismatch, ending/compression signal, and other named findings; it edits the existing body instead of silently replacing it with a new summary. The `repair` stage defaults to `deepseek-v4-pro` and can be overridden explicitly like other stages.
 
-If failures remain after the repair loop, treat `review.md` as the handoff source of truth and do not present the run as clean.
+If failures remain after that pass, treat `review.md` as the handoff source of truth, retain the main body for manual correction, and do not generate or present derivatives as clean.
 
 ## Return And Handoff
 

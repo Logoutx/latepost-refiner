@@ -34,6 +34,25 @@ test('override.note is carried verbatim into lockReason', () => {
   assert.equal(c.lockReason, '创始人本人确认')
 })
 
+test('a two-key public verification corrects a fresh Scout suspect-ASR strong name', () => {
+  const hit = { query: '林川', canonical: '林传', identity: '虚构公司创始人', source: 'example.com 官方团队页', two_key: true }
+  const applied = new Set(), rejected = new Set()
+  const out = applyVerifiedEntry({ canonical: '林川', variants: [], suspect_asr: true, confidence: 'unknown' }, true, new Map([['林川', hit]]), applied, rejected)
+  assert.equal(out.canonical, '林传', 'verified canonical is written back instead of preserving the ASR guess')
+  assert.ok(out.variants.includes('林川'))
+  assert.ok(applied.has(hit) && !rejected.has(hit))
+})
+
+test('fresh strong-name correction still requires two-key evidence; user/prior authority stays protected', () => {
+  const weakHit = { query: '林川', canonical: '林传', source: 'example.com 官方团队页' }
+  const applied = new Set(), rejected = new Set()
+  const suspect = applyVerifiedEntry({ canonical: '林川', variants: [], suspect_asr: true }, true, new Map([['林川', weakHit]]), applied, rejected)
+  assert.equal(suspect.canonical, '林川', 'a source string without two_key cannot rename a strong person name')
+  const verified = applyVerifiedEntry({ canonical: '林川', variants: [], suspect_asr: true, confidence: 'verified' }, true,
+    new Map([['林川', { ...weakHit, two_key: true }]]), new Set(), new Set())
+  assert.equal(verified.canonical, '林川', 'a carried human/externally verified canonical is not displaced automatically')
+})
+
 test('a decree collapses MULTIPLE matched clusters into one locked cluster (overrides the weak-key no-merge guard)', () => {
   // Two clusters the merge machinery would never join (a bare 王总 is a weak key), but the user says they are one.
   const clusters = clusterEntities([

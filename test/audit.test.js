@@ -216,6 +216,16 @@ test('a silently omitted section hard-fails content_gap with an accurate source 
   assert.ok(!s.failed.includes('content_gap'), 'summary mode does not gate')
 })
 
+test('one long substantive speaker turn omitted in full is a hard content_gap', () => {
+  const answer = Array.from({ length: 18 }, (_, i) => `第 ${i + 1} 个具体判断涉及客户需求、产品取舍、交付节奏和团队协作，不能被概括删除。`).join('')
+  const source = `记者：请完整解释这次调整。\n受访者：${answer}\n记者：明白了。`
+  const refined = '## 调整\n\n记者：请完整解释这次调整。\n\n记者：明白了。'
+  const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  const gap = r.gaps.find((g) => g.turns === 1)
+  assert.ok(gap && gap.chars >= 300 && gap.severity === 'hard')
+  assert.ok(r.failed.includes('content_gap'), 'a single long answer is a complete turn, not a soft loss')
+})
+
 test('the same omission WITH a stage-direction fold trace is downgraded to soft (cooperative fold, not censorship)', () => {
   const r = auditPair({ sourceText: covSource(), refinedText: fixture('coverage-refined-fold-long.md'), mode: 'refine' })
   assert.ok(!r.failed.includes('content_gap'), 'traced fold does not gate')

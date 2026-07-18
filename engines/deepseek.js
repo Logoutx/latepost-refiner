@@ -4,7 +4,7 @@
 // the ONLY API provider the Universal edition supports — Claude runs via the Claude Code skill,
 // not this engine. Everything here is hard-wired to DeepSeek; there is no provider selection.
 //
-// Fixed setup:
+// Fixed defaults (runJob/CLI may explicitly override a stage between these two DeepSeek model ids):
 //   • Endpoint  https://api.deepseek.com ; key from DEEPSEEK_API_KEY.
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
@@ -25,10 +25,12 @@ import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
 // DeepSeek's OpenAI-compatible endpoint. Fixed — there is no --base-url anymore.
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 
-// Tier word (core passes 'haiku'/'sonnet'/'opus') → DeepSeek model id. FIXED, no selection.
+// Tier word (core passes 'haiku'/'sonnet'/'opus') → default DeepSeek model id. No provider selection;
+// controlled runJob/CLI overrides may assign either supported v4 model to an individual stage.
 // Validated 2026-07-07 on a real 34K-char interview: the old all-deepseek-chat default failed the
 // hard gates (compression + a real dropped section); the flash/pro split passed everything.
-export const DEEPSEEK_MODELS = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
+export const DEEPSEEK_MODELS = Object.freeze({ haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' })
+export const DEEPSEEK_MODEL_IDS = Object.freeze(['deepseek-v4-flash', 'deepseek-v4-pro'])
 
 // Per-model faithful-refine budget, in 正文字数 (content chars). A model that silently compresses a long
 // transcript into a summary must be auto-split BELOW the length where it starts folding content — the refine
@@ -132,7 +134,10 @@ export function formatSearchResults(results) {
 }
 
 // Tier word / raw id → DeepSeek model id. Unknown tier → v4-pro (the safe, faithful writing model).
-const resolveModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
+export const resolveDeepSeekModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
+export const resolveDeepSeekRouting = (stageModels = {}) => Object.fromEntries(
+  Object.entries(stageModels).map(([stage, model]) => [stage, resolveDeepSeekModel(model)]),
+)
 
 export function makeDeepSeekEngine(opts = {}) {
   const {
@@ -148,7 +153,7 @@ export function makeDeepSeekEngine(opts = {}) {
   const client = opts.client || new OpenAI({ apiKey, baseURL: DEEPSEEK_BASE_URL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
-  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
   const log = (msg) => (onLog ? onLog(msg) : process.stderr.write(`  ${msg}\n`))
@@ -158,9 +163,18 @@ export function makeDeepSeekEngine(opts = {}) {
     if (comp && comp.usage) {
       // OpenAI-style prompt_tokens INCLUDES cached tokens, so cacheRead is a subset of
       // input reported for observability — we do not subtract it from input.
-      usage.input += comp.usage.prompt_tokens || 0
-      usage.output += comp.usage.completion_tokens || 0
-      usage.cacheRead += parseCachedTokens(comp.usage)
+      const input = comp.usage.prompt_tokens || 0
+      const output = comp.usage.completion_tokens || 0
+      const cacheRead = parseCachedTokens(comp.usage)
+      usage.input += input
+      usage.output += output
+      usage.cacheRead += cacheRead
+      const modelId = params.model || 'unknown'
+      const row = usage.byModel[modelId] || { input: 0, output: 0, cacheRead: 0 }
+      row.input += input
+      row.output += output
+      row.cacheRead += cacheRead
+      usage.byModel[modelId] = row
     }
     return comp
   }
@@ -207,7 +221,7 @@ export function makeDeepSeekEngine(opts = {}) {
   }
 
   async function runAgent(prompt, { model, schema, label } = {}) {
-    const modelId = resolveModel(model)
+    const modelId = resolveDeepSeekModel(model)
     const tools = [...FILE_TOOLS]
     if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS) // client Tavily search + fetch
     if (schema) tools.push(structuredTool(schema))
@@ -292,10 +306,10 @@ export function makeDeepSeekEngine(opts = {}) {
   // declares a budget, else undefined — the pipeline reads it to decide auto-chunking, and undefined means
   // "no cap". Pure lookup, no network.
   function refineBudget(tier) {
-    const model = resolveModel(tier)
+    const model = resolveDeepSeekModel(tier)
     const budget = REFINE_CHAR_BUDGET[model]
     return (typeof budget === 'number' && budget > 0) ? { model, budget } : undefined
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }), refineBudget }
+  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).map(([k, v]) => [k, { ...v }])) }), refineBudget }
 }

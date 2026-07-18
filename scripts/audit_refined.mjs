@@ -747,6 +747,10 @@ function endingCovered(sourceText, refinedText) {
   for (let i = 0; i + 4 <= tail.length; i += 1) {
     if (refHan.includes(tail.slice(i, i + 4))) return true
   }
+  // Closing pleasantries may be folded under the refine contract, but only when the output leaves an explicit
+  // stage-direction trace near EOF. A silent truncation has no such trace and still fails ending_missing.
+  const refTail = refinedText.split(/\r?\n/).slice(-12).map((x) => x.trim()).filter(Boolean)
+  if (refTail.some((line) => FOLD_TRACE_RE.test(line))) return true
   return false
 }
 
@@ -762,7 +766,8 @@ export const COVERAGE = {
   SHINGLE_LEN: 6,            // normalized-hanzi window per anchor
   SHINGLES_MIN: 3, SHINGLES_MAX: 8, SHINGLE_PER_CHARS: 80, // per-turn count = clamp(3, ceil(len/80), 8)
   SHINGLE_SPACING: 24,       // min normalized-char distance between a turn's selected shingles
-  GAP_HARD_CHARS: 400, GAP_HARD_TURNS: 3,  // hard requires BOTH, and no fold trace between the anchors
+  GAP_HARD_CHARS: 400, GAP_HARD_TURNS: 3,  // multi-turn hard requires BOTH, and no fold trace between anchors
+  GAP_SINGLE_TURN_HARD: 300,               // one long substantive answer is still a complete interview turn
   GAP_SOFT_CHARS: 150, GAP_SOFT_TURNS: 2,  // soft: run ≥ 2 turns & ≥ 150 字
   GAP_SINGLE_TURN_SOFT: 300,               // …or a single lost turn ≥ 300 字
   LOST_RATIO_SOFT: 0.15,                   // global scattered-loss signal
@@ -1886,7 +1891,10 @@ export function scanCoverage(sourceText, refinedText) {
       const l = refLines[i].trim()
       if (l && (FOLD_TRACE_RE.test(l) || GAP_MARKER_RE.test(l) || MODEL_MARKER_RE.test(l))) { trace = true; break }
     }
-    const hard = run.length >= COVERAGE.GAP_HARD_TURNS && chars >= COVERAGE.GAP_HARD_CHARS && !trace
+    const hard = !trace && (
+      (run.length >= COVERAGE.GAP_HARD_TURNS && chars >= COVERAGE.GAP_HARD_CHARS)
+      || (run.length === 1 && chars >= COVERAGE.GAP_SINGLE_TURN_HARD)
+    )
     const soft = (run.length >= COVERAGE.GAP_SOFT_TURNS && chars >= COVERAGE.GAP_SOFT_CHARS)
       || (run.length === 1 && chars >= COVERAGE.GAP_SINGLE_TURN_SOFT)
     if (hard || soft) {
@@ -2147,6 +2155,10 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     // no fold trace — the silent-omission (possible censorship) failure. Soft gaps and scattered loss
     // are reported as findings below, never gates.
     gates.content_gap = coverage.assessed && coverage.gaps.some((g) => g.severity === 'hard')
+    // High-confidence speaker mismatch is a body-fidelity failure, not merely typography. The attribution
+    // detector already keeps low-confidence multi-party cases in attribution_review; only its calibrated
+    // mismatch tier gates and becomes eligible for one targeted repair.
+    gates.attribution_mismatch = !!(attribution && attribution.assessed && attribution.mismatches > 0)
   }
   const failed = Object.keys(gates).filter((k) => gates[k])
   const findings = out.findings.concat([
@@ -2173,11 +2185,12 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...(atoms && atoms.assessed && atoms.driftNotes ? [
       { name: 'number_drift_note', severity: 'soft', count: atoms.driftNotes, samples: atoms.driftNoteSamples },
     ] : []),
-    // M6 attribution-tier finding — SOFT ONLY (a mislabeled speaker is a review flag, not a hard gate this pass).
+    // M6 attribution-tier finding — the calibrated mismatch tier is HARD; ambiguous multi-party cases remain
+    // attribution_review (soft) below.
     // attribution_mismatch: a high-confidence anchored turn whose refined-side label contradicts the self-learned
     // majority map for its source speaker (Henry's answer sitting under the interviewer's label, or vice versa).
     ...(attribution && attribution.assessed ? [
-      { name: 'attribution_mismatch', severity: 'soft', count: attribution.mismatches, samples: attribution.samples },
+      { name: 'attribution_mismatch', severity: 'hard', count: attribution.mismatches, samples: attribution.samples },
     ] : []),
     // P4 multi-party 复核 tier: a low-confidence attribution mismatch (a single misaligned pairing in a ≥3-party
     // conversation) — surfaced for human review rather than accused as a hard mismatch. Present only when non-empty.
