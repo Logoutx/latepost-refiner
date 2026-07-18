@@ -292,6 +292,18 @@ test('stitchParts removes a high-confidence semantic duplicate at a chunk seam',
   assert.match(merged, /记者：后来进展如何/)
 })
 
+test('stitchParts removes a multi-turn duplicated suffix/prefix sequence at a chunk seam', () => {
+  const a = '沈其安：我们做了一个桌面智能体，让模型像人一样先看屏幕，再判断下一步操作，并直接点击对应位置；这个方向后来成为多种电脑使用产品的基础。'
+  const b = '这个系统与过去依赖 HTML 的方案不同，它使用视觉感知和像素级动作，因此面对普通应用界面也能完成连续操作。'
+  const c = '随后多家公司推出类似产品，到了第二年，代码智能体也因为基础模型能力提升而快速普及，团队的工作方式在几个月里明显改变。'
+  const ap = '沈其安：我们做了一个桌面智能体，让模型像人一样先看屏幕、判断下一步操作，再直接点击对应位置；这个方向后来成为多种电脑使用产品的基础。'
+  const bp = '这个系统和过去依赖 HTML 的方案不同，使用视觉感知与像素级动作，因此面对普通应用界面也可以完成连续操作。'
+  const cp = '随后多家公司推出了类似产品。到了第二年，代码智能体也因基础模型能力提升而迅速普及，团队工作方式在几个月里明显改变。'
+  const merged = stitchParts([`## 前块\n\n${a}\n\n${b}\n\n${c}`, `## 后块\n\n${ap}\n\n${bp}\n\n${cp}\n\n记者：接下来你们准备做什么？`])
+  assert.equal((merged.match(/桌面智能体/g) || []).length, 1, 'the repeated three-turn sequence appears once')
+  assert.match(merged, /接下来你们准备做什么/)
+})
+
 test('stitchParts keeps short or differently attributed repetition', () => {
   const merged = stitchParts(['## 甲\n\n记者：这个结论很重要。', '## 乙\n\n受访者：这个结论很重要。'])
   assert.equal((merged.match(/这个结论很重要/g) || []).length, 2, 'short common wording is never deleted')

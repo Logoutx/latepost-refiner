@@ -138,7 +138,10 @@ export const REFINE_GATES = {
 }
 
 const EMPTY_PHRASE = /那个|这个|就是说|对吧|是吧|对不对|你知道/g
-const PHRASE_REPEAT = /因为因为|本身本身|涂鸦涂鸦|钉钉钉|然后[，,、]\s*然后|([A-Za-z][A-Za-z0-9-]{1,12})(?:\s+\1)+/g
+// ASCII repeats must start and end on full token boundaries. Without these guards,
+// adjacent words such as "language agent" can backtrack into the false repeat
+// "age age" (the suffix of language + the prefix of agent).
+const PHRASE_REPEAT = /因为因为|本身本身|涂鸦涂鸦|钉钉钉|然后[，,、]\s*然后|(?<![A-Za-z0-9-])([A-Za-z][A-Za-z0-9-]{1,12})(?:\s+\1)+(?![A-Za-z0-9-])/g
 const YEAR_REPEAT = /(?:20)?(\d{2})\s*年[，,、]\s*(?:20)?\1\s*年/g
 const BROKEN_FRAGMENT_START = /^(?![#*>|])(?:[^：:\n]{1,12}[：:]\s*)?(?:呢[，,、]|那个全国|你说那个是\s*$|当时呢只是说[。.]?)/gm
 const ASR_GLUE = /(?:20\d{2}){2}|一\s*20\d{2}(?:20\d{2})?|SaaSAPP/g
@@ -239,6 +242,62 @@ function bodyLines(text) {
     out.push({ no: i + 1, raw, text: line })
   }
   return out
+}
+
+// Deterministic repair for the only purely typographic body gate. Model-based targeted repair can leave a
+// handful of ASCII pairs behind in a long document, blocking every derivative even though no editorial
+// judgment is needed. Preserve fenced code, inline code, link targets/titles, URLs, HTML comments and front
+// matter; normalize only visible prose/heading characters. Idempotent and line-ending preserving.
+export function normalizeQuoteStyleText(input) {
+  const rawText = String(input || '')
+  const eol = rawText.includes('\r\n') ? '\r\n' : '\n'
+  const lines = rawText.split(/\r?\n/)
+  let inFence = false, inComment = false, inFront = false
+  const corner = { '「': '“', '」': '”', '『': '‘', '』': '’' }
+
+  const out = lines.map((raw, i) => {
+    const trimmed = raw.trim()
+    if (i === 0 && trimmed === '---') { inFront = true; return raw }
+    if (inFront) { if (trimmed === '---') inFront = false; return raw }
+    if (/^(```+|~~~+)/.test(trimmed)) { inFence = !inFence; return raw }
+    if (inFence) return raw
+
+    let mask = raw
+    if (inComment) {
+      const end = mask.indexOf('-->')
+      if (end < 0) return raw
+      mask = ' '.repeat(end + 3) + mask.slice(end + 3)
+      inComment = false
+    }
+    mask = mask.replace(/<!--[\s\S]*?-->/g, (m) => ' '.repeat(m.length))
+    const open = mask.indexOf('<!--')
+    if (open >= 0) { inComment = true; mask = mask.slice(0, open) + ' '.repeat(mask.length - open) }
+    mask = mask.replace(/`[^`]*`/g, (m) => ' '.repeat(m.length))
+    mask = mask.replace(/\]\([^)]*\)/g, (m) => ' '.repeat(m.length))
+    mask = mask.replace(/https?:\/\/[^\s]+/g, (m) => ' '.repeat(m.length))
+
+    // `mask` is indexed in UTF-16 code units; keep the editable buffer on the same indexing model so an
+    // astral character (emoji, historic glyph) before a quote cannot shift replacements or corrupt text.
+    const chars = raw.split('')
+    let doubleOpen = true, singleOpen = true
+    for (let k = 0; k < mask.length; k += 1) {
+      const ch = mask[k]
+      if (corner[ch]) { chars[k] = corner[ch]; continue }
+      if (ch !== '"' && ch !== "'") continue
+      const prevCjk = CJK_CHAR.test(mask[k - 1] || '')
+      const nextCjk = CJK_CHAR.test(mask[k + 1] || '')
+      if (!prevCjk && !nextCjk) continue
+      if (ch === '"') {
+        chars[k] = nextCjk && !prevCjk ? '“' : prevCjk && !nextCjk ? '”' : (doubleOpen ? '“' : '”')
+        doubleOpen = chars[k] !== '“'
+      } else {
+        chars[k] = nextCjk && !prevCjk ? '‘' : prevCjk && !nextCjk ? '’' : (singleOpen ? '‘' : '’')
+        singleOpen = chars[k] !== '‘'
+      }
+    }
+    return chars.join('')
+  })
+  return out.join(eol)
 }
 
 // quote_style: ASCII "/' hugging a CJK char (hard), 直角引号 (hard), and a low-curly-quote density hint.
@@ -2761,6 +2820,7 @@ function usage() {
   … --source <源稿> --refined <精校稿> --annotate [--dry-run]      # 把 hard 内容缺口标记插进成稿（--dry-run 只演示不落盘）
   … --source <源稿> --refined <精校稿> --anchors [--dry-run]       # 给每个 ## 小节插入源锚点注释 <!-- 源 L25-L38 · 08:00-12:05 -->
                                                                   # （渲染不可见；引文可循此跳回源文件行号与录音时间；可与 --annotate 同用）
+  node scripts/audit_refined.mjs --refined <精校稿> --fix-quotes  # 确定性修正正文可见区域的 ASCII/直角引号；代码、URL、链接不动
 
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就、因为因为/涂鸦涂鸦、重复年份、20182018/SaaSAPP 等纯噪音或 ASR 粘连；超约 900 字的对话长段。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
@@ -2788,6 +2848,14 @@ function main() {
   const logic = getOpt(argv, '--logic')
   const derivative = getOpt(argv, '--derivative')
   const glossaryOnly = getOpt(argv, '--glossary-only')
+  if (refined && argv.includes('--fix-quotes')) {
+    const before = fs.readFileSync(refined, 'utf8')
+    const after = normalizeQuoteStyleText(before)
+    const changed = before !== after
+    if (changed && !argv.includes('--dry-run')) fs.writeFileSync(refined, after, 'utf8')
+    console.log(JSON.stringify({ status: 'ok', file: path.resolve(refined), changed, dryRun: argv.includes('--dry-run') }, null, 2))
+    return 0
+  }
   // --derivative audits a 时间线/总结 against the interview corpus (--corpus = comma-joined source transcript(s)
   // and/or 成稿). Standalone entry: fabricated 访谈 figures → hard (exit 1); 待核/未标注 items are soft (listed).
   if (derivative) {

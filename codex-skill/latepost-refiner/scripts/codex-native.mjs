@@ -53,7 +53,7 @@ import {
   weakDupFlags,
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
-import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource } from './audit_refined.mjs'
+import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource, normalizeQuoteStyleText } from './audit_refined.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -878,7 +878,21 @@ function requestedDerivativeSkips(A) {
     .map((kind) => ({ kind, reason: '正文未完成或忠实性审计未通过' }))
 }
 
+function normalizeNativeBodyQuotes(files) {
+  for (const f of files || []) {
+    try {
+      if (!fs.existsSync(f.outPath)) continue
+      const before = fs.readFileSync(f.outPath, 'utf8')
+      const after = normalizeQuoteStyleText(before)
+      if (after !== before) fs.writeFileSync(f.outPath, after, 'utf8')
+    } catch {
+      // The following source-aware audit remains fail-loud; normalization is only a deterministic best effort.
+    }
+  }
+}
+
 function auditNativeBodies(A, refined = []) {
+  normalizeNativeBodyQuotes(A.files)
   const paths = new Set(refined.map(refinedPathOf).filter(Boolean).map((p) => path.resolve(p)))
   const missing = A.files.filter((f) => !paths.has(path.resolve(f.outPath)) || !fs.existsSync(f.outPath)).map((f) => ({ label: f.label, path: f.outPath }))
   const pairs = A.files
@@ -941,6 +955,7 @@ function auditDerivativeOutputs(A, result) {
 
 export function auditNativeResult(args, result) {
   const A = normalizeArgs(args)
+  normalizeNativeBodyQuotes(A.files)
   const refined = Array.isArray(result && result.refined) ? result.refined : []
   const refinedByPath = new Map(refined.map((r) => {
     const p = refinedPathOf(r)

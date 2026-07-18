@@ -55,6 +55,11 @@ export const VERIFY_SCHEMA = {
       canonical: { type: 'string', description: '核实后的正确写法' },
       identity: { type: 'string', description: '身份/title' },
       source: { type: 'string', description: '依据来源一句话' },
+      // Chinese-name spelling is a separate key from identity. An English/Pinyin author page may prove that
+      // Lin Chuan is the person being discussed, but it cannot prove whether the Chinese name is 林川 or 林传.
+      // The verifier must both set this flag and repeat the exact canonical Han spelling in `source`; the render
+      // side checks both before it lets a person-name conclusion enter the glossary/body.
+      name_script_exact: { type: 'boolean', description: '人名 canonical 为中文汉字时，仅当所列来源页面直接出现该完整汉字写法才置 true；仅有英文名/拼音/罗马字必须为 false' },
       // OPTIONAL (all existing consumers survive its absence): the agent attests BOTH keys held for a decisive
       // conclusion on a phonetically-suspect / contested entity — a 高级别来源（官方域名/大媒体/百科）AND 语境吻合.
       // Only two_key===true may retire a 〔同指两解〕 row (see confidenceMark); a coattail/SEO/分销站 never sets it.
@@ -850,6 +855,33 @@ export function isDuplicateSeamBlock(left, right) {
   return bigramDice(a, b) >= 0.88
 }
 
+function stripDuplicateSeamPrefix(left, right) {
+  const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+  const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+  const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
+  if (!leftBlocks.length || !rightProse.length) return right
+
+  // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
+  // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
+  // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
+  // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
+  const max = 4
+  let best = null
+  for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
+    const leftSeq = leftBlocks.slice(-lc).join('\n\n')
+    for (let rc = 1; rc <= Math.min(max, rightProse.length); rc += 1) {
+      const indices = rightProse.slice(0, rc)
+      const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
+      if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
+      const score = Math.min(seamNorm(leftSeq).length, seamNorm(rightSeq).length)
+      if (!best || score > best.score || (score === best.score && rc > best.indices.length)) best = { score, indices }
+    }
+  }
+  if (!best) return right
+  for (const i of best.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return rightBlocks.join('\n\n')
+}
+
 export function stitchParts(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
   if (!parts.length) return ''
@@ -861,17 +893,10 @@ export function stitchParts(texts) {
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
     }
-    // A model may repeat the previous chunk's final turn at the start of the next part even though source
-    // ownership is disjoint. Compare prose BLOCKS (not arbitrary suffixes) and remove at most two duplicated
-    // leading blocks. This keeps the operation deterministic and avoids deleting legitimate later repetition.
-    for (let pass = 0; pass < 2; pass += 1) {
-      const leftBlocks = out.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
-      const rightBlocks = next.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
-      const ri = rightBlocks.findIndex((x) => !/^#{1,6}\s/.test(x))
-      if (!leftBlocks.length || ri < 0 || !isDuplicateSeamBlock(leftBlocks[leftBlocks.length - 1], rightBlocks[ri])) break
-      rightBlocks.splice(ri, 1)
-      next = rightBlocks.join('\n\n')
-    }
+    // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
+    // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
+    // prose blocks, so later legitimate repetition remains untouched.
+    next = stripDuplicateSeamPrefix(out, next)
     out = `${out}\n\n${next}`
   }
   return `${out.replace(/\s+$/, '')}\n`
@@ -903,6 +928,20 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
+  // Chinese orthography is its own evidence key. A Romanized author name can establish identity/context but
+  // cannot choose among homophonic Han spellings. Fail closed unless the verifier explicitly attested that the
+  // cited page shows the exact Chinese canonical AND preserved that spelling in the source note, making the
+  // evidence contract machine-checkable instead of trusting a bare `two_key:true`.
+  const hitCanonical = stripDesc(hit.canonical)
+  const needsExactHanScript = isPerson && /^\p{Script=Han}{2,8}$/u.test(hitCanonical)
+  const hasExactHanScript = hit.name_script_exact === true && String(hit.source || '').includes(hitCanonical)
+  if (needsExactHanScript && !hasExactHanScript) {
+    rejected.add(hit)
+    const reason = hit.name_script_exact === true
+      ? `⚠ 联网来源说明未原样包含中文名“${hitCanonical}”，无法证明具体汉字——未采用，待补中文原文来源`
+      : `⚠ 联网仅确认身份/英文名，未直接证明中文名“${hitCanonical}”的汉字写法——未采用，待补中文原文来源`
+    return Object.assign({}, e, { hint: [e.hint, reason].filter(Boolean).join('；') })
+  }
   // Contested entry: a referent substitution (a DIFFERENT written form) is FORBIDDEN unless the fresh verdict
   // carries two_key===true — the verify agent attesting BOTH a high-tier source AND context-fit. Bare
   // concreteness, even a real-looking domain, never licenses it (the coattail failure: verify "confirms" the
@@ -918,13 +957,18 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
   // Authority order is explicit:
   //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
   // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
-  // exact failure it was meant to fix permanent: Scout flags 姚顺宇 as suspect_asr, Verify finds 姚顺雨, then the
-  // "strong name" guard keeps 姚顺宇. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // exact failure it was meant to fix permanent: Scout flags 林川 as suspect_asr, Verify finds 林传, then the
+  // "strong name" guard keeps 林川. A current suspect-ASR cluster may therefore be corrected only by a concrete
   // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
-  const scoutCorrection = e.confidence !== 'verified' && e.suspect_asr === true && hit.two_key === true && isConcreteSource(hit.source)
+  // Fresh first-run strong spellings are still only Scout hypotheses. A decisive Verify result already attests
+  // both source authority and context fit via two_key, so it may correct them even when Scout forgot to set
+  // suspect_asr (the real replay found the right public names but retained five ASR spellings for exactly this
+  // reason). Carried verified and contested rows remain protected by the branches above / this exclusion.
+  const freshTwoKeyCorrection = e.confidence !== 'verified' && e.confidence !== 'contested'
+    && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
       && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
-      && !scoutCorrection) {
+      && !freshTwoKeyCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })

@@ -302,6 +302,11 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
         { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
+      if (hard.includes('quote_style')) {
+        await engine.agent(
+          `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --refined ${JSON.stringify(out)} --fix-quotes\n这是确定性排版修复；只回复一句话确认即可。`,
+          { label: `quote-fix:${f.label}`, phase: 'Audit', model: 'haiku' })
+      }
       didRepair = true
     }
     if (didRepair) {

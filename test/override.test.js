@@ -35,7 +35,7 @@ test('override.note is carried verbatim into lockReason', () => {
 })
 
 test('a two-key public verification corrects a fresh Scout suspect-ASR strong name', () => {
-  const hit = { query: '林川', canonical: '林传', identity: '虚构公司创始人', source: 'example.com 官方团队页', two_key: true }
+  const hit = { query: '林川', canonical: '林传', identity: '虚构公司创始人', source: 'example.com 官方团队页显示“林传”', name_script_exact: true, two_key: true }
   const applied = new Set(), rejected = new Set()
   const out = applyVerifiedEntry({ canonical: '林川', variants: [], suspect_asr: true, confidence: 'unknown' }, true, new Map([['林川', hit]]), applied, rejected)
   assert.equal(out.canonical, '林传', 'verified canonical is written back instead of preserving the ASR guess')
@@ -51,6 +51,23 @@ test('fresh strong-name correction still requires two-key evidence; user/prior a
   const verified = applyVerifiedEntry({ canonical: '林川', variants: [], suspect_asr: true, confidence: 'verified' }, true,
     new Map([['林川', { ...weakHit, two_key: true }]]), new Set(), new Set())
   assert.equal(verified.canonical, '林川', 'a carried human/externally verified canonical is not displaced automatically')
+})
+
+test('Chinese person names require direct Han-script evidence, not English identity evidence', () => {
+  const base = { canonical: '林川', variants: [], suspect_asr: true, confidence: 'unknown' }
+  const englishOnly = { query: '林川', canonical: '林传', identity: 'Lin Chuan', source: 'example.edu author page lists Lin Chuan', two_key: true, name_script_exact: false }
+  const applied = new Set(), rejected = new Set()
+  const blocked = applyVerifiedEntry(base, true, new Map([['林川', englishOnly]]), applied, rejected)
+  assert.equal(blocked.canonical, '林川', 'Romanized identity evidence cannot select a Chinese homophone spelling')
+  assert.ok(rejected.has(englishOnly) && blocked.hint.includes('未直接证明中文名'))
+
+  const flagWithoutText = { ...englishOnly, source: 'example.edu 中文教师页', name_script_exact: true }
+  const blockedAgain = applyVerifiedEntry(base, true, new Map([['林川', flagWithoutText]]), new Set(), new Set())
+  assert.equal(blockedAgain.canonical, '林川', 'the source note must preserve the exact canonical Han spelling')
+
+  const direct = { ...englishOnly, source: 'example.edu 中文教师页显示“林传”', name_script_exact: true }
+  const accepted = applyVerifiedEntry(base, true, new Map([['林川', direct]]), new Set(), new Set())
+  assert.equal(accepted.canonical, '林传', 'direct source-visible Han spelling is accepted')
 })
 
 test('a decree collapses MULTIPLE matched clusters into one locked cluster (overrides the weak-key no-merge guard)', () => {
@@ -219,7 +236,7 @@ test('BLOCKER: verified/user markers survive a full render→parse→merge→re-
     errors: [], notes: [],
   }
   // 王志远 was resolved THIS round (query 王总 → 王志远), so it renders 〔核实·2025-07〕.
-  const verified1 = { resolved: [{ query: '王总', canonical: '王志远', identity: '受访者', source: 'example.com 官网团队页' }], unresolved: [] }
+  const verified1 = { resolved: [{ query: '王总', canonical: '王志远', identity: '受访者', source: 'example.com 官网团队页显示“王志远”', name_script_exact: true }], unresolved: [] }
   const md1 = renderGlossary(round1, verified1, null, GA)
   assert.ok(md1.includes('王志远') && /王志远.*〔核实·2025-07〕/.test(md1), 'round-1: verified marker present')
   assert.ok(/甄选.*〔用户钦定〕/.test(md1), 'round-1: user marker present')

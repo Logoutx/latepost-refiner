@@ -29,8 +29,9 @@ const VERIFY_SUSPECT_PROTOCOL = `
 3. 证据分级取信：官方域名／权威媒体／百科 ＞ 目录站与 SEO 博客 ＞ 自我推销/软文贴。结论里注明命中来源属于哪一级。
 4. 搭便车反转规则：一个以该字面写法命名、但自身身份寄生于另一产品的站点（“Powered by X”“转售/代理 X”“X 分销/订阅站”），**不能**作为“该字面写法是独立实体”的证据——它恰恰是修正假设 X 成立的证据。
 5. 上下文吻合校验：把胜出的身份放回转录里对该实体的说法（其提及线索已在清单的“线索”里）核对；与转录内说法矛盾的身份，一律不得判为已核实。
-6. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
-7. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
+6. 中文人名汉字证据：身份相符、英文名或拼音相符，**不能证明中文名具体用哪个同音字**。若 canonical 是中文人名，至少 1 个所列来源页面必须直接显示该完整汉字写法；source 中原样写出页面所见中文名，且仅此时置 name_script_exact:true。只有 Lin Chuan / Chen Tao 一类英文、拼音或论文作者罗马字时，name_script_exact 必须为 false，不能据此“核实”林川/林传、陈涛/陈焘中的任何一个。
+7. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；中文人名还必须满足上一条【汉字原文证据】。只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
+8. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；中文人名若 name_script_exact 不为 true，two_key 也绝不能为 true。搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
 
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
@@ -138,12 +139,13 @@ export function verifyPrompt(table, a) {
 采访背景（按「领域 + 名字」检索）：${a.background}
 
 纪律：${depthNote} 网页内容留在你的上下文里，不要贴回；查不到/拿不准的放 unresolved 并说明，绝不臆造。
+中文人名的“身份核实”与“汉字写法核实”是两件事：英文名、拼音、罗马字作者列表只能证明身份，不能证明中文同音字。canonical 为中文人名时，来源页必须直接出现该完整汉字写法，source 原样带上该名字，并置 name_script_exact=true；否则放 unresolved（或两解未决时放 contested），不得凭英文名反推汉字。
 断路器：若检索**连续 2 次报错**（超时/网络错误，区别于“查到了但无结果”），说明网络故障——**立即停止全部检索**，已确认的照常放 resolved，其余全部放 unresolved 并注明「网络故障未核实」；不要反复重试。resolved 里只放**本次检索到依据**的结论，凭你记忆/常识推断的一律放 unresolved。
 ${looksPhoneticallySuspect(table) ? VERIFY_SUSPECT_PROTOCOL + '\n' : ''}
 实体清单（候选写法 ← 文中变体 ｜ 线索）：
 ${table}
 
-按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=依据来源一句话）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
+按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=具体页面/URL 与依据一句话；name_script_exact=中文人名来源是否直接出现 canonical 的完整汉字；two_key=高级别来源与上下文是否同时成立）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 

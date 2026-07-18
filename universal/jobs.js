@@ -10,7 +10,7 @@ import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts, parseTurns } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile } from '../scripts/audit_refined.mjs'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
@@ -477,8 +477,14 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, 1), {
         label: `repair:${f.label || path.basename(f.outPath)}`, phase: 'Audit', model,
       })
-      const after = fs.readFileSync(f.outPath, 'utf8')
-      const ok = !!response && after !== before
+      let after = fs.readFileSync(f.outPath, 'utf8')
+      let deterministicQuoteFix = false
+      if ((auditFile.failed || []).includes('quote_style')) {
+        const normalized = normalizeQuoteStyleText(after)
+        deterministicQuoteFix = normalized !== after
+        if (deterministicQuoteFix) { fs.writeFileSync(f.outPath, normalized, 'utf8'); after = normalized }
+      }
+      const ok = after !== before && (!!response || deterministicQuoteFix)
       qualityRepairAttempts.push({ file: f.outPath, attempt: 1, action, model: effectiveModels.repair, failedBefore: auditFile.failed || [], ok })
       if (!ok) throw new Error('定向修复未写回任何变化')
       return { ok: true, action, model: effectiveModels.repair }

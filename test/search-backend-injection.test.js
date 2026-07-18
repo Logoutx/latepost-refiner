@@ -20,7 +20,7 @@ const SUPERSET = {
   people: [{ canonical: '沈其安', variants: ['沈奇安'], hint: '云洲仪器 创始人' }],
   brands: [{ canonical: '云洲仪器', variants: ['云州仪器'], hint: '受访公司' }],
   terms: [],
-  resolved: [{ query: '沈其安', canonical: '沈其安', identity: '云洲仪器 创始人', source: 'example.com 官网团队页' }],
+  resolved: [{ query: '沈其安', canonical: '沈其安', identity: '云洲仪器 创始人', source: 'example.com 官网团队页显示“沈其安”', name_script_exact: true }],
   unresolved: [],
   suspects: [],
 }

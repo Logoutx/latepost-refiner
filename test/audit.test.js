@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, normalizeQuoteStyleText, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -52,6 +52,17 @@ test('hard-fails phrase repeats, broken starts, and ASR glue left in refined out
   assert.ok(hard.includes('repeated_years'), 'repeated years')
   assert.ok(hard.includes('broken_fragment_starts'), 'broken speaker starts')
   assert.ok(hard.includes('asr_glue'), 'ASR glued tokens')
+})
+
+test('ASCII phrase-repeat detection respects whole-token boundaries', () => {
+  const clean = auditText('李明：Language Agent 是一种常见写法，language agent 也不应被误判为重复。', 'ascii-boundary.md')
+  const cleanRepeat = clean.findings.find((f) => f.name === 'phrase_repeats')
+  assert.equal(cleanRepeat.count, 0, 'overlapping suffix/prefix across adjacent words is not a repeat')
+
+  const repeated = auditText('李明：这个 APP APP 权限需要重新配置。', 'ascii-repeat.md')
+  const repeatedFinding = repeated.findings.find((f) => f.name === 'phrase_repeats')
+  assert.equal(repeatedFinding.count, 1, 'a true repeated ASCII token still fails')
+  assert.equal(repeated.status, 'fail')
 })
 
 // ---------- source-aware audit (compression / under-refinement) ----------
@@ -429,6 +440,29 @@ test('quote_style (SF-4): a markdown-link title with CJK-adjacent ASCII quotes d
   // A genuine straight quote in the prose still fires (the masking is scoped to the link segment only).
   const real = '## 出处\n\n周砚：他说"这个太贵"，详见 [报告](https://example.com/a "行业惯例")。'
   assert.ok(checkQuoteStyle(real).find((f) => f.name === 'quote_style').count >= 1, 'a real prose straight quote still fires alongside a masked link title')
+})
+
+test('normalizeQuoteStyleText fixes visible prose/headings but preserves protected Markdown regions', () => {
+  const doc = [
+    '## 「示例标题」',
+    '',
+    '周砚：他说"这个太贵"，也把『内部方案』称为\'第二曲线\'。',
+    '周砚：😀 他说"带 emoji 的中文引语"。',
+    '周砚：命令是 `grep "中文" file`，参见 [报告](https://example.com/a "中文标题") 和 https://example.com/?q="中文"。',
+    '```',
+    'const x = "中文"',
+    '```',
+  ].join('\n')
+  const out = normalizeQuoteStyleText(doc)
+  assert.match(out, /## “示例标题”/)
+  assert.match(out, /他说“这个太贵”/)
+  assert.match(out, /把‘内部方案’称为‘第二曲线’/)
+  assert.match(out, /😀 他说“带 emoji 的中文引语”/, 'astral characters do not shift quote replacements')
+  assert.ok(out.includes('`grep "中文" file`'), 'inline code is unchanged')
+  assert.ok(out.includes('(https://example.com/a "中文标题")'), 'link target/title is unchanged')
+  assert.ok(out.includes('const x = "中文"'), 'fenced code is unchanged')
+  assert.equal(checkQuoteStyle(out).find((f) => f.name === 'quote_style').count, 0)
+  assert.equal(normalizeQuoteStyleText(out), out, 'normalization is idempotent')
 })
 
 test('quote_density_low: a long body with zero 弯引号 emits a soft hint (never a gate)', () => {

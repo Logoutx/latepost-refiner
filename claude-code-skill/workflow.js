@@ -82,6 +82,11 @@ const VERIFY_SCHEMA = {
       canonical: { type: 'string', description: '核实后的正确写法' },
       identity: { type: 'string', description: '身份/title' },
       source: { type: 'string', description: '依据来源一句话' },
+      // Chinese-name spelling is a separate key from identity. An English/Pinyin author page may prove that
+      // Lin Chuan is the person being discussed, but it cannot prove whether the Chinese name is 林川 or 林传.
+      // The verifier must both set this flag and repeat the exact canonical Han spelling in `source`; the render
+      // side checks both before it lets a person-name conclusion enter the glossary/body.
+      name_script_exact: { type: 'boolean', description: '人名 canonical 为中文汉字时，仅当所列来源页面直接出现该完整汉字写法才置 true；仅有英文名/拼音/罗马字必须为 false' },
       // OPTIONAL (all existing consumers survive its absence): the agent attests BOTH keys held for a decisive
       // conclusion on a phonetically-suspect / contested entity — a 高级别来源（官方域名/大媒体/百科）AND 语境吻合.
       // Only two_key===true may retire a 〔同指两解〕 row (see confidenceMark); a coattail/SEO/分销站 never sets it.
@@ -877,6 +882,33 @@ function isDuplicateSeamBlock(left, right) {
   return bigramDice(a, b) >= 0.88
 }
 
+function stripDuplicateSeamPrefix(left, right) {
+  const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+  const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+  const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
+  if (!leftBlocks.length || !rightProse.length) return right
+
+  // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
+  // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
+  // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
+  // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
+  const max = 4
+  let best = null
+  for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
+    const leftSeq = leftBlocks.slice(-lc).join('\n\n')
+    for (let rc = 1; rc <= Math.min(max, rightProse.length); rc += 1) {
+      const indices = rightProse.slice(0, rc)
+      const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
+      if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
+      const score = Math.min(seamNorm(leftSeq).length, seamNorm(rightSeq).length)
+      if (!best || score > best.score || (score === best.score && rc > best.indices.length)) best = { score, indices }
+    }
+  }
+  if (!best) return right
+  for (const i of best.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return rightBlocks.join('\n\n')
+}
+
 function stitchParts(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
   if (!parts.length) return ''
@@ -888,17 +920,10 @@ function stitchParts(texts) {
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
     }
-    // A model may repeat the previous chunk's final turn at the start of the next part even though source
-    // ownership is disjoint. Compare prose BLOCKS (not arbitrary suffixes) and remove at most two duplicated
-    // leading blocks. This keeps the operation deterministic and avoids deleting legitimate later repetition.
-    for (let pass = 0; pass < 2; pass += 1) {
-      const leftBlocks = out.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
-      const rightBlocks = next.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
-      const ri = rightBlocks.findIndex((x) => !/^#{1,6}\s/.test(x))
-      if (!leftBlocks.length || ri < 0 || !isDuplicateSeamBlock(leftBlocks[leftBlocks.length - 1], rightBlocks[ri])) break
-      rightBlocks.splice(ri, 1)
-      next = rightBlocks.join('\n\n')
-    }
+    // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
+    // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
+    // prose blocks, so later legitimate repetition remains untouched.
+    next = stripDuplicateSeamPrefix(out, next)
     out = `${out}\n\n${next}`
   }
   return `${out.replace(/\s+$/, '')}\n`
@@ -930,6 +955,20 @@ function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
+  // Chinese orthography is its own evidence key. A Romanized author name can establish identity/context but
+  // cannot choose among homophonic Han spellings. Fail closed unless the verifier explicitly attested that the
+  // cited page shows the exact Chinese canonical AND preserved that spelling in the source note, making the
+  // evidence contract machine-checkable instead of trusting a bare `two_key:true`.
+  const hitCanonical = stripDesc(hit.canonical)
+  const needsExactHanScript = isPerson && /^\p{Script=Han}{2,8}$/u.test(hitCanonical)
+  const hasExactHanScript = hit.name_script_exact === true && String(hit.source || '').includes(hitCanonical)
+  if (needsExactHanScript && !hasExactHanScript) {
+    rejected.add(hit)
+    const reason = hit.name_script_exact === true
+      ? `⚠ 联网来源说明未原样包含中文名“${hitCanonical}”，无法证明具体汉字——未采用，待补中文原文来源`
+      : `⚠ 联网仅确认身份/英文名，未直接证明中文名“${hitCanonical}”的汉字写法——未采用，待补中文原文来源`
+    return Object.assign({}, e, { hint: [e.hint, reason].filter(Boolean).join('；') })
+  }
   // Contested entry: a referent substitution (a DIFFERENT written form) is FORBIDDEN unless the fresh verdict
   // carries two_key===true — the verify agent attesting BOTH a high-tier source AND context-fit. Bare
   // concreteness, even a real-looking domain, never licenses it (the coattail failure: verify "confirms" the
@@ -945,13 +984,18 @@ function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
   // Authority order is explicit:
   //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
   // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
-  // exact failure it was meant to fix permanent: Scout flags 姚顺宇 as suspect_asr, Verify finds 姚顺雨, then the
-  // "strong name" guard keeps 姚顺宇. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // exact failure it was meant to fix permanent: Scout flags 林川 as suspect_asr, Verify finds 林传, then the
+  // "strong name" guard keeps 林川. A current suspect-ASR cluster may therefore be corrected only by a concrete
   // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
-  const scoutCorrection = e.confidence !== 'verified' && e.suspect_asr === true && hit.two_key === true && isConcreteSource(hit.source)
+  // Fresh first-run strong spellings are still only Scout hypotheses. A decisive Verify result already attests
+  // both source authority and context fit via two_key, so it may correct them even when Scout forgot to set
+  // suspect_asr (the real replay found the right public names but retained five ASR spellings for exactly this
+  // reason). Carried verified and contested rows remain protected by the branches above / this exclusion.
+  const freshTwoKeyCorrection = e.confidence !== 'verified' && e.confidence !== 'contested'
+    && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
       && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
-      && !scoutCorrection) {
+      && !freshTwoKeyCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })
@@ -1848,8 +1892,9 @@ const VERIFY_SUSPECT_PROTOCOL = `
 3. 证据分级取信：官方域名／权威媒体／百科 ＞ 目录站与 SEO 博客 ＞ 自我推销/软文贴。结论里注明命中来源属于哪一级。
 4. 搭便车反转规则：一个以该字面写法命名、但自身身份寄生于另一产品的站点（“Powered by X”“转售/代理 X”“X 分销/订阅站”），**不能**作为“该字面写法是独立实体”的证据——它恰恰是修正假设 X 成立的证据。
 5. 上下文吻合校验：把胜出的身份放回转录里对该实体的说法（其提及线索已在清单的“线索”里）核对；与转录内说法矛盾的身份，一律不得判为已核实。
-6. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
-7. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
+6. 中文人名汉字证据：身份相符、英文名或拼音相符，**不能证明中文名具体用哪个同音字**。若 canonical 是中文人名，至少 1 个所列来源页面必须直接显示该完整汉字写法；source 中原样写出页面所见中文名，且仅此时置 name_script_exact:true。只有 Lin Chuan / Chen Tao 一类英文、拼音或论文作者罗马字时，name_script_exact 必须为 false，不能据此“核实”林川/林传、陈涛/陈焘中的任何一个。
+7. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；中文人名还必须满足上一条【汉字原文证据】。只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
+8. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；中文人名若 name_script_exact 不为 true，two_key 也绝不能为 true。搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
 
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
@@ -1957,12 +2002,13 @@ function verifyPrompt(table, a) {
 采访背景（按「领域 + 名字」检索）：${a.background}
 
 纪律：${depthNote} 网页内容留在你的上下文里，不要贴回；查不到/拿不准的放 unresolved 并说明，绝不臆造。
+中文人名的“身份核实”与“汉字写法核实”是两件事：英文名、拼音、罗马字作者列表只能证明身份，不能证明中文同音字。canonical 为中文人名时，来源页必须直接出现该完整汉字写法，source 原样带上该名字，并置 name_script_exact=true；否则放 unresolved（或两解未决时放 contested），不得凭英文名反推汉字。
 断路器：若检索**连续 2 次报错**（超时/网络错误，区别于“查到了但无结果”），说明网络故障——**立即停止全部检索**，已确认的照常放 resolved，其余全部放 unresolved 并注明「网络故障未核实」；不要反复重试。resolved 里只放**本次检索到依据**的结论，凭你记忆/常识推断的一律放 unresolved。
 ${looksPhoneticallySuspect(table) ? VERIFY_SUSPECT_PROTOCOL + '\n' : ''}
 实体清单（候选写法 ← 文中变体 ｜ 线索）：
 ${table}
 
-按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=依据来源一句话）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
+按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=具体页面/URL 与依据一句话；name_script_exact=中文人名来源是否直接出现 canonical 的完整汉字；two_key=高级别来源与上下文是否同时成立）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 
@@ -2539,6 +2585,11 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
         { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
+      if (hard.includes('quote_style')) {
+        await engine.agent(
+          `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --refined ${JSON.stringify(out)} --fix-quotes\n这是确定性排版修复；只回复一句话确认即可。`,
+          { label: `quote-fix:${f.label}`, phase: 'Audit', model: 'haiku' })
+      }
       didRepair = true
     }
     if (didRepair) {
