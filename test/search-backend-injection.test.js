@@ -10,7 +10,7 @@ import { makeDeepSeekEngine } from '../engines/deepseek.js'
 // The search-api bench's Level-2 verify replay (bench/search-api/run-verify-replay.mjs) drives the REAL
 // pipeline with scope=['verify'] and an alternative search adapter injected via makeDeepSeekEngine({ searchFn }).
 // This test pins that seam end-to-end without a network or a real model: a fake OpenAI-style client walks
-// scout→verify, and we assert the injected searchFn (not Tavily) is what the verify stage calls, that its
+// scout→verify, and we assert the injected searchFn (not the fixed Serper adapter) is what verify calls, that its
 // result reaches the rendered glossary, and that refine is skipped because scope excludes it.
 // All fixture names are fictional (repo placeholders 云洲仪器/沈其安).
 
@@ -46,7 +46,7 @@ function makeFakeClient() {
   }
 }
 
-test('verify replay seam: scope=[verify] drives scout→verify against the injected searchFn, not Tavily', async () => {
+test('verify replay seam: scope=[verify] drives scout→verify against the injected searchFn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-inject-'))
   // A real-sized transcript (≥ ONE_PASS_CHARS) so the pipeline takes the scout+verify branch, not one-pass.
   const turns = []

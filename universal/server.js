@@ -110,6 +110,10 @@ export function sanitizeRunParams(raw = {}) {
   const params = { ...raw }
   delete params.__engine
   delete params.skillDir
+  delete params.searchFn
+  delete params.fetchImpl
+  delete params.localFetchFn
+  delete params.dnsLookup
   return params
 }
 

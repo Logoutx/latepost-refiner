@@ -99,7 +99,7 @@ function usage() {
   node "<this skill dir>/scripts/codex-native.mjs" mark-stage --args <out>/_codex-native/args.json --stage refine --status start|end
 
 This helper is deterministic glue for the Codex subscription-native workflow. It never calls model APIs and never
-requires OPENAI_API_KEY or TAVILY_API_KEY. Codex subagents consume the generated prompt files and return JSON reports.`
+requires OPENAI_API_KEY, SERPER_API_KEY, or JINA_API_KEY. Codex subagents consume the generated prompt files and return JSON reports.`
 }
 
 function parseCli(argv) {

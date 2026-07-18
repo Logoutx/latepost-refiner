@@ -53,7 +53,8 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
 
 密钥（环境变量，或仓库根目录 .env）:
   DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
-  TAVILY_API_KEY         建议——标准/深度核实与时间线的联网搜索用；未设时联网核实降级为不联网（refine 不受影响）
+  SERPER_API_KEY         建议——标准/深度核实与时间线的联网搜索用；未设时联网核实降级为不联网（refine 不受影响）
+  JINA_API_KEY           可选——Jina Reader key；未设仍可调用公开 Reader，失败后走本地安全抓取
   ⚠ 信源提示            DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。
                          涉敏感话题或需保护信源的访谈请慎用。
 `
@@ -138,6 +139,9 @@ export function buildRunParams(a, { env = process.env } = {}) {
   }
 
   return {
+    apiKey: env.DEEPSEEK_API_KEY,
+    serperKey: env.SERPER_API_KEY,
+    jinaKey: env.JINA_API_KEY,
     topic,
     date,
     background,

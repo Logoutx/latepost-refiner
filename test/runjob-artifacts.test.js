@@ -248,8 +248,9 @@ test('runJob targeted repair closes content_gap, replaces the first audit result
 // A clean refine (no gap) must not populate auditFailed, and each refined entry gets audit.status='ok'.
 function cleanEngine() {
   const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const webTelemetry = { searchCalls: 2, searchAttempts: 1, searchBilled: 1, searchCacheHits: 1, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 1, fetchCacheHits: 0, fetchJinaAttempts: 1, fetchJinaSuccess: 1, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
   return {
-    phase() {}, log() {}, usage: () => ({ ...usage }),
+    phase() {}, log() {}, usage: () => ({ ...usage }), webTelemetry: () => ({ ...webTelemetry }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => t().catch(() => null))),
     pipeline: async (items) => items.map((f) => {
       fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
@@ -271,6 +272,10 @@ test('runJob: a faithful refine leaves auditFailed empty and marks each entry au
   assert.deepEqual(result.auditFailed, [], 'no hard findings → auditFailed empty')
   assert.ok(result.refined.every((r) => r.audit && r.audit.status === 'ok'), 'every refined entry audited ok')
   assert.ok((result.anchors || []).length >= 1, 'anchors still ran on the clean 成稿')
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.deepEqual(manifest.webTelemetry, result.webTelemetry, 'runJob persists job-scoped web telemetry in run.json')
+  assert.equal(manifest.config.searchProvider, 'serper')
+  assert.equal(manifest.config.fetchProvider, 'jina-reader+local-fallback')
 })
 
 test('runJob preserves models override and run.json records the complete effective routing', async () => {

@@ -20,7 +20,7 @@ npm run web
 ```
 
 Open the printed `http://127.0.0.1:<port>` URL. The UI has:
-- Two key fields: `DEEPSEEK_API_KEY` and (optional) `TAVILY_API_KEY`.
+- Three key fields: required `DEEPSEEK_API_KEY` and `SERPER_API_KEY`, plus optional `JINA_API_KEY`.
 - File upload for `.txt`, `.md`, `.docx`, `.pptx`, `.xlsx`, `.pdf`.
 - Scope checkboxes: `refine` (always on), plus `logic` / `summary` / `timeline`.
 - Verify depth: `key` (default) / `deep` / `none`.
@@ -46,7 +46,7 @@ node universal/cli.js \
 Useful flags:
 - `--background-file <路径>` to read a long background from a file instead of inline text
 - `--heading-policy none|keep|regenerate` (default `none`)
-- `--verify key|deep|none` (default `key`) — use `none` to skip web verification, e.g. when `TAVILY_API_KEY` isn't set
+- `--verify key|deep|none` (default `key`) — use `none` to skip web verification, e.g. when `SERPER_API_KEY` isn't set
 - `--chunk speed|cost|off` (default `cost`) — long files auto-chunk at speaker-turn boundaries regardless, to stop the DeepSeek models from silently compressing them; `speed` additionally parallelizes big files for faster multi-file batches; `off` disables all chunking, including the automatic kind
 - `--chunk-size <N>` — explicit chunk target in 正文字数 (≥2000), overrides the automatic budget
 - `--fresh` to ignore an existing `校对表.md` and rebuild from zero
@@ -62,7 +62,10 @@ Run `node universal/cli.js --help` for the complete, current flag list — treat
 ## Environment
 
 - `DEEPSEEK_API_KEY` — required. DeepSeek's API key; used for every stage.
-- `TAVILY_API_KEY` — advised, not required. Used for standard/deep web verification and the timeline stage. Without it, verify/timeline degrade automatically to no-verify (refine itself never goes online, so it is unaffected); pass `--verify none` to skip web verification explicitly instead of relying on the degrade.
+- `SERPER_API_KEY` — required for standard/deep web verification and the timeline stage. Without it, online stages degrade with visible unresolved warnings; refine itself never goes online. Pass `--verify none` when intentionally running offline.
+- `JINA_API_KEY` — optional bearer token for Jina Reader. `web_fetch` tries Jina Reader first and then the SSRF-guarded local extractor; the token is never persisted.
+
+Each job permits at most 100 unique search queries. `run.json` records search/fetch calls, cache hits, HTTP attempts, billed Serper responses, fallbacks, and failures without recording credentials. The per-run JSONL log keeps model cost in `estCost`, records Serper cost separately in `searchEstCost`, and combines them in `totalEstCost`.
 
 ⚠ DeepSeek is operated by a China-based company: full transcript text is transmitted to its servers and subject to local regulation, including content review. Avoid this edition for sensitive-topic interviews or ones needing source protection.
 

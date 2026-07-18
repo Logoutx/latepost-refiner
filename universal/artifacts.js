@@ -407,6 +407,8 @@ export function buildRunManifest(result = {}, context = {}) {
       // manifest auditable even when defaults supplied most stages.
       models: A.effectiveModels || result.modelRouting || A.models || null,
       modelOverrides: A.modelOverrides || {},
+      searchProvider: A.searchProvider || null,
+      fetchProvider: A.fetchProvider || null,
       outputDir,
       skillDir: A.skillDir || null,
       backgroundLength: A.background ? String(A.background).length : 0,
@@ -449,6 +451,7 @@ export function buildRunManifest(result = {}, context = {}) {
         ...(((result.derivativeAudit && result.derivativeAudit.files) || []).flatMap((f) => (f.numericConflicts || []).map((c) => ({ file: path.basename(f.file || ''), keyNoun: c.keyNoun, unit: c.unit, values: (c.values || []).map((v) => ({ value: v.value, line: v.line })) })))),
       ],
     },
+    webTelemetry: result.webTelemetry || null,
     // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
     derivativeAudit: result.derivativeAudit ? {
       status: result.derivativeAudit.status,

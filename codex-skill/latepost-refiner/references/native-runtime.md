@@ -1,7 +1,7 @@
 # Codex Native Runtime
 
 Use this path first in Codex. It runs on the signed-in ChatGPT/Codex subscription and does not require
-`OPENAI_API_KEY` or `TAVILY_API_KEY`.
+`OPENAI_API_KEY`, `SERPER_API_KEY`, or `JINA_API_KEY`.
 
 The native runtime mirrors the Claude Workflow edition:
 
@@ -10,7 +10,7 @@ The native runtime mirrors the Claude Workflow edition:
 | Step 0 preflight | Local shell + deterministic helper | File stats, output paths, prior glossary loading. |
 | Scout | Codex native subagents, one per file | Full-file reading stays out of the main context. |
 | Merge/glossary | Local Node helper using `core/spec.js` | Reuses exact clustering, weak-name guards, glossary render. |
-| Verify | Codex native web/browsing subagents | Public-source checks without Tavily/API keys. |
+| Verify | Codex native web/browsing subagents | Public-source checks without external search/reader API keys. |
 | Dedup | Codex native subagent | Semantic same-referent review. |
 | Refine | Codex native subagents, one per file or chunk | Heavy transcript text stays inside file-level workers. |
 | Audit/anchors | Local Node helper | Deterministic source-aware completeness, content-gap, compression, and source-anchor checks. |
@@ -22,14 +22,15 @@ The native runtime mirrors the Claude Workflow edition:
 Before a run, verify the key is absent:
 
 ```bash
-printf 'OPENAI_API_KEY=[%s]\nTAVILY_API_KEY=[%s]\n' "$OPENAI_API_KEY" "$TAVILY_API_KEY"
+printf 'OPENAI_API_KEY=[%s]\nSERPER_API_KEY=[%s]\nJINA_API_KEY=[%s]\n' "$OPENAI_API_KEY" "$SERPER_API_KEY" "$JINA_API_KEY"
 ```
 
 Expected:
 
 ```text
 OPENAI_API_KEY=[]
-TAVILY_API_KEY=[]
+SERPER_API_KEY=[]
+JINA_API_KEY=[]
 ```
 
 Do not ask the user for API keys on the primary path. If a stage cannot use native Codex tools, degrade that stage and
@@ -59,7 +60,7 @@ The June 2026 spike passed all required gates:
 |---|---|---|
 | A — parallel subagents, no key | pass | Native `multi_agent_v1` subagents launched concurrently and cleaned both snippets with no API key. |
 | B — `node` runs `core/` JS, no key | pass | `env -u OPENAI_API_KEY npm test` passed 30/30; direct `clusterEntities()` import printed expected output. |
-| C — web search, no key | pass | Built-in Codex browsing returned sourced public facts without Tavily/API keys. |
+| C — web search, no key | pass | Built-in Codex browsing returned sourced public facts without external search/reader API keys. |
 
 Chosen design: use the full no-key Codex-native pipeline.
 
@@ -175,7 +176,7 @@ This writes `state-after-scout.json`, verify prompts, and a dedup prompt when ne
 
 ## Verify And Dedup
 
-Spawn native Codex subagents for each verify prompt, using each prompt entry's `model` and `reasoning_effort` when available. Use built-in browsing/web search only; do not use Tavily.
+Spawn native Codex subagents for each verify prompt, using each prompt entry's `model` and `reasoning_effort` when available. Use built-in browsing/web search only; do not call the Universal Serper/Jina adapters.
 
 Save verify results either as an array of prompt results:
 

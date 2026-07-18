@@ -133,12 +133,17 @@ export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files
 // Build the DeepSeek engine — the only API provider the Universal edition supports. apiKey (if given)
 // overrides the env lookup: the web UI passes the key the user typed; the CLI passes nothing and falls
 // back to DEEPSEEK_API_KEY. Endpoint and the flash/pro model split are fixed inside makeDeepSeekEngine.
-export function selectEngine({ concurrency, apiKey, filePolicy, env = process.env, onPhase, onLog } = {}) {
+export function selectEngine({ concurrency, apiKey, serperKey, jinaKey, filePolicy, env = process.env, onPhase, onLog, searchFn, fetchImpl, localFetchFn, dnsLookup } = {}) {
   const key = apiKey || env.DEEPSEEK_API_KEY
   if (!key) throw new Error('未设 DEEPSEEK_API_KEY（DeepSeek 的 API key）')
   return {
     provider: 'deepseek',
-    engine: makeDeepSeekEngine({ apiKey: key, concurrency, filePolicy, onPhase, onLog }),
+    engine: makeDeepSeekEngine({
+      apiKey: key,
+      searchApiKey: serperKey || env.SERPER_API_KEY,
+      readerApiKey: jinaKey || env.JINA_API_KEY,
+      concurrency, filePolicy, onPhase, onLog, searchFn, fetchImpl, localFetchFn, dnsLookup,
+    }),
     info: { label: 'DeepSeek', baseURL: DEEPSEEK_BASE_URL, keyVar: 'DEEPSEEK_API_KEY' },
   }
 }
@@ -366,7 +371,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedAt = new Date(startedMs).toISOString()
   const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
-    apiKey, tavilyKey, models,
+    apiKey, serperKey, jinaKey, models,
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     outputDir, fresh = false, concurrency,
@@ -409,17 +414,17 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     notice(`沿用既有校对表：${priorSource}`)
   }
 
-  // 3. engine: an injected engine (tests) or the DeepSeek engine. The web-search backend (Tavily) is set
-  //    for the run from the top-level tavilyKey (client-side search on verify/timeline; absent → no-verify).
+  // 3. engine: an injected engine (tests) or DeepSeek + a job-scoped Serper/Jina runtime. Keys are passed
+  //    explicitly; never mutate process.env, so concurrent jobs cannot leak credentials into one another.
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
-  const webTavily = tavilyKey
-  const prevTavily = process.env.TAVILY_API_KEY
-  if (webTavily) process.env.TAVILY_API_KEY = webTavily
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
   else {
     try {
-      sel = selectEngine({ concurrency, apiKey, filePolicy, onPhase, onLog })
+      sel = selectEngine({
+        concurrency, apiKey, serperKey, jinaKey, filePolicy, onPhase, onLog,
+        searchFn: params.searchFn, fetchImpl: params.fetchImpl, localFetchFn: params.localFetchFn, dnsLookup: params.dnsLookup,
+      })
     } catch (e) {
       throw new JobConfigError(e.message)
     }
@@ -427,8 +432,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   if (sel.provider === 'deepseek') {
     notice(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
     notice(`⚠ ${SOURCE_PROTECTION_NOTE}`)
-    if (!process.env.TAVILY_API_KEY && (scope.includes('timeline') || verifyDepth !== 'none')) {
-      notice('提示：未设 TAVILY_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
+    if (!(serperKey || process.env.SERPER_API_KEY) && (scope.includes('timeline') || verifyDepth !== 'none')) {
+      notice('提示：未设 SERPER_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
     }
   }
   notice(`
@@ -530,10 +535,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     modelOverrides,
     effectiveModels,
     capabilities,
+    searchProvider: 'serper', fetchProvider: 'jina-reader+local-fallback',
     fresh, annotate: params.annotate, files: fileEntries,
   }
 
-  try {
+  {
     const r = await runPipeline(A, sel.engine)
     cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
@@ -574,7 +580,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
     const usage = sel.engine.usage()
-    const result = { ...r, audit, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, warnings, usage, startedAt, finishedAt, durationMs }
+    const webTelemetry = typeof sel.engine.webTelemetry === 'function' ? sel.engine.webTelemetry() : null
+    const result = { ...r, audit, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
@@ -594,14 +601,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     let runLog = null
     if (params.runLog !== false) {
       const runLogModels = sel.provider === 'deepseek' ? effectiveModels : null
-      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels })
+      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels, webTelemetry })
       const logRes = appendRunLog(entry, { logPath: params.runLogPath })
       if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }
       else notice(`警告：运行日志写入失败：${logRes.error}`)
     }
 
     return { ...result, ...artifacts, runLog }
-  } finally {
-    if (webTavily) { if (prevTavily === undefined) delete process.env.TAVILY_API_KEY; else process.env.TAVILY_API_KEY = prevTavily }
   }
 }

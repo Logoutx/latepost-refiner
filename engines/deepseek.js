@@ -9,10 +9,8 @@
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
 //               Non-thinking tiers on purpose: DeepSeek's thinking mode disables function calling.
-//   • Web       Tavily by default (TAVILY_API_KEY): a CLIENT-side web_search + web_fetch pair injected on
-//               the online stages (verify/timeline). Absent key → graceful degrade to no-verify. An optional
-//               programmatic `searchFn` override (bench/tests only — NO CLI flag, NO env switch) swaps the
-//               web_search backend for a normalized adapter; web_fetch is unchanged. See makeDeepSeekEngine.
+//   • Web       Job-scoped runtime: Serper search → Jina Reader → SSRF-safe local fallback. Optional
+//               programmatic searchFn/fetch injections remain for tests and benchmarks.
 //   • Structured output via a forced function call (tool_choice), which DeepSeek supports.
 //
 // Client tools Read/Write/Edit share fileops.js. Offline stages never receive web tools.
@@ -21,6 +19,8 @@ import os from 'node:os'
 import OpenAI from 'openai'
 import pLimit from 'p-limit'
 import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
+import { makeWebRuntime } from './web.js'
+export { formatSearchResults } from './web.js'
 
 // DeepSeek's OpenAI-compatible endpoint. Fixed — there is no --base-url anymore.
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
@@ -58,8 +58,7 @@ const FILE_TOOLS = TOOL_SPECS.map(toFn)
 const WEB_SEARCH_TOOL = toFn({ name: 'web_search', description: '联网搜索，返回若干结果（标题 / 网址 / 摘要）。', parameters: { type: 'object', properties: { query: { type: 'string', description: '搜索词' } }, required: ['query'] } })
 const WEB_FETCH_TOOL = toFn({ name: 'web_fetch', description: '抓取一个网页 URL，返回正文文本（截断）。', parameters: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } })
 const WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
-// Online stages (verify/timeline) are the only ones that should search; gating web-tool injection to them
-// limits blast radius if Tavily is down (scout/refine still run).
+// Online stages (verify/timeline) are the only ones that should search.
 const ONLINE_LABEL = /^(verify|timeline)/
 const structuredTool = (schema) => ({
   type: 'function',
@@ -95,44 +94,6 @@ function parseJSON(s) {
   return null
 }
 
-async function webSearch(query) {
-  const key = process.env.TAVILY_API_KEY
-  if (!key) return 'web_search 不可用：未配置 TAVILY_API_KEY（联网核实需设 TAVILY_API_KEY；未设时本次按不联网处理）。'
-  try {
-    const r = await fetch('https://api.tavily.com/search', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: key, query, max_results: 5 }),
-    })
-    if (!r.ok) return `web_search 出错：HTTP ${r.status}`
-    const j = await r.json()
-    const results = (j.results || []).map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}\n   ${(x.content || '').slice(0, 500)}`).join('\n')
-    return (j.answer ? `摘要：${j.answer}\n\n` : '') + (results || '无结果')
-  } catch (e) { return `web_search 出错：${e.message}` }
-}
-
-async function webFetch(url) {
-  try {
-    const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 latepost-refiner' } })
-    if (!r.ok) return `web_fetch 出错：HTTP ${r.status}`
-    const html = await r.text()
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim()
-    return text.slice(0, 8000) || '(页面无可提取文本)'
-  } catch (e) { return `web_fetch 出错：${e.message}` }
-}
-
-// Render normalized adapter results ([{title,url,snippet}]) into the same text block webSearch returns for
-// Tavily, so the online agents see an identical tool-result contract whichever backend produced them. Pure +
-// exported for unit testing. (Adapters carry no synthesized answer, so there is no 摘要 line — snippets only.)
-export function formatSearchResults(results) {
-  const list = Array.isArray(results) ? results : []
-  const text = list
-    .map((x, i) => `${i + 1}. ${(x && x.title) || ''}\n   ${(x && x.url) || ''}\n   ${String((x && x.snippet) || '').slice(0, 500)}`)
-    .join('\n')
-  return text || '无结果'
-}
-
 // Tier word / raw id → DeepSeek model id. Unknown tier → v4-pro (the safe, faithful writing model).
 export const resolveDeepSeekModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
 export const resolveDeepSeekRouting = (stageModels = {}) => Object.fromEntries(
@@ -145,14 +106,17 @@ export function makeDeepSeekEngine(opts = {}) {
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     filePolicy,
     onPhase, onLog,
-    searchFn,        // optional programmatic web_search override (bench/tests only) — replaces Tavily on online stages
-    searchK = 5,     // k passed to searchFn; 5 matches Tavily's max_results default
+    searchApiKey, readerApiKey,
+    searchFn, fetchImpl, localFetchFn, dnsLookup,
+    searchK = 5, maxSearchRequestsPerJob = 100,
+    webRuntime,
   } = opts
   if (!opts.client && !apiKey) throw new Error('makeDeepSeekEngine: 缺少 DEEPSEEK_API_KEY')
 
   const client = opts.client || new OpenAI({ apiKey, baseURL: DEEPSEEK_BASE_URL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
+  const web = webRuntime || makeWebRuntime({ searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
@@ -179,24 +143,11 @@ export function makeDeepSeekEngine(opts = {}) {
     return comp
   }
 
-  // web_search backend: the injected searchFn override (bench/tests) or the built-in Tavily path. The override
-  // receives (query, {k}) and returns the normalized adapter shape [{title,url,snippet}]; we format it exactly
-  // like the Tavily branch so the online agents' tool-result contract is unchanged. web_fetch is never overridden
-  // (adapters are search-only). Default (no searchFn) → webSearch, byte-for-byte the prior behaviour.
-  async function runWebSearch(query) {
-    if (!searchFn) return await webSearch(query)
-    try {
-      return formatSearchResults(await searchFn(query, { k: searchK }))
-    } catch (e) {
-      return `web_search 出错：${e.message}`
-    }
-  }
-
   async function execTool(call) {
     const name = call.function && call.function.name
     const args = parseJSON(call.function && call.function.arguments) || {}
-    if (name === 'web_search') return await runWebSearch(args.query || '')
-    if (name === 'web_fetch') return await webFetch(args.url || '')
+    if (name === 'web_search') return await web.search(args.query || '')
+    if (name === 'web_fetch') return await web.fetch(args.url || '')
     return runFileTool(name, args, safeFilePolicy).text // Read / Write / Edit
   }
 
@@ -223,7 +174,7 @@ export function makeDeepSeekEngine(opts = {}) {
   async function runAgent(prompt, { model, schema, label } = {}) {
     const modelId = resolveDeepSeekModel(model)
     const tools = [...FILE_TOOLS]
-    if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS) // client Tavily search + fetch
+    if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) tools.push(structuredTool(schema))
     const content = schema
       ? `${prompt}\n\n【提交方式】完成全部工作后，必须调用 structured_output 工具提交结构化结果；不要用普通文字给出最终结果。`
@@ -311,5 +262,10 @@ export function makeDeepSeekEngine(opts = {}) {
     return (typeof budget === 'number' && budget > 0) ? { model, budget } : undefined
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).map(([k, v]) => [k, { ...v }])) }), refineBudget }
+  return {
+    agent, parallel, pipeline, phase, log,
+    usage: () => ({ ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).map(([k, v]) => [k, { ...v }])) }),
+    refineBudget,
+    webTelemetry: web.telemetry,
+  }
 }

@@ -70,6 +70,8 @@ test('buildRunManifest records run config without secrets and hashes source file
       scope: ['refine'],
       verifyDepth: 'key',
       headingPolicy: 'none',
+      searchProvider: 'serper',
+      fetchProvider: 'jina-reader+local-fallback',
       outputDir: dir,
       skillDir: '/repo/skill',
       files: [{ label: 'source', title: 'source', path: source, outPath: path.join(dir, 'Transcripts/source.md'), lines: 1, bytes: 6 }],
@@ -83,6 +85,8 @@ test('buildRunManifest records run config without secrets and hashes source file
   assert.equal(manifest.schemaVersion, 1)
   assert.equal(manifest.quality.status, 'blocked')
   assert.equal(manifest.config.topic, '测试项目')
+  assert.equal(manifest.config.searchProvider, 'serper')
+  assert.equal(manifest.config.fetchProvider, 'jina-reader+local-fallback')
   assert.equal(manifest.config.backgroundLength, 'sensitive background'.length)
   assert.equal(manifest.config.backgroundSha256.length, 64)
   assert.equal(manifest.config.files[0].sha256.length, 64)
@@ -98,6 +102,13 @@ test('writeRunArtifacts writes review.md and run.json', () => {
   assert.equal(fs.existsSync(paths.manifestPath), true)
   assert.match(fs.readFileSync(paths.reviewPath, 'utf8'), /Review Queue/)
   assert.equal(JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8')).artifacts.reviewPath, paths.reviewPath)
+})
+
+test('run manifest persists web telemetry without credentials', () => {
+  const webTelemetry = { searchCalls: 3, searchAttempts: 2, searchBilled: 2, searchCacheHits: 1, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 1, fetchCacheHits: 0, fetchJinaAttempts: 1, fetchJinaSuccess: 1, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
+  const manifest = buildRunManifest({ ...baseResult, webTelemetry }, { outputDir: '/tmp/out', topic: 'T', A: { searchProvider: 'serper', fetchProvider: 'jina-reader+local-fallback' } })
+  assert.deepEqual(manifest.webTelemetry, webTelemetry)
+  assert.equal(JSON.stringify(manifest).includes('SERPER_API_KEY'), false)
 })
 
 test('provider-budget auto-chunk is traced in run.json and rendered as a plain-language review.md line', () => {

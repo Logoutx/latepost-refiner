@@ -44,8 +44,21 @@ test('buildRunLogEntry: shape from a fake result (all fields, worked-example cos
   // fresh = 1000-200 = 800; cheaper (flash) for input, writing-tier (pro) for output:
   // (800*0.14 + 200*0.0028 + 500*0.87) / 1e6 = (112 + 0.56 + 435) / 1e6 = 0.000548
   assert.deepEqual(entry.estCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
+  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
+  assert.deepEqual(entry.totalEstCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.equal(entry.auditStatus, 'ok')
   assert.equal(entry.outputDir, '/out/虚构示例项目')
+})
+
+test('buildRunLogEntry adds Serper billed-search cost without changing estCost semantics', () => {
+  const models = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
+  const result = { usage: { input: 1000, output: 500 }, durationMs: 1 }
+  const webTelemetry = { searchBilled: 7 }
+  const entry = buildRunLogEntry({ params: {}, result, provider: 'deepseek', models, webTelemetry })
+  assert.equal(entry.estCost.value, 0.000575)
+  assert.deepEqual(entry.searchEstCost, { value: 0.007, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
+  assert.equal(entry.totalEstCost.value, 0.007575)
+  assert.deepEqual(entry.webTelemetry, webTelemetry)
 })
 
 test('buildRunLogEntry: auditStatus is "unavailable" when result.audit is absent, "fail" when audit failed', () => {
@@ -165,10 +178,12 @@ test('appendRunLog: defaults to ~/.config/latepost-refiner/runs.jsonl when no lo
 
 function mockEngine() {
   const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const webTelemetry = { searchCalls: 1, searchAttempts: 1, searchBilled: 1, searchCacheHits: 0, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 0, fetchCacheHits: 0, fetchJinaAttempts: 0, fetchJinaSuccess: 0, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
   return {
     phase() {},
     log() {},
     usage: () => ({ ...usage }),
+    webTelemetry: () => ({ ...webTelemetry }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => t())),
     pipeline: async () => [],
     agent: async (_prompt, opts = {}) => {
@@ -209,6 +224,9 @@ test('runJob integration: a completed run appends exactly one log line with the 
   assert.equal(entry.topic, '虚构示例集团')
   assert.equal(entry.engine, 'universal')
   assert.equal(entry.provider, 'injected')
+  assert.equal(entry.webTelemetry.searchBilled, 1)
+  assert.equal(entry.searchEstCost.value, 0.001)
+  assert.equal(entry.totalEstCost.value, 0.001)
   assert.ok(['ok', 'fail', 'unavailable'].includes(entry.auditStatus))
 })
 

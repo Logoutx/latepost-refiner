@@ -8,7 +8,7 @@ import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, REFINE_CHAR_BUD
 // The Universal edition supports exactly ONE API provider — DeepSeek — with two FIXED models: v4-flash for the
 // mechanical tiers (scout/check/dedup/stitch → haiku/sonnet) and v4-pro for the writing tiers (refine/logic/
 // summary/timeline → opus). There is no model/provider/base-url selection anywhere. These tests pin that contract
-// and the engine's wire behaviour (forced structured output, Tavily-only web tools on online stages).
+// and the engine's wire behaviour (forced structured output, fixed web tools on online stages).
 
 function completion(message, finishReason = 'stop') {
   return {
@@ -127,7 +127,7 @@ test('file tool calls feed local tool results back to the model', async () => {
   assert.match(toolMessage.content, /hello from transcript/)
 })
 
-test('Tavily web tools are only exposed to online (verify/timeline) labels', async () => {
+test('web tools are only exposed to online (verify/timeline) labels', async () => {
   const offlineClient = mockClient([
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
   ])
@@ -152,9 +152,7 @@ test('Tavily web tools are only exposed to online (verify/timeline) labels', asy
   assert.equal(toolNames(tlClient.calls[0]).includes('web_search'), true)
 })
 
-// ---- searchFn override (bench/tests): swap the web_search backend, Tavily default unchanged --------------
-// The Universal edition ships Tavily-only, but makeDeepSeekEngine takes a programmatic `searchFn` override so
-// the bench can drive verify against an alternative adapter. It is NOT wired to any CLI flag or env var.
+// ---- searchFn override (bench/tests): same job-scoped budget/cache seam as Serper -------------------------
 
 test('searchFn override: online web_search routes to the injected adapter with (query, {k}); results reach the model', async () => {
   const calls = []
@@ -178,30 +176,23 @@ test('searchFn override: online web_search routes to the injected adapter with (
   assert.match(toolMsg.content, /example\.com\/team/, 'the adapter url is rendered')
 })
 
-test('default (no searchFn): web_search uses the built-in Tavily path — proven by its no-key message, no network', async () => {
-  const prev = process.env.TAVILY_API_KEY
-  delete process.env.TAVILY_API_KEY   // force Tavily's graceful no-key branch (returns before any fetch)
-  try {
-    const client = mockClient([
-      completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
-      completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
-    ])
-    const engine = makeDeepSeekEngine({ client, concurrency: 1 })   // no searchFn
-    await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
-    const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
-    assert.match(toolMsg.content, /未配置 TAVILY_API_KEY/, 'default routed to Tavily (its no-key message), so searchFn did not intercept')
-  } finally {
-    if (prev === undefined) delete process.env.TAVILY_API_KEY
-    else process.env.TAVILY_API_KEY = prev
-  }
+test('default (no searchFn): web_search uses the fixed Serper path and fails cleanly without a key', async () => {
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
+    completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1 })
+  await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
+  const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
+  assert.match(toolMsg.content, /SERPER_API_KEY/, 'fixed Serper runtime reports its missing key without network')
 })
 
-test('formatSearchResults renders the normalized adapter shape like the Tavily branch (empty → 无结果)', () => {
+test('formatSearchResults renders the normalized search contract (empty → 无结果)', () => {
   assert.equal(formatSearchResults([]), '无结果')
   assert.equal(formatSearchResults(null), '无结果')
   const txt = formatSearchResults([{ title: 'T1', url: 'https://a', snippet: 'S1' }, { title: 'T2', url: 'https://b', snippet: 'S2' }])
   assert.match(txt, /^1\. T1\n   https:\/\/a\n   S1\n2\. T2\n   https:\/\/b\n   S2$/, 'numbered title/url/snippet block')
-  // snippet is capped at 500 chars, matching the Tavily branch
+  // snippet is capped at 500 chars
   assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(500)), true)
   assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(501)), false)
 })

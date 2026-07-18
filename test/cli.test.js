@@ -36,7 +36,7 @@ test('parseArgs output maps CLI flags to runJob params', () => {
     '--prior-glossary', path.join(dir, '往次校对表.md'),
     '--models', 'refine=deepseek-v4-pro,repair=opus',
   ])
-  const params = buildRunParams(args, { env: { HOME: dir } })
+  const params = buildRunParams(args, { env: { HOME: dir, DEEPSEEK_API_KEY: 'd', SERPER_API_KEY: 's', JINA_API_KEY: 'j' } })
 
   assert.deepEqual(params.files, [{ path: a }, { path: b }])
   assert.equal(params.topic, '虚构项目')
@@ -53,6 +53,9 @@ test('parseArgs output maps CLI flags to runJob params', () => {
   assert.equal(params.annotate, false)
   assert.equal(params.priorGlossaryPath, path.join(dir, '往次校对表.md'), '--prior-glossary resolves to an absolute path')
   assert.deepEqual(params.models, { refine: 'deepseek-v4-pro', repair: 'opus' })
+  assert.equal(params.apiKey, 'd')
+  assert.equal(params.serperKey, 's')
+  assert.equal(params.jinaKey, 'j')
 })
 
 test('--models accepts JSON or stage=model and rejects non-DeepSeek/provider values', () => {

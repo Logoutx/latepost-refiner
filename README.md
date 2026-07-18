@@ -14,7 +14,7 @@
 |---|---|---|
 | Claude | Claude Code 技能 | 走 Claude 订阅 |
 | Codex | Codex 技能 | 走 Codex 订阅 |
-| DeepSeek | 命令行 或 本地网页版 | DeepSeek API（`DEEPSEEK_API_KEY` 必填，建议再加 `TAVILY_API_KEY`——不填则无法联网核实、无时间线） |
+| DeepSeek | 命令行 或 本地网页版 | DeepSeek API（`DEEPSEEK_API_KEY` 必填，建议再加 `SERPER_API_KEY`；`JINA_API_KEY` 可选） |
 
 ## 安装
 
@@ -48,7 +48,7 @@ docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.
 |---|---|---|---|---|
 | 侦察 | 每份转录并行读一遍，抽取人名、品牌、术语、发言人与待核实项 | Haiku | gpt-5.4-mini（low） | deepseek-v4-flash |
 | 合并聚类 | 纯 JS 按真名合并；“X 总”等敬称不与未经确认的同名对象乱并 | 不调模型 | 不调模型 | 不调模型 |
-| 联网核实 | 分批查询公开资料，核实关键人名、公司、产品和术语的标准写法；中文人名必须有来源直接显示目标汉字，英文名/拼音只能证明身份、不能反推正字 | Sonnet | gpt-5.4（medium） | deepseek-v4-flash，搜索走 Tavily |
+| 联网核实 | 分批查询公开资料，核实关键人名、公司、产品和术语的标准写法；中文人名必须有来源直接显示目标汉字，英文名/拼音只能证明身份、不能反推正字 | Sonnet | gpt-5.4（medium） | deepseek-v4-flash；Serper 搜索，Jina Reader 提取正文，失败后本地安全抓取 |
 | 同指去重 | 找出写法不同但实际指向同一对象的实体，例如同音人名、简称和口号的不同转写 | Sonnet | gpt-5.4（medium） | deepseek-v4-flash |
 | 精校 | 逐份精校：删除口癖和无意义重复、修复 ASR 噪声、增加小标题，并按校对表统一写法 | Opus | gpt-5.5（high） | deepseek-v4-pro；超过 10,000 字自动分块 |
 | 源比对审计 | 纯 JS 比对源文与精校稿，检查压缩、内容缺口、数字漂移和结尾遗漏；完整性由此判定 | 不调模型 | 不调模型 | 不调模型 |
@@ -72,7 +72,8 @@ core/                所有逻辑的唯一出处
   pipeline.js        runPipeline(A, engine)：流水线主体，只依赖一个 engine 接口
   meta.js            Workflow 元信息
 engines/             DeepSeek 版（命令行/网页/二进制）的引擎（Claude Code 版的引擎是 Workflow 全局，见 build/bootstrap-cc.js）
-  deepseek.js        DeepSeek 引擎：endpoint、默认模型分层（flash/pro）与忠实处理长度集中在这里；仅 CLI/runJob 可显式覆盖阶段模型
+  deepseek.js        DeepSeek 引擎：endpoint、默认模型分层（flash/pro）、忠实处理长度与工具循环；仅 CLI/runJob 可显式覆盖阶段模型
+  web.js             每任务独立的 Serper/Jina runtime：预算、缓存、URL allow-set、SSRF 防护与遥测
   fileops.js         Read/Write/Edit 工具实现，带沙箱限制
 build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 workflow.js
 claude-code-skill/   Claude Code 版（workflow.js 是 build 产物，别手改）
@@ -81,6 +82,8 @@ universal/           命令行 + 网页 + 单文件 App（DeepSeek 版）
 ```
 
 **改了逻辑**：改 `core/*`，跑 `node build/build-cc.mjs`，别手改 `workflow.js`（build 产物，下次 build 会覆盖）。
+
+DeepSeek 版每个任务最多发起 100 个去重后的搜索请求；同一查询和网页会在任务内缓存。`run.json` 记录搜索/抓取次数、缓存命中、失败与实际计费请求数；运行日志把模型估算成本与 Serper 搜索估算成本分开记录。
 
 ## 数据去向与信源保护
 

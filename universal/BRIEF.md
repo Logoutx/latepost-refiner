@@ -1,6 +1,6 @@
 # LatePost-Refiner Universal — Build Brief
 
-> **历史文档**：这是最初的建造简报，当时的目标是直连 Anthropic API。2026-07-14 起 API 版收敛为 DeepSeek 单一引擎（`engines/deepseek.js`）+ Tavily 搜索，Anthropic/多 provider 相关内容仅作历史记录，现状见仓库根 README。
+> **历史文档**：这是最初的建造简报，当时的目标是直连 Anthropic API。当前 API 版已收敛为 DeepSeek 单一引擎 + Serper/Jina Web runtime；Anthropic/多 provider 相关内容仅作历史记录，现状见仓库根 README。
 
 ## One-line goal
 

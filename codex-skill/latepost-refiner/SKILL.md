@@ -9,14 +9,14 @@ Use this skill to turn rough dialogue transcripts into faithful, citable researc
 
 ## First Choice In Codex: Native Subscription Runtime
 
-When running inside Codex, prefer the Codex native runtime in [references/native-runtime.md](references/native-runtime.md). It runs on the signed-in ChatGPT/Codex subscription through native subagents and deterministic local Node helpers. It does **not** require `OPENAI_API_KEY` or `TAVILY_API_KEY` on the primary path.
+When running inside Codex, prefer the Codex native runtime in [references/native-runtime.md](references/native-runtime.md). It runs on the signed-in ChatGPT/Codex subscription through native subagents and deterministic local Node helpers. It does **not** require `OPENAI_API_KEY`, `SERPER_API_KEY`, or `JINA_API_KEY` on the primary path.
 
 Read [references/native-runtime.md](references/native-runtime.md) when:
 - Running from Codex or installing this skill for Codex.
 - Using no-key scout, verify, refine, logic, summary, or timeline stages.
 - Explaining the generated prompt manifests, local audit, quality scorecard, `review.md`, or `run.json`.
 
-Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch work, `gpt-5.4` for verify/dedup/summary, and `gpt-5.5` for quality-critical refine, logic planning, and logic writing. `verifyDepth: deep` should keep web verification on the native browsing path and surface unresolved items rather than asking for a Tavily key.
+Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch work, `gpt-5.4` for verify/dedup/summary, and `gpt-5.5` for quality-critical refine, logic planning, and logic writing. `verifyDepth: deep` should keep web verification on the native browsing path and surface unresolved items rather than asking for external search/reader keys.
 
 ## Universal Runtime Fallback
 

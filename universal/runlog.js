@@ -89,7 +89,7 @@ export function estimateCost(provider, models, usage) {
 // `provider`/`models` describe what actually served the run: `models` is the tier→model-id map used for
 // cost estimation (e.g. DEEPSEEK_MODELS) — null when it doesn't apply (e.g. an injected test engine with
 // no real provider/model map).
-export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null } = {}) {
+export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null, webTelemetry = null } = {}) {
   const durationMs = result.durationMs || 0
   const usageSrc = result.usage || {}
   const usage = {
@@ -103,6 +103,13 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
   const audit = result.audit
   const auditStatus = !audit ? 'unavailable' : (audit.status === 'fail' ? 'fail' : 'ok')
 
+  const estCost = estimateCost(provider, models, usage)
+  const searchBilled = (webTelemetry && webTelemetry.searchBilled) || 0
+  const searchEstCost = { value: round6(searchBilled / 1000), currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' }
+  const totalEstCost = estCost
+    ? { value: round6(estCost.value + searchEstCost.value), currency: 'USD', note: estCost.note }
+    : (searchBilled ? { ...searchEstCost } : null)
+
   return {
     finishedAt: result.finishedAt || new Date().toISOString(),
     topic: params.topic || 'untitled',
@@ -114,7 +121,10 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     durationMs,
     durationMin: round1(durationMs / 60000),
     usage,
-    estCost: estimateCost(provider, models, usage),
+    estCost,
+    searchEstCost,
+    totalEstCost,
+    webTelemetry: webTelemetry || null,
     auditStatus,
     outputDir: result.outputDir || params.outputDir || null,
   }
