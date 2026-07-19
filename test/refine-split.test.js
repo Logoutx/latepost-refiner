@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, contentLength,
+  splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, stitchPartsWithReport, contentLength,
   REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
@@ -302,6 +302,18 @@ test('stitchParts removes a multi-turn duplicated suffix/prefix sequence at a ch
   const merged = stitchParts([`## 前块\n\n${a}\n\n${b}\n\n${c}`, `## 后块\n\n${ap}\n\n${bp}\n\n${cp}\n\n记者：接下来你们准备做什么？`])
   assert.equal((merged.match(/桌面智能体/g) || []).length, 1, 'the repeated three-turn sequence appears once')
   assert.match(merged, /接下来你们准备做什么/)
+})
+
+test('stitchPartsWithReport repairs a long replay beyond the normal four-block seam window', () => {
+  const blocks = Array.from({ length: 6 }, (_, i) => `受访者：第${i + 1}段说明包含一组足够具体的事实和完整限定条件，用来验证超长接缝回放不会在最终正文中重复出现。`)
+  const report = stitchPartsWithReport([
+    `## 前块\n\n${blocks.join('\n\n')}`,
+    `## 后块\n\n${blocks.join('\n\n')}\n\n记者：接下来发生了什么？`,
+  ])
+  assert.ok(report.seamRepairs.some((x) => x.removedBlocks >= 6), 'the extended deterministic pass records its repair')
+  assert.deepEqual(report.seamDuplicates, [], 'the repaired seam has no residual hard duplicate')
+  assert.equal((report.text.match(/接下来发生了什么/g) || []).length, 1)
+  for (const block of blocks) assert.equal((report.text.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length, 1)
 })
 
 test('stitchParts keeps short or differently attributed repetition', () => {

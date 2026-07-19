@@ -65,7 +65,7 @@ Run `node universal/cli.js --help` for the complete, current flag list — treat
 - `SERPER_API_KEY` — required for standard/deep web verification and the timeline stage. Without it, online stages degrade with visible unresolved warnings; refine itself never goes online. Pass `--verify none` when intentionally running offline.
 - `JINA_API_KEY` — optional bearer token for Jina Reader. `web_fetch` tries Jina Reader first and then the SSRF-guarded local extractor; the token is never persisted.
 
-Each job permits at most 100 unique search queries. `run.json` records search/fetch calls, cache hits, HTTP attempts, billed Serper responses, fallbacks, and failures without recording credentials. The per-run JSONL log keeps model cost in `estCost`, records Serper cost separately in `searchEstCost`, and combines them in `totalEstCost`.
+Each job permits at most 100 unique search queries. `run.json` records search/fetch calls, cache hits, HTTP attempts, billed Serper responses, Jina usage tokens, fallbacks, and failures without recording credentials. The per-run JSONL log keeps model cost in `estCost`, Serper cost in `searchEstCost`, Jina Reader cost in `fetchEstCost`, and combines all three in `totalEstCost`.
 
 ⚠ DeepSeek is operated by a China-based company: full transcript text is transmitted to its servers and subject to local regulation, including content review. Avoid this edition for sensitive-topic interviews or ones needing source protection.
 
@@ -82,13 +82,20 @@ The runtime writes:
 
 Read `review.md` before reporting completion. It consolidates failed files, incomplete endings, audit-gate failures, a thin-校对表 warning, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
 
-Read `run.json` when auditing a run or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
+Read `run.json` when auditing a run or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded. Use `artifactQuality` for the independent `ready / review_needed / blocked` state of each transcript, logic draft, summary, and timeline; the run-level `quality` is intentionally the worst state across the run.
 
 ## Exit Code And `auditFailed`
 
-The in-pipeline audit gate runs per file after refine. When a body is still **hard** (`content_gap`, `compression_risk`, `ending_missing`, high-confidence `attribution_mismatch`, or `quote_style`) after one targeted repair, it is recorded in top-level **`auditFailed`**. The main transcript and review artifacts are still written, but requested logic/summary/timeline products are withheld and listed in **`derivativesSkipped`** so no derivative can fossilize a known body defect. By default the CLI exits 1; callers should inspect both fields in `run.json` / `review.md` and retain the main transcript for targeted follow-up.
+The in-pipeline audit gate runs per file after refine. One shared publication contract drives repair, derivative withholding, CLI exit, scorecards, and installed editions:
 
-Pass **`--allow-audit-fail`** to make the CLI exit **0** when main transcripts were generated and the only problem is `auditFailed` (a pipeline error or unavailable audit still exits 1). This changes process control only; it never unblocks derivatives.
+- body fidelity: `content_gap`, `compression_risk`, `ending_missing`, high-confidence `attribution_mismatch`, `seam_duplicate`;
+- output quality: `residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`.
+
+Audit-generated failures receive one targeted repair and one re-audit. Chunk seams receive deterministic cleanup, an extended long-replay repair, then a residual scan. A still-failing body is recorded in top-level **`auditFailed`**. The main transcript and review artifacts are still written, but requested logic/summary/timeline products are withheld and listed in **`derivativesSkipped`** so no derivative can fossilize a known body defect. By default the CLI exits 1; callers should inspect both fields in `run.json` / `review.md` and retain the main transcript for targeted follow-up.
+
+After generation, logic drafts are audited independently for same-order copying and missing refined-section provenance (`logicFailed`). Summary/timeline facts are checked clause by clause: Chinese/English money scales and supported range compaction compare as equivalent, while a real amount reassigned to another glossary entity remains a hard derivative-attribution failure. These findings affect only the artifact that failed; inspect `artifactQuality` rather than inferring every attachment's state from the run-level label.
+
+Pass **`--allow-audit-fail`** to make the CLI exit **0** when transcripts were generated and the only problem is a completed audit recorded in `auditFailed` (a pipeline error, unavailable audit, or `logicFailed` still exits 1). This changes process control only; it never changes an artifact's status or unblocks derivatives.
 
 The runtime runs a source-aware quality audit for each refined transcript, then gives body-fidelity failures exactly one targeted repair and one re-audit. The repair prompt receives the audit's exact source ranges, speaker mismatch, ending/compression signal, and other named findings; it edits the existing body instead of silently replacing it with a new summary. The `repair` stage defaults to `deepseek-v4-pro` and can be overridden explicitly like other stages.
 

@@ -1,9 +1,21 @@
 // GENERATED FILE — DO NOT EDIT. Source: core/spec.js. Regenerate: npm run sync:skills
-// Failures that make a refined interview body unsafe as the source for logic/summary/timeline. Shared by the
-// core Workflow/Universal pipeline and the independent Codex-native helper so edition-specific orchestration
-// cannot drift on what "final body" means.
+// Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
 export const BODY_FIDELITY_GATES = Object.freeze([
-  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'quote_style',
+  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'seam_duplicate',
+])
+
+// Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file
+// carrying one of them is still not a final body. Keep them separate from BODY_FIDELITY_GATES so diagnostics can
+// say whether the risk is factual or editorial; both groups receive one repair + re-audit before blocking.
+export const OUTPUT_QUALITY_GATES = Object.freeze([
+  'residual_noise', 'under_refined', 'long_paragraphs', 'quote_style',
+])
+
+// The ONE shared answer to “does this body block derivatives/direct publication?”. Pipeline repair, Codex-native
+// gating, and run-level scorecards must consume this list instead of re-interpreting audit `status` independently.
+export const PUBLICATION_BLOCK_GATES = Object.freeze([
+  ...BODY_FIDELITY_GATES,
+  ...OUTPUT_QUALITY_GATES,
 ])
 
 // ---------- schemas ----------
@@ -855,17 +867,16 @@ export function isDuplicateSeamBlock(left, right) {
   return bigramDice(a, b) >= 0.88
 }
 
-function stripDuplicateSeamPrefix(left, right) {
+function findDuplicateSeamPrefix(left, right, max = 4) {
   const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
   const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
   const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
-  if (!leftBlocks.length || !rightProse.length) return right
+  if (!leftBlocks.length || !rightProse.length) return null
 
   // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
   // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
   // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
   // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
-  const max = 4
   let best = null
   for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
     const leftSeq = leftBlocks.slice(-lc).join('\n\n')
@@ -873,19 +884,38 @@ function stripDuplicateSeamPrefix(left, right) {
       const indices = rightProse.slice(0, rc)
       const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
       if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
-      const score = Math.min(seamNorm(leftSeq).length, seamNorm(rightSeq).length)
-      if (!best || score > best.score || (score === best.score && rc > best.indices.length)) best = { score, indices }
+      const a = seamNorm(leftSeq), b = seamNorm(rightSeq)
+      const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+      // Prefer the tightest semantic fit, not simply the longest match. Otherwise an exact six-block replay
+      // followed by one NEW short question can look like a seven-block containment match and the new question
+      // gets deleted. Length fit + containment/Dice makes the exact replay win while retaining paraphrase support.
+      const quality = ratio + ((a.includes(b) || b.includes(a)) ? 1 : bigramDice(a, b))
+      const score = Math.min(a.length, b.length)
+      if (!best || quality > best.quality || (quality === best.quality && score > best.score)) best = { quality, score, indices }
     }
   }
-  if (!best) return right
-  for (const i of best.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
-  return rightBlocks.join('\n\n')
+  return best ? { ...best, rightBlocks } : null
 }
 
-export function stitchParts(texts) {
+function stripDuplicateSeamPrefix(left, right, max = 4) {
+  const match = findDuplicateSeamPrefix(left, right, max)
+  if (!match) return { text: right, removedBlocks: 0 }
+  const rightBlocks = match.rightBlocks.slice()
+  const removedBlocks = match.indices.length
+  for (const i of match.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return { text: rightBlocks.join('\n\n'), removedBlocks }
+}
+
+// Merge plus a post-merge seam audit. The normal four-block pass preserves the historical conservative cleanup.
+// If an unusually long replay remains, one deterministic eight-block repair is allowed, then a wider final scan
+// records (but does not hide) any still-duplicated seam. The caller can block derivatives on `seamDuplicates`
+// while still delivering the body for review.
+export function stitchPartsWithReport(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
-  if (!parts.length) return ''
+  if (!parts.length) return { text: '', seamRepairs: [], seamDuplicates: [] }
   let out = parts[0]
+  const seamRepairs = []
+  const seamDuplicates = []
   for (let i = 1; i < parts.length; i += 1) {
     let next = parts[i]
     const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
@@ -896,10 +926,25 @@ export function stitchParts(texts) {
     // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
     // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
     // prose blocks, so later legitimate repetition remains untouched.
-    next = stripDuplicateSeamPrefix(out, next)
+    const normal = stripDuplicateSeamPrefix(out, next, 4)
+    next = normal.text
+    let removedBlocks = normal.removedBlocks
+    const longReplay = findDuplicateSeamPrefix(out, next, 8)
+    if (longReplay) {
+      const repaired = stripDuplicateSeamPrefix(out, next, 8)
+      next = repaired.text
+      removedBlocks += repaired.removedBlocks
+    }
+    if (removedBlocks) seamRepairs.push({ seam: i, removedBlocks })
+    const residual = findDuplicateSeamPrefix(out, next, 12)
+    if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return `${out.replace(/\s+$/, '')}\n`
+  return { text: `${out.replace(/\s+$/, '')}\n`, seamRepairs, seamDuplicates }
+}
+
+export function stitchParts(texts) {
+  return stitchPartsWithReport(texts).text
 }
 
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but

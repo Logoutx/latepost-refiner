@@ -47,9 +47,9 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
   --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
                          时间/token 用量/估算成本）
-  --allow-audit-fail     正文忠实性门禁未过（缺口/压缩/结尾/说话人/引号，定点修复后仍 hard）时，若成稿已生成，
+  --allow-audit-fail     正文发布门禁未过（忠实性/接缝/清理/排版，定点修复后仍 hard）时，若成稿已生成，
                          仍以退出码 0 结束（默认退出 1）。主成稿照样落盘、派生产物暂停；请查 review.md / run.json
-                         的 auditFailed 与 derivativesSkipped 字段逐份核对
+                         的 auditFailed 与 derivativesSkipped 字段逐份核对。逻辑稿自身审计失败不能用此参数豁免
 
 密钥（环境变量，或仓库根目录 .env）:
   DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
@@ -179,6 +179,7 @@ export function computeExitCode(result, { allowAuditFail = false } = {}) {
   // by --allow-audit-fail: that flag means "the audit ran and found a hard issue I accept", a different decision
   // from "the audit never ran, so nothing was verified". An unverified run must never masquerade as success.
   if ((result.auditUnavailable || []).length > 0) return 1
+  if ((result.logicFailed || []).length > 0) return 1
   const auditFailed = (result.auditFailed || []).length > 0
   if (!auditFailed) return 0
   const producedOutput = (result.refined || []).length > 0
@@ -206,6 +207,7 @@ export function printRunSummary(r) {
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
   if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿未经审计，不可视为通过；请求的总结/时间线/逻辑稿已暂停。主成稿已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
   if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
+  if ((r.logicFailed || []).length) console.error(`\n⚠ 逻辑顺序稿审计未过：` + r.logicFailed.map((x) => `${path.basename(x.path || '')}（${(x.findings || []).join('/')}）`).join('、') + `\n  （精校主成稿不受影响；失败逻辑稿不可作为合格附件，退出码 1，且 --allow-audit-fail 不豁免）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {
       console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或重精校该段')

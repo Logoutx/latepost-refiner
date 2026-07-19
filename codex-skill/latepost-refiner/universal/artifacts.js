@@ -3,6 +3,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PUBLICATION_BLOCK_GATES } from '../core/spec.js'
+import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_PATH = path.join(REPO_ROOT, 'package.json')
@@ -101,6 +103,8 @@ function formatAudit(f) {
   if (f.long_paragraphs && f.long_paragraphs.length) parts.push(`超 900 字段×${f.long_paragraphs.length}`)
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
 }
+
+const publicationFailures = (f) => (f.blockingFailed || f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
 
 // M5: one review line per FLAGGED refined section (empty-flags sections are trusted, omitted). Aggregates the
 // audit's per-file sections[] into human 逐节复核 lines: 「§标题 — 源 L340-L360 · 15:17-16:02 — 存疑数字 2 处（样例…）/
@@ -246,7 +250,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '未完成，需要补做', items: result.failed || [], priority: 'high' },
     { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
-    { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
+    { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => publicationFailures(f).length).map(formatAudit), priority: 'high' },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
@@ -260,6 +264,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },
     { title: '因网络故障未核实，可网络恢复后补查', items: (result.networkUnverified || []).map(formatNetworkItem), priority: 'medium' },
     { title: '逻辑顺序稿失败', items: logic.filter((l) => !l.path).map((l) => l.label || jsonLine(l)), priority: 'medium' },
+    { title: '逻辑顺序稿审计未过（假重排或遗漏精校稿来源小节）', items: (result.logicFailed || []).map((x) => `${path.basename(x.path || '')} — ${(x.findings || []).join('、')}`), priority: 'high' },
     { title: '逻辑顺序稿疑漏小标题', items: logic.filter((l) => l.missingSections && l.missingSections.length).map(formatLogicGap), priority: 'medium' },
     { title: '收尾待问', items: (result.openQuestions || []).map(jsonLine), priority: 'medium' },
     { title: '已自动分段精校（文件超出该模型忠实处理长度，已按发言轮边界切分——仅告知，无需处理）', items: autoChunkItems(result), priority: 'low' },
@@ -274,7 +279,12 @@ export function qualityScorecard(result = {}) {
   const auditFailed = result.auditFailed || []
   const sectionSummary = sectionReviewSummary(result)
   const hardFiles = new Set()
-  for (const f of auditFiles) if (f.status === 'fail' || (f.failed || []).length) hardFiles.add(f.file || f.refinedFile || '')
+  // Do not reinterpret every detector-level `status=fail` as a publication block. The audit intentionally emits
+  // review-only candidates too; only the shared publication contract may promote a body file to hardFiles.
+  for (const f of auditFiles) {
+    const blocking = (f.blockingFailed || f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
+    if (blocking.length) hardFiles.add(f.file || f.refinedFile || '')
+  }
   for (const f of auditFailed) hardFiles.add(f.path || '')
   const incomplete = result.incomplete || []
   const unchecked = result.unchecked || []
@@ -309,6 +319,70 @@ export function qualityScorecard(result = {}) {
     },
     glossaryWarnings,
   }
+}
+
+const qualityStatus = (blocked, review) => blocked.length ? 'blocked' : review.length ? 'review_needed' : 'ready'
+const resolvedPath = (p) => p ? path.resolve(p) : null
+
+// Per-artifact status keeps one bad timeline from making a passed transcript LOOK bad. The run-level quality above
+// still takes the worst state for conservative automation; consumers can use this map to label each attachment by
+// its own evidence. Findings are stable machine keys, not rendered prose.
+export function artifactQualityScorecard(result = {}, context = {}) {
+  const A = context.A || {}
+  const outputDir = path.resolve(context.outputDir || result.outputDir || A.outputDir || process.cwd())
+  const auditFiles = (result.audit && result.audit.files) || []
+  const auditFailed = result.auditFailed || []
+  const failedByPath = new Map()
+  for (const f of auditFailed) failedByPath.set(resolvedPath(f.path), f.findings || ['audit_failed'])
+  const incomplete = new Set((result.incomplete || []).map((x) => resolvedPath(x.path || x)))
+  const unavailable = new Set((result.auditUnavailable || []).map((x) => resolvedPath(x.path || x)))
+  const unchecked = new Set((result.unchecked || []).map((x) => resolvedPath(x.path || x)))
+
+  const refined = (result.refined || []).map((r) => {
+    const p = resolvedPath(r.outPath || r.path)
+    const af = auditFiles.find((f) => resolvedPath(f.file || f.refinedFile) === p)
+    const blocking = Array.from(new Set([
+      ...(failedByPath.get(p) || []),
+      ...((af && (af.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))) || []),
+      ...(incomplete.has(p) ? ['incomplete'] : []),
+      ...(unavailable.has(p) ? ['audit_unavailable'] : []),
+    ]))
+    const review = Array.from(new Set([
+      ...((af && (af.findings || []).filter((f) => f && f.count && !PUBLICATION_BLOCK_GATES.includes(f.name)).map((f) => f.name)) || []),
+      ...((af && (af.sections || []).some((s) => (s.flags || []).length)) ? ['section_review'] : []),
+      ...(unchecked.has(p) ? ['unchecked'] : []),
+      ...(!af && !unavailable.has(p) ? ['audit_missing'] : []),
+    ]))
+    return { path: p, kind: 'transcript', status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  })
+
+  const logic = (result.logic || []).filter((l) => l && l.path).map((l) => {
+    const p = resolvedPath(l.path)
+    const f = ((result.logicAudit && result.logicAudit.files) || []).find((x) => resolvedPath(x.file) === p)
+    const blocking = f && f.status === 'fail' ? (f.failed || ['logic_audit']) : []
+    const review = f ? (f.findings || []).filter((x) => x && x.count && x.severity !== 'hard').map((x) => x.name) : ['audit_missing']
+    return { path: p, kind: 'logic', status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  })
+
+  const derivativeFiles = (result.derivativeAudit && result.derivativeAudit.files) || []
+  const derivative = (kind, value) => {
+    if (!value) return null
+    const fallback = path.join(outputDir, kind === 'summary' ? summaryDeliverableName(A.topic || context.topic || '') : timelineDeliverableName(A.topic || context.topic || ''))
+    const df = derivativeFiles.find((f) => f.kind === kind)
+    const p = resolvedPath((value && value.path) || (df && df.file) || fallback)
+    const blocking = df && (df.hardFail || []).length ? ['derivative_attribution'] : []
+    const review = df
+      ? [
+        ...((df.reporterVerify || []).length ? ['derivative_reporter_verify'] : []),
+        ...((df.review || []).length ? ['derivative_review'] : []),
+        ...((df.contextReview || []).length ? ['derivative_context_review'] : []),
+        ...((df.numericConflicts || []).length ? ['numeric_inconsistency'] : []),
+      ]
+      : ['audit_missing']
+    return { path: p, kind, status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  }
+
+  return { refined, logic, summary: derivative('summary', result.summary), timeline: derivative('timeline', result.timeline) }
 }
 
 export function buildReviewMarkdown(result = {}, context = {}) {
@@ -428,6 +502,7 @@ export function buildRunManifest(result = {}, context = {}) {
     },
     issues: Object.fromEntries(reviewSections(result, context.warnings || result.warnings || []).map((s) => [s.title, s.items.length])),
     quality: qualityScorecard(result),
+    artifactQuality: artifactQualityScorecard(result, { ...context, A, outputDir }),
     result: {
       error: result.error || null,
       failed: result.failed || [],
@@ -442,6 +517,7 @@ export function buildRunManifest(result = {}, context = {}) {
       networkUnverified: result.networkUnverified || [],
       openQuestions: result.openQuestions || [],
       derivativesSkipped: result.derivativesSkipped || [],
+      logicFailed: result.logicFailed || [],
       // M8: cross-file numeric conflicts (same entity + unit, disjoint values across ≥2 files). Structured so a
       // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
       crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),
@@ -460,6 +536,10 @@ export function buildRunManifest(result = {}, context = {}) {
         file: f.file, kind: f.kind, status: f.status,
         hardFail: f.hardFail || [], reporterVerify: f.reporterVerify || [], review: f.review || [], contextReview: f.contextReview || [],
       })),
+    } : null,
+    logicAudit: result.logicAudit ? {
+      status: result.logicAudit.status,
+      files: (result.logicAudit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null })),
     } : null,
     audit: result.audit ? {
       status: result.audit.status,

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildReviewMarkdown, buildRunManifest, qualityScorecard, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
+import { artifactQualityScorecard, buildReviewMarkdown, buildRunManifest, qualityScorecard, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-artifacts-'))
@@ -55,6 +55,35 @@ test('qualityScorecard classifies ready, review-needed, and blocked runs', () =>
   assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, refined: [] }).status, 'ready')
   assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, networkUnverified: [{ query: '示例品牌' }] }).status, 'review_needed')
   assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['content_gap'] }] } }).status, 'blocked')
+  assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['detector_candidate_only'] }] } }).status, 'ready', 'unknown detector failures cannot silently become publication gates')
+})
+
+test('artifactQualityScorecard isolates a blocked timeline from a review-only transcript', () => {
+  const result = {
+    outputDir: '/tmp/out',
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    timeline: { path: '/tmp/out/T时间线.md' },
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [{ name: 'hedge_loss', severity: 'soft', count: 1 }], sections: [] }] },
+    auditFailed: [{ path: '/tmp/out/T时间线.md', findings: ['derivative_attribution'] }],
+    derivativeAudit: { status: 'fail', files: [{ file: '/tmp/out/T时间线.md', kind: 'timeline', status: 'fail', hardFail: [{ value: '17' }], reporterVerify: [], review: [] }] },
+  }
+  const q = artifactQualityScorecard(result, { A: { topic: 'T' }, outputDir: '/tmp/out' })
+  assert.equal(q.refined[0].status, 'review_needed')
+  assert.equal(q.timeline.status, 'blocked')
+  assert.deepEqual(q.timeline.blockingFindings, ['derivative_attribution'])
+})
+
+test('artifactQualityScorecard exposes a failed logic draft without downgrading the passed transcript', () => {
+  const result = {
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    logic: [{ label: 'A', path: '/tmp/out/逻辑顺序/A.md' }],
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [], sections: [] }] },
+    logicAudit: { status: 'fail', files: [{ file: '/tmp/out/逻辑顺序/A.md', status: 'fail', failed: ['logic_order_unchanged'], findings: [] }] },
+  }
+  const q = artifactQualityScorecard(result, { outputDir: '/tmp/out' })
+  assert.equal(q.refined[0].status, 'ready')
+  assert.equal(q.logic[0].status, 'blocked')
+  assert.deepEqual(q.logic[0].blockingFindings, ['logic_order_unchanged'])
 })
 
 test('buildRunManifest records run config without secrets and hashes source files', () => {

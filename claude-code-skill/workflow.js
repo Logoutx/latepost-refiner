@@ -26,11 +26,23 @@ export const meta = {
 
 // ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====
 
-// Failures that make a refined interview body unsafe as the source for logic/summary/timeline. Shared by the
-// core Workflow/Universal pipeline and the independent Codex-native helper so edition-specific orchestration
-// cannot drift on what "final body" means.
+// Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
 const BODY_FIDELITY_GATES = Object.freeze([
-  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'quote_style',
+  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'seam_duplicate',
+])
+
+// Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file
+// carrying one of them is still not a final body. Keep them separate from BODY_FIDELITY_GATES so diagnostics can
+// say whether the risk is factual or editorial; both groups receive one repair + re-audit before blocking.
+const OUTPUT_QUALITY_GATES = Object.freeze([
+  'residual_noise', 'under_refined', 'long_paragraphs', 'quote_style',
+])
+
+// The ONE shared answer to “does this body block derivatives/direct publication?”. Pipeline repair, Codex-native
+// gating, and run-level scorecards must consume this list instead of re-interpreting audit `status` independently.
+const PUBLICATION_BLOCK_GATES = Object.freeze([
+  ...BODY_FIDELITY_GATES,
+  ...OUTPUT_QUALITY_GATES,
 ])
 
 // ---------- schemas ----------
@@ -882,17 +894,16 @@ function isDuplicateSeamBlock(left, right) {
   return bigramDice(a, b) >= 0.88
 }
 
-function stripDuplicateSeamPrefix(left, right) {
+function findDuplicateSeamPrefix(left, right, max = 4) {
   const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
   const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
   const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
-  if (!leftBlocks.length || !rightProse.length) return right
+  if (!leftBlocks.length || !rightProse.length) return null
 
   // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
   // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
   // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
   // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
-  const max = 4
   let best = null
   for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
     const leftSeq = leftBlocks.slice(-lc).join('\n\n')
@@ -900,19 +911,38 @@ function stripDuplicateSeamPrefix(left, right) {
       const indices = rightProse.slice(0, rc)
       const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
       if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
-      const score = Math.min(seamNorm(leftSeq).length, seamNorm(rightSeq).length)
-      if (!best || score > best.score || (score === best.score && rc > best.indices.length)) best = { score, indices }
+      const a = seamNorm(leftSeq), b = seamNorm(rightSeq)
+      const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+      // Prefer the tightest semantic fit, not simply the longest match. Otherwise an exact six-block replay
+      // followed by one NEW short question can look like a seven-block containment match and the new question
+      // gets deleted. Length fit + containment/Dice makes the exact replay win while retaining paraphrase support.
+      const quality = ratio + ((a.includes(b) || b.includes(a)) ? 1 : bigramDice(a, b))
+      const score = Math.min(a.length, b.length)
+      if (!best || quality > best.quality || (quality === best.quality && score > best.score)) best = { quality, score, indices }
     }
   }
-  if (!best) return right
-  for (const i of best.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
-  return rightBlocks.join('\n\n')
+  return best ? { ...best, rightBlocks } : null
 }
 
-function stitchParts(texts) {
+function stripDuplicateSeamPrefix(left, right, max = 4) {
+  const match = findDuplicateSeamPrefix(left, right, max)
+  if (!match) return { text: right, removedBlocks: 0 }
+  const rightBlocks = match.rightBlocks.slice()
+  const removedBlocks = match.indices.length
+  for (const i of match.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return { text: rightBlocks.join('\n\n'), removedBlocks }
+}
+
+// Merge plus a post-merge seam audit. The normal four-block pass preserves the historical conservative cleanup.
+// If an unusually long replay remains, one deterministic eight-block repair is allowed, then a wider final scan
+// records (but does not hide) any still-duplicated seam. The caller can block derivatives on `seamDuplicates`
+// while still delivering the body for review.
+function stitchPartsWithReport(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
-  if (!parts.length) return ''
+  if (!parts.length) return { text: '', seamRepairs: [], seamDuplicates: [] }
   let out = parts[0]
+  const seamRepairs = []
+  const seamDuplicates = []
   for (let i = 1; i < parts.length; i += 1) {
     let next = parts[i]
     const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
@@ -923,10 +953,25 @@ function stitchParts(texts) {
     // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
     // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
     // prose blocks, so later legitimate repetition remains untouched.
-    next = stripDuplicateSeamPrefix(out, next)
+    const normal = stripDuplicateSeamPrefix(out, next, 4)
+    next = normal.text
+    let removedBlocks = normal.removedBlocks
+    const longReplay = findDuplicateSeamPrefix(out, next, 8)
+    if (longReplay) {
+      const repaired = stripDuplicateSeamPrefix(out, next, 8)
+      next = repaired.text
+      removedBlocks += repaired.removedBlocks
+    }
+    if (removedBlocks) seamRepairs.push({ seam: i, removedBlocks })
+    const residual = findDuplicateSeamPrefix(out, next, 12)
+    if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return `${out.replace(/\s+$/, '')}\n`
+  return { text: `${out.replace(/\s+$/, '')}\n`, seamRepairs, seamDuplicates }
+}
+
+function stitchParts(texts) {
+  return stitchPartsWithReport(texts).text
 }
 
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
@@ -2196,7 +2241,7 @@ function summaryPrompt(a, refined, sectionMapPath) {
 ${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
-三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要带来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**绝不可把公开资料或你推算/换算的数字标成【访谈】**，拿不准就标待核）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
+三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
 
 ${TYPESET}
@@ -2218,7 +2263,7 @@ function timelinePrompt(a, glossary, refined, sectionMapPath) {
 
 步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；${mapNote ? `${mapNote} ` : ''}再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
 ${list}
-抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一。**每一条、尤其每一个数字/金额/数量/规格都必须带来源标注**，三选一：【访谈】=访谈亲口所述；【公开·待记者核实】=取自公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。**红线：标【访谈】的数字必须确实出自本次成稿原文——绝不可把公开资料、行业常识或你自己推算/换算的数字标成【访谈】**；来源拿不准就标【公开·待记者核实】，宁可标待核也不可冒充访谈。**源头可溯**：凡含【访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
+抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一。**每一个事实子句、尤其每一个数字/金额/数量/规格都必须紧跟自己的来源标注**，三选一：【访谈】=访谈亲口所述；【公开·待记者核实】=取自公开资料、须记者复核；【公开+访谈·待记者核实】=同一事实本身由两者互证（公开部分仍待核）。**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注；禁止用行末一个标签统管整条。**红线：标【访谈】的数字必须确实出自本次成稿原文——绝不可把公开资料、行业常识或你自己推算/换算的数字标成【访谈】；来源拿不准就标【公开·待记者核实】，宁可标待核也不可冒充访谈。**源头可溯**：凡含【访谈】的事件，在该事实子句末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
 
 ${TYPESET}
 
@@ -2289,9 +2334,8 @@ const DEFAULT_STAGE_MODELS = Object.freeze({
   stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus',
 })
 
-// These failures mean the interview body is not a trustworthy final source for derivatives. Other audit
-// findings (cleanup density, paragraph length, etc.) remain review-tier and do not trigger a model rewrite.
-{ BODY_FIDELITY_GATES } from './spec.js'
+// One shared publication contract: body-fidelity and output-quality groups stay separate for diagnostics, while
+// their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
 // 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
@@ -2419,10 +2463,12 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   }
   const good = partReps.filter(Boolean)
   const cap = (A && A.capabilities) || {}
+  let stitchReport = null
   if (typeof cap.stitch === 'function') {
     try {
       const stitched = await cap.stitch(f, chunks)
       if (stitched == null) { engine.log(`精校分块：${f.label} 确定性拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+      stitchReport = stitched
       engine.log(`精校分块：${f.label} 已确定性拼接 ${chunks.length} 块`)
     } catch (e) {
       engine.log(`精校分块：${f.label} 确定性拼接失败：${(e && e.message) || e}`)
@@ -2438,6 +2484,8 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     key_fixes: good.flatMap((r) => r.key_fixes || []),
     open_questions: good.flatMap((r) => r.open_questions || []),
     chunked: chunks.length,
+    ...((stitchReport && stitchReport.seamRepairs && stitchReport.seamRepairs.length) ? { seamRepairs: stitchReport.seamRepairs } : {}),
+    ...((stitchReport && stitchReport.seamDuplicates && stitchReport.seamDuplicates.length) ? { seamDuplicates: stitchReport.seamDuplicates } : {}),
     ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
   }
 }
@@ -2506,7 +2554,7 @@ function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
-// JSON. Any BODY_FIDELITY_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
+// JSON. Any PUBLICATION_BLOCK_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
 // subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
@@ -2561,8 +2609,8 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
   if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => BODY_FIDELITY_GATES.includes(k))
-  const softOf = (r) => (r.failed || []).filter((k) => !BODY_FIDELITY_GATES.includes(k))
+  const hardOf = (r) => (r.failed || []).filter((k) => PUBLICATION_BLOCK_GATES.includes(k))
+  const softOf = (r) => (r.failed || []).filter((k) => !PUBLICATION_BLOCK_GATES.includes(k))
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
@@ -2581,6 +2629,9 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       if (hard.includes('compression_risk')) parts.push('· 全文压缩：从源文件重新逐轮核对，把被概括掉的事实、数字、例子、判断与限定语补回；保持说话人归属。')
       if (hard.includes('ending_missing')) parts.push('· 结尾缺失：读取源文件尾部，把尚未进入成稿的最后几轮发言补回对应位置。')
       if (hard.includes('attribution_mismatch')) parts.push('· 发言人串位：按审计 finding 的源行与成稿行，只修正这些轮次的发言人标签/段落归属，不能改写内容。')
+      if (hard.includes('under_refined')) parts.push('· 欠精校：对照源文件做一轮完整清噪和顺句，删除无意义口癖但保留事实、语气与对话体。')
+      if (hard.includes('residual_noise')) parts.push('· 残留噪音：只修审计标出的口癖、重复、断裂片段和 ASR 粘连，必要时对照源文件确认不改义。')
+      if (hard.includes('long_paragraphs')) parts.push('· 超长段落：在同一发言人内部按语义拆成 200–600 字左右的连贯段落，不得移动内容到其他发言人名下。')
       if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
@@ -2870,7 +2921,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（缺口/压缩/结尾/说话人/引号 hard → 自动定点修复一次 → 复检；仍 hard 记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量 → 自动定点修复一次 → 复检；仍未过记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
@@ -2897,6 +2948,16 @@ if (scope.includes('refine') && pairsToAudit.length) {
     // "no direct audit capability" CC case (where the agent audit DID run). Only auditUnavailable qualifies.
     if (a.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
     if ((a.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: a.auditFailed })
+    const seamDuplicates = (r && r.seamDuplicates) || []
+    if (seamDuplicates.length) {
+      if (r && r.audit) {
+        r.audit.status = 'fail'
+        r.audit.hardFindings = [...new Set([...(r.audit.hardFindings || []), 'seam_duplicate'])]
+      }
+      const existing = auditFailed.find((x) => x.path === f.outPath)
+      if (existing) existing.findings = [...new Set([...(existing.findings || []), 'seam_duplicate'])]
+      else auditFailed.push({ path: f.outPath, findings: ['seam_duplicate'] })
+    }
   })
   if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)

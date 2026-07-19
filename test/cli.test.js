@@ -136,3 +136,13 @@ test('computeExitCode (P7): an audit that could not run exits 1 and is NOT bypas
   assert.equal(computeExitCode(result), 1, 'default: auditUnavailable → exit 1')
   assert.equal(computeExitCode(result, { allowAuditFail: true }), 1, '--allow-audit-fail cannot mask an audit that never ran')
 })
+
+test('computeExitCode: a failed logic draft exits 1 and is not bypassed by --allow-audit-fail', () => {
+  const result = {
+    refined: [{ path: '/o/A.md' }],
+    auditFailed: [],
+    logicFailed: [{ path: '/o/logic/A.md', findings: ['logic_order_unchanged'] }],
+  }
+  assert.equal(computeExitCode(result), 1)
+  assert.equal(computeExitCode(result, { allowAuditFail: true }), 1)
+})

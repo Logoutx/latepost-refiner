@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { prepareFile, runJob } from '../universal/jobs.js'
+import { computeLogicAudit, prepareFile, runJob } from '../universal/jobs.js'
 import { computeExitCode } from '../universal/cli.js'
 import { timelineDeliverableName } from '../core/prompts.js'
 
@@ -59,6 +59,36 @@ function mockEngine() {
     },
   }
 }
+
+test('computeLogicAudit independently blocks a same-order fake logic draft', () => {
+  const outputDir = tmpdir()
+  const refinedPath = path.join(outputDir, 'Transcripts', 'A.md')
+  const logicPath = path.join(outputDir, '逻辑顺序', 'A.md')
+  fs.mkdirSync(path.dirname(refinedPath), { recursive: true })
+  fs.mkdirSync(path.dirname(logicPath), { recursive: true })
+  const sections = ['创业起点', '产品迭代', '客户变化', '渠道调整', '供应协同', '组织搭建']
+  const body = (title) => [
+    `记者：请讲讲${title}这件事的背景。`,
+    `受访者：${title}包含一组完整事实，我们先做内部验证，再和外部客户逐步确认。`,
+    '记者：这个变化对公司节奏有什么影响？',
+    '受访者：影响主要体现在交付节奏、团队分工和后续复盘上，每一步都有明确责任人。',
+  ].join('\n\n')
+  fs.writeFileSync(refinedPath, [
+    '# 示例访谈', '',
+    ...sections.flatMap((title) => [`## ${title}`, '', body(title), '']),
+  ].join('\n'), 'utf8')
+  fs.writeFileSync(logicPath, [
+    '# 示例访谈 · 逻辑顺序稿', '', '## 主线脉络（导读）', '', '按原顺序复制。', '',
+    ...sections.flatMap((title) => [`## ${title}`, `*〔取自精校稿：${title}〕*`, '', body(title), '']),
+  ].join('\n'), 'utf8')
+
+  const audit = computeLogicAudit({
+    scope: ['logic'],
+    files: [{ label: 'A', outPath: refinedPath }],
+  }, { logic: [{ label: 'A', path: logicPath }] })
+  assert.equal(audit.status, 'fail')
+  assert.ok(audit.files[0].failed.includes('logic_order_unchanged'))
+})
 
 // A source whose distinctive last sentence the refine will DROP, so the deterministic audit's ending_missing
 // gate fires → the file lands in `incomplete`. The omitted tail is a single short closing turn (well under the

@@ -208,12 +208,37 @@ test('audit gate (P7): a throwing runAudit capability is retried once, then FAIL
   assert.equal(r.refined[0].audit.auditUnavailable, true)
 })
 
-test('audit gate: soft-only findings never fail the gate', async () => {
+test('audit gate: publication-quality failures receive one repair and still block when they persist', async () => {
   const labels = []
-  const capabilities = { runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
+  let audits = 0, repairs = 0
+  const capabilities = {
+    runAudit: (f) => { audits += 1; return { file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] } },
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.deepEqual(r.auditFailed, [], 'under_refined (not content_gap/quote_style) is not a hard gate here')
-  assert.deepEqual(r.refined[0].audit.softFindings, ['under_refined'])
+  assert.equal(audits, 2, 'publication-quality failure is re-audited once')
+  assert.equal(repairs, 1, 'publication-quality failure is not allowed to block without a repair attempt')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['under_refined'] }])
+  assert.deepEqual(r.refined[0].audit.hardFindings, ['under_refined'])
+})
+
+test('chunk seam: a residual duplicate reported after deterministic stitch blocks derivatives', async () => {
+  const labels = []
+  const capabilities = {
+    stitch: () => ({ path: '/o/Transcripts/A.md', seamRepairs: [], seamDuplicates: [{ seam: 1, repeatedBlocks: 2 }] }),
+    runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({
+    scope: ['refine', 'summary'],
+    chunkMode: 'speed',
+    files: [F({ chars: 30000, lines: 600 })],
+    capabilities,
+  }), engine(labels))
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['seam_duplicate'] }])
+  assert.equal(r.refined[0].audit.status, 'fail')
+  assert.equal(r.summary, null, 'a derivative cannot read a body with a residual seam duplicate')
 })
 
 test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a parseable pass → ok', async () => {

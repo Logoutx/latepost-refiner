@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
@@ -6,9 +6,9 @@ export const DEFAULT_STAGE_MODELS = Object.freeze({
   stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus',
 })
 
-// These failures mean the interview body is not a trustworthy final source for derivatives. Other audit
-// findings (cleanup density, paragraph length, etc.) remain review-tier and do not trigger a model rewrite.
-export { BODY_FIDELITY_GATES } from './spec.js'
+// One shared publication contract: body-fidelity and output-quality groups stay separate for diagnostics, while
+// their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
+export { BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES } from './spec.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
 // 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
@@ -136,10 +136,12 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   }
   const good = partReps.filter(Boolean)
   const cap = (A && A.capabilities) || {}
+  let stitchReport = null
   if (typeof cap.stitch === 'function') {
     try {
       const stitched = await cap.stitch(f, chunks)
       if (stitched == null) { engine.log(`精校分块：${f.label} 确定性拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+      stitchReport = stitched
       engine.log(`精校分块：${f.label} 已确定性拼接 ${chunks.length} 块`)
     } catch (e) {
       engine.log(`精校分块：${f.label} 确定性拼接失败：${(e && e.message) || e}`)
@@ -155,6 +157,8 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     key_fixes: good.flatMap((r) => r.key_fixes || []),
     open_questions: good.flatMap((r) => r.open_questions || []),
     chunked: chunks.length,
+    ...((stitchReport && stitchReport.seamRepairs && stitchReport.seamRepairs.length) ? { seamRepairs: stitchReport.seamRepairs } : {}),
+    ...((stitchReport && stitchReport.seamDuplicates && stitchReport.seamDuplicates.length) ? { seamDuplicates: stitchReport.seamDuplicates } : {}),
     ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
   }
 }
@@ -223,7 +227,7 @@ export function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
-// JSON. Any BODY_FIDELITY_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
+// JSON. Any PUBLICATION_BLOCK_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
 // subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
@@ -278,8 +282,8 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
   if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => BODY_FIDELITY_GATES.includes(k))
-  const softOf = (r) => (r.failed || []).filter((k) => !BODY_FIDELITY_GATES.includes(k))
+  const hardOf = (r) => (r.failed || []).filter((k) => PUBLICATION_BLOCK_GATES.includes(k))
+  const softOf = (r) => (r.failed || []).filter((k) => !PUBLICATION_BLOCK_GATES.includes(k))
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
@@ -298,6 +302,9 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       if (hard.includes('compression_risk')) parts.push('· 全文压缩：从源文件重新逐轮核对，把被概括掉的事实、数字、例子、判断与限定语补回；保持说话人归属。')
       if (hard.includes('ending_missing')) parts.push('· 结尾缺失：读取源文件尾部，把尚未进入成稿的最后几轮发言补回对应位置。')
       if (hard.includes('attribution_mismatch')) parts.push('· 发言人串位：按审计 finding 的源行与成稿行，只修正这些轮次的发言人标签/段落归属，不能改写内容。')
+      if (hard.includes('under_refined')) parts.push('· 欠精校：对照源文件做一轮完整清噪和顺句，删除无意义口癖但保留事实、语气与对话体。')
+      if (hard.includes('residual_noise')) parts.push('· 残留噪音：只修审计标出的口癖、重复、断裂片段和 ASR 粘连，必要时对照源文件确认不改义。')
+      if (hard.includes('long_paragraphs')) parts.push('· 超长段落：在同一发言人内部按语义拆成 200–600 字左右的连贯段落，不得移动内容到其他发言人名下。')
       if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
       await engine.agent(
         `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
@@ -587,7 +594,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（缺口/压缩/结尾/说话人/引号 hard → 自动定点修复一次 → 复检；仍 hard 记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量 → 自动定点修复一次 → 复检；仍未过记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
@@ -614,6 +621,16 @@ if (scope.includes('refine') && pairsToAudit.length) {
     // "no direct audit capability" CC case (where the agent audit DID run). Only auditUnavailable qualifies.
     if (a.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
     if ((a.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: a.auditFailed })
+    const seamDuplicates = (r && r.seamDuplicates) || []
+    if (seamDuplicates.length) {
+      if (r && r.audit) {
+        r.audit.status = 'fail'
+        r.audit.hardFindings = [...new Set([...(r.audit.hardFindings || []), 'seam_duplicate'])]
+      }
+      const existing = auditFailed.find((x) => x.path === f.outPath)
+      if (existing) existing.findings = [...new Set([...(existing.findings || []), 'seam_duplicate'])]
+      else auditFailed.push({ path: f.outPath, findings: ['seam_duplicate'] })
+    }
   })
   if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
