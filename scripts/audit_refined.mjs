@@ -2664,6 +2664,16 @@ function derivMoneyAbsSpan(a) {
   return span ? { lo: span.lo * scale, hi: span.hi * scale } : null
 }
 
+// Decimal scale conversion is mathematically exact but not always binary-floating exact:
+// `1.03 * 1e9` can differ from `10.3 * 1e8` by about 1e-7. Treat that machine epsilon as overlap,
+// while keeping the tolerance far below the smallest editorially meaningful currency difference.
+function derivMoneySpansOverlap(a, b) {
+  if (!a || !b) return false
+  const magnitude = Math.max(1, Math.abs(a.lo), Math.abs(a.hi), Math.abs(b.lo), Math.abs(b.hi))
+  const epsilon = magnitude * 1e-12
+  return !(a.hi + epsilon < b.lo || b.hi + epsilon < a.lo)
+}
+
 // Unit-family fold for derivative matching: the transcript's spoken unit and the derivative's canonical unit are
 // the same quantity (源 “4000块” ⇄ 时间线 “4000 元”, “4 个小时” ⇄ “4 小时” — live FP class, 2026-07-14). The 月
 // family is deliberately NOT folded here: 个月 is a duration magnitude while bare 月 is a weak date unit
@@ -2683,7 +2693,7 @@ function derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) {
   const span = xfileValueSpan(a.value)
   if (span) for (const cs of corpusByUnit.get(derivUnitKey(a.unit)) || []) if (!(span.hi < cs.lo || cs.hi < span.lo)) return true
   const abs = derivMoneyAbsSpan(a)
-  if (abs) for (const cs of corpusMoneyAbs || []) if (!(abs.hi < cs.lo || cs.hi < abs.lo)) return true
+  if (abs) for (const cs of corpusMoneyAbs || []) if (derivMoneySpansOverlap(abs, cs)) return true
   if (corpusKeys.has(`${a.value}|`)) return true
   return false
 }
@@ -2714,7 +2724,7 @@ function derivAtomsEquivalent(a, b) {
   const as = xfileValueSpan(a.value), bs = xfileValueSpan(b.value)
   if (as && bs && au === bu && !(as.hi < bs.lo || bs.hi < as.lo)) return true
   const aa = derivMoneyAbsSpan(a), ba = derivMoneyAbsSpan(b)
-  if (aa && ba && !(aa.hi < ba.lo || ba.hi < aa.lo)) return true
+  if (aa && ba && derivMoneySpansOverlap(aa, ba)) return true
   // Preserve the existing spoken-unit escape hatch: an exact bare corpus value may support a canonical unit.
   return b.unit === '' && a.value === b.value
 }

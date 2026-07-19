@@ -284,6 +284,17 @@ test('stitchParts collapses an exact-duplicate heading straddling a seam', () =>
   assert.ok(merged.includes('李明：上。') && merged.includes('王某：下。'))
 })
 
+test('stitchParts collapses typography-only duplicate H2 sections and an exact replayed turn', () => {
+  const question = '小君：你对 2026 年的 agent 发展还会有什么预期吗？年初 OpenClaw 已经这么火了。'
+  const merged = stitchParts([
+    `## 2026 年 agent 的关键瓶颈：continual learning\n\n苏煜：关键在持续学习。\n\n${question}`,
+    `## 2026年agent的关键瓶颈：continual learning\n\n${question}\n\n苏煜：接下来会出现很多不同路线。`,
+  ])
+  assert.equal((merged.match(/关键瓶颈：continual learning/g) || []).length, 1, 'spacing-only duplicate heading is unified')
+  assert.equal((merged.match(/OpenClaw 已经这么火了/g) || []).length, 1, 'the exact seam replay is removed once')
+  assert.match(merged, /接下来会出现很多不同路线/, 'new substantive content remains')
+})
+
 test('stitchParts removes a high-confidence semantic duplicate at a chunk seam', () => {
   const repeated = '周砚：我们在东南亚先后设立了本地团队，并在中东建设区域中转仓，欧洲则通过跨境电商做小规模验证；这套路径的共同点是先验证需求，再逐步增加固定投入。'
   const paraphrase = '周砚：我们在东南亚先后设立本地团队，也在中东建设区域中转仓；欧洲主要通过跨境电商做小规模验证。这套路径共同点是先验证需求，再逐步增加固定投入。'

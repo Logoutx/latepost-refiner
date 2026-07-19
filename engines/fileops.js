@@ -88,7 +88,12 @@ function checkAccess(kind, filePath, policy) {
   const abs = path.resolve(String(filePath))
   const roots = kind === 'Read' ? p.readRoots : p.writeRoots
   const exact = kind === 'Read' ? uniq([...p.readPaths, ...p.writePaths]) : p.writePaths
-  if (!lexicalAllowed(abs, roots, exact)) {
+  // When writePaths is non-empty it is an allowlist, not merely an escape hatch beside writeRoots.
+  // Universal jobs use this to prevent a model from leaving scratch/test files in the production output tree.
+  const allowed = kind === 'Read'
+    ? lexicalAllowed(abs, roots, exact)
+    : (exact.length ? exact.includes(abs) : insideAnyRoot(abs, roots))
+  if (!allowed) {
     const hint = roots.concat(exact).join('；') || '（无）'
     return { ok: false, text: `${kind}: 路径不在允许范围内: ${abs}；允许范围: ${hint}` }
   }

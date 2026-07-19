@@ -881,12 +881,12 @@ test('derivative guard: a legitimate money-scale conversion (8000 万 ⇄ 0.8 �
 
 test('derivative guard: English million/billion amounts match equivalent Chinese 亿 amounts', () => {
   const corpus = [
-    '沈其安：A 轮是 1.23 billion USD，B 轮超过 860 million dollars。',
+    '沈其安：A 轮是 1.03 billion USD，追加轮是 1.23 billion USD，B 轮超过 860 million dollars。',
     '沈其安：另外两家公司分别是 $450 million 和 153m USD。',
   ].join('\n')
   const deriv = [
     '## 时间线',
-    '- **2023 年**【访谈】A 轮融资 12.3 亿美元。',
+    '- **2023 年**【访谈】A 轮融资 10.3 亿美元，追加轮融资 12.3 亿美元。',
     '- **2024 年**【访谈】B 轮融资超过 8.6 亿美元。',
     '- **2025 年**【访谈】另外两轮融资分别为 4.5 亿美元和 1.53 亿美元。',
   ].join('\n')

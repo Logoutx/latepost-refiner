@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { computeLogicAudit, prepareFile, runJob } from '../universal/jobs.js'
+import { buildFilePolicy, computeLogicAudit, prepareFile, runJob } from '../universal/jobs.js'
 import { computeExitCode } from '../universal/cli.js'
 import { timelineDeliverableName } from '../core/prompts.js'
 
@@ -40,6 +40,23 @@ test('prepareFile normalizes SRT sources before the model sees them', async () =
   assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(prepared), 'raw SRT timecode arrow is not sent to prompts')
   assert.ok(prepared.includes('发言人 1 00:00:01'))
   assert.ok(prepared.includes('我们 2026 年做了 3 次试验。'))
+})
+
+test('buildFilePolicy only allows this run\'s declared deliverable paths', () => {
+  const outputDir = tmpdir()
+  const refined = path.join(outputDir, 'Transcripts', 'A.md')
+  const policy = buildFilePolicy({
+    outputDir,
+    topic: '很长的访谈主题',
+    scope: ['refine', 'logic', 'summary', 'timeline'],
+    files: [{ title: 'A', path: '/source/A.md', outPath: refined }],
+  })
+  assert.ok(policy.writePaths.includes(refined))
+  assert.ok(policy.writePaths.includes(`${refined}.part1`))
+  assert.ok(policy.writePaths.includes(path.join(outputDir, '逻辑顺序', 'A.md')))
+  assert.ok(policy.writePaths.some((p) => p.endsWith('访谈总结.md')))
+  assert.ok(policy.writePaths.some((p) => p.endsWith('时间线.md')))
+  assert.ok(!policy.writePaths.some((p) => p.includes('test_quotes')))
 })
 
 function mockEngine() {
