@@ -856,6 +856,65 @@ function bigramDice(a, b) {
   return total ? (2 * overlap) / total : 0
 }
 
+function h2Key(line) {
+  const m = String(line || '').match(/^\s*##\s+(.+?)\s*$/)
+  if (!m) return null
+  return m[1].normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function proseRanges(lines, start, end) {
+  const out = []
+  let i = start
+  while (i < end) {
+    while (i < end && (!lines[i].trim() || /^\s*<!--/.test(lines[i]))) i += 1
+    if (i >= end || /^\s*#{1,6}\s+/.test(lines[i])) { i += 1; continue }
+    const from = i
+    while (i < end && lines[i].trim() && !/^\s*#{1,6}\s+/.test(lines[i])) i += 1
+    if (i > from) out.push({ start: from, end: i, text: lines.slice(from, i).join('\n') })
+  }
+  return out
+}
+
+// A chunked model sometimes reopens the same topic with typography-only differences
+// (`2026 年 agent` / `2026年agent`) or repeats the exact heading. When two consecutive H2 sections
+// normalize to the same key, keep one heading and all substantive content. If the boundary also replays the
+// exact same speaker paragraph, remove only that repeated copy. Different-speaker or paraphrased prose stays.
+export function collapseAdjacentDuplicateHeadings(text) {
+  const source = String(text || '')
+  const trailingNewline = /\n$/.test(source)
+  const lines = source.split(/\r?\n/)
+  const headings = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const key = h2Key(lines[i])
+    if (key) headings.push({ index: i, key })
+  }
+  const remove = new Set()
+  let removedHeadings = 0
+  let removedBlocks = 0
+  for (let i = 1; i < headings.length; i += 1) {
+    const prev = headings[i - 1]
+    const curr = headings[i]
+    if (!curr.key || curr.key !== prev.key) continue
+    remove.add(curr.index)
+    removedHeadings += 1
+
+    const before = proseRanges(lines, prev.index + 1, curr.index)
+    const nextHeading = headings[i + 1] ? headings[i + 1].index : lines.length
+    const after = proseRanges(lines, curr.index + 1, nextHeading)
+    const left = before.at(-1), right = after[0]
+    if (!left || !right) continue
+    const a = seamNorm(left.text), b = seamNorm(right.text)
+    const sa = seamSpeaker(left.text), sb = seamSpeaker(right.text)
+    if (a.length >= 20 && a === b && (!sa || !sb || sa === sb)) {
+      for (let n = right.start; n < right.end; n += 1) remove.add(n)
+      removedBlocks += 1
+    }
+  }
+  if (!remove.size) return { text: source, removedHeadings: 0, removedBlocks: 0 }
+  const result = lines.filter((_, i) => !remove.has(i)).join('\n').replace(/\n{3,}/g, '\n\n')
+  return { text: result.replace(/\s+$/, '') + (trailingNewline ? '\n' : ''), removedHeadings, removedBlocks }
+}
+
 export function isDuplicateSeamBlock(left, right) {
   const a = seamNorm(left), b = seamNorm(right)
   if (Math.min(a.length, b.length) < 60) return false
@@ -940,7 +999,14 @@ export function stitchPartsWithReport(texts) {
     if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return { text: `${out.replace(/\s+$/, '')}\n`, seamRepairs, seamDuplicates }
+  const headingRepair = collapseAdjacentDuplicateHeadings(`${out.replace(/\s+$/, '')}\n`)
+  return {
+    text: headingRepair.text,
+    seamRepairs,
+    seamDuplicates,
+    headingRepairs: headingRepair.removedHeadings,
+    headingReplayBlocksRemoved: headingRepair.removedBlocks,
+  }
 }
 
 export function stitchParts(texts) {

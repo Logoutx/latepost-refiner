@@ -57,7 +57,7 @@ docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.
 | 总结（可选） | 从精校稿生成分类要点、核心判断和金句，不以总结替代完整精校稿 | Opus | gpt-5.4（medium） | deepseek-v4-pro |
 | 时间线（可选） | 结合精校稿和公开资料，整理人物、公司、产品与事件的发展时间线 | Opus | gpt-5.4（high） | deepseek-v4-pro |
 
-可选的逻辑稿、总结和时间线只会在所有正文完成精校、定点修复并通过发布复检后生成。正文仍有硬问题时，主成稿和 `review.md` 照常交付，派生产物暂停，并在 `run.json` 的 `derivativesSkipped` 里说明原因。生成后，逻辑稿还会检查“假重排/漏来源”，总结和时间线会逐事实子句核对来源标签与数字归属；一份附件失败不会把已经通过的主成稿标成失败，`run.json.artifactQuality` 逐件记录 `ready / review_needed / blocked`。
+可选的逻辑稿、总结和时间线只会在所有正文完成精校、定点修复并通过发布复检后生成。正文仍有硬问题时，主成稿和 `review.md` 照常交付，派生产物暂停，并在 `run.json` 的 `derivativesSkipped` 里说明原因。生成后，逻辑稿还会检查“假重排/漏来源”，总结和时间线会逐事实子句核对来源标签与数字归属；金额审计识别 `1.03 billion = 10.3 亿` 等等值量级换算，不把浮点舍入误差当成炮制。一份附件失败不会把已经通过的主成稿标成失败，`run.json.artifactQuality` 逐件记录 `ready / review_needed / blocked`。Universal 模型只能写入本次声明的主稿、分块、逻辑稿、总结和时间线路径，不能在输出目录另建测试或临时文件。
 
 DeepSeek 版默认仍按上表使用 flash/pro。CLI 与 `runJob()` 只为受控测试提供显式阶段覆盖（`--models stage=model`）；未指定阶段沿用默认值，`run.json` 记录完整的实际阶段→模型路由和本次稀疏覆盖，避免配置与真实调用不一致。
 

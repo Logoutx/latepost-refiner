@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchPartsWithReport, parseTurns } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
@@ -120,13 +120,22 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   return { entry, hasHeadings, headingWarning }
 }
 
-export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [] }) {
+export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [], topic = '', scope = [] }) {
   const outDir = path.resolve(outputDir || process.cwd())
+  const writePaths = []
+  for (const f of files || []) {
+    if (!f || !f.outPath) continue
+    writePaths.push(f.outPath)
+    for (let i = 1; i <= MAX_REFINE_CHUNKS; i += 1) writePaths.push(partPath(f.outPath, i))
+    if (scope.includes('logic')) writePaths.push(path.join(outDir, '逻辑顺序', `${safeName(f.title)}.md`))
+  }
+  if (scope.includes('summary')) writePaths.push(path.join(outDir, summaryDeliverableName(topic)))
+  if (scope.includes('timeline')) writePaths.push(path.join(outDir, timelineDeliverableName(topic)))
   return {
     readRoots: [outDir, path.resolve(skillDir)],
     writeRoots: [outDir],
     readPaths: files.map((f) => f && f.path).filter(Boolean),
-    writePaths: files.map((f) => f && f.outPath).filter(Boolean),
+    writePaths,
   }
 }
 
@@ -431,7 +440,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
 
   // 3. engine: an injected engine (tests) or the DeepSeek engine. The web-search backend (Tavily) is set
   //    for the run from the top-level tavilyKey (client-side search on verify/timeline; absent → no-verify).
-  const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries })
+  const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries, topic, scope })
   const webTavily = tavilyKey
   const prevTavily = process.env.TAVILY_API_KEY
   if (webTavily) process.env.TAVILY_API_KEY = webTavily
@@ -483,6 +492,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // ghost_name / missing_yin checks, because on a first run the file isn't persisted until after the pipeline
     // returns, so reading it from disk would miss it. Fall back to the on-disk copy only when nothing was passed.
     runAudit: (f, opts = {}) => {
+      // Normalize a model-created duplicate topic boundary before any quality or derivative audit consumes it.
+      // This preserves all distinct prose and only removes a repeated H2 plus an optional exact replayed turn.
+      const before = fs.readFileSync(f.outPath, 'utf8')
+      const normalized = collapseAdjacentDuplicateHeadings(before)
+      if (normalized.text !== before) fs.writeFileSync(f.outPath, normalized.text, 'utf8')
       const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
       const res = auditPairs([{ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText }])
       const file = res.files[0]

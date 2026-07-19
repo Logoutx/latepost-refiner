@@ -39,6 +39,18 @@ test('file policy permits explicit source reads outside the output root', () => 
   assert.match(read.text, /source text/)
 })
 
+test('explicit write paths form an allowlist inside the output root', () => {
+  const base = tmpdir()
+  const root = path.join(base, 'out')
+  const deliverable = path.join(root, 'Transcripts', '访谈.md')
+  const scratch = path.join(root, 'Transcripts', 'test_quotes.md')
+  const policy = { readRoots: [root], writeRoots: [root], writePaths: [deliverable] }
+
+  assert.equal(writeFile({ file_path: deliverable, content: '正式产物\n' }, policy).ok, true)
+  assert.equal(writeFile({ file_path: scratch, content: '临时测试\n' }, policy).ok, false)
+  assert.equal(fs.existsSync(scratch), false)
+})
+
 test('file policy rejects symlink read/write/edit escapes from allowed roots', () => {
   const base = tmpdir()
   const root = path.join(base, 'out')
