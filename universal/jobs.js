@@ -9,8 +9,8 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchParts, parseTurns } from '../core/spec.js'
-import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
+import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchPartsWithReport, parseTurns } from '../core/spec.js'
+import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
@@ -195,7 +195,27 @@ export function computeDerivativeAudit(A, result) {
     const files = []
     for (const d of deliverables) {
       if (!fs.existsSync(d.path)) continue    // the deliverable agent did not write the expected file — skip (surfaced elsewhere)
-      files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind }))
+      files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind, glossaryText: result.glossary || '' }))
+    }
+    if (!files.length) return null
+    return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
+  } catch { return null }
+}
+
+// Universal parity with Codex-native: audit each produced logic稿 against the refined body it claims to reorder.
+// The deterministic checker blocks fake same-order copies and missing source-section provenance; size inflation and
+// duplicate paragraphs remain review-tier. Missing logic output is surfaced by the existing partial-delivery path,
+// not misreported as a quality failure for a file that does not exist.
+export function computeLogicAudit(A, result) {
+  try {
+    if (!(A.scope || []).includes('logic')) return null
+    const files = []
+    const entries = (result.logic || []).filter((l) => l && l.path)
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i]
+      const source = (A.files || []).find((f) => f.label === entry.label) || (A.files || [])[i]
+      if (!source || !source.outPath || !fs.existsSync(source.outPath) || !fs.existsSync(entry.path)) continue
+      files.push(auditLogicFile(source.outPath, entry.path))
     }
     if (!files.length) return null
     return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
@@ -510,11 +530,18 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     stitch: (f, chunks) => {
       const parts = (chunks || []).map((c) => partPath(f.outPath, c.idx))
       const texts = parts.map((p) => fs.readFileSync(p, 'utf8'))
-      const merged = stitchParts(texts)
+      const stitched = stitchPartsWithReport(texts)
+      const merged = stitched.text
       fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
       fs.writeFileSync(f.outPath, merged, 'utf8')
       for (const p of parts) { try { fs.rmSync(p, { force: true }) } catch { /* ignore */ } }
-      return { path: f.outPath, merged: parts.length, bytes: Buffer.byteLength(merged, 'utf8') }
+      return {
+        path: f.outPath,
+        merged: parts.length,
+        bytes: Buffer.byteLength(merged, 'utf8'),
+        seamRepairs: stitched.seamRepairs,
+        seamDuplicates: stitched.seamDuplicates,
+      }
     },
   }
 
@@ -557,6 +584,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       r.openQuestions = [...(r.openQuestions || []), `跨文件互证：${crossFileConflicts.length} 处同实体数值在不同文件里冲突（每份内部都合规）——请对照录音确认哪个是对的，详见 review.md「跨文件互证」`]
     }
 
+    const logicAudit = !r.error ? computeLogicAudit(A, r) : null
+    const logicFailed = logicAudit
+      ? logicAudit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file, findings: f.failed || [] }))
+      : []
+    if (logicFailed.length) notice(`⚠ 逻辑顺序稿审计未过 ${logicFailed.length} 份——见 review.md「逻辑顺序稿审计」`)
+
     // P1: audit the produced 时间线/总结 for fabricated 访谈-attributed figures. A hard fabrication joins
     // auditFailed (→ non-zero exit + review.md), exactly like any other hard finding; 待核/复核 items are soft.
     const derivativeAudit = !r.error ? computeDerivativeAudit(A, r) : null
@@ -574,7 +607,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
     const usage = sel.engine.usage()
-    const result = { ...r, audit, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

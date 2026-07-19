@@ -1,10 +1,17 @@
 # Refined Output Quality Fix Plan
 
-> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+> **本轮忠实性修复已实现，待合并与生产 canary**（2026-07-19；三 edition：Claude Code / Codex / DeepSeek API。本文早期章节保留为历史设计记录。）
 
 Date: 2026-06-23
 
-Status note: this plan was written from the pre-`7519636` audit state. Phase 1 landed on `main` with `speakerTurnRatio` intentionally changed to a confirming/reporting signal only, never an independent failure gate. This follow-up branch implements the Phase 2 hard detectors, Phase 5 repair loop, and no-shell checklist while preserving that metric behavior.
+Status note: this plan was written from the pre-`7519636` audit state. Phase 1 landed on `main` with `speakerTurnRatio` intentionally changed to a confirming/reporting signal only, never an independent failure gate. The 2026-07-19 fidelity branch preserves that calibration and closes the remaining contract gaps:
+
+- One shared publication-gate taxonomy now drives repair, derivative withholding, CLI exit, run scorecards, and installed-skill copies. Body fidelity (`content_gap`, `compression_risk`, `ending_missing`, `attribution_mismatch`, `seam_duplicate`) stays separate from output quality (`residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`) for diagnosis; both receive at most one repair/recheck.
+- Chunk stitching performs conservative seam dedup, an extended deterministic repair for long replays, then a residual scan. A residual blocks derivatives but never deletes the main transcript.
+- Timeline/summary attribution is clause-scoped, understands Chinese/English money-scale conversions and spoken endpoint→range compaction, and rejects a globally real amount reassigned to another glossary entity.
+- Logic drafts have their own post-generation audit. Same-order copies and missing refined-section provenance block only that logic artifact.
+- `run.json.artifactQuality` records independent status for every transcript, logic draft, summary, and timeline; run-level quality remains the conservative worst state.
+- Summary/timeline prompts require every factual clause—not merely every Markdown bullet—to carry its own source label.
 
 ## Commits Reviewed
 
@@ -265,10 +272,11 @@ Suggested model policy:
 
 ## Acceptance Criteria
 
-- The known Codex under-refined output fails audit.
-- The known Claude compressed output fails audit in `mode: "refine"`.
-- A clean refined transcript passes.
-- `npm test` covers all three cases.
-- `universal/jobs.js` and `universal/cli.js` both write audit results to `review.md` and `run.json`.
-- Codex installed skill can run its audit without relying on the repo worktree branch.
-- Final handoff cannot say “clean” while audit has `status: fail`.
+- [x] The known Codex under-refined output fails audit.
+- [x] The known Claude compressed output fails audit in `mode: "refine"`.
+- [x] A clean refined transcript passes.
+- [x] `npm test` covers the three baseline classes plus seam replay, speaker attribution, derivative money conversions/entity attribution, and fake logic reorder.
+- [x] `universal/jobs.js` and `universal/cli.js` write audit results to `review.md` and `run.json`.
+- [x] Codex installed skill can run its audit without relying on the repo worktree branch.
+- [x] Final handoff cannot say “clean” while a shared publication gate has `status: fail`; per-artifact status prevents unrelated files from being conflated.
+- [ ] Merge the fidelity branch into the Serper/Jina integration branch, deploy to the mac mini, and run a production canary before changing the production pin.

@@ -308,3 +308,23 @@ test('Codex native withholds every derivative prompt and ignores injected deriva
   assert.equal(guarded.timeline, null)
   assert.deepEqual(guarded.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
 })
+
+test('Codex native treats a reported residual chunk seam as a publication gate', () => {
+  const out = tmpdir()
+  const src = path.join(out, 'source.md')
+  fs.writeFileSync(src, sourceLines(), 'utf8')
+  const outPath = path.join(out, 'Transcripts', '示例访谈.md')
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, refinedDoc('示例访谈'), 'utf8')
+  const args = {
+    topic: '接缝测试', outputDir: out, skillDir: path.resolve('codex-skill/latepost-refiner'),
+    scope: ['refine', 'summary'], verifyDepth: 'none',
+    files: [{ path: src, label: '示例访谈', title: '示例访谈', lines: 16, chars: 24000, outPath }],
+  }
+  const entry = { label: '示例访谈', path: outPath, outPath, seamDuplicates: [{ seam: 1, repeatedBlocks: 2 }] }
+  const state = { refined: [entry], resultSeed: { refined: [entry], openQuestions: [] } }
+  const deliver = deliverPrompts(args, state)
+  assert.equal(deliver.bodyGate.status, 'fail')
+  assert.ok(deliver.bodyGate.files[0].failed.includes('seam_duplicate'))
+  assert.deepEqual(deliver.prompts, [])
+})

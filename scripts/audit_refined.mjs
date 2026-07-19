@@ -2165,7 +2165,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   // qualifiers). All-soft; SOFT findings never enter failed[] this pass (see below).
   const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText) : null
   // M6 attribution tier: speaker-misattribution via a self-calibrated majority map. refine mode only (a summary /
-  // timeline / logic draft has no per-turn labels to defend). SOFT only.
+  // timeline / logic draft has no per-turn labels to defend). Calibrated mismatches are hard; ambiguous cases soft.
   const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText) : null
   // M7 quote-integrity guard: manufactured-quote detection. refine mode only, SOFT. Reliably quiet on faithful
   // quotes (verified on real pairs), so it is default-on.
@@ -2186,8 +2186,8 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...(numericConsistency ? { numericConsistency: { conflicts: numericConsistency.conflicts.length } } : {}),
   }
 
-  // Editorial deterministic checks (typesetting + glossary residue). quote_style is HARD → it opens its own
-  // gate; the rest are soft findings only. ghost_name/missing_yin need a glossary — parsed leniently here.
+  // Editorial deterministic checks (typesetting + glossary residue). quote_style opens a publication gate;
+  // ghost_name/missing_yin and label-style observations remain review-tier and need a glossary parsed here.
   const glossary = parseGlossaryLite(glossaryText)
   const quoteFindings = checkQuoteStyle(refinedText)
   const speakerFindings = checkSpeakerLabelStyle(refinedText)
@@ -2588,7 +2588,11 @@ const DERIV_MAGNITUDE_UNITS = ['平方公里', '平方千米', '立方米', '平
 // across scales (8000 万 ⇄ 0.8 亿, both 8e7); comparing only value|unit keys would false-fail that conversion. So
 // a money atom ALSO matches when its absolute magnitude overlaps a same-family source amount. (元/美元 stay
 // key-matched — a currency's magnitude word is what converts, not the currency itself.)
-const DERIV_MONEY_SCALE = { 万: 1e4, 千万: 1e7, 亿: 1e8 }
+const DERIV_MONEY_SCALE = {
+  万: 1e4, 千万: 1e7, 亿: 1e8,
+  thousand: 1e3, million: 1e6, billion: 1e9, trillion: 1e12,
+  k: 1e3, mn: 1e6, m: 1e6, bn: 1e9,
+}
 
 // One derivative/corpus atom = { value, unit, idx, magnitude }. Base atoms come from extractNumberAtoms (money /
 // percent / duration / 万亿 / bare integer / year); a supplementary pass adds the mass/distance/… magnitudes it
@@ -2610,6 +2614,16 @@ function extractDerivativeAtoms(text) {
     if (!folded) continue
     supp.push({ value: folded.value, unit: folded.unit, idx: m.index ?? 0, magnitude: true })
   }
+  // English financial magnitudes are common in raw AI/VC transcripts: `1.23 billion`, `$860 million`,
+  // `450m USD`. The refined/timeline artifact legitimately rewrites them as 12.3 亿 / 8.6 亿 / 4.5 亿.
+  // Treat the English scale as a money-scale atom so derivMoneyAbsSpan can compare absolute amounts across
+  // languages. Requiring a scale word/suffix keeps ordinary bare English numbers out of this pass.
+  const EN_MONEY_RE = /(?:[$￥¥]\s*)?(\d+(?:\.\d+)?(?:\s*(?:[-~—－]|to)\s*\d+(?:\.\d+)?)?)\s*(thousand|million|billion|trillion|bn|mn|m|k)\b(?:\s*(?:usd|us\s*dollars?|dollars?))?/gi
+  for (const m of half.matchAll(EN_MONEY_RE)) {
+    const value = canonValue(m[1])
+    if (value == null) continue
+    supp.push({ value: String(value), unit: m[2].toLowerCase(), idx: m.index ?? 0, magnitude: true })
+  }
   const suppIdx = new Set(supp.map((a) => a.idx))
   return base.filter((a) => !suppIdx.has(a.idx)).concat(supp).sort((a, b) => a.idx - b.idx)
 }
@@ -2622,11 +2636,20 @@ function derivIsDateAtom(a) {
   return DERIV_WEAK_TIME.has(a.unit) || /(?:19|20)\d{2}/.test(String(a.value))
 }
 
-// The governing source label of ONE derivative line. 【公开…】 (incl. 【公开+访谈…】) → 'public': the public
-// component is a legitimate reason a figure is absent from the transcript, so it never hard-fails — it is a
-// reporter-verification item. A pure 【访谈】 (no 公开) → 'interview' (hard-fail eligible). Otherwise 'none'.
-function derivLineLabel(line) {
-  const inBrackets = String(line).match(/【[^】]*】/g) || []
+// The governing source label of ONE factual clause, not the whole Markdown line. A timeline bullet can contain an
+// interview fact followed by a public supplement; letting the first 【访谈】 label govern both is exactly how a
+// public valuation was misrepresented as interview evidence. Split on sentence/semicolon/em-dash boundaries and
+// inspect only the clause that contains this atom. A clause that carries no label stays review-tier (`none`).
+function derivClaimLabel(line, atomIdx) {
+  const s = String(line || '')
+  const boundaries = []
+  for (const m of s.matchAll(/[；;。！？!?]|\s*[—–]\s*/g)) boundaries.push({ start: m.index ?? 0, end: (m.index ?? 0) + m[0].length })
+  let start = 0, end = s.length
+  for (const b of boundaries) {
+    if (b.end <= atomIdx) { start = b.end; continue }
+    if (b.start > atomIdx) { end = b.start; break }
+  }
+  const inBrackets = s.slice(start, end).match(/【[^】]*】/g) || []
   const joined = inBrackets.join('')
   if (/公开/.test(joined)) return 'public'
   if (/访谈/.test(joined)) return 'interview'
@@ -2665,6 +2688,68 @@ function derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) {
   return false
 }
 
+// A derivative may compact two scalar alternatives into one range: source “100 刀或者 200 刀” → summary
+// “100 到 200 美元”. The range is supported only when BOTH scalar endpoints occur on the SAME corpus line and
+// are unit-compatible (or colloquial currency left them bare). Requiring co-location avoids blessing a range from
+// two unrelated numbers scattered across a long interview.
+function derivRangeEndpointMatch(a, corpusAtoms, corpusText) {
+  const span = xfileValueSpan(a.value)
+  if (!span || span.lo === span.hi) return { matched: false, atoms: [] }
+  const unit = derivUnitKey(a.unit)
+  const endpointCandidates = (value) => (corpusAtoms || []).filter((b) => {
+    const bs = xfileValueSpan(b.value)
+    if (!bs || bs.lo !== bs.hi || bs.lo !== value) return false
+    const bu = derivUnitKey(b.unit)
+    return !b.unit || bu === unit
+  })
+  const lows = endpointCandidates(span.lo), highs = endpointCandidates(span.hi)
+  for (const lo of lows) for (const hi of highs) {
+    if (lineAround(corpusText, lo.idx).offset === lineAround(corpusText, hi.idx).offset) return { matched: true, atoms: [lo, hi] }
+  }
+  return { matched: false, atoms: [] }
+}
+
+function derivAtomsEquivalent(a, b) {
+  const au = derivUnitKey(a.unit), bu = derivUnitKey(b.unit)
+  const as = xfileValueSpan(a.value), bs = xfileValueSpan(b.value)
+  if (as && bs && au === bu && !(as.hi < bs.lo || bs.hi < as.lo)) return true
+  const aa = derivMoneyAbsSpan(a), ba = derivMoneyAbsSpan(b)
+  if (aa && ba && !(aa.hi < ba.lo || ba.hi < aa.lo)) return true
+  // Preserve the existing spoken-unit escape hatch: an exact bare corpus value may support a canonical unit.
+  return b.unit === '' && a.value === b.value
+}
+
+function derivEntityGroups(glossaryText) {
+  const entries = parseGlossaryLite(glossaryText).entries || []
+  return entries.map((e) => ({ canonical: e.canonical, names: Array.from(new Set([e.canonical, ...(e.variants || [])].filter(Boolean))) }))
+}
+
+function lineAround(text, idx) {
+  const s = String(text || '')
+  const lo = s.lastIndexOf('\n', Math.max(0, idx - 1)) + 1
+  const nl = s.indexOf('\n', idx)
+  return { text: s.slice(lo, nl < 0 ? s.length : nl), offset: lo }
+}
+
+// Resolve the ONE glossary entity governing a numeric atom on its line. Multiple names from the SAME glossary
+// cluster (Roda / Rhoda AI) collapse to one canonical; two distinct nearby clusters are ambiguous and return null.
+function derivEntityNear(text, idx, groups) {
+  if (!groups || !groups.length) return null
+  const line = lineAround(text, idx)
+  const localIdx = idx - line.offset
+  const found = new Set()
+  for (const g of groups) {
+    for (const name of g.names) {
+      let p = 0
+      while ((p = line.text.indexOf(name, p)) >= 0) {
+        if (Math.abs(p - localIdx) <= 80) found.add(g.canonical)
+        p += Math.max(name.length, 1)
+      }
+    }
+  }
+  return found.size === 1 ? [...found][0] : null
+}
+
 // derivative_context_review (warning tier): an interview magnitude that PASSES the hard gate by matching the corpus
 // value+unit can still be a fabrication BUILT AROUND an unrelated corpus number of the same magnitude (corpus 融资 2
 // 亿 → derivative 亏损 2 亿【访谈】). This corroborates the LOCAL context: does the derivative line's own measured-
@@ -2690,12 +2775,13 @@ function derivContextCorroboration(derivNoun, corpusStr, occIdxs) {
 //   corpusText = source transcript(s) + refined 成稿 concatenated (the interview's ground-truth figures).
 //   derivativeText = the rendered 时间线 or 访谈总结.
 // Returns { assessed, hardFail[], reporterVerify[], review[] }. Pure and order-stable.
-export function checkDerivativeAttribution(corpusText, derivativeText) {
+export function checkDerivativeAttribution(corpusText, derivativeText, { glossaryText = null } = {}) {
   const empty = { assessed: false, hardFail: [], reporterVerify: [], review: [], contextReview: [] }
   const deriv = String(derivativeText || '')
   if (!deriv.trim()) return empty
   const corpusStr = String(corpusText || '')
   const corpusAtoms = extractDerivativeAtoms(corpusStr)
+  const entityGroups = derivEntityGroups(glossaryText)
   const corpusKeys = new Set(corpusAtoms.map((a) => `${a.value}|${derivUnitKey(a.unit)}`))
   const corpusValues = new Set(corpusAtoms.map((a) => a.value))
   // exact value+unit → the corpus offsets where that figure occurs (feeds the derivative_context_review windows).
@@ -2734,10 +2820,10 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
     const line = rawLine.replace(/^\s*(?:[-*+]|\d+[.)、])\s+/, '')
     const atoms = extractDerivativeAtoms(line)
     if (!atoms.length) continue
-    const label = derivLineLabel(rawLine)
     const snippet = rawLine.trim().slice(0, 80)
     for (const a of atoms) {
       if (derivIsDateAtom(a)) continue                     // dates / years / entry anchors are never flagged
+      const label = derivClaimLabel(line, a.idx)
       const unitLabel = a.unit ? `${a.value} ${a.unit}` : a.value
       if (label === 'public') {
         reporterVerify.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
@@ -2745,8 +2831,22 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
       }
       if (label === 'interview') {
         if (a.magnitude) {
-          if (!derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs)) {
-            if (canHardFail) hardFail.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet })
+          const endpointMatch = derivRangeEndpointMatch(a, corpusAtoms, corpusStr)
+          const magnitudeMatched = derivMagnitudeMatches(a, corpusKeys, corpusByUnit, corpusMoneyAbs) || endpointMatch.matched
+          const matchingCorpusAtoms = magnitudeMatched
+            ? [...corpusAtoms.filter((b) => derivAtomsEquivalent(a, b)), ...endpointMatch.atoms]
+            : []
+          const derivativeEntity = derivEntityNear(line, a.idx, entityGroups)
+          const corpusEntities = new Set(matchingCorpusAtoms.map((b) => derivEntityNear(corpusStr, b.idx, entityGroups)).filter(Boolean))
+          // If every matching occurrence is explicitly tied to another known entity, the figure exists globally but
+          // does NOT support this claim. An unscoped occurrence keeps the conservative old behaviour (no accusation).
+          const entityMismatch = !!(derivativeEntity && matchingCorpusAtoms.length && corpusEntities.size
+            && !corpusEntities.has(derivativeEntity)
+            && matchingCorpusAtoms.every((b) => derivEntityNear(corpusStr, b.idx, entityGroups)))
+          if (!magnitudeMatched || entityMismatch) {
+            if (canHardFail) hardFail.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet,
+              reason: entityMismatch ? 'entity_mismatch' : 'missing_value', entity: derivativeEntity || null,
+              corpusEntities: entityMismatch ? [...corpusEntities] : [] })
             else review.push({ line: li + 1, value: a.value, unit: a.unit, text: unitLabel, snippet, note: '访谈标注量纲数字，但无可比对语料（复核）' })
           } else if (corpusKeys.has(`${a.value}|${derivUnitKey(a.unit)}`)) {
             // Hard gate satisfied by an EXACT value+unit corpus match (range / scale overlaps are skipped — no single
@@ -2776,13 +2876,15 @@ export function checkDerivativeAttribution(corpusText, derivativeText) {
 
 // auditDerivative: wrap checkDerivativeAttribution into a file-result shaped like the rest of the audit
 // (status + findings[]), so callers wire it into pass/fail exactly as the other hard detectors.
-export function auditDerivative({ corpusText, derivativeText, kind = 'derivative', derivativeFile = '<derivative>' }) {
-  const r = checkDerivativeAttribution(corpusText, derivativeText)
+export function auditDerivative({ corpusText, derivativeText, kind = 'derivative', derivativeFile = '<derivative>', glossaryText = null }) {
+  const r = checkDerivativeAttribution(corpusText, derivativeText, { glossaryText })
   // P6: a 时间线/总结 can also contradict itself (same measured quantity, two numbers). Cheap, warning tier.
   const numericConflicts = checkNumericConsistency(derivativeText).conflicts
   const findings = [
     { name: 'derivative_attribution', severity: 'hard', count: r.hardFail.length,
-      samples: r.hardFail.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，标【访谈】但源文无此数字——疑炮制）`, line: x.line })) },
+      samples: r.hardFail.slice(0, 12).map((x) => ({ text: x.reason === 'entity_mismatch'
+        ? `${x.text}（第 ${x.line} 行，标【访谈】但该数字在语料中只归属于“${(x.corpusEntities || []).join('、')}”，不属于“${x.entity}”）`
+        : `${x.text}（第 ${x.line} 行，标【访谈】但源文无此数字——疑炮制）`, line: x.line })) },
     { name: 'derivative_reporter_verify', severity: 'soft', count: r.reporterVerify.length,
       samples: r.reporterVerify.slice(0, 12).map((x) => ({ text: `${x.text}（第 ${x.line} 行，公开来源·待记者核实）`, line: x.line })) },
     { name: 'derivative_review', severity: 'soft', count: r.review.length,
@@ -2797,12 +2899,12 @@ export function auditDerivative({ corpusText, derivativeText, kind = 'derivative
 
 // auditDerivativeFile: read the derivative + its interview corpus (source transcripts and/or refined 成稿) from
 // disk and run the guard. corpusPaths are normalised (SRT → turns) so an SRT source's figures still compare.
-export function auditDerivativeFile(derivativePath, corpusPaths = [], { kind = 'derivative' } = {}) {
+export function auditDerivativeFile(derivativePath, corpusPaths = [], { kind = 'derivative', glossaryText = null } = {}) {
   const derivativeText = fs.readFileSync(derivativePath, 'utf8')
   const corpusText = (corpusPaths || [])
     .map((p) => { try { return normalizeTranscriptSource(fs.readFileSync(p, 'utf8'), { sourceFile: p }) } catch { return '' } })
     .join('\n\n')
-  return auditDerivative({ corpusText, derivativeText, kind, derivativeFile: path.resolve(derivativePath) })
+  return auditDerivative({ corpusText, derivativeText, kind, derivativeFile: path.resolve(derivativePath), glossaryText })
 }
 
 function usage() {
@@ -2821,12 +2923,12 @@ function usage() {
                                                                   # （渲染不可见；引文可循此跳回源文件行号与录音时间；可与 --annotate 同用）
   node scripts/audit_refined.mjs --refined <精校稿> --fix-quotes  # 确定性修正正文可见区域的 ASCII/直角引号；代码、URL、链接不动
 
-输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就、因为因为/涂鸦涂鸦、重复年份、20182018/SaaSAPP 等纯噪音或 ASR 粘连；超约 900 字的对话长段。
+输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就、因为因为/涂鸦涂鸦、重复年份、20182018/SaaSAPP 等纯噪音或 ASR 粘连；超约 900 字的对话长段；中文旁 ASCII/直角引号。
 对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
   content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）、
-  quote_style（ASCII 直引号紧贴中文，或出现「」『』——排版规范明令禁止）。
+  attribution_mismatch（高置信度的发言内容落到另一位发言人名下）。
 soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失；
-  number_drift / hedge_loss（数字漂移 / 不确定语气被抹平）、attribution_mismatch（某轮内容落到了另一位发言人名下）、
+  number_drift / hedge_loss（数字漂移 / 不确定语气被抹平）、attribution_review（低置信度或多人场景下的说话人归属复核）、
   quote_fabrication_risk（引号内措辞源文中无对应——疑似炮制引语）、entity_substitution_risk（仅 --strict）、
   quote_density_low（长正文无弯引号）、speaker_label_style（标签风格混用）、ghost_name（残留错写变体）、
   missing_yin（未核实名裸写缺（音））、logic_order_unchanged / logic_section_coverage（逻辑稿假重排或漏来源，hard）、

@@ -52,7 +52,7 @@ Structure:
 # <主题> 时间线
 
 > 整理依据：<时间><对象>访谈，结合公开资料交叉校对。
-> 标注：【访谈】=访谈口述；【公开·待记者核实】=公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。每个数字/金额/规格都必须带其中一个标注。
+> 标注：【访谈】=访谈口述；【公开·待记者核实】=公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。每个事实子句及其中的数字/金额/规格都必须带自己的标注；一行混合访谈与公开信息时拆成分别标注的子句，不能用一个标签统管整行。
 
 ## 一句话背景
 
@@ -72,7 +72,7 @@ Rules:
 - If interview and public sources conflict, list both and note the divergence.
 - Do not force a resolution without evidence.
 - Mark not-found real names as `真名未公开`.
-- Source-label EVERY figure. Red line: a figure tagged 【访谈】 must actually appear in the refined 成稿 — never tag a public-source, industry-common, or self-computed/converted number as 【访谈】; when unsure, tag 【公开·待记者核实】. The deterministic audit compares every 访谈-tagged magnitude figure against the 成稿 and hard-fails a fabricated one.
+- Source-label every factual clause and figure. Red line: a figure tagged 【访谈】 must actually appear in the refined 成稿 — never tag a public-source, industry-common, or self-computed/converted number as 【访谈】; when unsure, tag 【公开·待记者核实】. If one bullet mixes an interview fact with a public valuation, split them into separately labelled clauses. The deterministic audit checks attribution clause by clause and hard-fails a fabricated or wrong-entity interview claim.
 
 ## Interview Summary
 
@@ -109,6 +109,6 @@ Structure:
 Rules:
 - Categorize by role/topic.
 - Every key point should carry a concrete fact where possible.
-- Source-label every figure: 【访谈】 (must come from the refined 成稿) or 【公开·待记者核实】 (public, reporter to verify). Never pass a public or self-computed number off as 【访谈】 — the deterministic audit checks each 访谈-tagged figure against the 成稿.
+- Source-label every factual clause and figure: 【访谈】 (must come from the refined 成稿) or 【公开·待记者核实】 (public, reporter to verify). Mixed-source bullets need separate labels per clause. Never pass a public or self-computed number off as 【访谈】 — the deterministic audit checks each clause and entity attribution against the 成稿.
 - Quotes must be faithful to the refined transcript.
 - Insights should show judgment, angle, and risk; do not merely restate the transcript.

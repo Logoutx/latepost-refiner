@@ -18,7 +18,7 @@ import {
 } from '../core/prompts.js'
 import {
   DEDUP_SCHEMA,
-  BODY_FIDELITY_GATES,
+  PUBLICATION_BLOCK_GATES,
   LOGIC_PLAN_SCHEMA,
   LOGIC_REPORT_SCHEMA,
   ONE_PASS_CHARS,
@@ -48,7 +48,7 @@ import {
   splitForRefine,
   splitForScout,
   mergeScoutChunks,
-  stitchParts,
+  stitchPartsWithReport,
   verifyChunks,
   weakDupFlags,
 } from '../core/spec.js'
@@ -667,7 +667,8 @@ export function afterRefine(args, state, refinedRaw) {
         continue
       }
       const texts = plan.partPaths.map((p) => fs.readFileSync(p, 'utf8'))
-      writeText(f.outPath, stitchParts(texts))
+      const stitched = stitchPartsWithReport(texts)
+      writeText(f.outPath, stitched.text)
       const reps = plan.partPaths.map((p, i) => reportFor(items, [p, `${f.label}#${i + 1}/${plan.partPaths.length}`])).filter(Boolean)
       refined.push({
         label: f.label,
@@ -677,6 +678,8 @@ export function afterRefine(args, state, refinedRaw) {
         key_fixes: reps.flatMap((r) => r.key_fixes || []),
         open_questions: reps.flatMap((r) => r.open_questions || []),
         chunked: plan.partPaths.length,
+        ...(stitched.seamRepairs.length ? { seamRepairs: stitched.seamRepairs } : {}),
+        ...(stitched.seamDuplicates.length ? { seamDuplicates: stitched.seamDuplicates } : {}),
         complete: null,
         checkNote: '结尾核对待跑',
       })
@@ -900,7 +903,11 @@ function auditNativeBodies(A, refined = []) {
     .map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText: glossaryTextForAudit(A) }))
   const audit = pairs.length ? auditPairs(pairs) : null
   const files = ((audit && audit.files) || []).map((f) => {
-    const failed = (f.failed || []).filter((kind) => BODY_FIDELITY_GATES.includes(kind))
+    const rr = refined.find((r) => path.resolve(refinedPathOf(r) || '') === path.resolve(f.file || f.refinedFile || ''))
+    const failed = [...new Set([
+      ...(f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind)),
+      ...((rr && (rr.seamDuplicates || []).length) ? ['seam_duplicate'] : []),
+    ])]
     return { file: f.file || f.refinedFile, status: failed.length ? 'fail' : 'ok', failed }
   })
   const status = missing.length || pairs.length !== A.files.length || files.some((f) => f.status === 'fail') ? 'fail' : 'ok'
@@ -947,7 +954,8 @@ function auditDerivativeOutputs(A, result) {
     const corpus = []
     for (const f of A.files || []) { for (const p of [f.path, f.outPath]) { if (p && fs.existsSync(p) && !corpus.includes(p)) corpus.push(p) } }
     const files = []
-    for (const d of deliverables) { if (fs.existsSync(d.path)) files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind })) }
+    const glossaryText = glossaryTextForAudit(A)
+    for (const d of deliverables) { if (fs.existsSync(d.path)) files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind, glossaryText })) }
     if (!files.length) return null
     return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
   } catch { return null }
@@ -970,8 +978,14 @@ export function auditNativeResult(args, result) {
     .filter(Boolean)
   const audit = pairs.length ? auditPairs(pairs) : null
   const auditFailed = audit
-    ? audit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file || f.refinedFile, findings: f.failed || [] }))
+    ? audit.files
+      .map((f) => ({ file: f, blocking: (f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind)) }))
+      .filter((x) => x.blocking.length)
+      .map(({ file, blocking }) => ({ path: file.file || file.refinedFile, findings: blocking }))
     : []
+  const seamFailed = refined
+    .filter((r) => (r.seamDuplicates || []).length)
+    .map((r) => ({ path: refinedPathOf(r), findings: ['seam_duplicate'] }))
   const annotations = [...(result.annotations || [])]
   const anchors = [...(result.anchors || [])]
   const refinedNext = refined.map((r) => ({ ...r }))
@@ -980,9 +994,11 @@ export function auditNativeResult(args, result) {
       const outPath = path.resolve(file.refinedFile || file.file || '')
       const rr = refinedNext.find((r) => path.resolve(refinedPathOf(r) || '') === outPath)
       if (rr) {
+        const seamHard = (rr.seamDuplicates || []).length ? ['seam_duplicate'] : []
+        const bodyHard = (file.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
         rr.audit = {
-          status: file.status,
-          hardFindings: file.failed || [],
+          status: bodyHard.length || seamHard.length ? 'fail' : 'ok',
+          hardFindings: [...new Set([...bodyHard, ...seamHard])],
           softFindings: (file.findings || []).filter((f) => f.severity !== 'hard' && f.count).map((f) => f.name),
           repaired: false,
           anchorsAdded: 0,
@@ -1017,7 +1033,13 @@ export function auditNativeResult(args, result) {
   const derivativeFailed = derivativeAudit
     ? derivativeAudit.files.filter((f) => (f.hardFail || []).length).map((f) => ({ path: f.file, findings: ['derivative_attribution'] }))
     : []
-  const auditFailedAll = [...auditFailed, ...derivativeFailed]
+  const failedByPath = new Map()
+  for (const item of [...auditFailed, ...seamFailed, ...derivativeFailed]) {
+    const p = item.path
+    if (!failedByPath.has(p)) failedByPath.set(p, { path: p, findings: [] })
+    failedByPath.get(p).findings.push(...(item.findings || []))
+  }
+  const auditFailedAll = [...failedByPath.values()].map((x) => ({ ...x, findings: [...new Set(x.findings)] }))
   const auditIncomplete = audit
     ? audit.files
       .filter((f) => (f.failed || []).includes('ending_missing'))

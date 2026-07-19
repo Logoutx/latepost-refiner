@@ -879,6 +879,76 @@ test('derivative guard: a legitimate money-scale conversion (8000 万 ⇄ 0.8 �
   assert.equal(bad.hardFail[0].value, '5')
 })
 
+test('derivative guard: English million/billion amounts match equivalent Chinese 亿 amounts', () => {
+  const corpus = [
+    '沈其安：A 轮是 1.23 billion USD，B 轮超过 860 million dollars。',
+    '沈其安：另外两家公司分别是 $450 million 和 153m USD。',
+  ].join('\n')
+  const deriv = [
+    '## 时间线',
+    '- **2023 年**【访谈】A 轮融资 12.3 亿美元。',
+    '- **2024 年**【访谈】B 轮融资超过 8.6 亿美元。',
+    '- **2025 年**【访谈】另外两轮融资分别为 4.5 亿美元和 1.53 亿美元。',
+  ].join('\n')
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.deepEqual(r.hardFail, [], 'cross-language money-scale conversions are equivalent, not fabricated figures')
+})
+
+test('derivative guard: a compacted money range is supported by two same-line spoken endpoints', () => {
+  const source = 'Henry：Codex 每个月 20 刀能用饱，Anthropic 可能至少是 100 刀或者 200 刀。'
+  const supported = checkDerivativeAttribution(source, '- 价格差距：Anthropic 同等用量需 100 到 200 美元【访谈】。')
+  assert.equal(supported.hardFail.length, 0, '100/200 on one source line supports the compacted 100-200 range')
+
+  const unrelated = checkDerivativeAttribution('甲：预算是 100。\n乙：另外一项指标是 200。', '- 预算为 100 到 200 美元【访谈】。')
+  assert.equal(unrelated.hardFail.length, 1, 'two unrelated endpoints on separate lines do not fabricate a range')
+})
+
+test('derivative guard: source labels govern factual clauses instead of leaking across a mixed-source line', () => {
+  const corpus = '沈其安：Roda 本轮融资 450 million USD。'
+  const deriv = '## 时间线\n- **2025 年**Roda 融资 4.5 亿美元【访谈】；公开报道的投后估值为 17 亿美元。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.deepEqual(r.hardFail, [], 'the first clause interview label cannot mislabel a later public clause')
+  assert.deepEqual(r.review.map((x) => x.value), ['17'], 'the unlabeled public valuation is still surfaced for correction')
+
+  const wronglyLabeled = auditDerivative({
+    corpusText: corpus,
+    derivativeText: '## 时间线\n- **2025 年**Roda 融资 4.5 亿美元【访谈】；投后估值为 17 亿美元【访谈】。',
+    kind: 'timeline',
+  })
+  assert.equal(wronglyLabeled.status, 'fail')
+  assert.deepEqual(wronglyLabeled.hardFail.map((x) => x.value), ['17'], 'an explicit wrong interview label on the public clause remains blocking')
+})
+
+test('derivative guard: a globally present amount cannot be reassigned to another glossary entity', () => {
+  const glossary = [
+    '## 品牌 / 公司 / 产品（写法 → 统一）',
+    '- **远山物流** ← 远山 ｜ 物流公司',
+    '- **青峰货运** ← 青峰 ｜ 货运公司',
+  ].join('\n')
+  const corpus = '沈其安：青峰货运完成融资 2 亿元。'
+  const wrong = auditDerivative({
+    corpusText: corpus,
+    derivativeText: '## 时间线\n- 远山物流完成融资 2 亿元【访谈】。',
+    kind: 'timeline',
+    glossaryText: glossary,
+  })
+  assert.equal(wrong.status, 'fail')
+  assert.equal(wrong.hardFail[0].reason, 'entity_mismatch')
+  assert.equal(wrong.hardFail[0].entity, '远山物流')
+  assert.deepEqual(wrong.hardFail[0].corpusEntities, ['青峰货运'])
+
+  const alias = auditDerivative({
+    corpusText: '沈其安：远山完成融资 2 亿元。',
+    derivativeText: '## 时间线\n- 远山物流完成融资 2 亿元【访谈】。',
+    kind: 'timeline',
+    glossaryText: glossary,
+  })
+  assert.equal(alias.status, 'ok', 'a source variant and its canonical belong to the same entity cluster')
+  assert.deepEqual(alias.hardFail, [])
+})
+
 // ---------- P1 (Finding 1): derivative_context_review — a passed magnitude with no local corroboration ----------
 
 test('derivative_context_review: a 访谈 magnitude that matches a corpus value+unit but under a DIFFERENT noun → SOFT 复核, no hard fail', () => {
