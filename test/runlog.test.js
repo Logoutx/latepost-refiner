@@ -45,19 +45,21 @@ test('buildRunLogEntry: shape from a fake result (all fields, worked-example cos
   // (800*0.14 + 200*0.0028 + 500*0.87) / 1e6 = (112 + 0.56 + 435) / 1e6 = 0.000548
   assert.deepEqual(entry.estCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
+  assert.deepEqual(entry.readerEstCost, { value: 0, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
   assert.deepEqual(entry.totalEstCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.equal(entry.auditStatus, 'ok')
   assert.equal(entry.outputDir, '/out/虚构示例项目')
 })
 
-test('buildRunLogEntry adds Serper billed-search cost without changing estCost semantics', () => {
+test('buildRunLogEntry separates DeepSeek, Serper, and Jina estimated costs', () => {
   const models = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
   const result = { usage: { input: 1000, output: 500 }, durationMs: 1 }
-  const webTelemetry = { searchBilled: 7 }
+  const webTelemetry = { searchBilled: 7, fetchJinaTokens: 608025, fetchJinaUsageMissing: 0 }
   const entry = buildRunLogEntry({ params: {}, result, provider: 'deepseek', models, webTelemetry })
   assert.equal(entry.estCost.value, 0.000575)
   assert.deepEqual(entry.searchEstCost, { value: 0.007, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
-  assert.equal(entry.totalEstCost.value, 0.007575)
+  assert.deepEqual(entry.readerEstCost, { value: 0.03040125, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
+  assert.equal(entry.totalEstCost.value, 0.03797625)
   assert.deepEqual(entry.webTelemetry, webTelemetry)
 })
 
@@ -178,7 +180,7 @@ test('appendRunLog: defaults to ~/.config/latepost-refiner/runs.jsonl when no lo
 
 function mockEngine() {
   const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
-  const webTelemetry = { searchCalls: 1, searchAttempts: 1, searchBilled: 1, searchCacheHits: 0, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 0, fetchCacheHits: 0, fetchJinaAttempts: 0, fetchJinaSuccess: 0, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
+  const webTelemetry = { searchCalls: 1, searchAttempts: 1, searchBilled: 1, searchCacheHits: 0, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 0, fetchCacheHits: 0, fetchJinaAttempts: 0, fetchJinaSuccess: 0, fetchJinaTokens: 0, fetchJinaUsageMissing: 0, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
   return {
     phase() {},
     log() {},

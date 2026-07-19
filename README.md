@@ -83,7 +83,7 @@ universal/           命令行 + 网页 + 单文件 App（DeepSeek 版）
 
 **改了逻辑**：改 `core/*`，跑 `node build/build-cc.mjs`，别手改 `workflow.js`（build 产物，下次 build 会覆盖）。
 
-DeepSeek 版每个任务最多发起 100 个去重后的搜索请求；同一查询和网页会在任务内缓存。`run.json` 记录搜索/抓取次数、缓存命中、失败与实际计费请求数；运行日志把模型估算成本与 Serper 搜索估算成本分开记录。
+DeepSeek 版每个任务最多发起 100 个去重后的搜索请求；同一查询和网页会在任务内缓存。`run.json` 记录搜索/抓取次数、缓存命中、失败、Serper 实际计费请求数，以及 Jina Reader 响应头回报的 token 总量；若某次成功响应缺少 `x-usage-tokens`，会单独计数而不静默当成零。运行日志把模型、Serper 搜索和 Jina Reader 三项估算成本分开记录；Jina 按 `$50 / 10 亿 token`（即 `$0.05 / 百万 token`）估算。
 
 在启用 Clash fake-IP 的机器上，系统 DNS 可能只返回 `198.18.0.0/15` 的保留地址。网页抓取仅在某个主机名的全部系统 DNS 结果都落入该网段时，才会向 Google Public DNS 的 DNS-over-HTTPS 接口查询真实 A/AAAA 地址并继续 SSRF 校验；普通私网地址、私网与公网混合结果仍直接拒绝，DoH 查询失败也不会放宽校验。此兼容路径会把待抓取网页的主机名发送给 Google。
 

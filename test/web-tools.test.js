@@ -106,7 +106,7 @@ test('web_fetch requires search allow-set, uses Jina with markdown/auth, truncat
   const fetchImpl = async (url, init) => {
     calls.push({ url, init })
     if (url.includes('google.serper.dev')) return response({ json: { organic: [{ title: 'A', link: 'https://example.com/page#section', snippet: 's' }] } })
-    return response({ text: '正文'.repeat(5000) })
+    return response({ text: '正文'.repeat(5000), headers: { 'x-usage-tokens': '1234' } })
   }
   const rt = makeWebRuntime({ searchApiKey: 's', readerApiKey: 'j', fetchImpl, dnsLookup: publicDns })
   assert.match(await rt.fetch('https://example.com/page'), /allow-set/)
@@ -125,6 +125,8 @@ test('web_fetch requires search allow-set, uses Jina with markdown/auth, truncat
   assert.equal(t.fetchCacheHits, 1)
   assert.equal(t.fetchJinaAttempts, 1)
   assert.equal(t.fetchJinaSuccess, 1)
+  assert.equal(t.fetchJinaTokens, 1234)
+  assert.equal(t.fetchJinaUsageMissing, 0)
 })
 
 test('Jina failure falls back once to local fetch; failures are not cached', async () => {
@@ -162,7 +164,7 @@ test('Jina HTTP-200 wrapper for an origin error falls back instead of becoming m
       'Warning: Target URL returned error 404: Not Found',
       '',
       'Markdown Content:',
-    ].join('\n') }),
+    ].join('\n'), headers: { 'x-usage-tokens': '77' } }),
     dnsLookup: publicDns,
     localFetchFn: async () => { local++; return '本地正文' },
   })
@@ -180,10 +182,26 @@ test('Jina HTTP-200 wrapper for an origin error falls back instead of becoming m
     fetchCacheHits: 0,
     fetchJinaAttempts: 1,
     fetchJinaSuccess: 0,
+    fetchJinaTokens: 77,
+    fetchJinaUsageMissing: 0,
     fetchLocalAttempts: 1,
     fetchLocalSuccess: 1,
     fetchFailures: 0,
   })
+})
+
+test('Jina 2xx without a valid usage header is visible as an accounting gap', async () => {
+  const rt = makeWebRuntime({
+    searchFn: async () => [{ title: 'A', url: 'https://example.com/a', snippet: '' }],
+    fetchImpl: async () => response({ text: 'Reader 正文', headers: { 'x-usage-tokens': 'unknown' } }),
+    dnsLookup: publicDns,
+  })
+  await rt.search('q')
+  assert.match(await rt.fetch('https://example.com/a'), /Reader 正文/)
+  const t = rt.telemetry()
+  assert.equal(t.fetchJinaSuccess, 1)
+  assert.equal(t.fetchJinaTokens, 0)
+  assert.equal(t.fetchJinaUsageMissing, 1)
 })
 
 test('Clash fake-IP DNS uses trusted DoH for SSRF validation without allowing reserved addresses', async () => {

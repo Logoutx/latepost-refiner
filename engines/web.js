@@ -12,7 +12,8 @@ export const JINA_READER_PREFIX = 'https://r.jina.ai/'
 export const DOH_ENDPOINT = 'https://dns.google/resolve'
 export const WEB_TELEMETRY_FIELDS = Object.freeze([
   'searchCalls', 'searchAttempts', 'searchBilled', 'searchCacheHits', 'searchBudgetRejected', 'searchFailures',
-  'fetchCalls', 'fetchCacheHits', 'fetchJinaAttempts', 'fetchJinaSuccess', 'fetchLocalAttempts', 'fetchLocalSuccess', 'fetchFailures',
+  'fetchCalls', 'fetchCacheHits', 'fetchJinaAttempts', 'fetchJinaSuccess', 'fetchJinaTokens', 'fetchJinaUsageMissing',
+  'fetchLocalAttempts', 'fetchLocalSuccess', 'fetchFailures',
 ])
 
 const SEARCH_TIMEOUT_MS = 15_000
@@ -298,6 +299,19 @@ export function makeWebRuntime(opts = {}) {
     if (readerApiKey) headers.Authorization = `Bearer ${readerApiKey}`
     const res = await fetchWithTimeout(fetchImpl, `${JINA_READER_PREFIX}${canonical}`, { method: 'GET', headers }, FETCH_TIMEOUT_MS)
     if (!res.ok) throw new Error(`Jina Reader HTTP ${res.status}`)
+    const usageRaw = res.headers && typeof res.headers.get === 'function'
+      ? res.headers.get('x-usage-tokens')
+      : null
+    if (usageRaw != null && /^\d+$/.test(String(usageRaw).trim())) {
+      const usageTokens = Number(String(usageRaw).trim())
+      if (Number.isSafeInteger(usageTokens)) stats.fetchJinaTokens += usageTokens
+      else stats.fetchJinaUsageMissing += 1
+    } else {
+      // A 2xx Reader response may still omit usage metadata (for example on an
+      // anonymous/legacy route). Keep the successful content, but make the
+      // accounting gap explicit instead of silently pricing it as zero.
+      stats.fetchJinaUsageMissing += 1
+    }
     const text = await res.text()
     if (!text.trim()) throw new Error('Jina Reader 返回空正文')
     // Reader may wrap an origin 4xx/5xx in its own HTTP 200 response. Treat that

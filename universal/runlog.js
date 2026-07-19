@@ -27,6 +27,7 @@ export const PRICES = {
 }
 
 const round6 = (n) => Math.round(n * 1e6) / 1e6 // 6dp — sub-cent runs would otherwise show as 0
+const round8 = (n) => Math.round(n * 1e8) / 1e8 // Jina can be below $0.000001 on a short page
 const round1 = (n) => Math.round(n * 10) / 10
 
 const deepseekPrice = (modelId) => (PRICES.deepseek && PRICES.deepseek[modelId]) || null
@@ -106,9 +107,18 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
   const estCost = estimateCost(provider, models, usage)
   const searchBilled = (webTelemetry && webTelemetry.searchBilled) || 0
   const searchEstCost = { value: round6(searchBilled / 1000), currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' }
+  const readerTokens = (webTelemetry && webTelemetry.fetchJinaTokens) || 0
+  const readerMissing = (webTelemetry && webTelemetry.fetchJinaUsageMissing) || 0
+  const readerEstCost = {
+    value: round8(readerTokens * 0.05 / 1e6),
+    currency: 'USD',
+    note: `Jina Reader estimate: $50 / 1B tokens${readerMissing ? `; ${readerMissing} response(s) missing x-usage-tokens` : ''}`,
+  }
   const totalEstCost = estCost
-    ? { value: round6(estCost.value + searchEstCost.value), currency: 'USD', note: estCost.note }
-    : (searchBilled ? { ...searchEstCost } : null)
+    ? { value: round8(estCost.value + searchEstCost.value + readerEstCost.value), currency: 'USD', note: estCost.note }
+    : ((searchBilled || readerTokens) ? {
+        value: round8(searchEstCost.value + readerEstCost.value), currency: 'USD', note: null,
+      } : null)
 
   return {
     finishedAt: result.finishedAt || new Date().toISOString(),
@@ -123,6 +133,7 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     usage,
     estCost,
     searchEstCost,
+    readerEstCost,
     totalEstCost,
     webTelemetry: webTelemetry || null,
     auditStatus,
