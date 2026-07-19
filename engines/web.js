@@ -16,7 +16,7 @@ export const WEB_TELEMETRY_FIELDS = Object.freeze([
 ])
 
 const SEARCH_TIMEOUT_MS = 15_000
-const FETCH_TIMEOUT_MS = 20_000
+const FETCH_TIMEOUT_MS = 15_000
 const MAX_FETCH_CHARS = 8_000
 const MAX_LOCAL_BYTES = 2 * 1024 * 1024
 const MAX_REDIRECTS = 5
@@ -300,6 +300,11 @@ export function makeWebRuntime(opts = {}) {
     if (!res.ok) throw new Error(`Jina Reader HTTP ${res.status}`)
     const text = await res.text()
     if (!text.trim()) throw new Error('Jina Reader 返回空正文')
+    // Reader may wrap an origin 4xx/5xx in its own HTTP 200 response. Treat that
+    // wrapper as a failed read so the guarded local fetch can preserve origin semantics.
+    if (/^Warning:\s*Target URL returned error [45]\d\d\b/im.test(text)) {
+      throw new Error('Jina Reader 目标页返回 HTTP 错误')
+    }
     stats.fetchJinaSuccess += 1
     return text
   }

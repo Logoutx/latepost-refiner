@@ -150,6 +150,42 @@ test('Jina failure falls back once to local fetch; failures are not cached', asy
   assert.equal(empty, 2, 'failed fetch is not cached')
 })
 
+test('Jina HTTP-200 wrapper for an origin error falls back instead of becoming model content', async () => {
+  let local = 0
+  const rt = makeWebRuntime({
+    searchFn: async () => [{ title: 'missing', url: 'https://example.com/missing', snippet: '' }],
+    fetchImpl: async () => response({ text: [
+      'Title:',
+      '',
+      'URL Source: https://example.com/missing',
+      '',
+      'Warning: Target URL returned error 404: Not Found',
+      '',
+      'Markdown Content:',
+    ].join('\n') }),
+    dnsLookup: publicDns,
+    localFetchFn: async () => { local++; return '本地正文' },
+  })
+  await rt.search('missing')
+  assert.match(await rt.fetch('https://example.com/missing'), /本地正文/)
+  assert.equal(local, 1)
+  assert.deepEqual(rt.telemetry(), {
+    searchCalls: 1,
+    searchAttempts: 0,
+    searchBilled: 0,
+    searchCacheHits: 0,
+    searchBudgetRejected: 0,
+    searchFailures: 0,
+    fetchCalls: 1,
+    fetchCacheHits: 0,
+    fetchJinaAttempts: 1,
+    fetchJinaSuccess: 0,
+    fetchLocalAttempts: 1,
+    fetchLocalSuccess: 1,
+    fetchFailures: 0,
+  })
+})
+
 test('Clash fake-IP DNS uses trusted DoH for SSRF validation without allowing reserved addresses', async () => {
   let dohCalls = 0
   let jinaCalls = 0
