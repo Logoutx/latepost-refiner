@@ -9,12 +9,13 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, MAX_REFINE_CHUNKS, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
+import { makeRunTrace } from './trace.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -123,10 +124,11 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
 export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [], topic = '', scope = [] }) {
   const outDir = path.resolve(outputDir || process.cwd())
   const writePaths = []
+  const writePartBases = []
   for (const f of files || []) {
     if (!f || !f.outPath) continue
     writePaths.push(f.outPath)
-    for (let i = 1; i <= MAX_REFINE_CHUNKS; i += 1) writePaths.push(partPath(f.outPath, i))
+    writePartBases.push(f.outPath)
     if (scope.includes('logic')) writePaths.push(path.join(outDir, '逻辑顺序', `${safeName(f.title)}.md`))
   }
   if (scope.includes('summary')) writePaths.push(path.join(outDir, summaryDeliverableName(topic)))
@@ -136,13 +138,14 @@ export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files
     writeRoots: [outDir],
     readPaths: files.map((f) => f && f.path).filter(Boolean),
     writePaths,
+    writePartBases,
   }
 }
 
 // Build the DeepSeek engine — the only API provider the Universal edition supports. apiKey (if given)
 // overrides the env lookup: the web UI passes the key the user typed; the CLI passes nothing and falls
 // back to DEEPSEEK_API_KEY. Endpoint and the flash/pro model split are fixed inside makeDeepSeekEngine.
-export function selectEngine({ concurrency, apiKey, serperKey, jinaKey, filePolicy, env = process.env, onPhase, onLog, searchFn, fetchImpl, localFetchFn, dnsLookup } = {}) {
+export function selectEngine({ concurrency, apiKey, serperKey, jinaKey, filePolicy, env = process.env, onPhase, onLog, onToolEvent, onAgentEvent, searchFn, fetchImpl, localFetchFn, dnsLookup } = {}) {
   const key = apiKey || env.DEEPSEEK_API_KEY
   if (!key) throw new Error('未设 DEEPSEEK_API_KEY（DeepSeek 的 API key）')
   return {
@@ -151,20 +154,28 @@ export function selectEngine({ concurrency, apiKey, serperKey, jinaKey, filePoli
       apiKey: key,
       searchApiKey: serperKey || env.SERPER_API_KEY,
       readerApiKey: jinaKey || env.JINA_API_KEY,
-      concurrency, filePolicy, onPhase, onLog, searchFn, fetchImpl, localFetchFn, dnsLookup,
+      concurrency, filePolicy, onPhase, onLog, onToolEvent, onAgentEvent, searchFn, fetchImpl, localFetchFn, dnsLookup,
     }),
     info: { label: 'DeepSeek', baseURL: DEEPSEEK_BASE_URL, keyVar: 'DEEPSEEK_API_KEY' },
   }
 }
 
-// Remove the <outPath>.partN intermediate files left by chunked refine (the stitch agent merged them
-// into outPath). Deterministic by index — no globbing. Safe to call when no chunking happened.
-export function cleanupRefineParts(fileEntries) {
-  for (const f of fileEntries || []) {
-    if (!f || !f.outPath) continue
-    for (let i = 1; i <= MAX_REFINE_CHUNKS; i += 1) {
-      try { fs.rmSync(partPath(f.outPath, i), { force: true }) } catch { /* ignore */ }
-    }
+// Merge exactly the planned parts and delete them only after the final body has been written. Any missing
+// or unreadable part throws before deletion, preserving the successful chunks as failure evidence/recovery input.
+export function stitchRefineParts(f, chunks) {
+  const parts = (chunks || []).map((c) => partPath(f.outPath, c.idx))
+  const texts = parts.map((p) => fs.readFileSync(p, 'utf8'))
+  const stitched = stitchPartsWithReport(texts)
+  const merged = stitched.text
+  fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+  fs.writeFileSync(f.outPath, merged, 'utf8')
+  for (const p of parts) { try { fs.rmSync(p, { force: true }) } catch { /* ignore */ } }
+  return {
+    path: f.outPath,
+    merged: parts.length,
+    bytes: Buffer.byteLength(merged, 'utf8'),
+    seamRepairs: stitched.seamRepairs,
+    seamDuplicates: stitched.seamDuplicates,
   }
 }
 
@@ -411,6 +422,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const effectiveModels = resolveDeepSeekRouting(stageModels)
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
+  const trace = makeRunTrace(outDir)
+  const heartbeat = setInterval(() => trace.heartbeat(), 15000)
+  heartbeat.unref?.()
+  let traceClosed = false
+  try {
   const uploadDir = path.join(outDir, '.uploads')
   const convertedDir = path.join(outDir, '.converted')
   const resolvedSkillDir = skillDir ? path.resolve(skillDir) : resolveSkillDir()
@@ -451,7 +467,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   else {
     try {
       sel = selectEngine({
-        concurrency, apiKey, serperKey, jinaKey, filePolicy, onPhase, onLog,
+        concurrency, apiKey, serperKey, jinaKey, filePolicy,
+        onPhase: (title) => { trace.stage(title); if (onPhase) onPhase(title) },
+        onLog,
+        onToolEvent: (event) => trace.tool(event),
+        onAgentEvent: (event) => trace.agent(event),
         searchFn: params.searchFn, fetchImpl: params.fetchImpl, localFetchFn: params.localFetchFn, dnsLookup: params.dnsLookup,
       })
     } catch (e) {
@@ -514,7 +534,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const model = stageModels.repair || stageModels.refine || 'opus'
       const before = fs.readFileSync(f.outPath, 'utf8')
       const response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, 1), {
-        label: `repair:${f.label || path.basename(f.outPath)}`, phase: 'Audit', model,
+        label: `repair:${f.label || path.basename(f.outPath)}`, phase: 'Audit', model, outputPath: f.outPath,
       })
       let after = fs.readFileSync(f.outPath, 'utf8')
       let deterministicQuoteFix = false
@@ -544,24 +564,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     // stitchParts() (one blank line between parts, exact-dup seam heading collapsed) — no stitch subagent, so
     // no per-response output cap and no paraphrase risk on a long transcript. The Workflow sandbox (no fs) has
     // no such capability and falls back to the concatenation agent. Reads <outPath>.part{idx} in chunk order,
-    // writes f.outPath, and drops the consumed parts (cleanupRefineParts also sweeps them post-run — idempotent).
+    // writes f.outPath, and drops the consumed parts only after the final write succeeds.
     // Returns a truthy summary; the pipeline consumer only distinguishes truthy (merged) from null (failed).
-    stitch: (f, chunks) => {
-      const parts = (chunks || []).map((c) => partPath(f.outPath, c.idx))
-      const texts = parts.map((p) => fs.readFileSync(p, 'utf8'))
-      const stitched = stitchPartsWithReport(texts)
-      const merged = stitched.text
-      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
-      fs.writeFileSync(f.outPath, merged, 'utf8')
-      for (const p of parts) { try { fs.rmSync(p, { force: true }) } catch { /* ignore */ } }
-      return {
-        path: f.outPath,
-        merged: parts.length,
-        bytes: Buffer.byteLength(merged, 'utf8'),
-        seamRepairs: stitched.seamRepairs,
-        seamDuplicates: stitched.seamDuplicates,
-      }
-    },
+    stitch: stitchRefineParts,
   }
 
   const A = {
@@ -578,11 +583,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     capabilities,
     searchProvider: 'serper', fetchProvider: 'jina-reader+local-fallback',
     fresh, annotate: params.annotate, files: fileEntries,
+    plannedChunks: [],
+    onChunkPlan: (plan) => trace.plan(plan),
   }
 
   {
     const r = await runPipeline(A, sel.engine)
-    cleanupRefineParts(fileEntries) // tidy <outPath>.partN intermediates from chunked refine
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
     // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
     // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
@@ -627,8 +633,32 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const finishedAt = new Date(finishedMs).toISOString()
     const durationMs = finishedMs - startedMs
     const usage = sel.engine.usage()
+    const engineFailures = typeof sel.engine.failures === 'function' ? sel.engine.failures() : []
     const webTelemetry = typeof sel.engine.webTelemetry === 'function' ? sel.engine.webTelemetry() : null
-    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
+    const executionFailed = !!r.error || (r.failed || []).length > 0
+    const primaryFailure = executionFailed
+      ? (engineFailures.at(-1) || {
+          code: r.error ? 'PIPELINE_ERROR' : 'PIPELINE_INCOMPLETE',
+          retryable: false,
+          message: r.error || `未完成正文：${(r.failed || []).join('、')}`,
+        })
+      : null
+    const execution = {
+      schemaVersion: 1,
+      status: executionFailed ? 'failed' : 'completed',
+      stage: 'finished',
+      failure: primaryFailure,
+      failures: engineFailures,
+      progress: {
+        filesTotal: fileEntries.length,
+        filesRefined: (r.refined || []).length,
+        filesFailed: (r.failed || []).length,
+        partsPlanned: (r.plannedChunks || []).reduce((sum, plan) => sum + (plan.parts || []).length, 0),
+      },
+      eventsPath: trace.eventsPath,
+      statePath: trace.statePath,
+    }
+    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,
@@ -641,6 +671,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       usage: result.usage,
       escalation: result.escalation,
     })
+    trace.finish(execution)
+    traceClosed = true
+    clearInterval(heartbeat)
 
     // Per-run log (time/tokens/estimated cost) — additive, never fatal, opt-out via params.runLog===false
     // (CLI: --no-run-log). `models` is DeepSeek's tier→model-id map (needed for the flash/pro cost split);
@@ -655,5 +688,17 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     }
 
     return { ...result, ...artifacts, runLog }
+  }
+  } catch (error) {
+    clearInterval(heartbeat)
+    if (!traceClosed) {
+      const failure = {
+        code: error && error.code === 'CONFIG_ERROR' ? 'CONFIG_ERROR' : 'INTERNAL_ERROR',
+        retryable: false,
+        message: (error && error.message) || String(error),
+      }
+      trace.finish({ status: 'failed', failure })
+    }
+    throw error
   }
 }

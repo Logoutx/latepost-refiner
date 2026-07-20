@@ -175,6 +175,8 @@ const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.
 // auditFailed field, not the exit code, to decide per-file follow-up.
 export function computeExitCode(result, { allowAuditFail = false } = {}) {
   if (result.error) return 1
+  if (result.execution && result.execution.status === 'failed') return 1
+  if ((result.failed || []).length > 0) return 1
   // P7 fail-loud: an audit that could NOT run (deliverables unaudited) always exits 1. This is NOT bypassable
   // by --allow-audit-fail: that flag means "the audit ran and found a hard issue I accept", a different decision
   // from "the audit never ran, so nothing was verified". An unverified run must never masquerade as success.
@@ -187,6 +189,10 @@ export function computeExitCode(result, { allowAuditFail = false } = {}) {
 }
 
 export function printRunSummary(r) {
+  if (r.execution && r.execution.failure) {
+    const f = r.execution.failure
+    console.error(`\n执行失败 [${f.code || 'UNKNOWN'}]${f.retryable ? '（可重试）' : '（不可整单自动重试）'}：${f.message || ''}`)
+  }
   if (r.error) {
     console.error(`\n流水线未执行：${r.error}`)
     console.error(`Review queue：${r.reviewPath}`)

@@ -1,5 +1,5 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
-import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, timelinePrompt, logicWritePrompt } from './prompts.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
   scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', repair: 'opus',
@@ -11,7 +11,8 @@ export const DEFAULT_STAGE_MODELS = Object.freeze({
 export { BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES } from './spec.js'
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
-// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
+// 字) → parallel chunk agents writing <outPath>.part{idx}, merged deterministically. Speed mode has its own
+// small cap; provider-budget and explicit-size chunking are intentionally uncapped.
 // when the host injects fs capability, or by a cheap stitch agent in the Workflow sandbox. Returns a
 // REFINE_REPORT-shaped object (path = f.outPath) or null if it
 // could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
@@ -89,18 +90,13 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
   // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
   const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
-  if (chunks.length <= 1) {
-    // Single agent → full glossary (no token multiplication on one agent).
-    return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
-  }
   // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
   // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
   // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
   // (and still carries model/budget when a budgeted provider is in play). Rides on the returned report → run.json +
   // review.md via artifacts.js.
-  const drivenByChunkSize = typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
-  const drivenByBudget = rb && refineSize(f) > rb.budget
+  const drivenByChunkSize = chunks.length > 1 && typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
+  const drivenByBudget = chunks.length > 1 && rb && refineSize(f) > rb.budget
   const autoChunk = (drivenByChunkSize || drivenByBudget)
     ? {
       label: f.label,
@@ -110,6 +106,27 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
       ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
     }
     : null
+  const plan = {
+    label: f.label,
+    outPath: f.outPath,
+    model: (rb && rb.model) || M.refine,
+    contentLength: refineSize(f),
+    driver: chunks.length <= 1 ? 'single' : (drivenByChunkSize ? 'chunk_size' : (drivenByBudget ? 'provider_budget' : 'speed')),
+    parts: chunks.map((c) => ({ idx: c.idx, startLine: c.startLine, endLine: c.endLine, path: chunks.length > 1 ? partPath(f.outPath, c.idx) : f.outPath })),
+    ...(rb ? { budget: rb.budget } : {}),
+    ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
+    ...(autoChunk ? { autoChunk } : {}),
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  const previousPlan = A.plannedChunks.findIndex((x) => x && x.label === plan.label)
+  if (previousPlan >= 0) A.plannedChunks[previousPlan] = plan
+  else A.plannedChunks.push(plan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(plan)
+  if (chunks.length <= 1) {
+    // Single agent → full glossary (no token multiplication on one agent).
+    return engine.agent(refinePrompt(f, glossary, finding, A),
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
+  }
   const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
     : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
@@ -117,14 +134,14 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   let partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })))
   const missing = chunks.map((c, i) => (!partReps[i] ? i : -1)).filter((i) => i >= 0)
   if (missing.length) {
     engine.log(`精校分块：${f.label} 首轮 ${missing.length}/${chunks.length} 块未返回——只重试缺失块一次`)
     const retries = await engine.parallel(missing.map((i) => {
       const c = chunks[i]
       return () => engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
+        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })
     }))
     partReps = partReps.slice()
     missing.forEach((i, k) => { if (retries[k]) partReps[i] = retries[k] })
@@ -148,7 +165,7 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
       return null
     }
   } else {
-    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch, outputPath: f.outPath })
     if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
   }
   return {
@@ -445,7 +462,14 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA })
+  const onePassPlan = {
+    label: f.label, outPath: f.outPath, model: M.refine, contentLength: refineSize(f), driver: 'single',
+    parts: [{ idx: 1, startLine: 1, endLine: f.lines, path: f.outPath }],
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  A.plannedChunks.push(onePassPlan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(onePassPlan)
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -667,7 +691,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })))
   logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -677,7 +701,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = derivativePairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
@@ -699,10 +723,10 @@ if (finalBodiesReady && (scope.includes('summary') || scope.includes('timeline')
 }
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && finalBodiesReady
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary'), outputPath: `${A.outputDir}/${summaryDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && finalBodiesReady
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline'), outputPath: `${A.outputDir}/${timelineDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
 ])
 
@@ -721,7 +745,8 @@ return {
   networkUnverified: netUnverified,
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
-  autoChunk: refined.map((r) => r.autoChunk).filter(Boolean),   // provider-budget auto-split records → run.json + review.md
+  plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
+  autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
   derivativesSkipped,
   openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),

@@ -127,6 +127,68 @@ test('file tool calls feed local tool results back to the model', async () => {
   assert.match(toolMessage.content, /hello from transcript/)
 })
 
+test('a denied write cannot be masked by structured_output; the agent must create the declared artifact', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-write-contract-'))
+  const outputPath = path.join(base, 'Transcripts', 'A.md.part3')
+  const scratch = path.join(base, 'Transcripts', 'scratch.md')
+  const events = []
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('bad-write', 'Write', { file_path: scratch, content: '临时文件' })] }),
+    completion({ content: '', tool_calls: [toolCall('too-early', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('good-write', 'Write', { file_path: outputPath, content: '采访者：问题\n\n受访者：回答\n' })] }),
+    completion({ content: '', tool_calls: [toolCall('final', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    onToolEvent: (event) => events.push(event),
+    filePolicy: {
+      readRoots: [base], writeRoots: [base], writePaths: [path.join(base, 'Transcripts', 'A.md')],
+      writePartBases: [path.join(base, 'Transcripts', 'A.md')],
+    },
+  })
+
+  const result = await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A#3/3', outputPath })
+
+  assert.deepEqual(result, { ok: true })
+  assert.equal(fs.existsSync(scratch), false)
+  assert.match(fs.readFileSync(outputPath, 'utf8'), /受访者：回答/)
+  assert.equal(client.calls.length, 4, 'premature structured_output was rejected instead of ending the agent')
+  assert.equal(events[0].code, 'TOOL_PATH_DENIED')
+  assert.equal(events.at(-1).ok, true)
+  assert.deepEqual(engine.failures(), [], 'a recovered tool denial is observable but does not fail the agent')
+})
+
+test('structured_output without the declared artifact becomes a typed non-retryable agent failure', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-missing-output-'))
+  const outputPath = path.join(base, 'Transcripts', 'A.md')
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('early-1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('early-2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+
+  const result = await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath })
+
+  assert.equal(result, null)
+  assert.equal(engine.usage().failed, 1)
+  assert.deepEqual(engine.failures(), [{ label: 'refine:A', code: 'OUTPUT_MISSING', retryable: false, message: `声明产物未生成：${outputPath}` }])
+})
+
+test('an unchanged stale artifact cannot satisfy the output postcondition', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-stale-output-'))
+  const outputPath = path.join(base, 'A.md')
+  fs.writeFileSync(outputPath, '旧产物\n', 'utf8')
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('stale-1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('stale-2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath }), null)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_NOT_UPDATED')
+})
+
 test('web tools are only exposed to online (verify/timeline) labels', async () => {
   const offlineClient = mockClient([
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),

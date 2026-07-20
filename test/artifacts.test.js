@@ -156,6 +156,28 @@ test('provider-budget auto-chunk is traced in run.json and rendered as a plain-l
   assert.ok(!reviewSections(baseResult, []).some((s) => s.title.includes('已自动分段精校')), 'no section when nothing auto-chunked')
 })
 
+test('manifest separates execution failure from quality and preserves the failed file pre-dispatch chunk plan', () => {
+  const execution = {
+    schemaVersion: 1, status: 'failed', stage: 'finished',
+    failure: { code: 'OUTPUT_MISSING', retryable: false, message: 'part3 missing' },
+    failures: [{ label: 'refine:甲#3/3', code: 'OUTPUT_MISSING', retryable: false, message: 'part3 missing' }],
+    progress: { filesTotal: 1, filesRefined: 0, filesFailed: 1, partsPlanned: 3 },
+    eventsPath: '/tmp/out/events.jsonl', statePath: '/tmp/out/run-state.json',
+  }
+  const plannedChunks = [{
+    label: '甲', outPath: '/tmp/out/Transcripts/甲.md', model: 'deepseek-v4-pro', budget: 10000,
+    contentLength: 25000, driver: 'provider_budget',
+    parts: [1, 2, 3].map((idx) => ({ idx, startLine: idx * 100 - 99, endLine: idx * 100, path: `/tmp/out/Transcripts/甲.md.part${idx}` })),
+  }]
+  const manifest = buildRunManifest({ outputDir: '/tmp/out', refined: [], failed: ['甲'], execution, plannedChunks, audit: { status: 'ok', files: [] } }, { outputDir: '/tmp/out', topic: 'T' })
+
+  assert.equal(manifest.execution.status, 'failed')
+  assert.equal(manifest.execution.failure.code, 'OUTPUT_MISSING')
+  assert.equal(manifest.quality.status, 'ready', 'quality remains a separate editorial dimension and does not mask execution failure')
+  assert.equal(manifest.plannedChunks[0].parts.length, 3)
+  assert.equal(manifest.plannedChunks[0].parts[2].path, '/tmp/out/Transcripts/甲.md.part3')
+})
+
 test('manifest carries content-gap details and annotations; review renders 内容缺口', () => {
   const gap = { startLine: 25, endLine: 38, turns: 5, chars: 434, severity: 'hard', trace: false }
   const withGaps = {

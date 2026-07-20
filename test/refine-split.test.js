@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import {
   splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, stitchPartsWithReport, contentLength,
-  REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
+  REFINE_CHUNK_CHARS, MAX_SPEED_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
   endsWithQuestion, parseTurns,
@@ -58,14 +58,14 @@ test('speed mode fallback: files ≤ char threshold stay single; just over → 2
 test('speed mode: large files split into up to 2 contiguous chunks by 字数 (conservative cap)', () => {
   for (const [lines, chars] of [[2130, 29599], [1467, 21000], [1350, 20764]]) {
     const chunks = splitForRefine({ lines, chars, label: 'A' }, 'speed')
-    assert.equal(chunks.length, 2, `${chars} 字 → 2 chunks (MAX ${MAX_REFINE_CHUNKS})`)
+    assert.equal(chunks.length, 2, `${chars} 字 → 2 chunks (MAX ${MAX_SPEED_REFINE_CHUNKS})`)
     assertContiguous(chunks, lines)
   }
 })
 
-test('speed mode: very large files capped at MAX_REFINE_CHUNKS', () => {
+test('speed mode: very large files capped at MAX_SPEED_REFINE_CHUNKS', () => {
   const chunks = splitForRefine({ lines: 9000, chars: 120000, label: 'A' }, 'speed')
-  assert.equal(chunks.length, MAX_REFINE_CHUNKS, 'capped at MAX_REFINE_CHUNKS')
+  assert.equal(chunks.length, MAX_SPEED_REFINE_CHUNKS, 'capped at MAX_SPEED_REFINE_CHUNKS')
   assertContiguous(chunks, 9000)
 })
 
@@ -640,6 +640,21 @@ test('auto-chunk: an over-budget file on a budgeted engine splits into ceil(字�
   assert.equal(r.autoChunk.length, 1, 'one autoChunk record for the file')
   assert.deepEqual(r.autoChunk[0], { label: 'A', model: 'stub-pro', budget: 10000, contentLength: 25000, parts: 3 }, 'the record carries model/budget/字数/parts')
   assert.equal(r.refined.length, 1, 'the file is still refined (stitched)')
+})
+
+test('a failed provider-budget chunk still leaves its complete pre-dispatch plan in the result', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] },
+    mockEngine(labels, { refineBudget: stubBudget('stub-pro', 10000), fail: (label) => /(?:refine|refine-retry):A#3\/3/.test(label) }),
+  )
+
+  assert.deepEqual(r.failed, ['A'])
+  assert.equal(r.refined.length, 0)
+  assert.equal(r.plannedChunks.length, 1)
+  assert.deepEqual(r.plannedChunks[0].parts.map((part) => part.path), ['/out/Transcripts/A.md.part1', '/out/Transcripts/A.md.part2', '/out/Transcripts/A.md.part3'])
+  assert.deepEqual(r.autoChunk[0], { label: 'A', model: 'stub-pro', budget: 10000, contentLength: 25000, parts: 3 })
 })
 
 test('no auto-chunk when the engine declares no budget (Anthropic / CC path unchanged)', async () => {

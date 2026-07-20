@@ -51,6 +51,23 @@ test('explicit write paths form an allowlist inside the output root', () => {
   assert.equal(fs.existsSync(scratch), false)
 })
 
+test('declared part family permits only positive integer part suffixes', () => {
+  const base = tmpdir()
+  const root = path.join(base, 'out')
+  const deliverable = path.join(root, 'Transcripts', '访谈.md')
+  const policy = {
+    readRoots: [root], writeRoots: [root], writePaths: [deliverable], writePartBases: [deliverable],
+  }
+
+  for (const n of [1, 2, 3, 4, 9, 27]) {
+    assert.equal(writeFile({ file_path: `${deliverable}.part${n}`, content: `part ${n}\n` }, policy).ok, true)
+  }
+  for (const suffix of ['0', '-1', 'x', '1.tmp', '01', '1/escape']) {
+    assert.equal(writeFile({ file_path: `${deliverable}.part${suffix}`, content: 'nope\n' }, policy).ok, false)
+  }
+  assert.equal(writeFile({ file_path: path.join(root, 'Transcripts', 'test_quotes.md'), content: 'nope\n' }, policy).ok, false)
+})
+
 test('file policy rejects symlink read/write/edit escapes from allowed roots', () => {
   const base = tmpdir()
   const root = path.join(base, 'out')

@@ -628,7 +628,7 @@ export function singleShotMaxTokens(sourceChars) {
 
 export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
-export const MAX_REFINE_CHUNKS = 2          // conservative cap for SPEED mode only — a coarse batch lever, not a fine split (budget mode is uncapped)
+export const MAX_SPEED_REFINE_CHUNKS = 2    // conservative cap for SPEED mode only — a coarse batch lever, not a limit on provider-budget chunks
 const singleChunk = (f) => {
   const lines = (f && f.lines) || 0
   return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
@@ -749,9 +749,9 @@ export function splitForRefine(f, mode, budget, chunkSize) {
     // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
     K = Math.max(1, Math.ceil(size / chunkSize))
   } else {
-    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    // Speed: opt-in coarse lever — only large files, capped at MAX_SPEED_REFINE_CHUNKS.
     const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      ? Math.min(MAX_SPEED_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
       : 1
     // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
     const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)

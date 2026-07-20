@@ -471,6 +471,9 @@ export function buildRunManifest(result = {}, context = {}) {
       name: context.provider || result.provider || null,
       info: sanitizeProviderInfo(context.providerInfo || result.providerInfo || {}),
     },
+    // Execution is separate from editorial quality: a completed run may still be quality.blocked, while a
+    // missing declared output is an execution failure regardless of what a model claimed in structured_output.
+    execution: result.execution || null,
     config: {
       topic: A.topic || context.topic || null,
       date: A.date || null,
@@ -562,6 +565,14 @@ export function buildRunManifest(result = {}, context = {}) {
     // Provider-aware auto-chunking: files auto-split because their 字数 exceeded the refine model's faithful
     // length. Empty unless a budgeted provider (e.g. DeepSeek) hit the cap. Human-readable lines in review.md.
     autoChunk: (result.autoChunk || []).map((a) => ({ label: a.label, model: a.model, budget: a.budget, contentLength: a.contentLength, parts: a.parts, ...(a.requestedChunkSize ? { requestedChunkSize: a.requestedChunkSize } : {}) })),
+    // Written from the pre-dispatch plan rather than successful refine reports, so failed part3+ runs remain
+    // diagnosable. Paths are declared artifact paths only; no prompts or transcript content are included.
+    plannedChunks: (result.plannedChunks || []).map((p) => ({
+      label: p.label, outPath: p.outPath, model: p.model, contentLength: p.contentLength, driver: p.driver,
+      ...(p.budget ? { budget: p.budget } : {}),
+      ...(p.requestedChunkSize ? { requestedChunkSize: p.requestedChunkSize } : {}),
+      parts: (p.parts || []).map((part) => ({ idx: part.idx, startLine: part.startLine, endLine: part.endLine, path: part.path })),
+    })),
     usage,
   }
 }

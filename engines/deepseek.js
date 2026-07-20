@@ -15,7 +15,9 @@
 //
 // Client tools Read/Write/Edit share fileops.js. Offline stages never receive web tools.
 
+import fs from 'node:fs'
 import os from 'node:os'
+import path from 'node:path'
 import OpenAI from 'openai'
 import pLimit from 'p-limit'
 import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
@@ -58,6 +60,8 @@ const FILE_TOOLS = TOOL_SPECS.map(toFn)
 const WEB_SEARCH_TOOL = toFn({ name: 'web_search', description: '联网搜索，返回若干结果（标题 / 网址 / 摘要）。', parameters: { type: 'object', properties: { query: { type: 'string', description: '搜索词' } }, required: ['query'] } })
 const WEB_FETCH_TOOL = toFn({ name: 'web_fetch', description: '抓取一个网页 URL，返回正文文本（截断）。', parameters: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } })
 const WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
+const FILE_TOOL_NAMES = new Set(['Read', 'Write', 'Edit', 'Concat'])
+const WRITE_TOOL_NAMES = new Set(['Write', 'Edit', 'Concat'])
 // Online stages (verify/timeline) are the only ones that should search.
 const ONLINE_LABEL = /^(verify|timeline)/
 const structuredTool = (schema) => ({
@@ -68,6 +72,46 @@ const structuredTool = (schema) => ({
 // big outputs (refine/logic/summary/timeline write whole docs via tool args / content)
 const BIG_LABEL = /^(refine|logic|summary|timeline)/i
 const maxTokensFor = (label = '') => (BIG_LABEL.test(label) ? 64000 : 16000)
+
+function agentError(code, message, retryable = false) {
+  const err = new Error(message)
+  err.code = code
+  err.retryable = retryable
+  return err
+}
+
+function outputSnapshot(filePath) {
+  if (!filePath) return null
+  const resolved = path.resolve(String(filePath))
+  try {
+    const stat = fs.statSync(resolved)
+    return { path: resolved, exists: stat.isFile(), bytes: stat.isFile() ? stat.size : 0, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs }
+  } catch {
+    return { path: resolved, exists: false, bytes: 0, mtimeMs: null, ctimeMs: null }
+  }
+}
+
+function checkOutputPostcondition(filePath, before) {
+  if (!filePath) return { ok: true }
+  const after = outputSnapshot(filePath)
+  if (!after.exists) return { ok: false, code: 'OUTPUT_MISSING', message: `声明产物未生成：${after.path}` }
+  if (after.bytes <= 0) return { ok: false, code: 'OUTPUT_EMPTY', message: `声明产物为空：${after.path}` }
+  if (before && before.exists && before.bytes === after.bytes && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs) {
+    return { ok: false, code: 'OUTPUT_NOT_UPDATED', message: `声明产物未在本代理调用中更新：${after.path}` }
+  }
+  return { ok: true, path: after.path, bytes: after.bytes }
+}
+
+function classifyAgentError(error) {
+  if (error && error.code && /^[A-Z][A-Z0-9_]+$/.test(error.code)) {
+    return { code: error.code, retryable: !!error.retryable, message: error.message || String(error) }
+  }
+  const status = Number(error && (error.status || error.statusCode || error.response?.status))
+  const code = error && error.code
+  const transient = status === 408 || status === 409 || status === 429 || status >= 500
+    || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENETUNREACH'].includes(code)
+  return { code: transient ? 'API_TRANSIENT' : 'AGENT_EXECUTION_ERROR', retryable: transient, message: (error && error.message) || String(error) }
+}
 
 // ---- Cache observability -----------------------------------------------------
 // DeepSeek caches the prompt prefix server-side automatically, so there are no request-side knobs to set —
@@ -105,7 +149,7 @@ export function makeDeepSeekEngine(opts = {}) {
     apiKey,
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     filePolicy,
-    onPhase, onLog,
+    onPhase, onLog, onToolEvent, onAgentEvent,
     searchApiKey, readerApiKey,
     searchFn, fetchImpl, localFetchFn, dnsLookup,
     searchK = 5, maxSearchRequestsPerJob = 100,
@@ -118,6 +162,7 @@ export function makeDeepSeekEngine(opts = {}) {
   const safeFilePolicy = makeFilePolicy(filePolicy)
   const web = webRuntime || makeWebRuntime({ searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
+  const failures = []
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
   const log = (msg) => (onLog ? onLog(msg) : process.stderr.write(`  ${msg}\n`))
@@ -143,12 +188,23 @@ export function makeDeepSeekEngine(opts = {}) {
     return comp
   }
 
-  async function execTool(call) {
+  const emitToolEvent = (event) => {
+    if (!onToolEvent) return
+    try { onToolEvent(event) } catch { /* observability must not fail the run */ }
+  }
+  const emitAgentEvent = (event) => {
+    if (!onAgentEvent) return
+    try { onAgentEvent(event) } catch { /* observability must not fail the run */ }
+  }
+
+  async function execTool(call, label) {
     const name = call.function && call.function.name
     const args = parseJSON(call.function && call.function.arguments) || {}
-    if (name === 'web_search') return await web.search(args.query || '')
-    if (name === 'web_fetch') return await web.fetch(args.url || '')
-    return runFileTool(name, args, safeFilePolicy).text // Read / Write / Edit
+    if (name === 'web_search') return { ok: true, text: await web.search(args.query || '') }
+    if (name === 'web_fetch') return { ok: true, text: await web.fetch(args.url || '') }
+    const result = runFileTool(name, args, safeFilePolicy)
+    emitToolEvent({ label: label || 'agent', tool: name, ok: !!result.ok, code: result.code || null, path: result.path || (args.file_path ? path.resolve(String(args.file_path)) : null), bytes: result.bytes ?? null })
+    return result
   }
 
   // Last-resort structured output when the model won't call the tool on its own: force the specific
@@ -171,7 +227,7 @@ export function makeDeepSeekEngine(opts = {}) {
     }
   }
 
-  async function runAgent(prompt, { model, schema, label } = {}) {
+  async function runAgent(prompt, { model, schema, label, outputPath } = {}) {
     const modelId = resolveDeepSeekModel(model)
     const tools = [...FILE_TOOLS]
     if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
@@ -181,13 +237,16 @@ export function makeDeepSeekEngine(opts = {}) {
       : prompt
     const messages = [{ role: 'user', content }]
     let nudges = 0
+    let outputNudges = 0
+    let unrecoveredWriteFailure = null
+    const beforeOutput = outputSnapshot(outputPath)
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const comp = await create({ model: modelId, messages, tools, max_tokens: maxTokensFor(label) })
       const choice = comp.choices?.[0]
-      if (!choice) return null
+      if (!choice) throw agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true)
       const m = choice.message || {}
-      if (m.refusal) { log(`⚠ ${label || 'agent'} 被拒：${m.refusal}`); return null }
+      if (m.refusal) throw agentError('MODEL_REFUSAL', `${label || 'agent'} 被拒：${m.refusal}`, false)
 
       const asst = { role: 'assistant', content: m.content ?? '' }
       const calls = m.tool_calls || []
@@ -195,42 +254,75 @@ export function makeDeepSeekEngine(opts = {}) {
       messages.push(asst)
 
       const so = calls.find((c) => c.function?.name === 'structured_output')
-      if (schema && so) { const v = parseJSON(so.function.arguments); if (v) return v }
+      const structuredValue = schema && so ? parseJSON(so.function.arguments) : null
 
       if (calls.length) {
         for (const c of calls) {
           const fname = c.function && c.function.name
-          const text = fname === 'structured_output'
-            ? 'structured_output 参数解析失败，请重新以合法 JSON 调用。'
-            : await execTool(c)
-          messages.push({ role: 'tool', tool_call_id: c.id, content: String(text) })
+          if (fname === 'structured_output') {
+            if (!structuredValue) messages.push({ role: 'tool', tool_call_id: c.id, content: 'structured_output 参数解析失败，请重新以合法 JSON 调用。' })
+            continue
+          }
+          const result = await execTool(c, label)
+          if (FILE_TOOL_NAMES.has(fname) && !result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = result
+          if (FILE_TOOL_NAMES.has(fname) && result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = null
+          messages.push({ role: 'tool', tool_call_id: c.id, content: String(result.text) })
+        }
+        if (structuredValue) {
+          const post = checkOutputPostcondition(outputPath, beforeOutput)
+          const failure = post.ok && !outputPath && unrecoveredWriteFailure
+            ? { ok: false, code: unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', message: unrecoveredWriteFailure.text }
+            : post
+          if (failure.ok) return structuredValue
+          outputNudges++
+          log(`⚠ ${label || 'agent'} 拒绝 structured_output：${failure.code} ${failure.message}`)
+          messages.push({ role: 'tool', tool_call_id: so.id, content: `${failure.code}: ${failure.message}。请先成功写入声明产物，再重新提交 structured_output。` })
+          if (outputNudges >= 2) throw agentError(failure.code, failure.message, false)
         }
         continue
       }
 
       // No tool calls → the model ended its turn.
-      if (choice.finish_reason === 'content_filter') { log(`⚠ ${label || 'agent'} content_filter`); return null }
-      if (!schema) return (m.content || '').trim()
+      if (choice.finish_reason === 'content_filter') throw agentError('CONTENT_FILTER', `${label || 'agent'} content_filter`, false)
+      if (!schema) {
+        const post = checkOutputPostcondition(outputPath, beforeOutput)
+        if (!post.ok) throw agentError(post.code, post.message, false)
+        if (!outputPath && unrecoveredWriteFailure) throw agentError(unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', unrecoveredWriteFailure.text, false)
+        return (m.content || '').trim()
+      }
       if (nudges < 2) {
         nudges++
         messages.push({ role: 'user', content: '请现在调用 structured_output 工具提交最终结构化结果（不要用普通文字回复）。' })
         continue
       }
-      return await forceStructured_(messages, schema, modelId, label)
+      const forced = await forceStructured_(messages, schema, modelId, label)
+      if (!forced) throw agentError('STRUCTURED_OUTPUT_MISSING', `${label || 'agent'} 未返回结构化结果`, true)
+      const post = checkOutputPostcondition(outputPath, beforeOutput)
+      if (!post.ok) throw agentError(post.code, post.message, false)
+      return forced
     }
-    log(`⚠ ${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`)
-    return schema ? await forceStructured_(messages, schema, modelId, label) : null
+    throw agentError('AGENT_TURN_LIMIT', `${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`, false)
   }
 
   // Limiter wraps each agent (leaf unit); nested parallel shares one global cap, no deadlock.
   function agent(prompt, agentOpts = {}) {
     return limit(async () => {
       usage.agents++
+      const baseEvent = {
+        label: agentOpts.label || 'agent', phase: agentOpts.phase || null,
+        model: resolveDeepSeekModel(agentOpts.model),
+      }
+      emitAgentEvent({ ...baseEvent, status: 'started' })
       try {
-        return await runAgent(prompt, agentOpts)
+        const value = await runAgent(prompt, agentOpts)
+        emitAgentEvent({ ...baseEvent, status: 'completed' })
+        return value
       } catch (e) {
         usage.failed++
-        log(`⚠ ${agentOpts.label || 'agent'} 失败：${e.message}`)
+        const failure = { label: agentOpts.label || 'agent', ...classifyAgentError(e) }
+        failures.push(failure)
+        emitAgentEvent({ ...baseEvent, status: 'failed', code: failure.code, retryable: failure.retryable })
+        log(`⚠ ${failure.label} 失败 [${failure.code}]：${failure.message}`)
         return null
       }
     })
@@ -265,6 +357,7 @@ export function makeDeepSeekEngine(opts = {}) {
   return {
     agent, parallel, pipeline, phase, log,
     usage: () => ({ ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).map(([k, v]) => [k, { ...v }])) }),
+    failures: () => failures.map((f) => ({ ...f })),
     refineBudget,
     webTelemetry: web.telemetry,
   }

@@ -112,6 +112,11 @@ test('computeExitCode: a clean run exits 0', () => {
   assert.equal(computeExitCode({ refined: [{ path: '/o/A.md' }], auditFailed: [] }), 0)
 })
 
+test('computeExitCode: a missing main output is an execution failure even without an audit result', () => {
+  assert.equal(computeExitCode({ failed: ['A'], refined: [], auditFailed: [] }), 1)
+  assert.equal(computeExitCode({ execution: { status: 'failed' }, failed: [], refined: [] }), 1)
+})
+
 test('computeExitCode: audit gate failure exits 1 by DEFAULT even though products were generated', () => {
   const result = { refined: [{ path: '/o/A.md' }], auditFailed: [{ path: '/o/A.md', findings: ['content_gap'] }] }
   assert.equal(computeExitCode(result), 1, 'default: auditFailed → exit 1')

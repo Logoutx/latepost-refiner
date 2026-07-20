@@ -656,7 +656,7 @@ function singleShotMaxTokens(sourceChars) {
 
 const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
-const MAX_REFINE_CHUNKS = 2          // conservative cap for SPEED mode only — a coarse batch lever, not a fine split (budget mode is uncapped)
+const MAX_SPEED_REFINE_CHUNKS = 2    // conservative cap for SPEED mode only — a coarse batch lever, not a limit on provider-budget chunks
 const singleChunk = (f) => {
   const lines = (f && f.lines) || 0
   return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
@@ -777,9 +777,9 @@ function splitForRefine(f, mode, budget, chunkSize) {
     // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
     K = Math.max(1, Math.ceil(size / chunkSize))
   } else {
-    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    // Speed: opt-in coarse lever — only large files, capped at MAX_SPEED_REFINE_CHUNKS.
     const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      ? Math.min(MAX_SPEED_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
       : 1
     // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
     const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
@@ -883,6 +883,65 @@ function bigramDice(a, b) {
   return total ? (2 * overlap) / total : 0
 }
 
+function h2Key(line) {
+  const m = String(line || '').match(/^\s*##\s+(.+?)\s*$/)
+  if (!m) return null
+  return m[1].normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function proseRanges(lines, start, end) {
+  const out = []
+  let i = start
+  while (i < end) {
+    while (i < end && (!lines[i].trim() || /^\s*<!--/.test(lines[i]))) i += 1
+    if (i >= end || /^\s*#{1,6}\s+/.test(lines[i])) { i += 1; continue }
+    const from = i
+    while (i < end && lines[i].trim() && !/^\s*#{1,6}\s+/.test(lines[i])) i += 1
+    if (i > from) out.push({ start: from, end: i, text: lines.slice(from, i).join('\n') })
+  }
+  return out
+}
+
+// A chunked model sometimes reopens the same topic with typography-only differences
+// (`2026 年 agent` / `2026年agent`) or repeats the exact heading. When two consecutive H2 sections
+// normalize to the same key, keep one heading and all substantive content. If the boundary also replays the
+// exact same speaker paragraph, remove only that repeated copy. Different-speaker or paraphrased prose stays.
+function collapseAdjacentDuplicateHeadings(text) {
+  const source = String(text || '')
+  const trailingNewline = /\n$/.test(source)
+  const lines = source.split(/\r?\n/)
+  const headings = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const key = h2Key(lines[i])
+    if (key) headings.push({ index: i, key })
+  }
+  const remove = new Set()
+  let removedHeadings = 0
+  let removedBlocks = 0
+  for (let i = 1; i < headings.length; i += 1) {
+    const prev = headings[i - 1]
+    const curr = headings[i]
+    if (!curr.key || curr.key !== prev.key) continue
+    remove.add(curr.index)
+    removedHeadings += 1
+
+    const before = proseRanges(lines, prev.index + 1, curr.index)
+    const nextHeading = headings[i + 1] ? headings[i + 1].index : lines.length
+    const after = proseRanges(lines, curr.index + 1, nextHeading)
+    const left = before.at(-1), right = after[0]
+    if (!left || !right) continue
+    const a = seamNorm(left.text), b = seamNorm(right.text)
+    const sa = seamSpeaker(left.text), sb = seamSpeaker(right.text)
+    if (a.length >= 20 && a === b && (!sa || !sb || sa === sb)) {
+      for (let n = right.start; n < right.end; n += 1) remove.add(n)
+      removedBlocks += 1
+    }
+  }
+  if (!remove.size) return { text: source, removedHeadings: 0, removedBlocks: 0 }
+  const result = lines.filter((_, i) => !remove.has(i)).join('\n').replace(/\n{3,}/g, '\n\n')
+  return { text: result.replace(/\s+$/, '') + (trailingNewline ? '\n' : ''), removedHeadings, removedBlocks }
+}
+
 function isDuplicateSeamBlock(left, right) {
   const a = seamNorm(left), b = seamNorm(right)
   if (Math.min(a.length, b.length) < 60) return false
@@ -967,7 +1026,14 @@ function stitchPartsWithReport(texts) {
     if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return { text: `${out.replace(/\s+$/, '')}\n`, seamRepairs, seamDuplicates }
+  const headingRepair = collapseAdjacentDuplicateHeadings(`${out.replace(/\s+$/, '')}\n`)
+  return {
+    text: headingRepair.text,
+    seamRepairs,
+    seamDuplicates,
+    headingRepairs: headingRepair.removedHeadings,
+    headingReplayBlocksRemoved: headingRepair.removedBlocks,
+  }
 }
 
 function stitchParts(texts) {
@@ -2338,7 +2404,8 @@ const DEFAULT_STAGE_MODELS = Object.freeze({
 // their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
-// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
+// 字) → parallel chunk agents writing <outPath>.part{idx}, merged deterministically. Speed mode has its own
+// small cap; provider-budget and explicit-size chunking are intentionally uncapped.
 // when the host injects fs capability, or by a cheap stitch agent in the Workflow sandbox. Returns a
 // REFINE_REPORT-shaped object (path = f.outPath) or null if it
 // could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
@@ -2416,18 +2483,13 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
   // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
   const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
-  if (chunks.length <= 1) {
-    // Single agent → full glossary (no token multiplication on one agent).
-    return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
-  }
   // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
   // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
   // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
   // (and still carries model/budget when a budgeted provider is in play). Rides on the returned report → run.json +
   // review.md via artifacts.js.
-  const drivenByChunkSize = typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
-  const drivenByBudget = rb && refineSize(f) > rb.budget
+  const drivenByChunkSize = chunks.length > 1 && typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
+  const drivenByBudget = chunks.length > 1 && rb && refineSize(f) > rb.budget
   const autoChunk = (drivenByChunkSize || drivenByBudget)
     ? {
       label: f.label,
@@ -2437,6 +2499,27 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
       ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
     }
     : null
+  const plan = {
+    label: f.label,
+    outPath: f.outPath,
+    model: (rb && rb.model) || M.refine,
+    contentLength: refineSize(f),
+    driver: chunks.length <= 1 ? 'single' : (drivenByChunkSize ? 'chunk_size' : (drivenByBudget ? 'provider_budget' : 'speed')),
+    parts: chunks.map((c) => ({ idx: c.idx, startLine: c.startLine, endLine: c.endLine, path: chunks.length > 1 ? partPath(f.outPath, c.idx) : f.outPath })),
+    ...(rb ? { budget: rb.budget } : {}),
+    ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
+    ...(autoChunk ? { autoChunk } : {}),
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  const previousPlan = A.plannedChunks.findIndex((x) => x && x.label === plan.label)
+  if (previousPlan >= 0) A.plannedChunks[previousPlan] = plan
+  else A.plannedChunks.push(plan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(plan)
+  if (chunks.length <= 1) {
+    // Single agent → full glossary (no token multiplication on one agent).
+    return engine.agent(refinePrompt(f, glossary, finding, A),
+      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
+  }
   const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
     : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
@@ -2444,14 +2527,14 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   let partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
+      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })))
   const missing = chunks.map((c, i) => (!partReps[i] ? i : -1)).filter((i) => i >= 0)
   if (missing.length) {
     engine.log(`精校分块：${f.label} 首轮 ${missing.length}/${chunks.length} 块未返回——只重试缺失块一次`)
     const retries = await engine.parallel(missing.map((i) => {
       const c = chunks[i]
       return () => engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
+        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })
     }))
     partReps = partReps.slice()
     missing.forEach((i, k) => { if (retries[k]) partReps[i] = retries[k] })
@@ -2475,7 +2558,7 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
       return null
     }
   } else {
-    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch, outputPath: f.outPath })
     if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
   }
   return {
@@ -2772,7 +2855,14 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA })
+  const onePassPlan = {
+    label: f.label, outPath: f.outPath, model: M.refine, contentLength: refineSize(f), driver: 'single',
+    parts: [{ idx: 1, startLine: 1, endLine: f.lines, path: f.outPath }],
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  A.plannedChunks.push(onePassPlan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(onePassPlan)
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -2994,7 +3084,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })))
   logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -3004,7 +3094,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = derivativePairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
@@ -3026,10 +3116,10 @@ if (finalBodiesReady && (scope.includes('summary') || scope.includes('timeline')
 }
 const [summary, timeline] = await engine.parallel([
   () => (scope.includes('summary') && finalBodiesReady
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary'), outputPath: `${A.outputDir}/${summaryDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
   () => (scope.includes('timeline') && finalBodiesReady
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline'), outputPath: `${A.outputDir}/${timelineDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
 ])
 
@@ -3048,7 +3138,8 @@ return {
   networkUnverified: netUnverified,
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
-  autoChunk: refined.map((r) => r.autoChunk).filter(Boolean),   // provider-budget auto-split records → run.json + review.md
+  plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
+  autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
   derivativesSkipped,
   openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),

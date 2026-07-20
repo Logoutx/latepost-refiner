@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildFilePolicy, computeLogicAudit, prepareFile, runJob } from '../universal/jobs.js'
+import { buildFilePolicy, computeLogicAudit, prepareFile, runJob, stitchRefineParts } from '../universal/jobs.js'
 import { computeExitCode } from '../universal/cli.js'
 import { timelineDeliverableName } from '../core/prompts.js'
+import { writeFile } from '../engines/fileops.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-runjob-'))
@@ -52,11 +53,96 @@ test('buildFilePolicy only allows this run\'s declared deliverable paths', () =>
     files: [{ title: 'A', path: '/source/A.md', outPath: refined }],
   })
   assert.ok(policy.writePaths.includes(refined))
-  assert.ok(policy.writePaths.includes(`${refined}.part1`))
+  assert.ok(policy.writePartBases.includes(refined))
   assert.ok(policy.writePaths.includes(path.join(outputDir, '逻辑顺序', 'A.md')))
   assert.ok(policy.writePaths.some((p) => p.endsWith('访谈总结.md')))
   assert.ok(policy.writePaths.some((p) => p.endsWith('时间线.md')))
   assert.ok(!policy.writePaths.some((p) => p.includes('test_quotes')))
+})
+
+for (const partCount of [2, 3, 4, 9]) {
+  test(`declared ${partCount}-part output writes and stitches through the real file policy`, () => {
+    const outputDir = tmpdir()
+    const refined = path.join(outputDir, 'Transcripts', 'A.md')
+    const entry = { title: 'A', path: path.join(outputDir, 'source.md'), outPath: refined }
+    const policy = buildFilePolicy({ outputDir, files: [entry], scope: ['refine'] })
+    const chunks = Array.from({ length: partCount }, (_, i) => ({ idx: i + 1 }))
+
+    for (const chunk of chunks) {
+      const wrote = writeFile({ file_path: `${refined}.part${chunk.idx}`, content: `采访者：问题 ${chunk.idx}\n\n受访者：回答 ${chunk.idx}\n` }, policy)
+      assert.equal(wrote.ok, true, wrote.text)
+    }
+    const report = stitchRefineParts(entry, chunks)
+    assert.equal(report.merged, partCount)
+    assert.match(fs.readFileSync(refined, 'utf8'), new RegExp(`回答 ${partCount}`))
+    for (const chunk of chunks) assert.equal(fs.existsSync(`${refined}.part${chunk.idx}`), false)
+    assert.equal(writeFile({ file_path: path.join(outputDir, 'Transcripts', 'scratch.md'), content: 'nope' }, policy).ok, false)
+  })
+}
+
+test('failed stitch preserves every successfully written part for diagnosis and targeted retry', () => {
+  const outputDir = tmpdir()
+  const refined = path.join(outputDir, 'Transcripts', 'A.md')
+  const entry = { title: 'A', path: path.join(outputDir, 'source.md'), outPath: refined }
+  const policy = buildFilePolicy({ outputDir, files: [entry], scope: ['refine'] })
+  assert.equal(writeFile({ file_path: `${refined}.part1`, content: '第一块\n' }, policy).ok, true)
+  assert.equal(writeFile({ file_path: `${refined}.part2`, content: '第二块\n' }, policy).ok, true)
+
+  assert.throws(() => stitchRefineParts(entry, [{ idx: 1 }, { idx: 2 }, { idx: 3 }]), /part3/)
+  assert.equal(fs.existsSync(`${refined}.part1`), true)
+  assert.equal(fs.existsSync(`${refined}.part2`), true)
+  assert.equal(fs.existsSync(refined), false)
+})
+
+test('runJob failure injection records part3 plan, typed execution failure, trace, and preserves good parts', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, 'long-source.md')
+  const turns = Array.from({ length: 360 }, (_, i) => `采访者：请说明第 ${i + 1} 个问题的背景和影响。\n\n受访者：第 ${i + 1} 个问题包含一段需要完整保留的事实、例子、判断、限定语与后续安排，不能压缩成摘要。`)
+  fs.writeFileSync(src, turns.join('\n\n'), 'utf8')
+  const failure = { label: 'refine:long-source#3/3', code: 'OUTPUT_MISSING', retryable: false, message: '声明产物未生成：part3' }
+  const usage = { input: 30, output: 10, cacheRead: 0, cacheWrite: 0, agents: 5, failed: 1, byModel: {} }
+  const engine = {
+    phase() {}, log() {},
+    usage: () => ({ ...usage }),
+    failures: () => [{ ...failure }],
+    refineBudget: () => ({ model: 'deepseek-v4-pro', budget: 10000 }),
+    parallel: async (thunks) => Promise.all(thunks.map((task) => task())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, i) => {
+      let value = item
+      for (const stage of stages) { value = await stage(value, item, i); if (!value) return null }
+      return value
+    })),
+    agent: async (_prompt, opts = {}) => {
+      if (opts.label?.startsWith('scout:')) return { speakers: [], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: {}, special_notes: [] }
+      if (/^refine(?:-retry)?:.*#3\/3$/.test(opts.label || '')) return null
+      if (opts.label?.startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, `采访者：问题\n\n受访者：${opts.label}\n`, 'utf8')
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      return null
+    },
+  }
+
+  const result = await runJob({
+    files: [{ path: src }], topic: '失败注入', outputDir, scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', runLog: false,
+    __engine: engine,
+  })
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  const state = JSON.parse(fs.readFileSync(path.join(outputDir, 'run-state.json'), 'utf8'))
+  const plan = manifest.plannedChunks[0]
+
+  assert.equal(result.execution.status, 'failed')
+  assert.equal(result.execution.failure.code, 'OUTPUT_MISSING')
+  assert.equal(manifest.execution.failure.retryable, false)
+  assert.equal(plan.parts.length, 3)
+  assert.match(plan.parts[2].path, /\.part3$/)
+  assert.equal(fs.existsSync(plan.parts[0].path), true)
+  assert.equal(fs.existsSync(plan.parts[1].path), true)
+  assert.equal(fs.existsSync(plan.parts[2].path), false)
+  assert.equal(state.status, 'failed')
+  assert.equal(state.progress.partsPlanned, 3)
+  assert.equal(computeExitCode(result), 1)
 })
 
 function mockEngine() {
