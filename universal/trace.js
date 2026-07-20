@@ -7,6 +7,35 @@ import path from 'node:path'
 
 const FILE_MODE = 0o600
 
+function safeToken(value, maxLength = 200) {
+  if (value == null) return null
+  const text = String(value).trim()
+  return text && text.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(text) ? text : null
+}
+
+function normalizeProviderSignal(signal) {
+  if (!signal || signal.provider !== 'deepseek') return null
+  const status = signal.httpStatus == null ? null : Number(signal.httpStatus)
+  const choices = signal.choiceCount == null ? null : Number(signal.choiceCount)
+  return {
+    provider: 'deepseek',
+    finishReason: safeToken(signal.finishReason, 80),
+    refusalPresent: typeof signal.refusalPresent === 'boolean' ? signal.refusalPresent : null,
+    choiceCount: Number.isInteger(choices) && choices >= 0 ? choices : null,
+    httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
+    requestId: safeToken(signal.requestId),
+  }
+}
+
+function normalizeFailure(failure) {
+  if (!failure) return null
+  return {
+    code: safeToken(failure.code, 80) || 'UNKNOWN_FAILURE',
+    retryable: !!failure.retryable,
+    providerSignal: normalizeProviderSignal(failure.providerSignal),
+  }
+}
+
 function safeWriteJson(filePath, value) {
   const tmp = `${filePath}.${process.pid}.tmp`
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: FILE_MODE })
@@ -80,12 +109,13 @@ export function makeRunTrace(outputDir, { now = () => new Date().toISOString() }
       return emit(`agent.${event.status}`, {
         label: event.label, phase: event.phase || null, model: event.model || null,
         code: event.code || null, retryable: event.retryable ?? null,
+        providerSignal: normalizeProviderSignal(event.providerSignal),
       })
     },
     finish(execution) {
       state.status = execution.status
       state.stage = 'finished'
-      state.failure = execution.failure || null
+      state.failure = normalizeFailure(execution.failure)
       state.finishedAt = now()
       emit('run.finished', { status: state.status, failure: state.failure })
       return { eventsPath, statePath }

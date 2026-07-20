@@ -172,7 +172,68 @@ test('structured_output without the declared artifact becomes a typed non-retrya
 
   assert.equal(result, null)
   assert.equal(engine.usage().failed, 1)
-  assert.deepEqual(engine.failures(), [{ label: 'refine:A', code: 'OUTPUT_MISSING', retryable: false, message: `声明产物未生成：${outputPath}` }])
+  assert.deepEqual(engine.failures(), [{
+    label: 'refine:A', code: 'OUTPUT_MISSING', retryable: false, message: `声明产物未生成：${outputPath}`,
+    providerSignal: { provider: 'deepseek', finishReason: 'stop', refusalPresent: false, choiceCount: 1, httpStatus: null, requestId: null },
+  }])
+})
+
+test('explicit refusal and content_filter become non-retryable failures with sanitized provider evidence', async () => {
+  const refusalEvents = []
+  const refusal = completion({ content: '', refusal: '原始拒绝正文不应进入失败记录' })
+  refusal._request_id = 'req_refusal-1'
+  const refusalEngine = makeDeepSeekEngine({ client: mockClient([refusal]), concurrency: 1, onAgentEvent: (event) => refusalEvents.push(event) })
+
+  assert.equal(await refusalEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:sensitive' }), null)
+  const refusalFailure = refusalEngine.failures()[0]
+  assert.equal(refusalFailure.code, 'MODEL_REFUSAL')
+  assert.equal(refusalFailure.retryable, false)
+  assert.deepEqual(refusalFailure.providerSignal, {
+    provider: 'deepseek', finishReason: 'stop', refusalPresent: true, choiceCount: 1, httpStatus: null, requestId: 'req_refusal-1',
+  })
+  assert.doesNotMatch(JSON.stringify(refusalFailure), /原始拒绝正文/)
+  assert.deepEqual(refusalEvents.at(-1).providerSignal, refusalFailure.providerSignal)
+
+  const filtered = completion({ content: '' }, 'content_filter')
+  filtered._request_id = 'req_filter-1'
+  const filterEngine = makeDeepSeekEngine({ client: mockClient([filtered]), concurrency: 1 })
+  assert.equal(await filterEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'summary' }), null)
+  assert.deepEqual(filterEngine.failures()[0], {
+    label: 'summary', code: 'CONTENT_FILTER', retryable: false, message: 'summary 被内容过滤',
+    providerSignal: { provider: 'deepseek', finishReason: 'content_filter', refusalPresent: false, choiceCount: 1, httpStatus: null, requestId: 'req_filter-1' },
+  })
+})
+
+test('silent empty responses remain cause-unknown and carry request metadata without being mislabeled as censorship', async () => {
+  const noChoice = { choices: [], usage: { prompt_tokens: 3, completion_tokens: 0 }, _request_id: 'req_empty-choice' }
+  const noChoiceEngine = makeDeepSeekEngine({ client: mockClient([noChoice]), concurrency: 1 })
+  assert.equal(await noChoiceEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:empty' }), null)
+  assert.deepEqual(noChoiceEngine.failures()[0].providerSignal, {
+    provider: 'deepseek', finishReason: null, refusalPresent: null, choiceCount: 0, httpStatus: null, requestId: 'req_empty-choice',
+  })
+  assert.equal(noChoiceEngine.failures()[0].code, 'MODEL_EMPTY_RESPONSE')
+
+  const emptyContent = completion({ content: '' })
+  emptyContent._request_id = 'req_empty-content'
+  const emptyContentEngine = makeDeepSeekEngine({ client: mockClient([emptyContent]), concurrency: 1 })
+  assert.equal(await emptyContentEngine.agent('prompt', { model: 'haiku', label: 'audit:file' }), null)
+  assert.equal(emptyContentEngine.failures()[0].code, 'MODEL_EMPTY_CONTENT')
+  assert.equal(emptyContentEngine.failures()[0].providerSignal.refusalPresent, false)
+  assert.doesNotMatch(JSON.stringify(emptyContentEngine.failures()), /CONTENT_FILTER|MODEL_REFUSAL/)
+})
+
+test('API errors retain only status/request id metadata and classify transient transport errors', async () => {
+  const apiError = Object.assign(new Error('provider response body must not be persisted'), { status: 429, requestID: 'req_rate-1' })
+  const engine = makeDeepSeekEngine({ client: mockClient([() => { throw apiError }]), concurrency: 1 })
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:rate' }), null)
+  const failure = engine.failures()[0]
+  assert.equal(failure.code, 'API_TRANSIENT')
+  assert.equal(failure.retryable, true)
+  assert.deepEqual(failure.providerSignal, {
+    provider: 'deepseek', finishReason: null, refusalPresent: null, choiceCount: null, httpStatus: 429, requestId: 'req_rate-1',
+  })
+  assert.doesNotMatch(JSON.stringify(failure), /provider response body/)
 })
 
 test('an unchanged stale artifact cannot satisfy the output postcondition', async () => {

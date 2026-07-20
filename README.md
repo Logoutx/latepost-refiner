@@ -61,7 +61,7 @@ docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.
 
 DeepSeek 版默认仍按上表使用 flash/pro。CLI 与 `runJob()` 只为受控测试提供显式阶段覆盖（`--models stage=model`）；未指定阶段沿用默认值，`run.json` 记录完整的实际阶段→模型路由和本次稀疏覆盖，避免配置与真实调用不一致。
 
-Universal 把“程序是否完成”和“稿件是否可发布”分开记录：`run.json.execution` 只描述执行状态与 typed failure（例如 `TOOL_PATH_DENIED`、`OUTPUT_MISSING`，并标明是否可重试），`run.json.quality` 继续描述 `ready / review_needed / blocked`。`plannedChunks` 在精校代理启动前生成，所以某个分块失败后仍能看到本次计划的全部 `.partN`。每个输出目录还会实时写权限为 `0600` 的 `run-state.json` 与 `events.jsonl`，记录阶段、15 秒心跳、分块计划、agent 和工具成败；不记录 prompt、转录正文、网页正文或 API key。
+Universal 把“程序是否完成”和“稿件是否可发布”分开记录：`run.json.execution` 只描述执行状态与 typed failure（例如 `TOOL_PATH_DENIED`、`OUTPUT_MISSING`，并标明是否可重试），`run.json.quality` 继续描述 `ready / review_needed / blocked`。DeepSeek 失败另带脱敏的 `providerSignal`：明确拒绝记 `MODEL_REFUSAL`，`finish_reason=content_filter` 记 `CONTENT_FILTER`，无 choice / 空内容分别记 `MODEL_EMPTY_RESPONSE` / `MODEL_EMPTY_CONTENT`，429、5xx 和网络错误记 `API_TRANSIENT`；静默空响应保持“原因不明”，不会推断成内容审查。证据只含 finish reason、是否出现 refusal、choice 数、HTTP 状态、request id，不保存响应正文。`plannedChunks` 在精校代理启动前生成，所以某个分块失败后仍能看到本次计划的全部 `.partN`。每个输出目录还会实时写权限为 `0600` 的 `run-state.json` 与 `events.jsonl`，记录阶段、15 秒心跳、分块计划、agent 和工具成败；不记录 prompt、转录正文、网页正文、provider 响应正文或 API key。
 
 ## 架构
 

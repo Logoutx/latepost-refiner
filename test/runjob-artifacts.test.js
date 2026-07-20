@@ -99,7 +99,10 @@ test('runJob failure injection records part3 plan, typed execution failure, trac
   const src = path.join(outputDir, 'long-source.md')
   const turns = Array.from({ length: 360 }, (_, i) => `采访者：请说明第 ${i + 1} 个问题的背景和影响。\n\n受访者：第 ${i + 1} 个问题包含一段需要完整保留的事实、例子、判断、限定语与后续安排，不能压缩成摘要。`)
   fs.writeFileSync(src, turns.join('\n\n'), 'utf8')
-  const failure = { label: 'refine:long-source#3/3', code: 'OUTPUT_MISSING', retryable: false, message: '声明产物未生成：part3' }
+  const failure = {
+    label: 'refine:long-source#3/3', code: 'OUTPUT_MISSING', retryable: false, message: '声明产物未生成：part3',
+    providerSignal: { provider: 'deepseek', finishReason: 'stop', refusalPresent: false, choiceCount: 1, httpStatus: null, requestId: 'req_part3' },
+  }
   const usage = { input: 30, output: 10, cacheRead: 0, cacheWrite: 0, agents: 5, failed: 1, byModel: {} }
   const engine = {
     phase() {}, log() {},
@@ -135,6 +138,7 @@ test('runJob failure injection records part3 plan, typed execution failure, trac
   assert.equal(result.execution.status, 'failed')
   assert.equal(result.execution.failure.code, 'OUTPUT_MISSING')
   assert.equal(manifest.execution.failure.retryable, false)
+  assert.equal(manifest.execution.failure.providerSignal.requestId, 'req_part3')
   assert.equal(plan.parts.length, 3)
   assert.match(plan.parts[2].path, /\.part3$/)
   assert.equal(fs.existsSync(plan.parts[0].path), true)

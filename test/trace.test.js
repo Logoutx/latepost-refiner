@@ -16,9 +16,13 @@ test('per-run trace persists stage, planned chunks, typed tool failures, heartbe
   })
   trace.agent({ status: 'started', label: 'refine:A#3/3', phase: 'Refine', model: 'deepseek-v4-pro' })
   trace.tool({ label: 'refine:A#3/3', tool: 'Write', ok: false, code: 'TOOL_PATH_DENIED', path: path.join(outputDir, 'A.md.part3') })
-  trace.agent({ status: 'failed', label: 'refine:A#3/3', phase: 'Refine', model: 'deepseek-v4-pro', code: 'OUTPUT_MISSING', retryable: false })
+  const providerSignal = {
+    provider: 'deepseek', finishReason: 'content_filter', refusalPresent: false, choiceCount: 1,
+    httpStatus: null, requestId: 'req_filter-1', responseBody: 'must not persist',
+  }
+  trace.agent({ status: 'failed', label: 'refine:A#3/3', phase: 'Refine', model: 'deepseek-v4-pro', code: 'CONTENT_FILTER', retryable: false, providerSignal })
   trace.heartbeat()
-  trace.finish({ status: 'failed', failure: { code: 'OUTPUT_MISSING', retryable: false, message: 'missing part3' } })
+  trace.finish({ status: 'failed', failure: { code: 'CONTENT_FILTER', retryable: false, message: 'provider body', providerSignal } })
 
   const state = JSON.parse(fs.readFileSync(trace.statePath, 'utf8'))
   const events = fs.readFileSync(trace.eventsPath, 'utf8').trim().split('\n').map(JSON.parse)
@@ -27,11 +31,17 @@ test('per-run trace persists stage, planned chunks, typed tool failures, heartbe
   assert.equal(state.progress.partsPlanned, 3)
   assert.equal(state.progress.toolsFailed, 1)
   assert.equal(state.progress.agentsFailed, 1)
-  assert.equal(state.failure.code, 'OUTPUT_MISSING')
+  assert.equal(state.failure.code, 'CONTENT_FILTER')
+  assert.equal(state.failure.message, undefined)
+  assert.equal(state.failure.providerSignal.requestId, 'req_filter-1')
+  assert.equal(state.failure.providerSignal.responseBody, undefined)
   assert.deepEqual(events.map((event) => event.type), [
     'run.started', 'stage.changed', 'refine.planned', 'agent.started', 'tool.completed', 'agent.failed', 'run.heartbeat', 'run.finished',
   ])
   assert.equal(events.find((event) => event.type === 'tool.completed').code, 'TOOL_PATH_DENIED')
+  const failedAgent = events.find((event) => event.type === 'agent.failed')
+  assert.equal(failedAgent.providerSignal.finishReason, 'content_filter')
+  assert.equal(failedAgent.providerSignal.responseBody, undefined)
   assert.equal(fs.statSync(trace.statePath).mode & 0o777, 0o600)
   assert.equal(fs.statSync(trace.eventsPath).mode & 0o777, 0o600)
 })

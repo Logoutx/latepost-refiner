@@ -73,10 +73,41 @@ const structuredTool = (schema) => ({
 const BIG_LABEL = /^(refine|logic|summary|timeline)/i
 const maxTokensFor = (label = '') => (BIG_LABEL.test(label) ? 64000 : 16000)
 
-function agentError(code, message, retryable = false) {
+function safeProviderToken(value, maxLength = 200) {
+  if (value == null) return null
+  const text = String(value).trim()
+  return text && text.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(text) ? text : null
+}
+
+function providerSignalFromResponse(comp, choice) {
+  const choices = Array.isArray(comp?.choices) ? comp.choices : []
+  return {
+    provider: 'deepseek',
+    finishReason: safeProviderToken(choice?.finish_reason, 80),
+    refusalPresent: choice ? !!choice.message?.refusal : null,
+    choiceCount: choices.length,
+    httpStatus: null,
+    requestId: safeProviderToken(comp?._request_id),
+  }
+}
+
+function providerSignalFromError(error) {
+  const rawStatus = Number(error && (error.status || error.statusCode || error.response?.status))
+  return {
+    provider: 'deepseek',
+    finishReason: null,
+    refusalPresent: null,
+    choiceCount: null,
+    httpStatus: Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : null,
+    requestId: safeProviderToken(error?.requestID || error?.request_id),
+  }
+}
+
+function agentError(code, message, retryable = false, providerSignal = null) {
   const err = new Error(message)
   err.code = code
   err.retryable = retryable
+  if (providerSignal) err.providerSignal = providerSignal
   return err
 }
 
@@ -103,14 +134,23 @@ function checkOutputPostcondition(filePath, before) {
 }
 
 function classifyAgentError(error) {
-  if (error && error.code && /^[A-Z][A-Z0-9_]+$/.test(error.code)) {
-    return { code: error.code, retryable: !!error.retryable, message: error.message || String(error) }
+  if (error && error.code && /^[A-Z][A-Z0-9_]+$/.test(error.code) && typeof error.retryable === 'boolean') {
+    const typed = { code: error.code, retryable: error.retryable, message: error.message || String(error) }
+    if (error.providerSignal) typed.providerSignal = error.providerSignal
+    return typed
   }
   const status = Number(error && (error.status || error.statusCode || error.response?.status))
   const code = error && error.code
   const transient = status === 408 || status === 409 || status === 429 || status >= 500
     || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENETUNREACH'].includes(code)
-  return { code: transient ? 'API_TRANSIENT' : 'AGENT_EXECUTION_ERROR', retryable: transient, message: (error && error.message) || String(error) }
+  const statusText = Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : null
+  const codeText = safeProviderToken(code, 80)
+  return {
+    code: transient ? 'API_TRANSIENT' : 'AGENT_EXECUTION_ERROR',
+    retryable: transient,
+    message: `DeepSeek API 调用失败（${statusText || codeText || '原因未明'}）`,
+    providerSignal: providerSignalFromError(error),
+  }
 }
 
 // ---- Cache observability -----------------------------------------------------
@@ -218,12 +258,18 @@ export function makeDeepSeekEngine(opts = {}) {
         tool_choice: { type: 'function', function: { name: 'structured_output' } },
         max_tokens: maxTokensFor(label),
       })
-      const c = (comp.choices?.[0]?.message?.tool_calls || []).find((x) => x.function?.name === 'structured_output')
+      const choice = comp.choices?.[0]
+      const signal = providerSignalFromResponse(comp, choice)
+      if (!choice) return { value: null, failure: classifyAgentError(agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true, signal)) }
+      if (choice.message?.refusal) return { value: null, failure: classifyAgentError(agentError('MODEL_REFUSAL', `${label || 'agent'} 被模型明确拒绝`, false, signal)) }
+      if (choice.finish_reason === 'content_filter') return { value: null, failure: classifyAgentError(agentError('CONTENT_FILTER', `${label || 'agent'} 被内容过滤`, false, signal)) }
+      const c = (choice.message?.tool_calls || []).find((x) => x.function?.name === 'structured_output')
       const v = c && parseJSON(c.function.arguments)
-      return v || null
+      return { value: v || null, signal }
     } catch (e) {
-      log(`⚠ ${label || 'agent'} 结构化兜底失败：${e.message}`)
-      return null
+      const failure = classifyAgentError(e)
+      log(`⚠ ${label || 'agent'} 结构化兜底失败 [${failure.code}]`)
+      return { value: null, failure }
     }
   }
 
@@ -239,14 +285,16 @@ export function makeDeepSeekEngine(opts = {}) {
     let nudges = 0
     let outputNudges = 0
     let unrecoveredWriteFailure = null
+    let lastProviderSignal = null
     const beforeOutput = outputSnapshot(outputPath)
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const comp = await create({ model: modelId, messages, tools, max_tokens: maxTokensFor(label) })
       const choice = comp.choices?.[0]
-      if (!choice) throw agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true)
+      lastProviderSignal = providerSignalFromResponse(comp, choice)
+      if (!choice) throw agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true, lastProviderSignal)
       const m = choice.message || {}
-      if (m.refusal) throw agentError('MODEL_REFUSAL', `${label || 'agent'} 被拒：${m.refusal}`, false)
+      if (m.refusal) throw agentError('MODEL_REFUSAL', `${label || 'agent'} 被模型明确拒绝`, false, lastProviderSignal)
 
       const asst = { role: 'assistant', content: m.content ?? '' }
       const calls = m.tool_calls || []
@@ -277,18 +325,20 @@ export function makeDeepSeekEngine(opts = {}) {
           outputNudges++
           log(`⚠ ${label || 'agent'} 拒绝 structured_output：${failure.code} ${failure.message}`)
           messages.push({ role: 'tool', tool_call_id: so.id, content: `${failure.code}: ${failure.message}。请先成功写入声明产物，再重新提交 structured_output。` })
-          if (outputNudges >= 2) throw agentError(failure.code, failure.message, false)
+          if (outputNudges >= 2) throw agentError(failure.code, failure.message, false, lastProviderSignal)
         }
         continue
       }
 
       // No tool calls → the model ended its turn.
-      if (choice.finish_reason === 'content_filter') throw agentError('CONTENT_FILTER', `${label || 'agent'} content_filter`, false)
+      if (choice.finish_reason === 'content_filter') throw agentError('CONTENT_FILTER', `${label || 'agent'} 被内容过滤`, false, lastProviderSignal)
       if (!schema) {
         const post = checkOutputPostcondition(outputPath, beforeOutput)
-        if (!post.ok) throw agentError(post.code, post.message, false)
-        if (!outputPath && unrecoveredWriteFailure) throw agentError(unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', unrecoveredWriteFailure.text, false)
-        return (m.content || '').trim()
+        if (!post.ok) throw agentError(post.code, post.message, false, lastProviderSignal)
+        if (!outputPath && unrecoveredWriteFailure) throw agentError(unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', unrecoveredWriteFailure.text, false, lastProviderSignal)
+        const text = (m.content || '').trim()
+        if (!outputPath && !text) throw agentError('MODEL_EMPTY_CONTENT', `${label || 'agent'} 返回空内容`, true, lastProviderSignal)
+        return text
       }
       if (nudges < 2) {
         nudges++
@@ -296,12 +346,15 @@ export function makeDeepSeekEngine(opts = {}) {
         continue
       }
       const forced = await forceStructured_(messages, schema, modelId, label)
-      if (!forced) throw agentError('STRUCTURED_OUTPUT_MISSING', `${label || 'agent'} 未返回结构化结果`, true)
+      if (!forced.value) {
+        if (forced.failure) throw agentError(forced.failure.code, forced.failure.message, forced.failure.retryable, forced.failure.providerSignal || lastProviderSignal)
+        throw agentError('STRUCTURED_OUTPUT_MISSING', `${label || 'agent'} 未返回结构化结果`, true, forced.signal || lastProviderSignal)
+      }
       const post = checkOutputPostcondition(outputPath, beforeOutput)
-      if (!post.ok) throw agentError(post.code, post.message, false)
-      return forced
+      if (!post.ok) throw agentError(post.code, post.message, false, forced.signal || lastProviderSignal)
+      return forced.value
     }
-    throw agentError('AGENT_TURN_LIMIT', `${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`, false)
+    throw agentError('AGENT_TURN_LIMIT', `${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`, false, lastProviderSignal)
   }
 
   // Limiter wraps each agent (leaf unit); nested parallel shares one global cap, no deadlock.
@@ -321,7 +374,7 @@ export function makeDeepSeekEngine(opts = {}) {
         usage.failed++
         const failure = { label: agentOpts.label || 'agent', ...classifyAgentError(e) }
         failures.push(failure)
-        emitAgentEvent({ ...baseEvent, status: 'failed', code: failure.code, retryable: failure.retryable })
+        emitAgentEvent({ ...baseEvent, status: 'failed', code: failure.code, retryable: failure.retryable, providerSignal: failure.providerSignal || null })
         log(`⚠ ${failure.label} 失败 [${failure.code}]：${failure.message}`)
         return null
       }
