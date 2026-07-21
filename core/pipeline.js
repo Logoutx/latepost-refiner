@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
@@ -743,9 +743,9 @@ if (scope.includes('logic') && derivativePairs.length) {
   // can't fabricate a nested directory under 逻辑顺序/ (§3). missingSections = refine小标题 not covered by threads.
   const toEntry = (lrep, f, rep) => {
     if (!lrep) return { label: f.label, path: null, mainline: '', threads: [], missingSections: [], open_questions: [] }
-    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map((s) => (s || '').trim()).filter(Boolean)))
+    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map(canonicalHeadingKey).filter(Boolean)))
     const srcHeadings = ((rep && rep.headings) || []).map((h) => (h || '').trim()).filter(Boolean)
-    const missing = srcHeadings.filter((h) => !covered.has(h))
+    const missing = srcHeadings.filter((h) => !covered.has(canonicalHeadingKey(h)))
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>

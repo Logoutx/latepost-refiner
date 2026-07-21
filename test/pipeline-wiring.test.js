@@ -356,6 +356,17 @@ test('logic: if the rerun still misses, the residual stays in the return (no inf
   assert.deepEqual(r.logic[0].missingSections, ['某节'], 'the still-missing heading is surfaced for a Step-5 spot-check')
 })
 
+test('logic: punctuation and whitespace variants in source_sections do not trigger a false rerun', async () => {
+  const labels = []
+  const eng = engine(labels, {
+    '^refine': { path: 'x', headings: ['“Good Enough”之后，差异化会消失', '2023 年上海车展：一次集体的“Shock”'], key_fixes: [], open_questions: [] },
+    '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['"good enough"之后差异化会消失', '２０２３年上海车展——一次集体的 shock'] }], open_questions: [] },
+  })
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
+  assert.deepEqual(r.logic[0].missingSections, [])
+  assert.equal(labels.filter((l) => /^logic-rerun/.test(l)).length, 0, 'typesetting-only drift is already covered')
+})
+
 test('logic: safeName is applied to the 逻辑顺序 output path (a slash/colon title can\'t fabricate a directory)', async () => {
   const labels = []
   const eng = engine(labels, {

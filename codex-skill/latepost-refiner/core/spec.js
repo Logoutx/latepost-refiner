@@ -18,6 +18,18 @@ export const PUBLICATION_BLOCK_GATES = Object.freeze([
   ...OUTPUT_QUALITY_GATES,
 ])
 
+// Compare semantic section titles, not their typesetting. Model-authored logic provenance often changes Chinese
+// curly quotes to ASCII quotes, folds spaces around Latin words, or swaps full-/half-width punctuation. None of
+// those changes means a source section is missing. NFKC folds width variants; lower-case removes Latin case drift;
+// every Unicode punctuation/space code point (including zero-width spaces) is ignored. Keep letters, numbers and
+// non-punctuation symbols because they may carry meaning (for example C++); callers retain the original title for reporting.
+export function canonicalHeadingKey(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{Z}\s\u200B-\u200D\uFEFF]+/gu, '')
+}
+
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
 // (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent

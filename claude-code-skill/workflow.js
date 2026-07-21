@@ -45,6 +45,18 @@ const PUBLICATION_BLOCK_GATES = Object.freeze([
   ...OUTPUT_QUALITY_GATES,
 ])
 
+// Compare semantic section titles, not their typesetting. Model-authored logic provenance often changes Chinese
+// curly quotes to ASCII quotes, folds spaces around Latin words, or swaps full-/half-width punctuation. None of
+// those changes means a source section is missing. NFKC folds width variants; lower-case removes Latin case drift;
+// every Unicode punctuation/space code point (including zero-width spaces) is ignored. Keep letters, numbers and
+// non-punctuation symbols because they may carry meaning (for example C++); callers retain the original title for reporting.
+function canonicalHeadingKey(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{Z}\s\u200B-\u200D\uFEFF]+/gu, '')
+}
+
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
 // (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent
@@ -3136,9 +3148,9 @@ if (scope.includes('logic') && derivativePairs.length) {
   // can't fabricate a nested directory under 逻辑顺序/ (§3). missingSections = refine小标题 not covered by threads.
   const toEntry = (lrep, f, rep) => {
     if (!lrep) return { label: f.label, path: null, mainline: '', threads: [], missingSections: [], open_questions: [] }
-    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map((s) => (s || '').trim()).filter(Boolean)))
+    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map(canonicalHeadingKey).filter(Boolean)))
     const srcHeadings = ((rep && rep.headings) || []).map((h) => (h || '').trim()).filter(Boolean)
-    const missing = srcHeadings.filter((h) => !covered.has(h))
+    const missing = srcHeadings.filter((h) => !covered.has(canonicalHeadingKey(h)))
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>

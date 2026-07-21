@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, normalizeQuoteStyleText, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, canonicalHeadingKey as auditHeadingKey, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, normalizeQuoteStyleText, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
+import { canonicalHeadingKey as pipelineHeadingKey } from '../core/spec.js'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
@@ -642,6 +643,24 @@ test('auditLogicPair accepts provenance titles that contain Chinese separators',
   const r = auditLogicPair(refined, logic)
   assert.equal(r.status, 'ok')
   assert.equal(r.metrics.missingSections, 0)
+})
+
+test('auditLogicPair ignores quotes, whitespace, punctuation, width, and case in provenance titles', () => {
+  const titles = [
+    '“Good Enough”之后，差异化会消失',
+    '2023 年上海车展：一次集体的“Shock”',
+    '“小龙虾”试点：博世中国的 AI 探索',
+  ]
+  const refined = titles.flatMap((title) => [`## ${title}`, `记者：请讲讲${title}。`, `受访者：${title}保留完整事实。`, '']).join('\n')
+  const logic = [
+    '## 新主线',
+    '*〔取自精校稿："good enough"之后差异化会消失、２０２３年上海车展——一次集体的 shock、"小龙虾"试点 博世中国的AI探索〕*',
+    ...titles.flatMap((title) => [`记者：请讲讲${title}。`, `受访者：${title}保留完整事实。`, '']),
+  ].join('\n')
+  const r = auditLogicPair(refined, logic)
+  assert.equal(r.status, 'ok')
+  assert.equal(r.metrics.missingSections, 0)
+  for (const title of titles) assert.equal(auditHeadingKey(title), pipelineHeadingKey(title), 'audit and pipeline canonicalization stay identical')
 })
 
 test('auditLogicPair hard-fails logic drafts that omit refined section provenance', () => {

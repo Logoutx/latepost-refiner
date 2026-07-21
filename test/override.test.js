@@ -11,6 +11,7 @@ import {
   applyVerifiedEntry,
   renderGlossary, parseGlossary,
   confidenceMark,
+  canonicalHeadingKey,
   safeName,
 } from '../core/spec.js'
 
@@ -340,6 +341,17 @@ test('SF-2: two decrees naming the SAME canonical merge WITHOUT a conflict (inte
 })
 
 // ---------- SF-3: safeName byte-budget truncation on astral (4-byte) input ----------
+
+test('canonicalHeadingKey ignores Unicode punctuation, width, case, and all whitespace', () => {
+  assert.equal(
+    canonicalHeadingKey(' “Good Enough”之后，差异化会消失 '),
+    canonicalHeadingKey('\u200B"good　enough"之后差异化会消失！'),
+  )
+  assert.equal(
+    canonicalHeadingKey('2023 年上海车展：一次集体的“Shock”'),
+    canonicalHeadingKey('２０２３年上海车展——一次集体的 shock'),
+  )
+})
 
 test('SF-3: 80 astral (4-byte) chars are truncated to a valid-UTF-8 name within the byte budget', () => {
   const astral = '𝔘'.repeat(80)                 // U+1D518, 4 bytes each in UTF-8 → 320 bytes

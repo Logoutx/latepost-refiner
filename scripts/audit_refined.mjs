@@ -30,6 +30,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// Keep this self-contained because the generated Claude skill ships audit_refined.mjs without core/spec.js.
+// core/spec.js exposes the same helper for pipeline/native-plan checks; regression tests lock both copies together.
+export function canonicalHeadingKey(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{Z}\s\u200B-\u200D\uFEFF]+/gu, '')
+}
+
 const SRT_TIME_RE = /^\s*(\d{1,2}:\d{2}:\d{2})[,.]\d{1,3}\s*-->\s*(\d{1,2}:\d{2}:\d{2})[,.]\d{1,3}(?:\s+.*)?$/
 
 export function isSrtPath(filePath = '') {
@@ -705,10 +714,12 @@ function refinedHeadings(text) {
 function logicProvenanceSections(logicText, sourceHeadings = []) {
   const out = []
   const source = Array.isArray(sourceHeadings) ? sourceHeadings.filter(Boolean) : []
+  const sourceKeys = source.map((heading) => ({ heading, key: canonicalHeadingKey(heading) })).filter((x) => x.key)
   const re = /〔取自精校稿：([^〕]+)〕/g
   for (const m of String(logicText || '').matchAll(re)) {
     const block = m[1]
-    const matched = source.filter((h) => block.includes(h))
+    const blockKey = canonicalHeadingKey(block)
+    const matched = sourceKeys.filter((item) => blockKey.includes(item.key)).map((item) => item.heading)
     if (matched.length) {
       out.push(...matched)
       continue
@@ -744,11 +755,13 @@ export function checkLogicOrder(refinedText, logicText) {
 export function checkLogicSectionCoverage(refinedText, logicText) {
   const source = refinedHeadings(refinedText)
   const cited = logicProvenanceSections(logicText, source)
-  const citedSet = new Set(cited)
-  const missing = source.filter((h) => !citedSet.has(h))
-  const dupes = Array.from(cited.reduce((m, h) => m.set(h, (m.get(h) || 0) + 1), new Map()))
+  const citedKeys = cited.map(canonicalHeadingKey).filter(Boolean)
+  const citedSet = new Set(citedKeys)
+  const missing = source.filter((h) => !citedSet.has(canonicalHeadingKey(h)))
+  const sourceByKey = new Map(source.map((h) => [canonicalHeadingKey(h), h]).filter(([key]) => key))
+  const dupes = Array.from(citedKeys.reduce((m, key) => m.set(key, (m.get(key) || 0) + 1), new Map()))
     .filter(([, n]) => n > 1)
-    .map(([h]) => h)
+    .map(([key]) => sourceByKey.get(key) || key)
   const enough = source.length < 3 || missing.length === 0
   const findings = []
   findings.push({

@@ -26,6 +26,7 @@ import {
   SCOUT_SCHEMA,
   VERIFY_SCHEMA,
   applyOverridesToMerged,
+  canonicalHeadingKey,
   cleanSuspects,
   contentLength,
   dedupListText,
@@ -532,13 +533,18 @@ function auditLogicPlan(plan, headings) {
     const explicit = Array.isArray(t?.source_order) ? t.source_order.map(Number).filter((n) => Number.isFinite(n)) : []
     if (explicit.length) order.push(...explicit)
     else for (const s of ss) {
-      const found = headings.find((h) => h.title === s)
+      const key = canonicalHeadingKey(s)
+      const found = headings.find((h) => canonicalHeadingKey(h.title) === key)
       if (found) order.push(found.order)
     }
   }
-  const coveredSet = new Set(covered)
-  const missing = source.filter((h) => !coveredSet.has(h))
-  const dupes = Array.from(covered.reduce((m, h) => m.set(h, (m.get(h) || 0) + 1), new Map())).filter(([, n]) => n > 1).map(([h]) => h)
+  const coveredKeys = covered.map(canonicalHeadingKey).filter(Boolean)
+  const coveredSet = new Set(coveredKeys)
+  const sourceByKey = new Map(source.map((h) => [canonicalHeadingKey(h), h]).filter(([key]) => key))
+  const missing = source.filter((h) => !coveredSet.has(canonicalHeadingKey(h)))
+  const dupes = Array.from(coveredKeys.reduce((m, key) => m.set(key, (m.get(key) || 0) + 1), new Map()))
+    .filter(([, n]) => n > 1)
+    .map(([key]) => sourceByKey.get(key) || key)
   if (missing.length) issues.push(`漏掉 ${missing.length}/${source.length} 个精校小标题：${missing.slice(0, 8).join('、')}`)
   if (dupes.length) issues.push(`重复覆盖 ${dupes.length} 个精校小标题：${dupes.slice(0, 8).join('、')}`)
   const canonical = headings.map((h) => h.order).filter((n) => order.includes(n))
