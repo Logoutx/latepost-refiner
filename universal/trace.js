@@ -36,6 +36,16 @@ function normalizeFailure(failure) {
   }
 }
 
+function repairPosition(label) {
+  if (typeof label !== 'string' || !label.startsWith('repair:')) return null
+  const match = label.match(/#(\d+)\/(\d+)$/)
+  if (!match) return null
+  const round = Number(match[1]), maxRounds = Number(match[2])
+  return Number.isInteger(round) && Number.isInteger(maxRounds) && round > 0 && maxRounds >= round
+    ? { round, maxRounds }
+    : null
+}
+
 function safeWriteJson(filePath, value) {
   const tmp = `${filePath}.${process.pid}.tmp`
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: FILE_MODE })
@@ -55,7 +65,11 @@ export function makeRunTrace(outputDir, { now = () => new Date().toISOString() }
     stage: 'prepare',
     startedAt: now(),
     updatedAt: null,
-    progress: { agentsStarted: 0, agentsCompleted: 0, agentsFailed: 0, toolsSucceeded: 0, toolsFailed: 0, filesPlanned: 0, partsPlanned: 0 },
+    progress: {
+      agentsStarted: 0, agentsCompleted: 0, agentsFailed: 0,
+      toolsSucceeded: 0, toolsFailed: 0, filesPlanned: 0, partsPlanned: 0,
+      repairRound: 0, repairMaxRounds: 0, repairToolsFailed: 0,
+    },
     failure: null,
   }
 
@@ -97,12 +111,18 @@ export function makeRunTrace(outputDir, { now = () => new Date().toISOString() }
     tool(event) {
       if (event.ok) state.progress.toolsSucceeded += 1
       else state.progress.toolsFailed += 1
+      if (!event.ok && repairPosition(event.label)) state.progress.repairToolsFailed += 1
       return emit('tool.completed', {
         label: event.label, tool: event.tool, ok: !!event.ok, code: event.code || null,
         path: event.path || null, bytes: event.bytes ?? null,
       })
     },
     agent(event) {
+      const repair = repairPosition(event.label)
+      if (repair) {
+        state.progress.repairRound = repair.round
+        state.progress.repairMaxRounds = repair.maxRounds
+      }
       if (event.status === 'started') state.progress.agentsStarted += 1
       else if (event.status === 'completed') state.progress.agentsCompleted += 1
       else if (event.status === 'failed') state.progress.agentsFailed += 1

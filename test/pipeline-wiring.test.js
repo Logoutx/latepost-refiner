@@ -164,20 +164,22 @@ test('audit gate: content_gap hard → auto-repair → re-audit passes → not a
   assert.equal(r.refined[0].audit.anchorsAdded, 1)
 })
 
-test('audit gate: still hard after one repair → auditFailed + visible marker (annotate) + fail status', async () => {
+test('audit gate: still hard after two repair rounds → auditFailed + visible marker (annotate) + fail status', async () => {
   const labels = []
-  let annotateCalled = false, auditCalls = 0
+  let annotateCalled = false, auditCalls = 0, repairCalls = 0
   const capabilities = {
     runAudit: (f) => { auditCalls += 1; return { file: f.outPath, status: 'fail', failed: ['content_gap', 'quote_style'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] } },
-    repair: () => {}, // repair runs but the re-audit still fails
+    repair: () => { repairCalls += 1 }, // both repairs run but both re-audits still fail
     annotate: () => { annotateCalled = true },
     annotateAnchors: () => ({ updated: [] }),
   }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.equal(auditCalls, 2, 'repair-then-reaudit capped at one extra audit (no loop)')
+  assert.equal(auditCalls, 3, 'initial audit plus one re-audit after each of two capped repairs')
+  assert.equal(repairCalls, 2, 'repair is capped at two rounds')
   assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap', 'quote_style'] }])
   assert.ok(annotateCalled, 'a still-hard gap drops a visible 缺口 marker')
   assert.equal(r.refined[0].audit.status, 'fail')
+  assert.equal(r.refined[0].audit.repairAttempts.length, 2)
 })
 
 test('known-bad body is delivered but logic/summary/timeline are withheld', async () => {
@@ -208,7 +210,7 @@ test('audit gate (P7): a throwing runAudit capability is retried once, then FAIL
   assert.equal(r.refined[0].audit.auditUnavailable, true)
 })
 
-test('audit gate: publication-quality failures receive one repair and still block when they persist', async () => {
+test('audit gate: publication-quality failures receive two repairs and still block when they persist', async () => {
   const labels = []
   let audits = 0, repairs = 0
   const capabilities = {
@@ -217,10 +219,68 @@ test('audit gate: publication-quality failures receive one repair and still bloc
     annotateAnchors: () => ({ updated: [] }),
   }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.equal(audits, 2, 'publication-quality failure is re-audited once')
-  assert.equal(repairs, 1, 'publication-quality failure is not allowed to block without a repair attempt')
+  assert.equal(audits, 3, 'publication-quality failure is re-audited after each repair round')
+  assert.equal(repairs, 2, 'publication-quality failure gets both allowed repair rounds before blocking')
   assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['under_refined'] }])
   assert.deepEqual(r.refined[0].audit.hardFindings, ['under_refined'])
+})
+
+test('audit gate keeps failed repair tools visible even when a later Edit and the final audit succeed', async () => {
+  let auditCalls = 0
+  const capabilities = {
+    runAudit: (f) => {
+      auditCalls += 1
+      return auditCalls === 1
+        ? {
+            file: f.outPath, status: 'fail', failed: ['residual_noise', 'attribution_mismatch'], gaps: [],
+            findings: [
+              { name: 'confirmation_repeats', severity: 'hard', count: 5, samples: [] },
+              { name: 'attribution_mismatch', severity: 'hard', count: 6, samples: [] },
+            ],
+          }
+        : { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }
+    },
+    repair: () => ({
+      action: 'targeted_repair', model: 'deepseek-v4-pro', changed: true, agentCompleted: true,
+      bytesBefore: 1000, bytesAfter: 1010,
+      toolSummary: {
+        succeeded: { Read: 30, Edit: 30 },
+        failed: [
+          { tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 },
+          { tool: 'Grep', code: 'TOOL_UNKNOWN', count: 5 },
+        ],
+      },
+    }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ capabilities }), engine([]))
+  const attempt = r.refined[0].audit.repairAttempts[0]
+  assert.equal(r.refined[0].audit.status, 'ok', 'the successful final audit remains authoritative')
+  assert.equal(attempt.outcome, 'passed_with_tool_errors')
+  assert.deepEqual(attempt.hardIssueCountsBefore, { confirmation_repeats: 5, attribution_mismatch: 6, residual_noise: 1 })
+  assert.deepEqual(attempt.toolSummary.failed, [
+    { tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 },
+    { tool: 'Grep', code: 'TOOL_UNKNOWN', count: 5 },
+  ])
+  assert.deepEqual(attempt.failedAfter, [])
+})
+
+test('audit gate stops safely and records audit_unavailable when a post-repair re-audit cannot run', async () => {
+  let auditCalls = 0
+  const capabilities = {
+    runAudit: (f) => {
+      auditCalls += 1
+      if (auditCalls === 1) return { file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [], findings: [] }
+      throw new Error('audit unavailable after repair')
+    },
+    repair: () => ({ action: 'targeted_repair', model: 'deepseek-v4-pro', changed: true, agentCompleted: true }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ capabilities }), engine([]))
+  assert.equal(auditCalls, 3, 'the post-repair audit receives its normal one retry before stopping')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap'] }])
+  assert.equal(r.refined[0].audit.repairAttempts[0].outcome, 'audit_unavailable')
+  assert.equal(r.refined[0].audit.repairAttempts.length, 1, 'a second repair never runs without a fresh audit')
 })
 
 test('chunk seam: a residual duplicate reported after deterministic stitch blocks derivatives', async () => {

@@ -339,8 +339,8 @@ test('annotate:false leaves the refined files untouched (still audited and repor
   }
 })
 
-// Universal injects one targeted repair. This mock deliberately returns null and leaves the file byte-identical,
-// so the attempt is rejected and the hard gap still surfaces.
+// Universal injects at most two targeted repair rounds. This mock deliberately returns null and leaves the file
+// byte-identical, so both attempts are recorded and the hard gap still surfaces.
 test('runJob surfaces an un-repairable hard gap as auditFailed and attaches a per-file audit summary', async () => {
   const result = await runGapJob()
   assert.ok((result.auditFailed || []).length >= 1, 'a still-hard gap is recorded in auditFailed')
@@ -348,7 +348,14 @@ test('runJob surfaces an un-repairable hard gap as auditFailed and attaches a pe
   const r0 = result.refined.find((r) => (result.auditFailed[0].path === (r.outPath || r.path)))
   assert.ok(r0 && r0.audit && r0.audit.status === 'fail', 'the refined entry carries audit.status=fail')
   assert.equal(r0.audit.repaired, false, 'a null/byte-identical repair is not counted as repaired')
-  assert.ok(result.qualityRepair.attempts.length >= 1 && result.qualityRepair.attempts.every((x) => !x.ok))
+  assert.equal(result.qualityRepair.maxRounds, 2)
+  assert.equal(result.qualityRepair.roundsUsed, 2)
+  assert.equal(result.qualityRepair.stopReason, 'max_rounds')
+  assert.equal(result.qualityRepair.attempts.length, 4, 'two files each receive two repair rounds')
+  assert.ok(result.qualityRepair.attempts.every((x) => x.outcome === 'agent_failed' && x.changed === false))
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.qualityRepair.maxRounds, 2)
+  assert.equal(manifest.qualityRepair.attempts.length, 4)
 })
 
 function repairableGapEngine() {
@@ -378,7 +385,9 @@ test('runJob targeted repair closes content_gap, replaces the first audit result
   assert.equal(result.audit.files.length, 2, 'one latest audit record per file, not fail+pass duplicates')
   assert.ok(result.audit.files.every((f) => f.status === 'ok'))
   assert.ok(result.refined.every((r) => r.audit.repaired === true))
-  assert.ok(result.qualityRepair.attempts.every((x) => x.ok))
+  assert.equal(result.qualityRepair.roundsUsed, 1)
+  assert.equal(result.qualityRepair.stopReason, 'passed')
+  assert.ok(result.qualityRepair.attempts.every((x) => x.outcome === 'passed' && x.changed === true))
   assert.equal(result.annotations.length, 0, 'a repaired gap needs no visible failure marker')
 })
 

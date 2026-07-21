@@ -6,7 +6,7 @@ export const BODY_FIDELITY_GATES = Object.freeze([
 
 // Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file
 // carrying one of them is still not a final body. Keep them separate from BODY_FIDELITY_GATES so diagnostics can
-// say whether the risk is factual or editorial; both groups receive one repair + re-audit before blocking.
+// say whether the risk is factual or editorial; both groups receive at most two repair + re-audit rounds before blocking.
 export const OUTPUT_QUALITY_GATES = Object.freeze([
   'residual_noise', 'under_refined', 'long_paragraphs', 'quote_style',
 ])

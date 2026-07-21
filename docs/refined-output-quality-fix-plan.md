@@ -6,7 +6,7 @@ Date: 2026-06-23
 
 Status note: this plan was written from the pre-`7519636` audit state. Phase 1 landed on `main` with `speakerTurnRatio` intentionally changed to a confirming/reporting signal only, never an independent failure gate. The 2026-07-19 fidelity branch preserves that calibration and closes the remaining contract gaps:
 
-- One shared publication-gate taxonomy now drives repair, derivative withholding, CLI exit, run scorecards, and installed-skill copies. Body fidelity (`content_gap`, `compression_risk`, `ending_missing`, `attribution_mismatch`, `seam_duplicate`) stays separate from output quality (`residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`) for diagnosis; both receive at most one repair/recheck.
+- One shared publication-gate taxonomy now drives repair, derivative withholding, CLI exit, run scorecards, and installed-skill copies. Body fidelity (`content_gap`, `compression_risk`, `ending_missing`, `attribution_mismatch`, `seam_duplicate`) stays separate from output quality (`residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`) for diagnosis; both receive at most two repair/recheck rounds.
 - Chunk stitching performs conservative seam dedup, an extended deterministic repair for long replays, then a residual scan. A residual blocks derivatives but never deletes the main transcript.
 - Timeline/summary attribution is clause-scoped, understands Chinese/English money-scale conversions and spoken endpoint→range compaction, and rejects a globally real amount reassigned to another glossary entity.
 - Logic drafts have their own post-generation audit. Same-order copies and missing refined-section provenance block only that logic artifact.

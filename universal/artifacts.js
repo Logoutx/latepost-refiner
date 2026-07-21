@@ -438,6 +438,65 @@ function sanitizeProviderInfo(info = {}) {
   return out
 }
 
+const REPAIR_STOP_REASONS = new Set(['not_needed', 'passed', 'max_rounds', 'audit_unavailable', 'repair_unavailable'])
+const REPAIR_OUTCOMES = new Set(['passed', 'passed_with_tool_errors', 'audit_failed', 'audit_failed_with_tool_errors', 'no_change', 'agent_failed', 'audit_unavailable'])
+const safeRepairToken = (value, maxLength = 160) => {
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  return text && text.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(text) ? text : null
+}
+const safeRepairCountMap = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out = {}
+  for (const [key, raw] of Object.entries(value)) {
+    const name = safeRepairToken(key, 80)
+    const count = Number(raw)
+    if (name && Number.isInteger(count) && count > 0) out[name] = count
+  }
+  return out
+}
+
+function manifestQualityRepair(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const maxRounds = Number(value.maxRounds)
+  const roundsUsed = Number(value.roundsUsed)
+  const attempts = Array.isArray(value.attempts) ? value.attempts : []
+  return {
+    schemaVersion: 1,
+    maxRounds: Number.isInteger(maxRounds) && maxRounds >= 0 && maxRounds <= 10 ? maxRounds : 0,
+    roundsUsed: Number.isInteger(roundsUsed) && roundsUsed >= 0 && roundsUsed <= 10 ? roundsUsed : 0,
+    stopReason: REPAIR_STOP_REASONS.has(value.stopReason) ? value.stopReason : 'repair_unavailable',
+    attempts: attempts.slice(0, 100).map((attempt) => {
+      const toolSummary = attempt && attempt.toolSummary && typeof attempt.toolSummary === 'object' ? attempt.toolSummary : {}
+      const failedTools = Array.isArray(toolSummary.failed) ? toolSummary.failed : []
+      return {
+        file: attempt && typeof attempt.file === 'string' ? attempt.file : null,
+        round: Number.isInteger(Number(attempt && attempt.round)) ? Number(attempt.round) : 0,
+        action: safeRepairToken(attempt && attempt.action),
+        model: safeRepairToken(attempt && attempt.model),
+        failedBefore: (Array.isArray(attempt && attempt.failedBefore) ? attempt.failedBefore : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
+        hardIssueCountsBefore: safeRepairCountMap(attempt && attempt.hardIssueCountsBefore),
+        toolSummary: {
+          succeeded: safeRepairCountMap(toolSummary.succeeded),
+          failed: failedTools.slice(0, 50).map((item) => ({
+            tool: safeRepairToken(item && item.tool, 80) || 'unknown',
+            code: safeRepairToken(item && item.code, 80) || 'TOOL_UNKNOWN',
+            count: Number.isInteger(Number(item && item.count)) && Number(item.count) > 0 ? Number(item.count) : 1,
+          })),
+        },
+        bytesBefore: Number.isInteger(Number(attempt && attempt.bytesBefore)) && Number(attempt.bytesBefore) >= 0 ? Number(attempt.bytesBefore) : null,
+        bytesAfter: Number.isInteger(Number(attempt && attempt.bytesAfter)) && Number(attempt.bytesAfter) >= 0 ? Number(attempt.bytesAfter) : null,
+        changed: !!(attempt && attempt.changed),
+        agentCompleted: typeof (attempt && attempt.agentCompleted) === 'boolean' ? attempt.agentCompleted : null,
+        failedAfter: (Array.isArray(attempt && attempt.failedAfter) ? attempt.failedAfter : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
+        hardIssueCountsAfter: safeRepairCountMap(attempt && attempt.hardIssueCountsAfter),
+        outcome: REPAIR_OUTCOMES.has(attempt && attempt.outcome) ? attempt.outcome : 'agent_failed',
+        errorCode: safeRepairToken(attempt && attempt.errorCode, 80),
+      }
+    }),
+  }
+}
+
 function manifestFiles(files = []) {
   return files.map((f) => ({
     label: f.label,
@@ -530,6 +589,7 @@ export function buildRunManifest(result = {}, context = {}) {
         ...(((result.derivativeAudit && result.derivativeAudit.files) || []).flatMap((f) => (f.numericConflicts || []).map((c) => ({ file: path.basename(f.file || ''), keyNoun: c.keyNoun, unit: c.unit, values: (c.values || []).map((v) => ({ value: v.value, line: v.line })) })))),
       ],
     },
+    qualityRepair: manifestQualityRepair(result.qualityRepair),
     webTelemetry: result.webTelemetry || null,
     // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
     derivativeAudit: result.derivativeAudit ? {

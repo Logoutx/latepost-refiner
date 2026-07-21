@@ -6,6 +6,8 @@ export const DEFAULT_STAGE_MODELS = Object.freeze({
   stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus',
 })
 
+export const QUALITY_REPAIR_MAX_ROUNDS = 2
+
 // One shared publication contract: body-fidelity and output-quality groups stay separate for diagnostics, while
 // their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
 export { BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES } from './spec.js'
@@ -244,8 +246,8 @@ export function normalizeAuditResult(raw, f) {
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
-// JSON. Any PUBLICATION_BLOCK_GATES finding → optionally auto-repair once (capabilities.repair, or a refine
-// subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
+// JSON. Any PUBLICATION_BLOCK_GATES finding → optionally auto-repair at most twice (capabilities.repair, or a
+// refine subagent with Read/Edit in CC), re-audit after each round, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
 async function runAuditStep(A, engine, f, capabilities, glossaryText) {
@@ -297,50 +299,106 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   // and the run reported success with an "audit unavailable" note — a quality gate that can be skipped silently.
   // Now the per-file result still carries auditUnavailable (the 成稿 is kept, not destroyed), but the orchestration
   // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
-  if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
+  if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, repairAttempts: [], anchorsAdded: 0, directAudit } }
 
   const hardOf = (r) => (r.failed || []).filter((k) => PUBLICATION_BLOCK_GATES.includes(k))
   const softOf = (r) => (r.failed || []).filter((k) => !PUBLICATION_BLOCK_GATES.includes(k))
+  const issueCounts = (r, hard) => {
+    const counts = {}
+    for (const finding of (r.findings || [])) {
+      if (!finding || finding.severity !== 'hard') continue
+      const count = Number(finding.count)
+      if (finding.name && Number.isFinite(count) && count > 0) counts[finding.name] = count
+    }
+    const hardGaps = (r.gaps || []).filter((g) => g && g.severity === 'hard').length
+    if (hardGaps) counts.content_gap = Math.max(counts.content_gap || 0, hardGaps)
+    const longParagraphs = Array.isArray(r.long_paragraphs) ? r.long_paragraphs.length : 0
+    if (longParagraphs) counts.long_paragraphs = Math.max(counts.long_paragraphs || 0, longParagraphs)
+    for (const name of hard) if (!counts[name]) counts[name] = 1
+    return counts
+  }
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
+  const repairAttempts = []
+  const repairAvailable = typeof cap.repair === 'function' || typeof cap.runAudit !== 'function'
 
-  if (hard.length) {
-    engine.log(`审计 hard：${f.label} → ${hard.join('、')}——尝试自动修复一次`)
+  if (hard.length && repairAvailable) engine.log(`审计 hard：${f.label} → ${hard.join('、')}——最多自动定点修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮，每轮后复检`)
+  for (let round = 1; hard.length && repairAvailable && round <= QUALITY_REPAIR_MAX_ROUNDS; round += 1) {
+    const failedBefore = hard.slice()
+    const hardIssueCountsBefore = issueCounts(cur, failedBefore)
     const gaps = (cur.gaps || []).filter((g) => g.severity === 'hard')
     const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
-    let didRepair = false
+    let repairMeta = {}
+    let repairError = null
     if (typeof cap.repair === 'function') {
-      try { await cap.repair(f, { gaps, hard, audit: cur }); didRepair = true } catch { didRepair = false }
-    } else if (typeof cap.runAudit !== 'function') {
+      try { repairMeta = (await cap.repair(f, { gaps, hard: failedBefore, audit: cur, round, maxRounds: QUALITY_REPAIR_MAX_ROUNDS })) || {} }
+      catch (error) { repairError = (error && error.code) || 'REPAIR_AGENT_FAILED' }
+    } else {
       // CC path: a refine-tier subagent with Read/Edit patches ONLY the flagged spots in the on-disk 成稿.
       const parts = []
-      if (hard.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
-      if (hard.includes('compression_risk')) parts.push('· 全文压缩：从源文件重新逐轮核对，把被概括掉的事实、数字、例子、判断与限定语补回；保持说话人归属。')
-      if (hard.includes('ending_missing')) parts.push('· 结尾缺失：读取源文件尾部，把尚未进入成稿的最后几轮发言补回对应位置。')
-      if (hard.includes('attribution_mismatch')) parts.push('· 发言人串位：按审计 finding 的源行与成稿行，只修正这些轮次的发言人标签/段落归属，不能改写内容。')
-      if (hard.includes('under_refined')) parts.push('· 欠精校：对照源文件做一轮完整清噪和顺句，删除无意义口癖但保留事实、语气与对话体。')
-      if (hard.includes('residual_noise')) parts.push('· 残留噪音：只修审计标出的口癖、重复、断裂片段和 ASR 粘连，必要时对照源文件确认不改义。')
-      if (hard.includes('long_paragraphs')) parts.push('· 超长段落：在同一发言人内部按语义拆成 200–600 字左右的连贯段落，不得移动内容到其他发言人名下。')
-      if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
-      await engine.agent(
-        `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
-        { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
-      if (hard.includes('quote_style')) {
-        await engine.agent(
-          `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --refined ${JSON.stringify(out)} --fix-quotes\n这是确定性排版修复；只回复一句话确认即可。`,
-          { label: `quote-fix:${f.label}`, phase: 'Audit', model: 'haiku' })
+      if (failedBefore.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
+      if (failedBefore.includes('compression_risk')) parts.push('· 全文压缩：从源文件重新逐轮核对，把被概括掉的事实、数字、例子、判断与限定语补回；保持说话人归属。')
+      if (failedBefore.includes('ending_missing')) parts.push('· 结尾缺失：读取源文件尾部，把尚未进入成稿的最后几轮发言补回对应位置。')
+      if (failedBefore.includes('attribution_mismatch')) parts.push('· 发言人串位：按审计 finding 的源行与成稿行，只修正这些轮次的发言人标签/段落归属，不能改写内容。')
+      if (failedBefore.includes('under_refined')) parts.push('· 欠精校：对照源文件做一轮完整清噪和顺句，删除无意义口癖但保留事实、语气与对话体。')
+      if (failedBefore.includes('residual_noise')) parts.push('· 残留噪音：只修审计标出的口癖、重复、断裂片段和 ASR 粘连，必要时对照源文件确认不改义。')
+      if (failedBefore.includes('long_paragraphs')) parts.push('· 超长段落：在同一发言人内部按语义拆成 200–600 字左右的连贯段落，不得移动内容到其他发言人名下。')
+      if (failedBefore.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
+      try {
+        const response = await engine.agent(
+          `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n这是第 ${round}/${QUALITY_REPAIR_MAX_ROUNDS} 轮修复。改完用一句话回复即可。`,
+          { label: `repair:${f.label}#${round}/${QUALITY_REPAIR_MAX_ROUNDS}`, phase: 'Audit', model: 'refine' })
+        repairMeta = { agentCompleted: response != null }
+      } catch (error) { repairError = (error && error.code) || 'REPAIR_AGENT_FAILED' }
+      if (failedBefore.includes('quote_style')) {
+        try {
+          await engine.agent(
+            `用 Bash 运行：node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --refined ${JSON.stringify(out)} --fix-quotes\n这是确定性排版修复；只回复一句话确认即可。`,
+            { label: `quote-fix:${f.label}#${round}/${QUALITY_REPAIR_MAX_ROUNDS}`, phase: 'Audit', model: 'haiku' })
+        } catch { /* the re-audit below remains authoritative */ }
       }
-      didRepair = true
     }
-    if (didRepair) {
-      const again = await audit()
-      if (again) { cur = again; repaired = true; hard = hardOf(cur); engine.log(`审计复检：${f.label} → ${hard.length ? 'hard 仍在：' + hard.join('、') : '已通过'}`) }
+
+    const again = await audit()
+    if (!again) {
+      repairAttempts.push({
+        file: out, round, action: repairMeta.action || null, model: repairMeta.model || null,
+        failedBefore, hardIssueCountsBefore, toolSummary: repairMeta.toolSummary || { succeeded: {}, failed: [] },
+        bytesBefore: repairMeta.bytesBefore ?? null, bytesAfter: repairMeta.bytesAfter ?? null,
+        changed: repairMeta.changed === true, agentCompleted: repairMeta.agentCompleted ?? null,
+        failedAfter: failedBefore, hardIssueCountsAfter: hardIssueCountsBefore,
+        outcome: 'audit_unavailable', errorCode: repairError,
+      })
+      engine.log(`审计复检：${f.label} 第 ${round}/${QUALITY_REPAIR_MAX_ROUNDS} 轮后无法运行——停止自动修复，保留原 hard 结论`)
+      break
     }
+
+    cur = again
+    hard = hardOf(cur)
+    const hardIssueCountsAfter = issueCounts(cur, hard)
+    const toolFailures = ((repairMeta.toolSummary || {}).failed || []).reduce((sum, x) => sum + (Number(x.count) || 0), 0)
+    const changed = repairMeta.changed === true
+    const improved = hard.length < failedBefore.length || hard.some((name) => !failedBefore.includes(name)) || failedBefore.some((name) => !hard.includes(name))
+    if (changed || improved || (!hard.length && repairMeta.changed == null)) repaired = true
+    let outcome
+    if (repairError || repairMeta.agentCompleted === false) outcome = 'agent_failed'
+    else if (!changed && repairMeta.changed != null) outcome = 'no_change'
+    else if (!hard.length) outcome = toolFailures ? 'passed_with_tool_errors' : 'passed'
+    else outcome = toolFailures ? 'audit_failed_with_tool_errors' : 'audit_failed'
+    repairAttempts.push({
+      file: out, round, action: repairMeta.action || null, model: repairMeta.model || null,
+      failedBefore, hardIssueCountsBefore, toolSummary: repairMeta.toolSummary || { succeeded: {}, failed: [] },
+      bytesBefore: repairMeta.bytesBefore ?? null, bytesAfter: repairMeta.bytesAfter ?? null,
+      changed, agentCompleted: repairMeta.agentCompleted ?? null,
+      failedAfter: hard.slice(), hardIssueCountsAfter, outcome,
+      errorCode: repairError || repairMeta.errorCode || null,
+    })
+    engine.log(`审计复检：${f.label} 第 ${round}/${QUALITY_REPAIR_MAX_ROUNDS} 轮 → ${hard.length ? `hard 仍在：${hard.join('、')}` : '已通过'}${toolFailures ? `；本轮工具失败 ${toolFailures} 次（已保留记录）` : ''}`)
   }
 
   const auditFailed = hard.length ? hard.slice() : []
-// Still hard after (at most one) repair → annotate any concrete source gaps so the document shows the defect.
+// Still hard after at most two repairs → annotate any concrete source gaps so the document shows the defect.
   // Risk (b): fall back to the agent whenever the annotate CAPABILITY specifically is missing — not only in the
   // all-agent CC path. A host that injects runAudit but not annotate still gets the marker via the agent.
   if (auditFailed.length && (cur.gaps || []).some((g) => g.severity === 'hard')) {
@@ -364,7 +422,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       { label: `anchors:${f.label}`, phase: 'Audit', model: 'haiku' })
   }
 
-  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }
+  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, repairAttempts, anchorsAdded, directAudit }
 }
 
 const DEDUP_SKIP_UNKNOWN_RATIO = 0.10
@@ -418,7 +476,7 @@ let headingConflicts = []
 let scoutSuspect = []
 let scoutFailed = []   // files whose scout returned nothing (stalled) — refined anyway (glossary degraded), surfaced for re-scout
 let dedup = null
-let auditFailed = []    // per-file body-fidelity findings still failing after one targeted repair
+let auditFailed = []    // per-file publication-gate findings still failing after at most two targeted repair rounds
 let incomplete = []     // Derived from direct deterministic audit ending_missing failures.
 let unchecked = []      // Refined files lacking a direct audit capability, or whose audit errored.
 let auditUnavailable = []  // P7 fail-loud: files whose audit could NOT run after one retry — the run is marked failed (unaudited, not passed).
@@ -609,8 +667,8 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 }
 
 // §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch and
-// BEFORE logic/summary/timeline. Any body-fidelity gate triggers one targeted auto-repair +
-// one re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
+// BEFORE logic/summary/timeline. Any publication gate triggers at most two targeted auto-repair rounds,
+// each followed by a re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
 // Anchors run on the (possibly repaired) 成稿. With fs the host injects capabilities.runAudit/annotateAnchors/
 // repair; without (CC sandbox) a subagent runs audit_refined.mjs. Skipped for a scope with no refine output.
 // M11b: on a batch-submit capture pass (A.captureSingleShot), no 成稿 is on disk yet (files are written on
@@ -618,7 +676,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量 → 自动定点修复一次 → 复检；仍未过记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量 → 最多自动定点修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮并逐轮复检；仍未过记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
@@ -630,7 +688,7 @@ if (scope.includes('refine') && pairsToAudit.length) {
     const endingMissing = (a.failedFindings || []).includes('ending_missing') || (a.softFindings || []).includes('ending_missing')
     const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
     if (r) {
-      r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
+      r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, repairAttempts: a.repairAttempts || [], anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
       if (a.directAudit && !a.auditUnavailable) {
         r.complete = !endingMissing
         r.checkNote = endingMissing ? 'deterministic audit: ending_missing' : ''
@@ -743,7 +801,7 @@ return {
   scoutFailed,
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
-  auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
+  auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after at most two repair rounds
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
   plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits

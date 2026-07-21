@@ -45,3 +45,20 @@ test('per-run trace persists stage, planned chunks, typed tool failures, heartbe
   assert.equal(fs.statSync(trace.statePath).mode & 0o777, 0o600)
   assert.equal(fs.statSync(trace.eventsPath).mode & 0o777, 0o600)
 })
+
+test('run-state exposes the active repair round and keeps failed repair tool counts append-only', () => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-repair-trace-'))
+  const trace = makeRunTrace(outputDir)
+  const label = 'repair:A#2/2'
+  trace.agent({ status: 'started', label, phase: 'Audit', model: 'deepseek-v4-pro' })
+  trace.tool({ label, tool: 'Edit', ok: false, code: 'TOOL_EDIT_TARGET_MISMATCH' })
+  trace.tool({ label, tool: 'Edit', ok: true, path: path.join(outputDir, 'A.md'), bytes: 1200 })
+  trace.agent({ status: 'completed', label, phase: 'Audit', model: 'deepseek-v4-pro' })
+
+  const state = JSON.parse(fs.readFileSync(trace.statePath, 'utf8'))
+  assert.equal(state.progress.repairRound, 2)
+  assert.equal(state.progress.repairMaxRounds, 2)
+  assert.equal(state.progress.repairToolsFailed, 1, 'the later successful Edit does not erase the prior failure')
+  assert.equal(state.progress.toolsFailed, 1)
+  assert.equal(state.progress.toolsSucceeded, 1)
+})

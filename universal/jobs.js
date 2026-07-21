@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
-import { runPipeline, DEFAULT_STAGE_MODELS } from '../core/pipeline.js'
+import { runPipeline, DEFAULT_STAGE_MODELS, QUALITY_REPAIR_MAX_ROUNDS } from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
@@ -260,7 +260,7 @@ export function persistGlossary(result, glossaryPath) {
 // Standalone audit-repair utility (retry loop). NOTE: as of the M-series merge this is NOT wired into
 // runJob — the headless path deliberately does in-pipeline audit (mark the gap, let the user decide)
 // instead of auto-rewriting a 成稿 (see runJob below). Kept as an exported, unit-tested helper (test/quality-repair.test.js).
-export const QUALITY_REPAIR_MAX_RETRIES = 2
+export const QUALITY_REPAIR_MAX_RETRIES = QUALITY_REPAIR_MAX_ROUNDS
 
 function auditListForFiles(files = []) {
   return files
@@ -278,6 +278,37 @@ function repairModel(A = {}, action) {
   const models = A.models || {}
   if (action === 'targeted_repair') return models.repair || models.refine || models.dedup || 'sonnet'
   return models.repair || models.refine || 'opus'
+}
+
+function summarizeRepairToolEvents(events = []) {
+  const succeeded = {}
+  const failed = new Map()
+  for (const event of events) {
+    const tool = typeof event.tool === 'string' && event.tool ? event.tool : 'unknown'
+    if (event.ok) {
+      succeeded[tool] = (succeeded[tool] || 0) + 1
+      continue
+    }
+    const code = typeof event.code === 'string' && event.code ? event.code : 'TOOL_UNKNOWN'
+    const key = `${tool}\u0000${code}`
+    const prev = failed.get(key) || { tool, code, count: 0 }
+    prev.count += 1
+    failed.set(key, prev)
+  }
+  return {
+    succeeded: Object.fromEntries(Object.entries(succeeded).sort(([a], [b]) => a.localeCompare(b))),
+    failed: [...failed.values()].sort((a, b) => a.tool.localeCompare(b.tool) || a.code.localeCompare(b.code)),
+  }
+}
+
+function qualityRepairResult(pipelineResult = {}) {
+  const attempts = (pipelineResult.refined || []).flatMap((entry) => ((entry.audit && entry.audit.repairAttempts) || []))
+  const roundsUsed = attempts.reduce((max, attempt) => Math.max(max, Number(attempt.round) || 0), 0)
+  let stopReason = 'not_needed'
+  if ((pipelineResult.auditUnavailable || []).length || attempts.some((attempt) => attempt.outcome === 'audit_unavailable')) stopReason = 'audit_unavailable'
+  else if ((pipelineResult.auditFailed || []).length) stopReason = attempts.length ? 'max_rounds' : 'repair_unavailable'
+  else if (attempts.length) stopReason = 'passed'
+  return { schemaVersion: 1, maxRounds: QUALITY_REPAIR_MAX_ROUNDS, roundsUsed, stopReason, attempts }
 }
 
 function auditPromptSummary(auditFile = {}) {
@@ -462,6 +493,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   // 3. engine: an injected engine (tests) or DeepSeek + a job-scoped Serper/Jina runtime. Keys are passed
   //    explicitly; never mutate process.env, so concurrent jobs cannot leak credentials into one another.
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries, topic, scope })
+  const repairToolEvents = []
   let sel
   if (params.__engine) sel = { provider: 'injected', engine: params.__engine, info: { label: 'injected' } }
   else {
@@ -470,7 +502,17 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
         concurrency, apiKey, serperKey, jinaKey, filePolicy,
         onPhase: (title) => { trace.stage(title); if (onPhase) onPhase(title) },
         onLog,
-        onToolEvent: (event) => trace.tool(event),
+        onToolEvent: (event) => {
+          trace.tool(event)
+          if (event && typeof event.label === 'string' && event.label.startsWith('repair:')) {
+            repairToolEvents.push({
+              label: event.label,
+              tool: typeof event.tool === 'string' ? event.tool : null,
+              ok: !!event.ok,
+              code: typeof event.code === 'string' ? event.code : null,
+            })
+          }
+        },
         onAgentEvent: (event) => trace.agent(event),
         searchFn: params.searchFn, fetchImpl: params.fetchImpl, localFetchFn: params.localFetchFn, dnsLookup: params.dnsLookup,
       })
@@ -494,13 +536,13 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   // results into the accumulators below, so the top-level result.audit / annotations / anchors keep the exact
   // shape writeRunArtifacts (+ cli/server) already consume. runAudit returns an auditPair file-result so the
   // gate can read failed/gaps; annotate writes the visible 缺口 marker (only when the gate hits a still-hard
-  // gap); annotateAnchors writes the invisible source anchors. Universal also injects one TARGETED repair pass:
-  // the prompt carries exact source ranges/findings, the agent must edit the existing body, and the pipeline
-  // immediately re-audits. A null response or byte-identical file is treated as a failed repair.
+  // gap); annotateAnchors writes the invisible source anchors. Universal injects at most two TARGETED repair rounds:
+  // the prompt carries exact source ranges/findings, the agent edits the existing body, and the pipeline
+  // immediately re-audits after every round. Tool failures remain in an append-only metadata ledger even if a
+  // later Edit succeeds; the post-repair audit, not the mere presence of a tool error, decides body quality.
   const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
   const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
   const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
-  const qualityRepairAttempts = []
   const recordAuditFile = (file) => {
     const i = auditFilesAcc.findIndex((x) => x && file && path.resolve(x.file) === path.resolve(file.file))
     if (i >= 0) auditFilesAcc[i] = file
@@ -533,9 +575,18 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const action = repairAction(auditFile.failed || [])
       const model = stageModels.repair || stageModels.refine || 'opus'
       const before = fs.readFileSync(f.outPath, 'utf8')
-      const response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, 1), {
-        label: `repair:${f.label || path.basename(f.outPath)}`, phase: 'Audit', model, outputPath: f.outPath,
-      })
+      const round = Number(opts.round) || 1
+      const maxRounds = Number(opts.maxRounds) || QUALITY_REPAIR_MAX_ROUNDS
+      const label = `repair:${f.label || path.basename(f.outPath)}#${round}/${maxRounds}`
+      let response = null
+      let errorCode = null
+      try {
+        response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, round), {
+          label, phase: 'Audit', model, outputPath: f.outPath,
+        })
+      } catch (error) {
+        errorCode = (error && error.code) || 'REPAIR_AGENT_FAILED'
+      }
       let after = fs.readFileSync(f.outPath, 'utf8')
       let deterministicQuoteFix = false
       if ((auditFile.failed || []).includes('quote_style')) {
@@ -543,10 +594,18 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
         deterministicQuoteFix = normalized !== after
         if (deterministicQuoteFix) { fs.writeFileSync(f.outPath, normalized, 'utf8'); after = normalized }
       }
-      const ok = after !== before && (!!response || deterministicQuoteFix)
-      qualityRepairAttempts.push({ file: f.outPath, attempt: 1, action, model: effectiveModels.repair, failedBefore: auditFile.failed || [], ok })
-      if (!ok) throw new Error('定向修复未写回任何变化')
-      return { ok: true, action, model: effectiveModels.repair }
+      const events = repairToolEvents.filter((event) => event.label === label)
+      return {
+        action,
+        model: effectiveModels.repair,
+        bytesBefore: Buffer.byteLength(before, 'utf8'),
+        bytesAfter: Buffer.byteLength(after, 'utf8'),
+        changed: after !== before,
+        agentCompleted: response != null,
+        deterministicQuoteFix,
+        toolSummary: summarizeRepairToolEvents(events),
+        errorCode: errorCode || (response == null ? 'REPAIR_AGENT_NO_RESPONSE' : null),
+      }
     },
     annotate: (f, gaps) => {
       if (params.annotate === false) return { inserted: [], skipped: [] }
@@ -658,7 +717,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       eventsPath: trace.eventsPath,
       statePath: trace.statePath,
     }
-    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: { maxRetries: 1, attempts: qualityRepairAttempts }, execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

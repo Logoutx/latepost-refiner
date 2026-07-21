@@ -123,6 +123,34 @@ test('buildRunManifest records run config without secrets and hashes source file
   assert.equal(manifest.provider.info.keyVar, 'MOCK_API_KEY')
 })
 
+test('run manifest persists only the whitelisted repair ledger and retains earlier tool failures', () => {
+  const qualityRepair = {
+    schemaVersion: 99,
+    maxRounds: 2,
+    roundsUsed: 1,
+    stopReason: 'passed',
+    prompt: 'must not persist',
+    attempts: [{
+      file: '/tmp/out/Transcripts/A.md', round: 1, action: 'targeted_repair', model: 'deepseek-v4-pro',
+      failedBefore: ['residual_noise'], hardIssueCountsBefore: { confirmation_repeats: 5 },
+      toolSummary: {
+        succeeded: { Read: 30, Edit: 30 },
+        failed: [{ tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 }],
+        oldString: 'must not persist',
+      },
+      bytesBefore: 1000, bytesAfter: 1010, changed: true, agentCompleted: true,
+      failedAfter: [], hardIssueCountsAfter: {}, outcome: 'passed_with_tool_errors', errorCode: null,
+      response: 'must not persist',
+    }],
+  }
+  const manifest = buildRunManifest({ ...baseResult, qualityRepair }, { outputDir: '/tmp/out', topic: 'T' })
+  assert.equal(manifest.qualityRepair.schemaVersion, 1)
+  assert.equal(manifest.qualityRepair.maxRounds, 2)
+  assert.equal(manifest.qualityRepair.attempts[0].toolSummary.failed[0].count, 6)
+  assert.equal(manifest.qualityRepair.attempts[0].outcome, 'passed_with_tool_errors')
+  assert.equal(JSON.stringify(manifest).includes('must not persist'), false)
+})
+
 test('writeRunArtifacts writes review.md and run.json', () => {
   const dir = tmpdir()
   const paths = writeRunArtifacts({ ...baseResult, outputDir: dir }, { outputDir: dir, topic: '测试项目', warnings: baseResult.warnings })
