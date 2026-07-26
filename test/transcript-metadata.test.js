@@ -9,6 +9,7 @@ test('low-confidence identity is forced blank at the manifest boundary', () => {
     interviewee_name: '猜测的人名',
     organization_name: '猜测的公司',
     role_title: 'CEO',
+    interviewee_intro: '未经证实的人物介绍',
     confidence: 'low',
     evidence: '只有文件名线索',
   }), {
@@ -17,6 +18,7 @@ test('low-confidence identity is forced blank at the manifest boundary', () => {
     organization_name: null,
     organization_aliases: [],
     role_title: null,
+    interviewee_intro: null,
     confidence: 'low',
     evidence: '只有文件名线索',
   })
@@ -29,6 +31,7 @@ test('metadata sanitizer normalizes fields and deduplicates aliases', () => {
     organization_name: ' 示例 公司 ',
     organization_aliases: ['示例公司', '示例公司'],
     role_title: ' 创始人 ',
+    interviewee_intro: ' 示例科技创始人，访谈主要讨论智能硬件创业。 ',
     confidence: 'high',
     evidence: ' 开头明确自我介绍。 ',
   }), {
@@ -37,6 +40,7 @@ test('metadata sanitizer normalizes fields and deduplicates aliases', () => {
     organization_name: '示例 公司',
     organization_aliases: ['示例公司'],
     role_title: '创始人',
+    interviewee_intro: '示例科技创始人,访谈主要讨论智能硬件创业。',
     confidence: 'high',
     evidence: '开头明确自我介绍。',
   })
@@ -51,6 +55,7 @@ test('metadata extractor uses the scout model and exposes canonical catalog', as
       return {
         interviewee_name: '徐大全',
         organization_name: '示例科技',
+        interviewee_intro: '示例科技负责人，本次主要讨论 Agent 产品。',
         confidence: 'high',
         evidence: '标题与自我介绍均明确。',
       }
@@ -71,10 +76,12 @@ test('metadata extractor uses the scout model and exposes canonical catalog', as
   assert.match(captured.prompt, /"canonical_name":"徐大全"/)
   assert.equal(result.interviewee_name, '徐大全')
   assert.equal(result.organization_name, '示例科技')
+  assert.equal(result.interviewee_intro, '示例科技负责人,本次主要讨论 Agent 产品。')
 })
 
 test('prompt forbids filling uncertain fields', () => {
   const prompt = transcriptMetadataPrompt(file)
   assert.match(prompt, /不能确认的字段单独留空/)
-  assert.match(prompt, /confidence=low 时所有实体字段必须留空/)
+  assert.match(prompt, /interviewee_intro 用一到两句具体说明/)
+  assert.match(prompt, /confidence=low 时姓名、机构和人物介绍必须留空/)
 })

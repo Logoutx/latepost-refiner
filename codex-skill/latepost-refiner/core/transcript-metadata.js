@@ -8,7 +8,7 @@ export const TRANSCRIPT_METADATA_SCHEMA = {
     interviewee_aliases: { type: 'array', items: { type: 'string' }, description: '稿件中明确出现、且确定指向该受访者的其它姓名写法' },
     organization_name: { type: 'string', description: '采访发生时受访者明确所属的公司或机构规范名；无法确认时留空' },
     organization_aliases: { type: 'array', items: { type: 'string' }, description: '稿件中明确出现、且确定指向该机构的其它写法' },
-    role_title: { type: 'string', description: '稿件明确给出的受访者职务；无法确认时留空' },
+    interviewee_intro: { type: 'string', description: '一到两句具体人物介绍：受访者做什么、与本次访谈主题有什么关系；只能写稿内可确认的信息' },
     confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'high=稿件直接明示；medium=多处线索一致；low=无法可靠确认' },
     evidence: { type: 'string', description: '不超过两句的稿内依据或无法确认原因，不要长段摘录' },
   },
@@ -50,6 +50,7 @@ export function sanitizeTranscriptMetadata(value) {
       organization_name: null,
       organization_aliases: [],
       role_title: null,
+      interviewee_intro: null,
       confidence,
       evidence,
     }
@@ -61,7 +62,9 @@ export function sanitizeTranscriptMetadata(value) {
     interviewee_aliases: cleanAliases(raw.interviewee_aliases, intervieweeName),
     organization_name: organizationName,
     organization_aliases: cleanAliases(raw.organization_aliases, organizationName),
+    // role_title is no longer requested, but keep accepting it for old manifests and downstream rollback.
     role_title: cleanString(raw.role_title, 120),
+    interviewee_intro: cleanString(raw.interviewee_intro, 300),
     confidence,
     evidence,
   }
@@ -93,9 +96,10 @@ ${readPlan(file)}
 3. organization_name 是采访发生时受访者明确所属的公司或机构，不是访谈中讨论到的其它公司。媒体、学校、政府、基金会等也属于机构。
 4. 若既有目录中已有同一实体，必须原样复用其 canonical_name；稿内其它明确写法放 aliases。不要仅因字面相近就强行合并。
 5. 多位受访者时，仅在稿件明确存在主受访者时填写；主次不清则姓名留空，并在 evidence 说明“多位受访者，主次不明”。
-6. 姓名、机构、职务分别判断，不能确认的字段单独留空；不要为了填满字段而猜测。
-7. high 仅用于标题、自我介绍、明确身份说明等直接证据；medium 用于多处一致且无冲突的稿内线索；只剩弱推断或有冲突时 confidence=low。confidence=low 时所有实体字段必须留空。
-8. evidence 只写不超过两句的稿内依据或无法确认原因，不要长段摘录。`
+6. 姓名、机构、人物介绍分别判断，不能确认的字段单独留空；不要为了填满字段而猜测。
+7. interviewee_intro 用一到两句具体说明受访者做什么、为何与本次访谈主题相关；只写稿内可确认的信息，不写评价、宣传话术或外部常识。
+8. high 仅用于标题、自我介绍、明确身份说明等直接证据；medium 用于多处一致且无冲突的稿内线索；只剩弱推断或有冲突时 confidence=low。confidence=low 时姓名、机构和人物介绍必须留空。
+9. evidence 只写不超过两句的稿内依据或无法确认原因，不要长段摘录。`
 }
 
 export async function extractTranscriptMetadata(engine, file, context = {}) {
