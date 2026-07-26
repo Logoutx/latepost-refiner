@@ -5,6 +5,7 @@
   "type": "module",
   "bin": {
     "latepost-refiner": "universal/cli.js",
+    "latepost-refiner-metadata": "universal/metadata-cli.js",
     "latepost-refiner-web": "universal/server.js",
     "transcriber": "universal/cli.js",
     "transcriber-web": "universal/server.js"

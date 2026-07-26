@@ -27,6 +27,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --date <YYYY-MM>       采访时间（写入抬头）
   --background <文本>     采访背景（指导侦察/核实）
   --background-file <路径> 从文件读取背景（背景较长时用）
+  --metadata-catalog <路径> 既有人物/机构规范名 JSON，供目录元数据统一写法
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
@@ -70,6 +71,7 @@ export function parseArgs(argv) {
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile',
+    '--metadata-catalog': 'metadataCatalogPath',
     '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
   }
   let i = 0
@@ -137,6 +139,18 @@ export function buildRunParams(a, { env = process.env } = {}) {
       throw new JobConfigError(`无法读取背景文件 ${backgroundPath}：${e.message}`)
     }
   }
+  let metadataCatalog
+  if (a.metadataCatalogPath) {
+    const catalogPath = path.resolve(a.metadataCatalogPath)
+    try {
+      metadataCatalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'))
+    } catch (e) {
+      throw new JobConfigError(`无法读取元数据目录 ${catalogPath}：${e.message}`)
+    }
+    if (!metadataCatalog || typeof metadataCatalog !== 'object' || Array.isArray(metadataCatalog)) {
+      throw new JobConfigError(`元数据目录 ${catalogPath} 必须是 JSON 对象`)
+    }
+  }
 
   return {
     apiKey: env.DEEPSEEK_API_KEY,
@@ -145,6 +159,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     topic,
     date,
     background,
+    metadataCatalog,
     outputDir,
     skillDir,
     scope: parseScope(a.scope),

@@ -16,6 +16,7 @@ import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTE
 import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 import { makeRunTrace } from './trace.js'
+import { extractTranscriptMetadata } from '../core/transcript-metadata.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -527,6 +528,18 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       notice('提示：未设 SERPER_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
     }
   }
+  // The bot submits one transcript per job. Extract its catalog identity concurrently with the editorial
+  // pipeline so the extra lightweight Scout call does not extend the critical path by a full model round-trip.
+  // Multi-file batches deliberately return no single top-level identity: choosing one would silently collapse
+  // several transcripts into one catalog record.
+  const metadataPromise = fileEntries.length === 1
+    ? extractTranscriptMetadata(sel.engine, fileEntries[0], {
+        topic,
+        background,
+        catalog: params.metadataCatalog,
+        model: stageModels.scout,
+      })
+    : Promise.resolve(null)
   notice(`
 开始：${fileEntries.length} 份文件 · scope=${scope.join(',')} · verify=${verifyDepth} · 输出 ${outDir}
 `)
@@ -648,6 +661,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
 
   {
     const r = await runPipeline(A, sel.engine)
+    const transcriptMetadata = await metadataPromise
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
     // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
     // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
@@ -717,7 +731,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       eventsPath: trace.eventsPath,
       statePath: trace.statePath,
     }
-    const result = { ...r, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, transcriptMetadata, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

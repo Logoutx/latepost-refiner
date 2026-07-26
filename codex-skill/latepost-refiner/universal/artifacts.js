@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PUBLICATION_BLOCK_GATES } from '../core/spec.js'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
+import { sanitizeTranscriptMetadata } from '../core/transcript-metadata.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_PATH = path.join(REPO_ROOT, 'package.json')
@@ -530,6 +531,7 @@ export function buildRunManifest(result = {}, context = {}) {
       name: context.provider || result.provider || null,
       info: sanitizeProviderInfo(context.providerInfo || result.providerInfo || {}),
     },
+    transcriptMetadata: result.transcriptMetadata == null ? null : sanitizeTranscriptMetadata(result.transcriptMetadata),
     // Execution is separate from editorial quality: a completed run may still be quality.blocked, while a
     // missing declared output is an execution failure regardless of what a model claimed in structured_output.
     execution: result.execution || null,
