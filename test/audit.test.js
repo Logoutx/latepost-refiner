@@ -291,9 +291,10 @@ test('annotateGaps falls back to header block / EOF when a gap has no anchors', 
   assert.ok(at > 0 && at < lines.length - 1 && lines.findIndex((l) => l.startsWith('记者：')) > at, 'file-start gap lands after the header block, before the body')
 })
 
-test('an unparseable source degrades to assessed:false and never gates', () => {
+test('an untracked source uses paragraph coverage while speaker attribution is not applicable', () => {
   const r = auditPair({ sourceText: '这是一段没有任何发言人标签的连续文字。\n再来一行还是没有标签。', refinedText: '# 标题\n\n随便的成稿。', mode: 'refine' })
-  assert.equal(r.metrics.coverage.assessed, false)
+  assert.equal(r.metrics.coverage.assessed, true)
+  assert.equal(r.metrics.attribution.status, 'not_applicable')
   assert.ok(!r.failed.includes('content_gap'))
   const s = scanCoverage('无标签文字。', '成稿。')
   assert.equal(s.assessed, false)

@@ -1,3 +1,4 @@
+// GENERATED FILE — DO NOT EDIT. Source: scripts/speaker-resolver.js. Regenerate: npm run sync:skills
 // Deterministic bridge between full-text Scout and Refine.
 //
 // Scout decides who each source speaker track represents. This module never re-diarizes prose and never lets

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildFilePolicy, computeLogicAudit, prepareFile, runJob, stitchRefineParts } from '../universal/jobs.js'
+import { buildFilePolicy, computeLogicAudit, JobConfigError, prepareFile, runJob, stitchRefineParts } from '../universal/jobs.js'
 import { computeExitCode } from '../universal/cli.js'
 import { timelineDeliverableName } from '../core/prompts.js'
 import { writeFile } from '../engines/fileops.js'
@@ -43,6 +43,99 @@ test('prepareFile normalizes SRT sources before the model sees them', async () =
   assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(prepared), 'raw SRT timecode arrow is not sent to prompts')
   assert.ok(prepared.includes('发言人 1 00:00:01'))
   assert.ok(prepared.includes('我们 2026 年做了 3 次试验。'))
+})
+
+test('runJob rejects an explicitly declared AI smart summary before selecting or calling an engine', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '总结.md')
+  fs.writeFileSync(src, [
+    '<title>智能纪要：示例访谈</title>',
+    '',
+    '> 智能纪要由 AI 生成，可能不准确，请谨慎甄别后使用',
+    '',
+    '# 总结',
+    '这不是妙记转录全文。',
+  ].join('\n'), 'utf8')
+  let engineCalls = 0
+
+  await assert.rejects(
+    runJob({
+      __engine: { agent: async () => { engineCalls += 1; return null } },
+      files: [{ path: src }],
+      topic: '测试项目',
+      outputDir,
+      scope: ['refine'],
+    }),
+    (error) => error instanceof JobConfigError && /AI 智能纪要/.test(error.message),
+  )
+
+  assert.equal(engineCalls, 0)
+  assert.equal(fs.existsSync(path.join(outputDir, 'Transcripts')), false, 'the pre-model gate emits no refined main draft')
+})
+
+test('runJob keeps a valid untracked monologue untracked and rejects model-invented speaker labels', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '独白.md')
+  const source = [
+    '这是第一段独白，完整说明项目背景和当前进展。',
+    '',
+    '这是第二段独白，完整说明下一步安排和最终结论。',
+  ].join('\n')
+  fs.writeFileSync(src, source, 'utf8')
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const engine = {
+    phase() {},
+    log() {},
+    usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((thunk) => thunk())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (_prompt, opts = {}) => {
+      usage.agents += 1
+      if (opts.label && opts.label.startsWith('metadata:')) return null
+      if (opts.label && opts.label.startsWith('scout:')) {
+        return { speakers: [], people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [] }
+      }
+      if (opts.label && opts.label.startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, [
+          '# 独白',
+          '',
+          '记者：这是第一段独白，完整说明项目背景和当前进展。',
+          '',
+          '记者：这是第二段独白，完整说明下一步安排和最终结论。',
+        ].join('\n'), 'utf8')
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      return null
+    },
+  }
+
+  const result = await runJob({
+    __engine: engine,
+    files: [{ path: src }],
+    topic: '测试项目',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+    anchors: false,
+  })
+
+  assert.equal(result.refined.length, 0, 'an invalid speaker structure is not declared as a deliverable main transcript')
+  assert.deepEqual(result.failed, ['独白'])
+  assert.equal(result.speakerStructuralFailures.length, 1)
+  assert.equal(result.speakerStructuralFailures[0].speakerMode, 'untracked')
+  assert.ok(result.speakerStructuralFailures[0].violations.every((item) => item.kind === 'invented_speaker_label'))
+  assert.equal(fs.existsSync(path.join(outputDir, 'Transcripts', '独白.md')), true, 'the rejected draft remains server-side for diagnosis')
+
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.deepEqual(manifest.artifacts.refined, [])
 })
 
 test('buildFilePolicy only allows this run\'s declared deliverable paths', () => {
@@ -174,6 +267,8 @@ function mockEngine() {
         }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, '# path-fixture\n*路径样本访谈*\n\n## 开场\n\n采访者：请介绍背景。\n\n受访者：这是虚构样本。\n', 'utf8')
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }
       return null
@@ -273,7 +368,7 @@ test('runJob writes review queue and manifest artifacts (deterministic audit end
   const outputDir = tmpdir()
   const src = path.join(outputDir, 'tiny-src.md')
   fs.writeFileSync(src, TRUNC_SOURCE, 'utf8')
-  // Pre-write the refined output that the one-pass refine agent "produces" (the injected engine reports success
+  // Pre-write the refined output that the refine agent "produces" (the injected engine reports success
   // but does not itself write a 成稿; the deterministic audit reads this file from disk and detects the dropped ending).
   const outPath = path.join(outputDir, 'Transcripts', 'tiny-src.md')
   fs.mkdirSync(path.dirname(outPath), { recursive: true })

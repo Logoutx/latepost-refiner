@@ -1,4 +1,6 @@
 // GENERATED FILE — DO NOT EDIT. Source: core/spec.js. Regenerate: npm run sync:skills
+import { parseSpeakerDocument } from '../scripts/speaker-resolver.js'
+
 // Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
 export const BODY_FIDELITY_GATES = Object.freeze([
   'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'seam_duplicate',
@@ -599,7 +601,7 @@ export function dedupListText(merged) {
 // (including auto) — the escape hatch. Unset budget + non-speed mode ⇒ one agent, exactly as before.
 // Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
 // NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
-// ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
+// ran 13.9 字/line). Chunking decisions key on this metric.
 // See [[feedback-size-metric]]. Read-tool pagination stays line-addressed (readPlan) because Read is
 // line-based — that's a mechanic, not a size judgment.
 export function contentLength(text) {
@@ -613,7 +615,7 @@ export function refineSize(f) {
   if (f && f.bytes) return Math.round(f.bytes / 2.6)
   return Math.round(((f && f.lines) || 0) * 14)
 }
-export const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+export const ONE_PASS_CHARS = 4000          // legacy short-file threshold; bypass is disabled so every file enters Scout
 
 // ---------- single-shot refine (M11a) ----------
 // Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
@@ -674,7 +676,6 @@ function evenLineChunks(f, K) {
 // preflight (universal jobs.prepareFile) to attach f.turns so the orchestrator can snap chunk boundaries to real
 // turns AND avoid ending a chunk on a question (see turnAwareChunks). Editions with no fs (the CC Workflow sandbox)
 // simply don't populate f.turns → splitForRefine falls back to evenLineChunks, byte-identical to before.
-const TURN_LABEL_RE = /^\s*[一-龥A-Za-z0-9·]{1,12}[：:]/
 // A turn "ends with a question" if — after stripping trailing whitespace, closing quotes/brackets, and any trailing
 // HTML-comment provenance marker (<!-- 源 L… -->) — the last visible glyph is ？ or ?. This is what lets us keep a
 // question glued to the answer that follows it. Pure + exported so the rule is unit-testable in isolation.
@@ -689,17 +690,10 @@ export function endsWithQuestion(text) {
   return /[？?]$/.test(t)
 }
 export function parseTurns(content) {
-  const lines = String(content == null ? '' : content).split('\n')
-  const idx = []   // 0-based line indices where a turn opens
-  for (let i = 0; i < lines.length; i += 1) if (TURN_LABEL_RE.test(lines[i])) idx.push(i)
-  if (!idx.length) return []
-  const turns = []
-  for (let k = 0; k < idx.length; k += 1) {
-    const start = idx[k]
-    const end = (k + 1 < idx.length) ? idx[k + 1] - 1 : lines.length - 1   // turn spans up to the next label line
-    turns.push({ startLine: start + 1, q: endsWithQuestion(lines.slice(start, end + 1).join('\n')) })
-  }
-  return turns
+  return parseSpeakerDocument(content).units.map((unit) => ({
+    startLine: unit.startLine,
+    q: endsWithQuestion(unit.text),
+  }))
 }
 // Split a file into K chunks whose boundaries land on real turn edges, then move any boundary that would END a chunk
 // on a question to a nearby non-question turn boundary. Only reached when f.turns is present and has ≥ K turns;
@@ -871,8 +865,8 @@ function seamNorm(text) {
 }
 
 function seamSpeaker(text) {
-  const m = String(text || '').trim().match(/^([一-龥A-Za-z0-9·]{1,16})[：:]/)
-  return m ? m[1] : null
+  const parsed = parseSpeakerDocument(text)
+  return parsed.speakerMode === 'tracked' && parsed.labels.length ? parsed.labels[0].label : null
 }
 
 function bigramDice(a, b) {

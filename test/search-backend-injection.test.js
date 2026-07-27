@@ -48,7 +48,7 @@ function makeFakeClient() {
 
 test('verify replay seam: scope=[verify] drives scout→verify against the injected searchFn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-inject-'))
-  // A real-sized transcript (≥ ONE_PASS_CHARS) so the pipeline takes the scout+verify branch, not one-pass.
+  // A real-sized transcript exercises Scout/Verify plus injected search backends.
   const turns = []
   for (let i = 0; i < 70; i += 1) {
     turns.push(`记者：第 ${i} 个问题，关于云洲仪器早期做水质监测设备的判断，你们当时怎么取舍？请具体讲讲。`)

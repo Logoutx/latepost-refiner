@@ -17,7 +17,13 @@ import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 import { makeRunTrace } from './trace.js'
 import { extractTranscriptMetadata } from '../core/transcript-metadata.js'
-import { enforceCanonicalSpeakerLabels, parseSpeakerLabels, rewriteSpeakerLabels } from '../scripts/speaker-resolver.js'
+import {
+  detectDeclaredAiSummary,
+  enforceCanonicalSpeakerLabels,
+  parseSpeakerDocument,
+  resolveSpeakerMapping,
+  rewriteSpeakerLabels,
+} from '../scripts/speaker-resolver.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -104,12 +110,24 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const bytes = Buffer.byteLength(content, 'utf8')
   const chars = contentLength(content)   // 正文字数 (汉字 + 英文词/数字)；文档长度以此衡量，行数仅供 Read 分页
   const hasHeadings = HEADING_RE.test(content)
-  const speakerShape = parseSpeakerLabels(content)
+  const speakerShape = parseSpeakerDocument(content)
+  const speakerBase = resolveSpeakerMapping(content, [])
+  const sourceDeclaration = detectDeclaredAiSummary(content)
   const title = deriveTitle(src)
   const entry = {
     path: mdPath, label: title, title,
     originalPath: path.resolve(src),
     sourceKind,
+    sourceDocumentKind: sourceDeclaration.kind,
+    sourceDeclaration,
+    speakerMode: speakerShape.speakerMode,
+    speakerResolution: {
+      speakerMode: speakerShape.speakerMode,
+      mappings: speakerBase.mappings,
+      unresolved: speakerBase.unresolved,
+      changedLines: 0,
+      labelLines: speakerShape.labelLines,
+    },
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
     lines, bytes, chars,
@@ -117,8 +135,8 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
     // real turn edges and never orphan a question from its answer. Empty for label-less text → splitForRefine falls
     // back to the line-based divider. Cheap: one linear pass already having read the content.
     turns: parseTurns(content),
-    // A short file may normally skip Scout. Generic/role-only speaker tracks must not: Scout is the one
-    // full-text stage that resolves them before Refine sees the transcript.
+    // Diagnostic shape for the full-text Scout and the speaker contract. Every file now enters Scout;
+    // generic/role-only tracks additionally require a full-text identity decision before Refine.
     speakerLabelLines: speakerShape.labelLines,
     needsSpeakerResolution: speakerShape.needsResolution,
   }
@@ -485,6 +503,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     fileEntries.push(entry)
   }
 
+  const declaredSummaries = fileEntries.filter((entry) => entry.sourceDocumentKind === 'declared_ai_summary')
+  if (declaredSummaries.length) {
+    const names = declaredSummaries.map((entry) => entry.label).join('、')
+    throw new JobConfigError(`检测到 ${names} 是文档自身明确声明的 AI 智能纪要，不是原始转录稿；请提交妙记转录全文后重新精校。`)
+  }
+
   // 2. prior glossary (persistent per-company校对表). Source priority: an explicit --prior-glossary path >
   //    the default <outDir>/校对表.md. Accumulation always writes back to <outDir>/校对表.md (glossaryPath),
   //    so a one-off external seed still lands in the canonical location for the next run.
@@ -571,7 +595,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
   const enforceSpeakerOutput = (f, phase = 'post_refine') => {
     const refinedText = fs.readFileSync(f.outPath, 'utf8')
-    const enforced = enforceCanonicalSpeakerLabels(refinedText, (f.speakerResolution && f.speakerResolution.mappings) || [])
+    const resolution = f.speakerResolution || {}
+    const enforced = enforceCanonicalSpeakerLabels(refinedText, resolution.mappings || [], {
+      speakerMode: resolution.speakerMode || f.speakerMode,
+    })
     if (enforced.text !== refinedText) fs.writeFileSync(f.outPath, enforced.text, 'utf8')
     speakerOutputEnforcements.push({
       sequence: speakerOutputEnforcements.length + 1,
@@ -582,6 +609,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       labelLines: enforced.labelLines || 0,
       replacements: enforced.replacements || [],
       unknownLabels: enforced.unknownLabels || [],
+      valid: enforced.valid !== false,
+      violations: enforced.violations || [],
     })
     return enforced
   }
@@ -596,11 +625,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     prepareSpeakerInput: (f, finding = {}) => {
       const sourceText = fs.readFileSync(f.path, 'utf8')
       const resolved = rewriteSpeakerLabels(sourceText, finding.speakers || [])
-      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, ...resolved }
+      const speakerMode = f.speakerMode || parseSpeakerDocument(sourceText).speakerMode
+      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, speakerMode, ...resolved }
       const resolvedPath = path.join(convertedDir, `${safeName(f.title || f.label)}.speaker-resolved.md`)
       fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })
       fs.writeFileSync(resolvedPath, resolved.text, 'utf8')
-      return { path: resolvedPath, ...resolved }
+      return { path: resolvedPath, speakerMode, ...resolved }
     },
     // Refine normally preserves the already-canonical input labels. If it nevertheless reintroduces a source
     // number or a role synonym, collapse that alias through the SAME mapping before audit. Unknown names are
@@ -612,16 +642,22 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     runAudit: (f, opts = {}) => {
       // A targeted repair is another model write. Re-apply the same canonical map before every audit round so a
       // repair cannot reintroduce source numbers or role synonyms after the first post-Refine enforcement.
-      if (f.speakerResolution && f.speakerResolution.mappings.length) {
-        enforceSpeakerOutput(f, opts.phase || (opts.round ? `post_repair_round_${opts.round}` : 'pre_audit'))
-      }
+      enforceSpeakerOutput(f, opts.phase || (opts.round ? `post_repair_round_${opts.round}` : 'pre_audit'))
       // Normalize a model-created duplicate topic boundary before any quality or derivative audit consumes it.
       // This preserves all distinct prose and only removes a repeated H2 plus an optional exact replayed turn.
       const before = fs.readFileSync(f.outPath, 'utf8')
       const normalized = collapseAdjacentDuplicateHeadings(before)
       if (normalized.text !== before) fs.writeFileSync(f.outPath, normalized.text, 'utf8')
       const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
-      const res = auditPairs([{ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText }])
+      const resolution = f.speakerResolution || {}
+      const res = auditPairs([{
+        sourcePath: f.path,
+        refinedPath: f.outPath,
+        mode: 'refine',
+        glossaryText,
+        speakerMode: resolution.speakerMode || f.speakerMode,
+        speakerMappings: resolution.mappings || [],
+      }])
       const file = res.files[0]
       recordAuditFile(file)
       return file

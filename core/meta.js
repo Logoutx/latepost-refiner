@@ -21,5 +21,5 @@ export const meta = {
 //     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
 //   fresh?: true to ignore any prior glossary and rebuild from scratch.
 //   files: [{ path, label, lines, bytes?, chars?, title, subtitle, outPath, speakerHints?, notes? }] }
-//   (chars = 正文字数 (汉字 + 每个英文词/数字各算 1); THE document-length metric — routing (one-pass / chunk) keys on it, not lines.
+//   (chars = 正文字数 (汉字 + 每个英文词/数字各算 1); THE document-length metric — chunk routing keys on it, not lines.
 //    lines/bytes are for Read pagination only (readPlan). If chars is absent it's estimated from bytes, then lines.)

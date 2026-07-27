@@ -212,7 +212,7 @@ test('parseTurns maps each 名字：label line to its opening line and question 
     { startLine: 3, q: false },  // 「为什么不涨价」 has no trailing ？
     { startLine: 4, q: false },
   ])
-  assert.deepEqual(parseTurns('没有任何发言人标签的纯文本'), [], 'label-less text → no turns (line-divider fallback)')
+  assert.deepEqual(parseTurns('没有任何发言人标签的纯文本'), [{ startLine: 1, q: false }], 'label-less text → one paragraph block boundary')
 })
 
 // ---------- splitForScout / mergeScoutChunks (oversized-file scout resilience) ----------

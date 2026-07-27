@@ -1,6 +1,36 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { enforceCanonicalSpeakerLabels, parseSpeakerLabels, resolveSpeakerMapping, rewriteSpeakerLabels } from '../scripts/speaker-resolver.js'
+import {
+  detectDeclaredAiSummary,
+  enforceCanonicalSpeakerLabels,
+  parseSpeakerDocument,
+  parseSpeakerLabels,
+  resolveSpeakerMapping,
+  rewriteSpeakerLabels,
+} from '../scripts/speaker-resolver.js'
+
+test('canonical speaker document distinguishes tracked transcripts from valid untracked monologues', () => {
+  const tracked = parseSpeakerDocument('讲者1：第一段。\n讲者2：第二段。')
+  assert.equal(tracked.speakerMode, 'tracked')
+  assert.deepEqual(tracked.units.map((unit) => [unit.speaker, unit.text]), [
+    ['讲者 1', '第一段。'],
+    ['讲者 2', '第二段。'],
+  ])
+
+  const untracked = parseSpeakerDocument('第一段独白。\n仍是第一段。\n\n第二段独白。')
+  assert.equal(untracked.speakerMode, 'untracked')
+  assert.deepEqual(untracked.units.map((unit) => unit.text), ['第一段独白。\n仍是第一段。', '第二段独白。'])
+})
+
+test('AI-summary gate requires an explicit provenance disclosure, not a title or monologue shape', () => {
+  const declared = detectDeclaredAiSummary('<title>智能纪要：示例</title>\n> 智能纪要由 AI 生成，可能不准确，请谨慎甄别后使用')
+  assert.equal(declared.declared, true)
+  assert.equal(declared.kind, 'declared_ai_summary')
+  assert.equal(declared.line, 2)
+
+  assert.equal(detectDeclaredAiSummary('# 智能纪要\n\n这是一篇没有说话人标签的正常独白。').declared, false)
+  assert.equal(detectDeclaredAiSummary('这是人工整理的会议摘要，但没有声明由 AI 生成。').declared, false)
+})
 
 test('speaker resolver recognizes generic, 讲者, Feishu cite, timestamp and recurring inline labels', () => {
   const source = [
@@ -135,4 +165,14 @@ test('output enforcement leaves an unknown invented name untouched for audit ins
   ])
   assert.equal(result.text, refined)
   assert.deepEqual(result.unknownLabels, [{ line: 1, label: '王小明' }, { line: 2, label: '王小明' }])
+})
+
+test('untracked source contract rejects model-invented speaker labels and accepts a label-free monologue', () => {
+  const invented = enforceCanonicalSpeakerLabels('记者：第一段。\n记者：第二段。', [], { speakerMode: 'untracked' })
+  assert.equal(invented.valid, false)
+  assert.deepEqual(invented.violations.map((item) => item.kind), ['invented_speaker_label', 'invented_speaker_label'])
+
+  const faithful = enforceCanonicalSpeakerLabels('第一段独白。\n\n第二段独白。', [], { speakerMode: 'untracked' })
+  assert.equal(faithful.valid, true)
+  assert.deepEqual(faithful.violations, [])
 })

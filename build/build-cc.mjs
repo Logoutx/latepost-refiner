@@ -19,6 +19,7 @@ const strip = (s) => s
 const out = [
   read('core/meta.js').trim(),        // export const meta = {...} (not stripped; must stay first)
   '// ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====',
+  strip(read('scripts/speaker-resolver.js')),
   strip(read('core/spec.js')),
   strip(read('core/prompts.js')),
   strip(read('core/pipeline.js')),

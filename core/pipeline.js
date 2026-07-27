@@ -485,9 +485,15 @@ let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster cl
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
 let speakerResolutions = []  // one deterministic Scout mapping per file; Refine reads its materialized input copy
 let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
+let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
 
-if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot && !A.files[0].needsSpeakerResolution) {
-  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
+// Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
+// Keep the former branch in place temporarily for an easy diff/review, but make it unreachable.
+const useShortFileFastPath = false
+// Former condition:
+// A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot && !A.files[0].needsSpeakerResolution
+if (useShortFileFastPath) {
+  // Legacy single-short-file path: one-pass refine, skipping Scout/Verify.
   // (M11b: a batch-submit capture pass forces the else-branch so even a tiny lone file is captured as a
   // single-shot batch request via refineFileSingleShot, not sent through the one-pass Write-tool agent.)
   // Length judged by 正文字数, not lines. NOTE (M11a): refineMode:'single-shot' does NOT change this branch —
@@ -658,8 +664,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     // prompt-only behaviour.
     if (capabilities && typeof capabilities.prepareSpeakerInput === 'function') {
       const prepared = await engine.parallel(A.files.map((f, i) => async () => {
-        const finding = cleanFindings[i]
-        if (!finding) return null
+        const finding = cleanFindings[i] || {}
         try { return await capabilities.prepareSpeakerInput(f, finding) } catch (e) {
           engine.log(`发言人统一输入生成失败：${f.label}（${(e && e.message) || e}）——保留原稿进入 Refine`)
           return null
@@ -670,12 +675,12 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
         const f = A.files[i]
         f.refinePath = resolution.path || f.path
         f.speakerResolution = {
+          speakerMode: resolution.speakerMode || f.speakerMode || (resolution.labelLines ? 'tracked' : 'untracked'),
           mappings: resolution.mappings || [],
           unresolved: resolution.unresolved || [],
           changedLines: resolution.changedLines || 0,
           labelLines: resolution.labelLines || 0,
         }
-        speakerResolutions.push({ label: f.label, path: f.refinePath, ...f.speakerResolution })
         const renamed = f.speakerResolution.mappings.filter((m) => m.sourceLabel !== m.outputLabel)
         if (renamed.length) engine.log(`发言人统一：${f.label} 已在 Refine 输入中一次性应用 ${renamed.map((m) => `${m.sourceLabel}→${m.outputLabel}`).join('、')}`)
         if (f.speakerResolution.unresolved.length) engine.log(`发言人仍未识别：${f.label} 的 ${f.speakerResolution.unresolved.join('、')}（未猜名，保留源标签）`)
@@ -688,34 +693,6 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
       (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, cleanFindings[i] || {}, A, M))
-    if (capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
-      const normalized = await engine.parallel(A.files.map((f, i) => async () => {
-        if (!positional[i] || positional[i].captured || !(f.speakerResolution && f.speakerResolution.mappings.length)) return null
-        try { return await capabilities.enforceSpeakerOutput(f) } catch (e) {
-          engine.log(`发言人输出收口失败：${f.label}（${(e && e.message) || e}）——保留模型原稿进入审计`)
-          return null
-        }
-      }))
-      normalized.forEach((report, i) => {
-        if (!report) return
-        const entry = {
-          label: A.files[i].label,
-          path: A.files[i].outPath,
-          changedLines: report.changedLines || 0,
-          replacements: report.replacements || [],
-          unknownLabels: report.unknownLabels || [],
-        }
-        speakerOutputNormalizations.push(entry)
-        if (entry.changedLines) engine.log(`发言人输出收口：${entry.label} 按全文统一映射修正 ${entry.changedLines} 个标签别名`)
-        if (entry.unknownLabels.length) {
-          engine.log(`发言人输出出现映射外标签：${entry.label} 的 ${[...new Set(entry.unknownLabels.map((x) => x.label))].join('、')}——未自动猜改，交审计复核`)
-          positional[i].open_questions = [
-            ...(positional[i].open_questions || []),
-            `成稿出现全文发言人映射外标签：${[...new Set(entry.unknownLabels.map((x) => x.label))].join('、')}，请复核。`,
-          ]
-        }
-      })
-    }
   }
   scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
   if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
@@ -729,6 +706,44 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
   refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: cleanFindings[i] && cleanFindings[i].ending_anchor })).filter((p) => p.rep)
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
+
+// One output contract for BOTH the one-pass and standard branches. Tracked sources may use only the canonical
+// mapping; untracked sources must remain untracked. Known aliases are rewritten deterministically. Unknown labels
+// are left visible for the final fail-closed check below — never guessed or stripped.
+if (scope.includes('refine') && refinedPairs.length && capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
+  const normalized = await engine.parallel(refinedPairs.map(({ f, rep }) => async () => {
+    if (!rep || rep.captured) return null
+    try { return await capabilities.enforceSpeakerOutput(f, 'post_refine') } catch (e) {
+      engine.log(`发言人输出收口失败：${f.label}（${(e && e.message) || e}）——最终结构契约将拒绝该草稿`)
+      return { contractUnavailable: true, unknownLabels: [], violations: [] }
+    }
+  }))
+  normalized.forEach((report, i) => {
+    if (!report) return
+    const { f, rep } = refinedPairs[i]
+    const entry = {
+      label: f.label,
+      path: f.outPath,
+      changedLines: report.changedLines || 0,
+      replacements: report.replacements || [],
+      unknownLabels: report.unknownLabels || [],
+      valid: report.valid !== false && !report.contractUnavailable,
+      violations: report.violations || [],
+    }
+    speakerOutputNormalizations.push(entry)
+    if (entry.changedLines) engine.log(`发言人输出收口：${entry.label} 按全文统一映射修正 ${entry.changedLines} 个标签别名`)
+    if (entry.unknownLabels.length) {
+      const labels = [...new Set(entry.unknownLabels.map((x) => x.label))]
+      engine.log(`发言人输出出现映射外标签：${entry.label} 的 ${labels.join('、')}——未自动猜改，最终结构契约将拒绝该草稿`)
+      rep.open_questions = [...(rep.open_questions || []), `成稿出现全文发言人映射外标签：${labels.join('、')}，请复核。`]
+    }
+  })
+}
+speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
+  label: f.label,
+  path: f.refinePath || f.path,
+  ...f.speakerResolution,
+}))
 
 // §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch and
 // BEFORE logic/summary/timeline. Any publication gate triggers at most two targeted auto-repair rounds,
@@ -780,6 +795,54 @@ if (scope.includes('refine') && pairsToAudit.length) {
   })
   if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
+}
+
+// Repairs are model writes too. Run the structural contract once more after the final audit/repair round and
+// fail closed. The draft remains on disk for server-side diagnosis, but it is removed from `refined`, so the
+// artifact manifest cannot advertise it as a deliverable main transcript.
+if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
+  const finalContracts = await engine.parallel(pairsToAudit.map(({ f }) => async () => {
+    try { return await capabilities.enforceSpeakerOutput(f, 'final_contract') } catch (e) {
+      engine.log(`发言人最终结构契约无法运行：${f.label}（${(e && e.message) || e}）`)
+      return { contractUnavailable: true, valid: false, unknownLabels: [], violations: [] }
+    }
+  }))
+  const rejectedPaths = new Set()
+  finalContracts.forEach((report, index) => {
+    const { f } = pairsToAudit[index]
+    const unknownLabels = (report && report.unknownLabels) || []
+    const violations = (report && report.violations) || []
+    const invalid = !report || report.contractUnavailable || report.valid === false || unknownLabels.length > 0 || violations.length > 0
+    if (!invalid) return
+    rejectedPaths.add(f.outPath)
+    const labels = [...new Set(unknownLabels.map((item) => item.label).filter(Boolean))]
+    const reason = report && report.contractUnavailable
+      ? 'speaker_contract_unavailable'
+      : 'speaker_structure'
+    speakerStructuralFailures.push({
+      path: f.outPath,
+      label: f.label,
+      finding: reason,
+      speakerMode: (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || null,
+      labels,
+      violations,
+    })
+    const existing = auditFailed.find((item) => item.path === f.outPath)
+    if (existing) existing.findings = [...new Set([...(existing.findings || []), reason])]
+    else auditFailed.push({ path: f.outPath, findings: [reason] })
+    const refinedEntry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+    if (refinedEntry && refinedEntry.audit) {
+      refinedEntry.audit.status = 'fail'
+      refinedEntry.audit.hardFindings = [...new Set([...(refinedEntry.audit.hardFindings || []), reason])]
+    }
+    failed.push(f.label)
+    engine.log(`发言人结构契约未通过：${f.label}${labels.length ? `（${labels.join('、')}）` : ''}——草稿仅留服务端诊断，不声明为可交付主稿`)
+  })
+  if (rejectedPaths.size) {
+    failed = [...new Set(failed)]
+    refined = refined.filter((item) => !rejectedPaths.has(item.outPath || item.path))
+    refinedPairs = refinedPairs.filter(({ f }) => !rejectedPaths.has(f.outPath))
+  }
 }
 
 // Derivatives may only read FINAL bodies. The main transcript is still delivered when blocked (with review /
@@ -870,6 +933,7 @@ return {
   plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
   speakerResolutions,
   speakerOutputNormalizations,
+  speakerStructuralFailures,
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
   derivativesSkipped,

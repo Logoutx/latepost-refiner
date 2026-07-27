@@ -506,6 +506,9 @@ function manifestFiles(files = []) {
     outPath: f.outPath,
     lines: f.lines,
     bytes: f.bytes,
+    sourceKind: f.sourceKind || null,
+    sourceDocumentKind: f.sourceDocumentKind || null,
+    speakerMode: f.speakerMode || null,
     sha256: f.path ? sha256File(f.path) : null,
   }))
 }
@@ -522,6 +525,7 @@ function manifestSpeakerTrace(result = {}) {
       path: text(item && item.path, 1000),
       changedLines: Number(item && item.changedLines) || 0,
       labelLines: Number(item && item.labelLines) || 0,
+      speakerMode: safeRepairToken(item && item.speakerMode, 40),
       unresolved: (Array.isArray(item && item.unresolved) ? item.unresolved : []).slice(0, 50).map((x) => text(x, 80)).filter(Boolean),
       mappings: (Array.isArray(item && item.mappings) ? item.mappings : []).slice(0, 50).map((mapping) => ({
         sourceLabel: text(mapping && mapping.sourceLabel, 80),
@@ -539,6 +543,7 @@ function manifestSpeakerTrace(result = {}) {
       path: text(item && item.path, 1000),
       changedLines: Number(item && item.changedLines) || 0,
       labelLines: Number(item && item.labelLines) || 0,
+      valid: item && item.valid !== false,
       replacements: (Array.isArray(item && item.replacements) ? item.replacements : []).slice(0, 200).map((replacement) => ({
         line: Number(replacement && replacement.line) || null,
         from: text(replacement && replacement.from, 80),
@@ -548,6 +553,13 @@ function manifestSpeakerTrace(result = {}) {
         line: Number(unknown && unknown.line) || null,
         label: text(unknown && unknown.label, 80),
       })),
+    })),
+    structuralFailures: (Array.isArray(result.speakerStructuralFailures) ? result.speakerStructuralFailures : []).slice(0, 50).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      finding: safeRepairToken(item && item.finding, 80),
+      speakerMode: safeRepairToken(item && item.speakerMode, 40),
+      labels: (Array.isArray(item && item.labels) ? item.labels : []).slice(0, 50).map((label) => text(label, 80)).filter(Boolean),
     })),
   }
 }

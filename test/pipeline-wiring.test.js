@@ -88,33 +88,31 @@ test('override: excludeVerified via prior confidence coexists with a fresh decre
   assert.ok(/新人/.test(verifyPrompts), 'a genuinely new entity still gets verified')
 })
 
-// ---------- one-pass branch: canonicalOverrides must not be silently dropped ----------
-// The one-pass branch (single short file, refineSize < ONE_PASS_CHARS) skips scout/merge entirely — before this
-// fix, A.canonicalOverrides had no cluster list to attach to and was dropped: singlePassPrompt never mentioned
-// the decree, and the audit gate got no glossaryText (so ghost_name/missing_yin couldn't watch for a variant
-// leaking into the 成稿). Both effects are now covered.
+// ---------- every file enters Scout, including one short file ----------
 
-test('one-pass: canonicalOverrides is injected into singlePassPrompt as a 用户钦定 note', async () => {
+test('short single file always enters Scout and carries canonicalOverrides into the normal Refine prompt', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
   await runPipeline(A({
     files: [F({ chars: 1000 })],
     canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘', '陈涛（同音）'] }],
   }), eng)
+  assert.ok(labels.includes('scout:A'), 'a short single file still runs full-text Scout')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
-  assert.ok(/用户钦定正名/.test(refinePrompt), 'the prompt carries a 用户钦定 section on the one-pass path')
+  assert.ok(/用户钦定/.test(refinePrompt), 'the normal Refine prompt carries the locked glossary entry')
   assert.ok(refinePrompt.includes('陈涛') && refinePrompt.includes('陈焘'), 'both canonical and variant are named')
 })
 
-test('one-pass: canonicalOverrides absent leaves singlePassPrompt unchanged (no stray section)', async () => {
+test('short single file without canonicalOverrides still enters Scout', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
   await runPipeline(A({ files: [F({ chars: 1000 })] }), eng)
+  assert.ok(labels.includes('scout:A'), 'there is no short-file Scout bypass')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
   assert.ok(!/用户钦定正名/.test(refinePrompt), 'no decree section appears when there is no override')
 })
 
-test('one-pass: canonicalOverrides is handed to the audit gate as glossaryText (canonical + variants present)', async () => {
+test('short single file hands the normal in-memory glossary to audit', async () => {
   const labels = []
   let seenGlossary = 'unset'
   const capabilities = {
@@ -131,7 +129,7 @@ test('one-pass: canonicalOverrides is handed to the audit gate as glossaryText (
   assert.ok(seenGlossary.includes('陈焘'), 'the decreed variant is present (so ghost_name can catch it surviving in prose)')
 })
 
-test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary (unchanged prior behaviour)', async () => {
+test('short single file without overrides still hands the Scout-built glossary to audit', async () => {
   const labels = []
   let seenGlossary = 'unset'
   const capabilities = {
@@ -139,7 +137,7 @@ test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary
     annotateAnchors: () => ({ updated: [] }),
   }
   await runPipeline(A({ files: [F({ chars: 1000 })], capabilities }), engine(labels))
-  assert.equal(seenGlossary, null, 'no fake glossary is handed to the audit when there is no override (SINGLE_FILE_GLOSSARY placeholder is never leaked)')
+  assert.ok(typeof seenGlossary === 'string' && seenGlossary.includes('统一校对表'), 'the normal Scout-built glossary reaches audit')
 })
 
 test('generic speakers bypass the short-file fast path and every Refine read uses the Scout-resolved input', async () => {
@@ -594,17 +592,16 @@ test('risk (a): on a first run the audit capability receives the in-memory gloss
   assert.ok(seenGlossary.includes('示例品牌'), 'it is THIS round\'s in-memory glossary (the entity is present) — not an empty disk read')
 })
 
-test('risk (a): the single-file one-pass branch passes NO glossary (SINGLE_FILE_GLOSSARY is not a real 校对表)', async () => {
+test('risk (a): a short single file now passes the Scout-built glossary to audit', async () => {
   const labels = []
   let called = false, seen = 'unset'
   const capabilities = {
     runAudit: (f, opts = {}) => { called = true; seen = opts.glossaryText; return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
     annotateAnchors: () => ({ updated: [] }),
   }
-  // A single short file → one-pass branch → glossary === SINGLE_FILE_GLOSSARY → audit gets null (no ghost/yin).
   await runPipeline(A({ capabilities, files: [F({ chars: 1000 })] }), engine(labels))
-  assert.ok(called, 'the audit still ran for the one-pass file')
-  assert.equal(seen, null, 'no fake glossary is handed to the audit on the one-pass path')
+  assert.ok(called, 'the audit ran for the short file')
+  assert.ok(typeof seen === 'string' && seen.includes('统一校对表'), 'the normal Scout-built glossary reaches audit')
 })
 
 // ---------- risk (b): per-capability agent fallback ----------

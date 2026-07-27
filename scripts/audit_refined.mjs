@@ -29,6 +29,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseSpeakerDocument, speakerKey } from './speaker-resolver.js'
 
 // Keep this self-contained because the generated Claude skill ships audit_refined.mjs without core/spec.js.
 // core/spec.js exposes the same helper for pipeline/native-plan checks; regression tests lock both copies together.
@@ -818,20 +819,7 @@ export function checkLogicSectionCoverage(refinedText, logicText) {
 // Ordered speaker identifiers from either format: source "**发言人 1 …**" or
 // refined "李某：/记者：". Headings/quotes/tables are skipped.
 function speakerSeq(text) {
-  const ids = []
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line) continue
-    const src = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)/)
-    if (src) { ids.push('S' + src[1]); continue }
-    // bare name+timestamp label line (`李某 15:12`) — the common ASR export format
-    const ts = line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+\d{1,2}:\d{2}(?::\d{2})?\s*\*{0,2}$/)
-    if (ts) { ids.push('T' + ts[1]); continue }
-    if (/^[#*>|]/.test(line)) continue
-    const ref = line.match(/^([一-龥A-Za-z][^：:\s]{0,7})[：:]/)
-    if (ref) { ids.push('R' + ref[1]) }
-  }
-  return ids
+  return parseSpeakerDocument(text).labels.map((fact) => fact.matchKey || fact.key)
 }
 // Consolidated turns = speaker *alternations* (collapse consecutive same-speaker).
 // Invariant to ASR fragmentation, so a faithful refine that merges split turns
@@ -843,14 +831,18 @@ function consolidatedTurns(text) {
 }
 // Lenient ending check: is the source's last sentence reflected in the refined output?
 function endingCovered(sourceText, refinedText) {
-  const srcLines = sourceText.split(/\r?\n/).map((s) => s.trim())
-    .filter((s) => s && !/^\*{0,2}\s*发言人/.test(s) && !/^[#*>|]/.test(s))
-  const lastSrc = srcLines[srcLines.length - 1] || ''
-  const tail = (lastSrc.match(/[一-龥]/g) || []).slice(-14).join('')
+  const structure = parseSpeakerDocument(sourceText)
+  const lastUnit = structure.units[structure.units.length - 1]
+  const lastSrc = (lastUnit && lastUnit.text) || ''
+  const tail = (lastSrc.match(/[一-龥]/g) || []).slice(-24).join('')
   if (tail.length < 4) return true // can't judge → lenient
   const refHan = (refinedText.match(/[一-龥]/g) || []).join('')
-  for (let i = 0; i + 4 <= tail.length; i += 1) {
-    if (refHan.includes(tail.slice(i, i + 4))) return true
+  // Four-character windows are too weak for a whole-document search: an earlier phrase such as
+  // “介绍一下” can accidentally mask a dropped closing sentence. Require the longest useful run
+  // up to eight Han characters; short closing lines still use their complete available text.
+  const runLength = Math.min(8, tail.length)
+  for (let i = 0; i + runLength <= tail.length; i += 1) {
+    if (refHan.includes(tail.slice(i, i + runLength))) return true
   }
   // Closing pleasantries may be folded under the refine contract, but only when the output leaves an explicit
   // stage-direction trace near EOF. A silent truncation has no such trace and still fails ending_missing.
@@ -903,33 +895,12 @@ const MODEL_MARKER_RE = /[⚠!！]?\s*[【\[]?未精校段/
 // Zero turns parsed → caller treats coverage as not assessable (never a gate), same leniency contract as
 // endingCovered.
 export function parseSourceTurns(sourceText) {
-  const turns = []
-  let cur = null
-  const lines = sourceText.split(/\r?\n/)
-  for (let i = 0; i < lines.length; i += 1) {
-    const lineNo = i + 1
-    const line = lines[i].trim()
-    if (!line) continue
-    if (/^<!--/.test(line)) continue
-    const a = line.match(/^\*{0,2}\s*发言人\s*([0-9一二三四五六七八九十]+)(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?\s*\*{0,2}$/)
-    const b = a ? null : line.match(/^\*{0,2}([一-龥A-Za-z][^：:\s]{0,7})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*\*{0,2}$/)
-    if (a || b) {
-      if (cur) turns.push(cur)
-      // ts = the label's raw timestamp verbatim (HH:MM or HH:MM:SS), or null — feeds the source anchors.
-      cur = { speaker: a ? '发言人' + a[1] : b[1], startLine: lineNo, endLine: lineNo, text: '', ts: (a ? a[2] : b[2]) || null }
-      continue
-    }
-    if (/^[#*>|]/.test(line)) continue
-    const c = line.match(/^([一-龥A-Za-z][^：:\s]{0,7})[：:]\s*(.*)$/)
-    if (c) {
-      if (cur) turns.push(cur)
-      cur = { speaker: c[1], startLine: lineNo, endLine: lineNo, text: c[2] || '', ts: null }
-      continue
-    }
-    if (cur) { cur.text += (cur.text ? '\n' : '') + line; cur.endLine = lineNo }
-  }
-  if (cur) turns.push(cur)
-  return turns
+  return parseSpeakerDocument(sourceText).units.map((unit) => ({
+    ...unit,
+    // Keep the audit's long-standing display form (`发言人1`) while the canonical parser internally normalizes
+    // variants such as `发言人 1` / `Speaker 1` through speakerKey.
+    speaker: unit.speaker ? unit.speaker.replace(/^(发言人|说话人|讲者|讲话人|Speaker)\s+([0-9一二三四五六七八九十]+)$/iu, '$1$2') : null,
+  }))
 }
 
 // Normalize to hanzi-only with filler stripped, keeping a norm-index → 1-based raw line map
@@ -1570,7 +1541,6 @@ export const ATTR = {
   MULTI_STRONG_CORROBORATION: 3,  // multi-party hard flag: ≥ this many corroborating anchors in the wrong paragraph
   MULTI_CORROBORATION_FRACTION: 0.6, // …AND ≥ this fraction of the turn's anchors — the whole turn sits under the wrong label
 }
-const ATTR_LABEL_RE = /^\s*([一-龥A-Za-z0-9·]{1,12})[：:]/   // `名字：` at line start (inline OR label-on-own-line)
 const ATTR_HEAD_RE = /^#{1,6}\s/
 // source turn text carrying a deletion-marked speaker label near its start → true speaker ambiguous
 const ATTR_STRUCK_RE = /~~[^~]{0,30}发言人[^~]{0,20}~~/
@@ -1579,11 +1549,11 @@ const ATTR_STRUCK_RE = /~~[^~]{0,30}发言人[^~]{0,20}~~/
 // Stops at a heading (a heading with no label above it inside the section → no governing label). Returns
 // { label, labelLine } (label null when none). Handles both the inline `名字：内容` shape and the label-on-its-
 // own-line shape (`名字：` then a blank line then the content) the same way — both start with `名字：`.
-function governingLabel(refLines, line1) {
+function governingLabel(refLines, line1, labelsByLine) {
   for (let i = Math.min(line1, refLines.length) - 1; i >= 0; i -= 1) {
     const raw = refLines[i]
-    const m = raw.match(ATTR_LABEL_RE)
-    if (m) return { label: m[1], labelLine: i + 1 }
+    const fact = labelsByLine.get(i + 1)
+    if (fact) return { label: fact.label, labelLine: i + 1 }
     if (ATTR_HEAD_RE.test(raw)) return { label: null, labelLine: i + 1 }
   }
   return { label: null, labelLine: -1 }
@@ -1612,14 +1582,19 @@ function attrParagraphNorm(refLines, line1) {
 // that merely clears the base bar drops to a warning-tier 复核 item (review) instead of accusing. A true swap
 // still hard-fails (the whole answer sits under the wrong name → full corroboration). Two-party interviews (≤2
 // speakers, where the check was already accurate) keep the exact prior behavior.
-export function checkAttribution(sourceText, refinedText) {
-  const empty = { assessed: false, map: {}, speakers: {}, assessedTurns: 0, mappedSpeakers: 0, mismatches: 0, samples: [], review: 0, reviewSamples: [], partyCount: 0, perTurn: [] }
+export function checkAttribution(sourceText, refinedText, options = {}) {
+  const sourceStructure = parseSpeakerDocument(sourceText)
+  const speakerMode = options.speakerMode || sourceStructure.speakerMode
+  const empty = { assessed: false, status: 'unassessed', map: {}, speakers: {}, assessedTurns: 0, mappedSpeakers: 0, mismatches: 0, samples: [], review: 0, reviewSamples: [], partyCount: 0, perTurn: [] }
+  if (speakerMode === 'untracked') return { ...empty, status: 'not_applicable' }
   const { subs } = anchorTurns(sourceText, refinedText)
-  if (!subs.length) return empty
+  const partyCount = sourceStructure.tracks.length
+  if (!subs.length) return { ...empty, partyCount }
   // distinct source speakers among substantive turns — the number of parties in the conversation (P4).
-  const partyCount = new Set(subs.map((t) => t.speaker)).size
   const multiParty = partyCount >= ATTR.MULTI_PARTY_MIN
   const refLines = refinedText.split(/\r?\n/)
+  const refinedStructure = parseSpeakerDocument(refinedText)
+  const labelsByLine = new Map(refinedStructure.labels.map((fact) => [fact.line, fact]))
   // rarity over the same substantive source text anchorTurns used, so pickShingles reproduces the anchor shingles.
   const freq = new Map()
   let total = 0
@@ -1632,26 +1607,41 @@ export function checkAttribution(sourceText, refinedText) {
   const firstSub = subs[0], lastSub = subs[subs.length - 1]
 
   // 1) tally source speaker → governing refined label (all usable turns contribute to LEARNING the map)
-  const tally = {}
-  for (const t of usable) {
-    const g = governingLabel(refLines, t.anchor.line)
-    if (!g.label) continue
-    ;(tally[t.speaker] = tally[t.speaker] || {})[g.label] = (tally[t.speaker][g.label] || 0) + 1
-  }
-  // 2) derive the trusted map + a per-speaker assessment record
   const map = {}
   const speakers = {}
-  for (const s of Object.keys(tally)) {
-    const entries = Object.entries(tally[s]).sort((a, b) => b[1] - a[1])
-    const sampled = entries.reduce((x, [, c]) => x + c, 0)
-    const [label, count] = entries[0]
-    const frac = Number((count / sampled).toFixed(3))
-    const trusted = sampled >= ATTR.MIN_MAP_SAMPLE && frac >= ATTR.MAJORITY_MIN
-    speakers[s] = { sampled, label, frac, trusted }
-    if (trusted) map[s] = label
+  const expectedByKey = new Map()
+  const suppliedMappings = Array.isArray(options.speakerMappings)
+    ? options.speakerMappings.filter((mapping) => mapping && mapping.sourceLabel && mapping.outputLabel)
+    : null
+  if (suppliedMappings) {
+    for (const mapping of suppliedMappings) {
+      const key = speakerKey(mapping.sourceLabel)
+      if (!key || expectedByKey.has(key)) continue
+      expectedByKey.set(key, mapping.outputLabel)
+      map[mapping.sourceLabel] = mapping.outputLabel
+      const sampled = usable.filter((turn) => (turn.speakerKey || speakerKey(turn.speaker)) === key).length
+      speakers[mapping.sourceLabel] = { sampled, label: mapping.outputLabel, frac: sampled ? 1 : 0, trusted: true, basis: 'resolver' }
+    }
+  } else {
+    const tally = {}
+    for (const t of usable) {
+      const g = governingLabel(refLines, t.anchor.line, labelsByLine)
+      if (!g.label) continue
+      ;(tally[t.speaker] = tally[t.speaker] || {})[g.label] = (tally[t.speaker][g.label] || 0) + 1
+    }
+    // Backward-compatible standalone audit: without a resolver map, retain the old majority-learning fallback.
+    for (const s of Object.keys(tally)) {
+      const entries = Object.entries(tally[s]).sort((a, b) => b[1] - a[1])
+      const sampled = entries.reduce((x, [, c]) => x + c, 0)
+      const [label, count] = entries[0]
+      const frac = Number((count / sampled).toFixed(3))
+      const trusted = sampled >= ATTR.MIN_MAP_SAMPLE && frac >= ATTR.MAJORITY_MIN
+      speakers[s] = { sampled, label, frac, trusted }
+      if (trusted) map[s] = label
+    }
   }
   const mappedSpeakers = Object.keys(map).length
-  if (!mappedSpeakers) return { ...empty, assessed: false, speakers, partyCount }
+  if (!mappedSpeakers) return { ...empty, speakers, partyCount }
 
   // 3) flag mismatches against the trusted map (FLAGS exclude the doc's first/last turn + boundary-glue anchors)
   const samples = []
@@ -1660,15 +1650,18 @@ export function checkAttribution(sourceText, refinedText) {
   let mismatches = 0
   let review = 0
   let assessedTurns = 0
+  const expectedFor = (turn) => suppliedMappings
+    ? expectedByKey.get(turn.speakerKey || speakerKey(turn.speaker))
+    : map[turn.speaker]
   const mkText = (t, g, expected) => {
     const snippet = t.text.replace(/\s+/g, ' ').replace(/~~[^~]*~~/g, '').trim().slice(0, 42)
     return `源第 ${t.startLine} 行（${t.speaker}）的内容落到了成稿“${g.label}”名下（应为“${expected}”）：${snippet}`
   }
   for (const t of usable) {
-    if (!(t.speaker in map)) continue
-    const g = governingLabel(refLines, t.anchor.line)
+    const expected = expectedFor(t)
+    if (!expected) continue
+    const g = governingLabel(refLines, t.anchor.line, labelsByLine)
     if (!g.label) continue
-    const expected = map[t.speaker]
     assessedTurns += 1
     const isMismatch = g.label !== expected
     let flagged = false      // hard mismatch (attribution_mismatch)
@@ -1698,7 +1691,7 @@ export function checkAttribution(sourceText, refinedText) {
     if (reviewed) review += 1
     perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, speaker: t.speaker, label: g.label, expected, mismatch: flagged, review: reviewed })
   }
-  return { assessed: true, map, speakers, assessedTurns, mappedSpeakers, mismatches, samples, review, reviewSamples, partyCount, perTurn }
+  return { assessed: assessedTurns > 0, status: assessedTurns > 0 ? 'assessed' : 'unassessed', map, speakers, assessedTurns, mappedSpeakers, mismatches, samples, review, reviewSamples, partyCount, perTurn }
 }
 
 // ===== Quote-integrity + entity-substitution guards (M7) =====
@@ -2191,7 +2184,10 @@ export function auditFiles(paths) {
 // Source-aware audit: compare refined output against its source transcript.
 // glossaryText (optional): a rendered 校对表.md — enables ghost_name / missing_yin. When absent, those
 // two checks are silently skipped (count 0), same leniency contract as the coverage scan.
-export function auditPair({ sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine', glossaryText = null, strict = false }) {
+export function auditPair({
+  sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine',
+  glossaryText = null, strict = false, speakerMode = null, speakerMappings = null,
+}) {
   sourceText = normalizeTranscriptSource(sourceText, { sourceFile })
   const out = auditText(refinedText, refinedFile) // output-only cleanliness (residual noise / long paras)
 
@@ -2212,7 +2208,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
   const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText) : null
   // M6 attribution tier: speaker-misattribution via a self-calibrated majority map. refine mode only (a summary /
   // timeline / logic draft has no per-turn labels to defend). Calibrated mismatches are hard; ambiguous cases soft.
-  const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText) : null
+  const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText, { speakerMode, speakerMappings }) : null
   // M7 quote-integrity guard: manufactured-quote detection. refine mode only, SOFT. Reliably quiet on faithful
   // quotes (verified on real pairs), so it is default-on.
   const quoteFab = mode === 'refine' ? checkQuoteFabrication(sourceText, refinedText) : null
@@ -2227,7 +2223,7 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
     ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
-    ...(attribution ? { attribution: { assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
+    ...(attribution ? { attribution: { status: attribution.status, assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
     ...(quoteFab ? { quotes: { assessed: quoteFab.assessed, spansChecked: quoteFab.spansChecked, flagged: quoteFab.flagged } } : {}),
     ...(numericConsistency ? { numericConsistency: { conflicts: numericConsistency.conflicts.length } } : {}),
   }
@@ -2302,6 +2298,9 @@ export function auditPair({ sourceText, refinedText, sourceFile = '<source>', re
     ...(attribution && attribution.assessed && attribution.review ? [
       { name: 'attribution_review', severity: 'soft', count: attribution.review, samples: attribution.reviewSamples },
     ] : []),
+    ...(attribution && attribution.status === 'unassessed' && attribution.partyCount > 0 ? [
+      { name: 'speaker_attribution_unassessed', severity: 'soft', count: 1, samples: [{ text: `源稿识别到 ${attribution.partyCount} 条说话人轨道，但正文锚点不足，归属未被审计为通过。`, line: 1 }] },
+    ] : []),
     // M7 quote-integrity finding — SOFT ONLY. quote_fabrication_risk: a refined curly-quote span whose rare bigrams
     // are absent from the source everywhere (a polished line quotation-marked as if spoken).
     ...(quoteFab && quoteFab.assessed ? [
@@ -2360,6 +2359,8 @@ export function auditPairs(pairs) {
     // glossaryText (inline) wins; else glossaryPath is read; else the two glossary checks stay dormant.
     glossaryText: p.glossaryText != null ? p.glossaryText : (p.glossaryPath ? fs.readFileSync(p.glossaryPath, 'utf8') : null),
     strict: !!p.strict,   // opt-in entity_substitution_risk
+    speakerMode: p.speakerMode || null,
+    speakerMappings: Array.isArray(p.speakerMappings) ? p.speakerMappings : null,
   }))
   return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
 }

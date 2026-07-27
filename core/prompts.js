@@ -151,10 +151,12 @@ ${table}
 
 function resolvedSpeakerBlock(f, finding = {}) {
   const mappings = (f.speakerResolution && f.speakerResolution.mappings) || []
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || (mappings.length ? 'tracked' : null)
   const scout = (finding.speakers && finding.speakers.length)
     ? JSON.stringify(finding.speakers)
     : '侦察未提取到发言人'
-  if (!mappings.length) return `【该份发言人】${scout}——精校时据全文语境归位，见规范 1/7。`
+  if (speakerMode === 'untracked') return `【全文结构契约：无说话人轨道】源文没有说话人标签，可能是独白、口述或无标签笔记。保持这种无标签形式：不要改写成问答，不要添加“记者/受访者/姓名：”等任何说话人标签，也不要把转述改造成新的直接引语。本条覆盖通用规范 1、4a、7 中关于对话体和标签的要求。`
+  if (!mappings.length) return `【全文发言人统一结果】未取得身份映射。只能保留源稿已有标签；不得据语境猜姓名、创造新标签或合并轨道。`
   const rows = mappings.map((mapping) => `${mapping.sourceLabel} → ${mapping.outputLabel}`).join('；')
   return `【全文发言人统一结果】${rows}
 你读取的源文件是依据上述结果生成的输入副本，标签行已经一次性替换完毕；这些**替换后的姓名/角色**是全篇唯一标签。照抄这些标签，不要改回原来的“发言人 N/说话人 N”，也不要在各分块里另起一套名字。
@@ -176,9 +178,17 @@ export function refinePrompt(f, glossary, finding, a, chunk) {
     const headBlock = chunk.isFirst
       ? `【抬头】你是第 1 块：第一行写 \`# ${f.title}\`，第二行写 \`${f.subtitle}\`，然后从第一个 \`##\` 小标题开始正文。`
       : `【抬头】你是第 ${chunk.idx} 块（非首块）：**不要写 H1 标题、不要写说明行**，直接从一个 \`##\` 小标题开始正文。`
+    const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
+    const boundaryRules = untracked
+      ? `- 本文没有说话人标签；以段落或列表内容块为边界。一个内容块归属于其首行行号落入的分块，整块归一处、绝不拆开。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的第一个完整内容块开始。${chunk.isFirst ? '你是第 1 块，从文件开头正常处理。' : `若第 ${chunk.startLine} 行位于上一内容块中间，跳过该块，从下一个完整块开始。`}
+- 你的终点：凡首行行号 ≤ ${chunk.endLine} 的内容块都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `最后一个内容块即使越过第 ${chunk.endLine} 行也要处理完整，但不要开始首行号 > ${chunk.endLine} 的下一块。`}`
+      : `- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
+- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}`
     const tailNote = chunk.isLast
       ? `【收尾】你这一块覆盖到源文件结尾（约第 ${f.lines} 行${anchor.text ? `，最后一句「${anchor.text}」` : ''}）——必须精校到最后，正文绝不能中途断掉（结尾客套可折成一句说明）。`
-      : '【收尾】你不是最后一块，正常精校到你负责的最后一轮发言即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。'
+      : `【收尾】你不是最后一块，正常精校到你负责的最后一${untracked ? '内容块' : '轮发言'}即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。`
     return `你是访谈转录「精校」子代理（分块并行：本份共 ${chunk.count} 块，你负责第 ${chunk.idx} 块）。
 
 【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
@@ -189,9 +199,7 @@ ${glossary}
 ${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 
 【分块边界规则——务必严格，确保各块不重不漏】
-- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
-- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
-- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}
+${boundaryRules}
 
 【输出】Write 到 ${outPart}
 ${headBlock}
@@ -271,14 +279,16 @@ ${listText}
 }
 
 export function singlePassPrompt(f, a, overrideNote) {
+  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
 
 【源文件】${f.path}（约 ${f.lines} 行）。先把全文**整份读完**。${readPlan(f)}
-边读边记发言人对应、人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
+${untracked ? '本文没有说话人标签；按独白/无标签文本精校，保持无标签形式，不得改成问答或新增说话人。' : '边读边记发言人对应，统一全文标签。'}同时记下人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
 【输出】Write 到 ${f.outPath}
 【抬头】第一行 \`# ${f.title}\`；第二行 \`${f.subtitle}\`
+${resolvedSpeakerBlock(f)}
 ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
@@ -297,9 +307,10 @@ ${RULES}
 // written to f.outPath verbatim by JS, so it MUST be pure document text: first line the H1, no preamble/epilogue,
 // no code fence, no report — the deterministic source-aware audit then gates it exactly as any other 成稿.
 export function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote, finding = {}) {
+  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
   const glossary = (glossaryBlock && glossaryBlock.trim())
     ? `【统一校对表】（“联网核实结论”与“写法统一”优先级最高；标 ⚠ 的条目未采纳、勿套用；术语/品牌请初次落笔即写对）：\n${glossaryBlock}\n`
-    : '边读边在心里建一张迷你校对表（发言人对应、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。'
+    : `边读边在心里建一张迷你校对表（${untracked ? '文本结构' : '发言人对应'}、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。`
   return `你是访谈转录「精校」子代理（单请求一次成稿）。
 
 采访背景：${a.background}
@@ -343,11 +354,12 @@ export function summaryPrompt(a, refined, sectionMapPath) {
     ? `\n先 Read 结构索引 ${sectionMapPath}，用它定位每份成稿的小标题、行号、主题标签和关键实体；需要引用原文时再按索引只读相关成稿小节，避免反复通读全文。`
     : ''
   const summaryTitle = String(a.topic || '').trim().endsWith('访谈') ? `${a.topic}总结` : `${a.topic}访谈总结`
+  const hasUntracked = (a.files || []).some((file) => ((file.speakerResolution && file.speakerResolution.speakerMode) || file.speakerMode) === 'untracked')
   return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${summaryTitle}》：
 ${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
-三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
+三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（${hasUntracked ? '有说话人标签的成稿按发言人归类；无标签独白按来源文件/章节归类，绝不补造发言人；' : '按发言人归类，'}忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
 
 ${TYPESET}
@@ -413,7 +425,8 @@ export function logicWritePrompt(f, a, missing, planPath) {
   const planNote = planPath
     ? `\n【已审重排方案】先 Read ${planPath}。最终稿必须严格按这个 JSON 里的 threads 顺序、source_sections 和 logic 执行；如果方案里 no_reorder_needed=true，就不要写假重排稿，改为返回 open_questions 说明无需另出逻辑稿。`
     : ''
-  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
+  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
+  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${untracked ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${untracked ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
@@ -423,7 +436,7 @@ export function logicWritePrompt(f, a, missing, planPath) {
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。
 2. 每条线索选一个**内部顺序逻辑**：讲历史按时间，讲决策按 问题→洞察→决定→结果，讲产品/事件按 起因→经过→结果。
-3. 把精校稿里属于该线索的问答**整段照原文搬过来**，按上面的逻辑排好——保留 \`发言人：\` 标签**及其在精校稿里的原样式**（精校稿是 \`张三：\` 就写 \`张三：\`，**别改成** \`**张三：**\` 加粗或其它样式）、保留全部事实细节与原话措辞，**只换位置，不改一字**。
+3. 把精校稿里属于该线索的${untracked ? '内容块' : '问答'}**整段照原文搬过来**，按上面的逻辑排好——${untracked ? '保持无说话人标签，不得改成问答或补造发言人，' : '保留 `发言人：` 标签及其在精校稿里的原样式（精校稿是 `张三：` 就写 `张三：`，别改成 `**张三：**` 加粗或其它样式）、'}保留全部事实细节与原话措辞，**只换位置，不改一字**。
 4. **指代修复（克制）**：仅当某段被移走后、开头的“他 / 那个 / 上面说的 / 然后”等指代或承接断了，才加一句 \`> [编者] …\` 衔接（如“此段原在访谈后段，承前文同属早期创业”），或把孤立的“他”补成名字。**绝不**改写原话、绝不补受访者没说的、绝不替他下结论。
 5. **不丢不重**：精校稿里每一段实质问答都要在重排稿里出现且**只出现一次**（纯客套/重复可省，与精校稿口径一致）。一段问答若横跨两条线索，放进主线索一次，必要时另一处用一句 \`> [编者]\` 指路。
 6. 开头加一节 \`## 主线脉络（导读）\`：一段话讲清这次访谈的主线与你的重排逻辑。
