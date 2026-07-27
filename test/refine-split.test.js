@@ -241,10 +241,11 @@ test('splitForScout: not gated by chunkMode (resilience, always on) and unsplitt
 test('mergeScoutChunks unions per-chunk findings into one and keeps the file-end anchor', () => {
   const parts = [
     { speakers: [{ label: '记者', role: '记者' }, { label: '发言人1', role: '受访者' }], people: [{ canonical: '张三' }], brands: [], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['A'] }], themes: ['开场'], has_existing_headings: false, ending_anchor: { line: 700, text: '中段。' }, special_notes: ['注一'] },
-    { speakers: [{ label: '发言人1', role: '受访者' }], people: [{ canonical: '李四' }], brands: [{ canonical: '某品牌' }], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['B'] }], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 2000, text: '就到这里。' }, special_notes: ['注二'] },
+    { speakers: [{ label: '发言人 1', role: '受访者', identity: '李四，创始人', output_label: '李四' }], people: [{ canonical: '李四' }], brands: [{ canonical: '某品牌' }], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['B'] }], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 2000, text: '就到这里。' }, special_notes: ['注二'] },
   ]
   const m = mergeScoutChunks(parts, { lines: 2000 })
   assert.deepEqual(m.speakers.map((s) => s.label), ['记者', '发言人1'], 'speakers unioned, deduped by label')
+  assert.equal(m.speakers[1].output_label, '李四', 'a later chunk with a specific identity upgrades the shared speaker record')
   assert.equal(m.people.length, 2, 'people concatenated (downstream clusterEntities dedups across chunks, as it does across files)')
   assert.deepEqual(m.themes, ['开场', '收尾'], 'themes unioned')
   assert.equal(m.has_existing_headings, true, 'has_existing_headings is OR across chunks')

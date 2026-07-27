@@ -511,6 +511,48 @@ function manifestFiles(files = []) {
   }))
 }
 
+function manifestSpeakerTrace(result = {}) {
+  const text = (value, max = 120) => {
+    if (typeof value !== 'string') return null
+    const cleaned = value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim()
+    return cleaned ? cleaned.slice(0, max) : null
+  }
+  return {
+    resolutions: (Array.isArray(result.speakerResolutions) ? result.speakerResolutions : []).slice(0, 50).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      changedLines: Number(item && item.changedLines) || 0,
+      labelLines: Number(item && item.labelLines) || 0,
+      unresolved: (Array.isArray(item && item.unresolved) ? item.unresolved : []).slice(0, 50).map((x) => text(x, 80)).filter(Boolean),
+      mappings: (Array.isArray(item && item.mappings) ? item.mappings : []).slice(0, 50).map((mapping) => ({
+        sourceLabel: text(mapping && mapping.sourceLabel, 80),
+        outputLabel: text(mapping && mapping.outputLabel, 80),
+        role: text(mapping && mapping.role, 80),
+        basis: safeRepairToken(mapping && mapping.basis, 80),
+        firstLine: Number(mapping && mapping.firstLine) || null,
+        labelLines: Number(mapping && mapping.labelLines) || 0,
+      })),
+    })),
+    outputEnforcements: (Array.isArray(result.speakerOutputNormalizations) ? result.speakerOutputNormalizations : []).slice(0, 200).map((item, index) => ({
+      sequence: Number(item && item.sequence) || index + 1,
+      phase: safeRepairToken(item && item.phase, 80) || 'post_refine',
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      changedLines: Number(item && item.changedLines) || 0,
+      labelLines: Number(item && item.labelLines) || 0,
+      replacements: (Array.isArray(item && item.replacements) ? item.replacements : []).slice(0, 200).map((replacement) => ({
+        line: Number(replacement && replacement.line) || null,
+        from: text(replacement && replacement.from, 80),
+        to: text(replacement && replacement.to, 80),
+      })),
+      unknownLabels: (Array.isArray(item && item.unknownLabels) ? item.unknownLabels : []).slice(0, 200).map((unknown) => ({
+        line: Number(unknown && unknown.line) || null,
+        label: text(unknown && unknown.label, 80),
+      })),
+    })),
+  }
+}
+
 export function buildRunManifest(result = {}, context = {}) {
   const A = context.A || {}
   const pkg = readPackage()
@@ -593,6 +635,7 @@ export function buildRunManifest(result = {}, context = {}) {
       ],
     },
     qualityRepair: manifestQualityRepair(result.qualityRepair),
+    speaker: manifestSpeakerTrace(result),
     webTelemetry: result.webTelemetry || null,
     // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
     derivativeAudit: result.derivativeAudit ? {

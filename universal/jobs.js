@@ -17,6 +17,7 @@ import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 import { makeRunTrace } from './trace.js'
 import { extractTranscriptMetadata } from '../core/transcript-metadata.js'
+import { enforceCanonicalSpeakerLabels, parseSpeakerLabels, rewriteSpeakerLabels } from '../scripts/speaker-resolver.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_SKILL_DIR = path.join(REPO_ROOT, 'claude-code-skill')
@@ -103,6 +104,7 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const bytes = Buffer.byteLength(content, 'utf8')
   const chars = contentLength(content)   // 正文字数 (汉字 + 英文词/数字)；文档长度以此衡量，行数仅供 Read 分页
   const hasHeadings = HEADING_RE.test(content)
+  const speakerShape = parseSpeakerLabels(content)
   const title = deriveTitle(src)
   const entry = {
     path: mdPath, label: title, title,
@@ -115,6 +117,10 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
     // real turn edges and never orphan a question from its answer. Empty for label-less text → splitForRefine falls
     // back to the line-based divider. Cheap: one linear pass already having read the content.
     turns: parseTurns(content),
+    // A short file may normally skip Scout. Generic/role-only speaker tracks must not: Scout is the one
+    // full-text stage that resolves them before Refine sees the transcript.
+    speakerLabelLines: speakerShape.labelLines,
+    needsSpeakerResolution: speakerShape.needsResolution,
   }
   const headingWarning = hasHeadings && headingPolicy === 'none'
     ? `${path.basename(src)} 疑似已带小标题，而 headingPolicy=none——可用 headingPolicy=keep|regenerate 重跑该份`
@@ -556,22 +562,59 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
   const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
   const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
+  const speakerOutputEnforcements = [] // every deterministic pass, including the passes after targeted repairs
   const recordAuditFile = (file) => {
     const i = auditFilesAcc.findIndex((x) => x && file && path.resolve(x.file) === path.resolve(file.file))
     if (i >= 0) auditFilesAcc[i] = file
     else auditFilesAcc.push(file)
   }
   const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
+  const enforceSpeakerOutput = (f, phase = 'post_refine') => {
+    const refinedText = fs.readFileSync(f.outPath, 'utf8')
+    const enforced = enforceCanonicalSpeakerLabels(refinedText, (f.speakerResolution && f.speakerResolution.mappings) || [])
+    if (enforced.text !== refinedText) fs.writeFileSync(f.outPath, enforced.text, 'utf8')
+    speakerOutputEnforcements.push({
+      sequence: speakerOutputEnforcements.length + 1,
+      phase,
+      label: f.label,
+      path: f.outPath,
+      changedLines: enforced.changedLines || 0,
+      labelLines: enforced.labelLines || 0,
+      replacements: enforced.replacements || [],
+      unknownLabels: enforced.unknownLabels || [],
+    })
+    return enforced
+  }
   const capabilities = {
     readFile: (p) => fs.readFileSync(p, 'utf8'),
     // M11a single-shot refine writes the model's response text straight to the 成稿 (no Write-tool agent). Only
     // the single-shot path uses this; the agentic path still writes via the model's Write tool. mkdir -p first
     // so a first-run Transcripts/ dir exists, then the downstream audit reads it back from disk unchanged.
     writeFile: (p, text) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text, 'utf8') },
+    // Scout owns speaker identity. Materialize its one mapping as a disposable Refine input so every chunk sees
+    // the same names from its first Read. The original f.path is never edited and remains the audit source.
+    prepareSpeakerInput: (f, finding = {}) => {
+      const sourceText = fs.readFileSync(f.path, 'utf8')
+      const resolved = rewriteSpeakerLabels(sourceText, finding.speakers || [])
+      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, ...resolved }
+      const resolvedPath = path.join(convertedDir, `${safeName(f.title || f.label)}.speaker-resolved.md`)
+      fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })
+      fs.writeFileSync(resolvedPath, resolved.text, 'utf8')
+      return { path: resolvedPath, ...resolved }
+    },
+    // Refine normally preserves the already-canonical input labels. If it nevertheless reintroduces a source
+    // number or a role synonym, collapse that alias through the SAME mapping before audit. Unknown names are
+    // never guessed or rewritten; they remain visible in unknownLabels for audit/review.
+    enforceSpeakerOutput,
     // Risk (a): the pipeline hands us THIS round's in-memory 校对表 (opts.glossaryText) — use it for the
     // ghost_name / missing_yin checks, because on a first run the file isn't persisted until after the pipeline
     // returns, so reading it from disk would miss it. Fall back to the on-disk copy only when nothing was passed.
     runAudit: (f, opts = {}) => {
+      // A targeted repair is another model write. Re-apply the same canonical map before every audit round so a
+      // repair cannot reintroduce source numbers or role synonyms after the first post-Refine enforcement.
+      if (f.speakerResolution && f.speakerResolution.mappings.length) {
+        enforceSpeakerOutput(f, opts.phase || (opts.round ? `post_repair_round_${opts.round}` : 'pre_audit'))
+      }
       // Normalize a model-created duplicate topic boundary before any quality or derivative audit consumes it.
       // This preserves all distinct prose and only removes a repeated H2 plus an optional exact replayed turn.
       const before = fs.readFileSync(f.outPath, 'utf8')
@@ -731,7 +774,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       eventsPath: trace.eventsPath,
       statePath: trace.statePath,
     }
-    const result = { ...r, transcriptMetadata, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
+    const result = { ...r, speakerOutputNormalizations: speakerOutputEnforcements, transcriptMetadata, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
       A,
       outputDir: outDir,

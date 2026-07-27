@@ -142,13 +142,61 @@ test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary
   assert.equal(seenGlossary, null, 'no fake glossary is handed to the audit when there is no override (SINGLE_FILE_GLOSSARY placeholder is never leaked)')
 })
 
+test('generic speakers bypass the short-file fast path and every Refine read uses the Scout-resolved input', async () => {
+  const labels = [], prompts = []
+  let auditSource = '', outputEnforced = false
+  const capabilities = {
+    prepareSpeakerInput: (f, finding) => {
+      assert.equal(f.path, '/s/A.txt', 'the resolver reads the untouched original')
+      assert.equal(finding.speakers[0].output_label, '刘益枫')
+      return {
+        path: '/o/.converted/A.speaker-resolved.md',
+        mappings: [{ sourceLabel: '发言人 1', outputLabel: '刘益枫', basis: 'scout_output_label' }],
+        unresolved: [],
+        changedLines: 12,
+        labelLines: 12,
+      }
+    },
+    enforceSpeakerOutput: (f) => {
+      outputEnforced = true
+      assert.equal(f.refinePath, '/o/.converted/A.speaker-resolved.md', 'output enforcement reuses the prepared mapping')
+      return { changedLines: 1, replacements: [{ line: 10, from: '发言人 1', to: '刘益枫' }], unknownLabels: [] }
+    },
+    runAudit: (f) => {
+      auditSource = f.path
+      return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }
+    },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const eng = engine(labels, {
+    '^scout': {
+      speakers: [{ label: '发言人 1', role: '受访者', identity: '刘益枫，某公司创始人', output_label: '刘益枫' }],
+      people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [],
+    },
+  }, prompts)
+  const result = await runPipeline(A({
+    files: [F({ chars: 1000, needsSpeakerResolution: true })],
+    capabilities,
+  }), eng)
+
+  assert.ok(labels.includes('scout:A'), 'a generic-label short file no longer skips the whole-file Scout')
+  const refine = prompts.find((item) => item.label === 'refine:A')
+  assert.ok(refine.prompt.includes('/o/.converted/A.speaker-resolved.md'), 'Refine reads the materialized canonical-label copy')
+  assert.ok(refine.prompt.includes('发言人 1 → 刘益枫'), 'the one mapping is explicit in the prompt')
+  assert.equal(outputEnforced, true, 'the same mapping is enforced once after Refine and before audit')
+  assert.equal(auditSource, '/s/A.txt', 'the source-aware audit still compares against the original transcript')
+  assert.equal(result.speakerResolutions[0].mappings[0].outputLabel, '刘益枫')
+  assert.equal(result.speakerOutputNormalizations[0].changedLines, 1)
+})
+
 // ---------- §2 in-pipeline audit gate (capability injection) ----------
 
 test('audit gate: content_gap hard → auto-repair → re-audit passes → not auditFailed', async () => {
   const labels = []
   let auditCalls = 0, repaired = false, anchored = false
+  const auditContexts = []
   const capabilities = {
-    runAudit: (f) => { auditCalls += 1; return auditCalls === 1
+    runAudit: (f, opts) => { auditCalls += 1; auditContexts.push(opts); return auditCalls === 1
       ? { file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] }
       : { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
     repair: () => { repaired = true },
@@ -162,6 +210,8 @@ test('audit gate: content_gap hard → auto-repair → re-audit passes → not a
   assert.equal(r.refined[0].audit.status, 'ok')
   assert.equal(r.refined[0].audit.repaired, true)
   assert.equal(r.refined[0].audit.anchorsAdded, 1)
+  assert.equal(auditContexts[0].phase, 'pre_audit')
+  assert.deepEqual({ phase: auditContexts[1].phase, round: auditContexts[1].round }, { phase: 'post_repair_round_1', round: 1 })
 })
 
 test('audit gate: still hard after two repair rounds → auditFailed + visible marker (annotate) + fail status', async () => {

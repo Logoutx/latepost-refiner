@@ -51,6 +51,9 @@ export const SCOUT_SCHEMA = {
       label: { type: 'string', description: '转录中的发言人标签原样' },
       role: { type: 'string', description: '受访者 / 记者 / PR陪同 / 同事 / 协调 等' },
       identity: { type: 'string', description: '对应到谁 + title（若文中可判断）' },
+      output_label: { type: 'string', description: '精校稿最终应显示的纯标签：能判断真名则只写真名，否则写可区分角色；拿不准留空' },
+      output_label_confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '真名归属置信度；只有全文内有直接证据才可 high' },
+      output_label_evidence: { type: 'string', description: '支持 output_label 的一处原文证据；写真名时必须说明为何这是本人而非被提到/被喊话的人' },
       sample: { type: 'string', description: '一处原文标签样例' },
     } } },
     people: { type: 'array', items: entitySchema({ public_figure: { type: 'boolean', description: '公众人物，可公开核实' } }) },
@@ -799,10 +802,30 @@ export function splitForScout(f) {
 export function mergeScoutChunks(parts, f) {
   const got = (parts || []).filter(Boolean)
   if (!got.length) return null
-  const speakers = []; const seenSp = new Set()
+  const speakers = []; const speakerIndex = new Map()
+  const speakerKey = (value) => {
+    const label = String(value || '').normalize('NFKC').trim()
+    const generic = label.match(/^(?:发言人|说话人|讲者|讲话人|Speaker)\s*([0-9一二三四五六七八九十]+)$/iu)
+    return generic ? `generic:${generic[1]}` : label
+  }
+  const speakerScore = (speaker) => {
+    const output = String((speaker && speaker.output_label) || '').trim()
+    const identity = String((speaker && speaker.identity) || '').trim()
+    const role = String((speaker && speaker.role) || '').trim()
+    const confident = speaker && speaker.output_label_confidence === 'high' && String(speaker.output_label_evidence || '').trim()
+    const outputIsRole = /^(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)$/iu.test(output)
+    return (confident && output && !outputIsRole ? 20 : 0) + (confident && identity ? 10 : 0) + (output ? 4 : 0) + (role ? 2 : 0)
+  }
   for (const p of got) for (const s of p.speakers || []) {
-    const k = ((s && s.label) || '').trim()
-    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+    const k = speakerKey(s && s.label)
+    if (!k) continue
+    if (!speakerIndex.has(k)) {
+      speakerIndex.set(k, speakers.length)
+      speakers.push(s)
+      continue
+    }
+    const i = speakerIndex.get(k)
+    if (speakerScore(s) > speakerScore(speakers[i])) speakers[i] = { ...s, label: speakers[i].label }
   }
   const cat = (key) => got.flatMap((p) => p[key] || [])
   const errByKind = {}

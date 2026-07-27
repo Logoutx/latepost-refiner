@@ -35,7 +35,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   if (typeof cap.readFile !== 'function') return { degrade: true }
   if (!capturing && (typeof engine.complete !== 'function' || typeof cap.writeFile !== 'function')) return { degrade: true }
   let sourceText
-  try { sourceText = await cap.readFile(f.path) } catch (e) {
+  try { sourceText = await cap.readFile(f.refinePath || f.path) } catch (e) {
     engine.log(`单请求精校：${f.label} 读源失败（${(e && e.message) || e}）——回退代理式`)
     return { degrade: true }
   }
@@ -51,7 +51,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   const glossaryBlock = (glossary && glossary !== SINGLE_FILE_GLOSSARY) ? glossary : ''
   const overrideNote = (A.singleShotOverrideNote && A.singleShotOverrideNote[f.label]) || ''
   const maxTokens = singleShotMaxTokens(chars)
-  const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote)
+  const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote, finding)
   const model = M.refine, effort = effortFor(A, 'refine')   // M12-defaults: user override wins, else cap at 'high'
   // M11b batch-submit seam: when A.captureSingleShot is set, hand the built payload to it INSTEAD of sending —
   // the batch script reuses the whole scout→verify→glossary→single-shot-prompt pipeline to assemble batch
@@ -263,13 +263,13 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const glossaryPath = A.outputDir ? `${A.outputDir}/校对表.md` : null
 
   // 1) obtain an audit file-result ({ status, failed[], gaps[], findings[], modelMarkers[] })
-  async function audit() {
+  async function audit(auditContext = {}) {
     if (typeof cap.runAudit === 'function') {
       // Pass the in-memory glossary so the capability doesn't have to read a not-yet-persisted file (risk a).
       // Fail-loud (P7): a thrown direct audit is retried ONCE (parity with the CC agent path's one retry); still
       // throwing → null, which the caller turns into a LOUD run failure instead of a quiet "audit unavailable".
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary }), f) }
+        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary, ...auditContext }), f) }
         catch { if (attempt >= 1) return null }
       }
       return null
@@ -294,7 +294,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     return normalizeAuditResult(parsed, f)
   }
 
-  const first = await audit()
+  const first = await audit({ phase: 'pre_audit' })
   // Fail-loud (P7): the audit could not run after one retry. Previously this "degraded to record-only, non-blocking"
   // and the run reported success with an "audit unavailable" note — a quality gate that can be skipped silently.
   // Now the per-file result still carries auditUnavailable (the 成稿 is kept, not destroyed), but the orchestration
@@ -360,7 +360,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       }
     }
 
-    const again = await audit()
+    const again = await audit({ phase: `post_repair_round_${round}`, round })
     if (!again) {
       repairAttempts.push({
         file: out, round, action: repairMeta.action || null, model: repairMeta.model || null,
@@ -483,8 +483,10 @@ let auditUnavailable = []  // P7 fail-loud: files whose audit could NOT run afte
 let derivativesSkipped = [] // requested derivatives withheld because their source body was not final/audited
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
+let speakerResolutions = []  // one deterministic Scout mapping per file; Refine reads its materialized input copy
+let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
 
-if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot) {
+if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot && !A.files[0].needsSpeakerResolution) {
   // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
   // (M11b: a batch-submit capture pass forces the else-branch so even a tiny lone file is captured as a
   // single-shot batch request via refineFileSingleShot, not sent through the one-pass Write-tool agent.)
@@ -650,19 +652,81 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 
   let positional = []
   if (scope.includes('refine')) {
+    // Speaker identity is a whole-file decision owned by Scout, not by independent Refine chunks. Universal
+    // materializes that mapping into a disposable, line-for-line input copy here. The original path stays on f
+    // for source-aware audit; only Refine switches to refinePath. Runtimes without fs capability keep the prior
+    // prompt-only behaviour.
+    if (capabilities && typeof capabilities.prepareSpeakerInput === 'function') {
+      const prepared = await engine.parallel(A.files.map((f, i) => async () => {
+        const finding = cleanFindings[i]
+        if (!finding) return null
+        try { return await capabilities.prepareSpeakerInput(f, finding) } catch (e) {
+          engine.log(`发言人统一输入生成失败：${f.label}（${(e && e.message) || e}）——保留原稿进入 Refine`)
+          return null
+        }
+      }))
+      prepared.forEach((resolution, i) => {
+        if (!resolution) return
+        const f = A.files[i]
+        f.refinePath = resolution.path || f.path
+        f.speakerResolution = {
+          mappings: resolution.mappings || [],
+          unresolved: resolution.unresolved || [],
+          changedLines: resolution.changedLines || 0,
+          labelLines: resolution.labelLines || 0,
+        }
+        speakerResolutions.push({ label: f.label, path: f.refinePath, ...f.speakerResolution })
+        const renamed = f.speakerResolution.mappings.filter((m) => m.sourceLabel !== m.outputLabel)
+        if (renamed.length) engine.log(`发言人统一：${f.label} 已在 Refine 输入中一次性应用 ${renamed.map((m) => `${m.sourceLabel}→${m.outputLabel}`).join('、')}`)
+        if (f.speakerResolution.unresolved.length) engine.log(`发言人仍未识别：${f.label} 的 ${f.speakerResolution.unresolved.join('、')}（未猜名，保留源标签）`)
+      })
+    }
     engine.phase('Refine')
     engine.log(`▶ 3/${scope.includes('logic') ? 5 : 4} 精校 Refine：${A.files.length} 份逐份精校${A.chunkMode === 'speed' ? '（大文件分块并行）' : ''}`)
     // Refine runs even when scout failed for a file (findings[i] null): refine reads the source directly and
     // the glossary is only an aid, so a stalled cheap scout degrades the glossary but
     // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
-      (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, findings[i] || {}, A, M))
+      (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, cleanFindings[i] || {}, A, M))
+    if (capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
+      const normalized = await engine.parallel(A.files.map((f, i) => async () => {
+        if (!positional[i] || positional[i].captured || !(f.speakerResolution && f.speakerResolution.mappings.length)) return null
+        try { return await capabilities.enforceSpeakerOutput(f) } catch (e) {
+          engine.log(`发言人输出收口失败：${f.label}（${(e && e.message) || e}）——保留模型原稿进入审计`)
+          return null
+        }
+      }))
+      normalized.forEach((report, i) => {
+        if (!report) return
+        const entry = {
+          label: A.files[i].label,
+          path: A.files[i].outPath,
+          changedLines: report.changedLines || 0,
+          replacements: report.replacements || [],
+          unknownLabels: report.unknownLabels || [],
+        }
+        speakerOutputNormalizations.push(entry)
+        if (entry.changedLines) engine.log(`发言人输出收口：${entry.label} 按全文统一映射修正 ${entry.changedLines} 个标签别名`)
+        if (entry.unknownLabels.length) {
+          engine.log(`发言人输出出现映射外标签：${entry.label} 的 ${[...new Set(entry.unknownLabels.map((x) => x.label))].join('、')}——未自动猜改，交审计复核`)
+          positional[i].open_questions = [
+            ...(positional[i].open_questions || []),
+            `成稿出现全文发言人映射外标签：${[...new Set(entry.unknownLabels.map((x) => x.label))].join('、')}，请复核。`,
+          ]
+        }
+      })
+    }
   }
   scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
   if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
   failed = A.files.filter((f, i) => scope.includes('refine') && !positional[i]).map((f) => f.label)
-  refined = positional.map((rep, i) => rep && Object.assign({}, rep, { outPath: A.files[i].outPath, complete: null, checkNote: '审计待跑' })).filter(Boolean)
-  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: findings[i] && findings[i].ending_anchor })).filter((p) => p.rep)
+  refined = positional.map((rep, i) => rep && Object.assign({}, rep, {
+    outPath: A.files[i].outPath,
+    complete: null,
+    checkNote: '审计待跑',
+    ...(A.files[i].speakerResolution ? { speakerResolution: A.files[i].speakerResolution } : {}),
+  })).filter(Boolean)
+  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: cleanFindings[i] && cleanFindings[i].ending_anchor })).filter((p) => p.rep)
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
@@ -804,6 +868,8 @@ return {
   auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after at most two repair rounds
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
   plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
+  speakerResolutions,
+  speakerOutputNormalizations,
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
   derivativesSkipped,

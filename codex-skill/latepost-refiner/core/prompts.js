@@ -116,7 +116,8 @@ ${knownNote(a)}
 
 ${readBlock}
 读完后按 schema 返回结构化侦察结果：
-- speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
+- speakers：为源转录的**每一条发言轨道**填写 label（源标签原样）、role、identity、output_label、output_label_confidence、output_label_evidence 和一处 sample。output_label 是精校稿最终可见的纯标签：能从全文判断具体是谁时，**只写真名**（如「刘益枫」，不要带公司/title）；真名不确定时才写可区分角色（如「记者」「受访者」「PR」）；连角色也拿不准则留空，绝不猜人名。相同源标签在全文只能对应同一个 output_label。
+  · 具体姓名只有在**本人自我介绍、speakerHints 明示、或另一条清楚分轨的发言直接称呼此人**等直接证据成立时，才可标 output_label_confidence=high，并把依据原句写进 output_label_evidence。只是在该轨道正文里提到某个名字、转述某人观点、或混轨段里出现“赵磊，你们组……”一类喊话，不能证明该轨道本人就是赵磊；这种情况 confidence 只能 medium/low，output_label 应退回角色。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
   · **知名实体用你已知的正确写法做 canonical**：若这是你认得的知名公司/产品/机构/公众人物，canonical 一律填**你所知的规范写法**，哪怕转录通篇是另一种听写——把转录里的写法放进 variants。例：转录一直写「苍碧科技」、而你知道这家公司规范写法是「苍璧科技」（碧→璧 同音误写），则 canonical=苍璧科技、variants 含 苍碧科技。别让一个一直被听错的名字、因为转录里写法统一就当成正确写法。
@@ -149,11 +150,24 @@ ${table}
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
 }
 
+function resolvedSpeakerBlock(f, finding = {}) {
+  const mappings = (f.speakerResolution && f.speakerResolution.mappings) || []
+  const scout = (finding.speakers && finding.speakers.length)
+    ? JSON.stringify(finding.speakers)
+    : '侦察未提取到发言人'
+  if (!mappings.length) return `【该份发言人】${scout}——精校时据全文语境归位，见规范 1/7。`
+  const rows = mappings.map((mapping) => `${mapping.sourceLabel} → ${mapping.outputLabel}`).join('；')
+  return `【全文发言人统一结果】${rows}
+你读取的源文件是依据上述结果生成的输入副本，标签行已经一次性替换完毕；这些**替换后的姓名/角色**是全篇唯一标签。照抄这些标签，不要改回原来的“发言人 N/说话人 N”，也不要在各分块里另起一套名字。
+【Scout 识别依据】${scout}`
+}
+
 export function refinePrompt(f, glossary, finding, a, chunk) {
   // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
   const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
-  const speakers = (finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'
+  const sourcePath = f.refinePath || f.path
+  const speakers = resolvedSpeakerBlock(f, finding)
 
   // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
   // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
@@ -171,7 +185,7 @@ export function refinePrompt(f, glossary, finding, a, chunk) {
 【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
 ${glossary}
 
-【源文件】${f.path}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
+【源文件】${sourcePath}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
 读取计划（首尾各多读约 ${CHUNK_MARGIN} 行邻接内容，好看清边界处的整轮发言；只精校属于你的那些发言轮）：
 ${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 
@@ -182,7 +196,7 @@ ${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 
 【输出】Write 到 ${outPart}
 ${headBlock}
-【该份发言人】${speakers}
+${speakers}
 ${notes ? `【该份特别提醒】\n${notes}` : ''}
 ${headingNote(a.headingPolicy)}
 
@@ -201,10 +215,10 @@ ${tailNote}
 【统一校对表】（「联网核实结论」与「写法统一」两节优先级最高，与前文冲突时以它们为准——但其中**标 ⚠ 的条目未被采纳、勿套用**；「写法统一」里的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
 ${glossary}
 
-【源文件】${f.path}（约 ${f.lines} 行）。${readPlan(f)}
+【源文件】${sourcePath}（约 ${f.lines} 行）。${readPlan(f)}
 【输出】Write 到 ${f.outPath}
 【抬头】第一行 \`# ${f.title}\`；第二行 \`${f.subtitle}\`
-【该份发言人】${(finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'}
+${speakers}
 ${notes ? `【该份特别提醒】\n${notes}` : ''}
 ${headingNote(a.headingPolicy)}
 
@@ -283,7 +297,7 @@ ${RULES}
 // single-shot run passes '' and the model builds its own mini-glossary as in singlePassPrompt. The response is
 // written to f.outPath verbatim by JS, so it MUST be pure document text: first line the H1, no preamble/epilogue,
 // no code fence, no report — the deterministic source-aware audit then gates it exactly as any other 成稿.
-export function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote) {
+export function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote, finding = {}) {
   const glossary = (glossaryBlock && glossaryBlock.trim())
     ? `【统一校对表】（“联网核实结论”与“写法统一”优先级最高；标 ⚠ 的条目未采纳、勿套用；术语/品牌请初次落笔即写对）：\n${glossaryBlock}\n`
     : '边读边在心里建一张迷你校对表（发言人对应、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。'
@@ -292,7 +306,8 @@ export function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote) 
 采访背景：${a.background}
 
 ${glossary}
-下面 <源转录> 标签之间是需要精校的**完整**转录原文（${f.path}）。按规范精校全文。
+下面 <源转录> 标签之间是需要精校的**完整**转录原文（${f.refinePath || f.path}）。按规范精校全文。
+${resolvedSpeakerBlock(f, finding)}
 ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}

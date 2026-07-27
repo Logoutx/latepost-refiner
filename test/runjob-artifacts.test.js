@@ -37,6 +37,8 @@ test('prepareFile normalizes SRT sources before the model sees them', async () =
   assert.equal(entry.sourceKind, 'srt')
   assert.equal(entry.originalPath, src)
   assert.equal(path.extname(entry.path), '.md')
+  assert.equal(entry.speakerLabelLines, 2)
+  assert.equal(entry.needsSpeakerResolution, true, 'generic SRT speakers force Scout even when the transcript is short')
   const prepared = fs.readFileSync(entry.path, 'utf8')
   assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(prepared), 'raw SRT timecode arrow is not sent to prompts')
   assert.ok(prepared.includes('发言人 1 00:00:01'))
@@ -156,9 +158,21 @@ function mockEngine() {
     log() {},
     usage: () => ({ ...usage }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => t())),
-    pipeline: async () => [],
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, i) => {
+      let value = item
+      for (const stage of stages) { value = await stage(value, item, i); if (!value) return null }
+      return value
+    })),
     agent: async (_prompt, opts = {}) => {
       usage.agents++
+      if (opts.label && opts.label.startsWith('scout:')) {
+        return {
+          speakers: [{ label: '采访者', role: '记者' }, { label: '受访者', role: '受访者' }],
+          people: [], brands: [], terms: [], errors: [], themes: [],
+          ending_anchor: { line: 9, text: '今天先到这里，后续我们再补充渠道数据和客户案例。' },
+          special_notes: [],
+        }
+      }
       if (opts.label && opts.label.startsWith('refine:')) {
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }
@@ -230,10 +244,23 @@ function truncatedEndingEngine() {
   return {
     phase() {}, log() {}, usage: () => ({ ...usage }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => t().catch(() => null))),
-    // Single short file → one-pass branch → runJob refines via a `refine:` agent (not the pipeline stage).
-    // The agent reports success; the test pre-writes the 成稿 on disk for the deterministic audit to read.
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, i) => {
+      let value = item
+      for (const stage of stages) { value = await stage(value, item, i); if (!value) return null }
+      return value
+    })),
+    // Role-only speaker labels now force Scout before Refine even on a short file. The refine agent reports
+    // success; the test pre-writes the 成稿 on disk for the deterministic audit to read.
     agent: async (_prompt, opts = {}) => {
       usage.agents++
+      if (opts.label && opts.label.startsWith('scout:')) {
+        return {
+          speakers: [{ label: '采访者', role: '记者' }, { label: '受访者', role: '受访者' }],
+          people: [], brands: [], terms: [], errors: [], themes: [],
+          ending_anchor: { line: TRUNC_SOURCE.split('\n').length, text: '今天就先聊到这里。' },
+          special_notes: [],
+        }
+      }
       if (opts.label && opts.label.startsWith('refine:')) {
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }

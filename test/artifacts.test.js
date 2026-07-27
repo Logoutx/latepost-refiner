@@ -151,6 +151,42 @@ test('run manifest persists only the whitelisted repair ledger and retains earli
   assert.equal(JSON.stringify(manifest).includes('must not persist'), false)
 })
 
+test('run manifest persists the full-text speaker mapping and every deterministic output enforcement pass', () => {
+  const speakerResolutions = [{
+    label: '访谈 A',
+    path: '/tmp/out/.converted/A.speaker-resolved.md',
+    changedLines: 12,
+    labelLines: 12,
+    unresolved: [],
+    mappings: [{
+      key: 'generic:1',
+      sourceLabel: '说话人 1',
+      outputLabel: '记者',
+      role: '记者',
+      basis: 'scout_role',
+      firstLine: 1,
+      labelLines: 6,
+    }],
+  }]
+  const speakerOutputNormalizations = [{
+    sequence: 2,
+    phase: 'post_repair_round_1',
+    label: '访谈 A',
+    path: '/tmp/out/Transcripts/A.md',
+    changedLines: 1,
+    labelLines: 11,
+    replacements: [{ line: 20, from: '访谈者', to: '记者' }],
+    unknownLabels: [{ line: 30, label: '神秘人' }],
+  }]
+  const manifest = buildRunManifest({ ...baseResult, speakerResolutions, speakerOutputNormalizations }, { outputDir: '/tmp/out', topic: 'T' })
+
+  assert.equal(manifest.speaker.resolutions[0].mappings[0].outputLabel, '记者')
+  assert.equal(manifest.speaker.resolutions[0].mappings[0].key, undefined, 'internal track keys/Feishu ids are not persisted')
+  assert.equal(manifest.speaker.outputEnforcements[0].phase, 'post_repair_round_1')
+  assert.deepEqual(manifest.speaker.outputEnforcements[0].replacements[0], { line: 20, from: '访谈者', to: '记者' })
+  assert.deepEqual(manifest.speaker.outputEnforcements[0].unknownLabels[0], { line: 30, label: '神秘人' })
+})
+
 test('writeRunArtifacts writes review.md and run.json', () => {
   const dir = tmpdir()
   const paths = writeRunArtifacts({ ...baseResult, outputDir: dir }, { outputDir: dir, topic: '测试项目', warnings: baseResult.warnings })
