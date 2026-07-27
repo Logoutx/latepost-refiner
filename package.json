@@ -1,7 +1,12 @@
 {
   "name": "latepost-refiner",
   "version": "1.0.0",
+  "private": true,
   "description": "访谈转录精校流水线：侦察、联网核实、统一校对表、并行精校加完整性核对，可选产出逻辑顺序稿、访谈总结、时间线。Claude Code Workflow 版和独立命令行版共用一套 core/。",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/latepost-team/latepost-refiner.git"
+  },
   "type": "module",
   "bin": {
     "latepost-refiner": "universal/cli.js",

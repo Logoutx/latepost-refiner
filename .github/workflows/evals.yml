@@ -2,9 +2,6 @@ name: Model Evals
 
 on:
   workflow_dispatch:
-  schedule:
-    # Monday 04:05 Asia/Shanghai.
-    - cron: "5 20 * * 0"
 
 permissions:
   contents: read

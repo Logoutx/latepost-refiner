@@ -8,6 +8,12 @@
 - 联网核实修正音转写弄错的人名、术语；
 - （可选）根据逻辑重排 QA、做访谈总结、结合公开信息生成时间线。
 
+## 仓库与协作
+
+`latepost-team/latepost-refiner` 是公司内部唯一权威仓库，设为 private。日常修改从 `main` 新建分支、通过 PR 和 CI 合并；不再自动跟踪或同步其他公开、个人仓库。需要吸收外部改动时，先审阅并以独立 PR 引入。
+
+生产机器人不会自动跟随 `main`：`lark-refine-bot` 通过 git submodule 固定到一个已验收 commit，只有显式更新 gitlink 并部署后，生产版本才会变化。真实转录稿、运行日志、API key 和私有评测结果不得提交。
+
 ## 同一个逻辑，三个模型
 
 | 模型 | 用哪个 | 订阅/API |
@@ -18,17 +24,15 @@
 
 ## 安装
 
-最简单的就是把仓库地址发给 Claude Code / Codex，说“安装这个技能”。
+公司成员先取得 private repo 权限，再克隆并安装锁定依赖：
 
-或者从 [Releases](https://github.com/Logoutx/latepost-refiner/releases/latest) 按模型下载：
+```bash
+git clone https://github.com/latepost-team/latepost-refiner.git
+cd latepost-refiner
+npm ci
+```
 
-| 下载 | 怎么用 |
-|---|---|
-| [latepost-refiner-claude-skill.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-claude-skill.zip) | 解压出的 `latepost-refiner/` 拖进 `~/.claude/skills/` |
-| [latepost-refiner-codex-skill.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-codex-skill.zip) | 解压出的 `latepost-refiner/` 拖进 Codex 的技能目录 |
-| [latepost-refiner-deepseek-mac.zip](https://github.com/Logoutx/latepost-refiner/releases/download/latest/latepost-refiner-deepseek-mac.zip) | Mac 免安装：解压后**右键打开** `启动.command`（只第一次要右键），浏览器自动打开本地页面；Apple Silicon / Intel 自动适配，不需要 Node、不需要 Homebrew，key 填在网页里不落盘 |
-
-开发者手动方式：
+各运行方式：
 
 **Claude Code 技能**
 git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refiner`
@@ -37,7 +41,7 @@ git clone 后：`ln -s "$(pwd)/claude-code-skill" ~/.claude/skills/latepost-refi
 技能目录 `codex-skill/latepost-refiner/`，接入方式见其 SKILL.md。
 
 **DeepSeek 版·命令行 / 本地网页（源码跑，需 Node 20+）**
-npm install；cp .env.example .env 填 key；`node universal/cli.js --files … --topic …` 或 `npm run web`。
+`cp .env.example .env` 填 key；`node universal/cli.js --files … --topic …` 或 `npm run web`。
 docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.sh`。
 
 ## 如何工作
