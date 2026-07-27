@@ -1,8 +1,10 @@
 # Handoff — build the no-key Codex skill (Phase 3b)
 
-> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）。
+>
+> **当前操作边界**：禁止直接 commit、push 或 merge 到 `main`；所有修改走分支 + PR + CI + 同事审阅。Codex skill 是本地/人工接口，公司 mac mini 当前只支持 Universal，不把本文路径当作生产后端或 fallback。
 
-_For Codex. Self-contained; assumes no prior conversation. Work on a branch and coordinate before pushing `main` (the maintainer's edition shares this repo)._
+_For Codex. Self-contained; assumes no prior conversation. Work on a branch and submit a reviewed PR; never push or merge directly to `main`._
 
 ## Goal
 
@@ -49,7 +51,7 @@ Split the pipeline by what needs a model vs. what doesn't:
 - **No `OPENAI_API_KEY` / no `TAVILY_API_KEY` on the primary path.** Document any per-stage key fallback explicitly so the user knows when a key would be needed.
 - Keep heavy text out of the main Codex context (delegate to subagents).
 - Don't drift the editorial rules from `references/editorial-spec.md`.
-- Work on a branch; coordinate before pushing `main`.
+- Work on a branch; submit a reviewed PR. Never push or merge directly to `main`.
 
 ## References in this repo
 

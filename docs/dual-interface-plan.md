@@ -1,6 +1,8 @@
 # LatePost-Refiner — Development Plan: two subscription-native interfaces (Claude + Codex) over one core
 
-> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）
+> **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）。
+>
+> **当前操作边界**：公司协作以 `README.md`、`AGENTS.md` / `CLAUDE.md` 和 `CONTRIBUTING.md` 为准。禁止直接 commit、push 或 merge 到 `main`，所有修改走分支 + PR + CI + 同事审阅。公司 mac mini 当前只支持 Universal；本文的 Claude/Codex 订阅接口不属于生产后端。
 
 _Drafted 2026-06-22. Companion to `docs/streamlining-proposal.md` (the collaborator's structure proposal). This is the agreed execution plan._
 
@@ -13,17 +15,17 @@ LatePost-Refiner (renamed from interview-transcriber; repo `Logoutx/latepost-ref
 **Research findings:**
 - **Claude no-key already works.** The Claude Code skill's `workflow.js` runs inside the Workflow tool; its `agent/parallel/pipeline/phase/log` are the Workflow globals (`build/bootstrap-cc.js`), billed to the Claude Code session — no `ANTHROPIC_API_KEY`. The key-requiring path (`engines/api.js`) is a separate edition.
 - **Codex no-key is feasible but unproven.** Codex runs on a ChatGPT plan (OAuth, no key) and has a subscription-billed parallel sub-agent primitive (`spawn_agents_on_csv`, ~6 concurrent). Unconfirmed in OpenAI docs: (1) whether Codex subagents can **web-search on the subscription** (needed by `verify`); (2) whether that batch-oriented primitive (and Agents-SDK fan-out) is flexible/subscription-billable enough for the multi-stage pipeline. Codex *can* run `node` locally (free) to execute the deterministic `core/` JS.
-- **The collaborator's current Codex build does NOT meet the no-key goal:** their `codex-skill/latepost-refiner/SKILL.md` has Codex **delegate to the Node CLI** (`node universal/cli.js --provider openai`) → needs `OPENAI_API_KEY` (metered). Their checkout also diverges (keeps `transcriber` bin aliases vs our clean rename; adds `codex-skill/`, `engines/model-profiles.js`, `universal/artifacts.js`, plus resume/cancel/pricing-default features) and they **force-push `main`**.
+- **Historical state at drafting:** the collaborator's Codex build did not meet the no-key goal and their checkout force-pushed `main`. That old behavior is now explicitly prohibited by the current company workflow.
 
 **Direction (agreed):** one `core/`, one canonical Node runtime, thin interfaces, model defaults in a single source. **Keep both subscription-native paths (Claude Workflow, Codex subagents) first-class** — do NOT collapse them into CLI shell-outs (that reintroduces API keys). Node runtime stays canonical for CLI/web/binary and as the API-key fallback.
 
 ## Plan (phased by risk / leverage)
 
 ### Phase 0 — Reconcile with the collaborator's branch  *(prerequisite — don't build on a fork)*
-- `git fetch` first (collaborator force-pushes), then diff their checkout and `origin/main` against local.
+- Historical prerequisite: `git fetch` first, then diff the collaborator checkout and `origin/main` against local.
 - Both sides currently have **uncommitted** work touching the **same files** (`README`, `package.json`, `universal/{cli,jobs,server}.js`, `universal/web/index.html`, `test/server.test.js`). Resolution path: each side commits to its own branch first, then a real 3-way merge — not a working-tree fix.
 - Decide the rename strategy (recommend keeping `transcriber` aliases for a deprecation window), fold in our binary + de-jargon and their `codex-skill/` + `model-profiles.js` + `artifacts.js` + resume/cancel/pricing work.
-- Land ONE canonical `main`; coordinate push timing so neither side clobbers.
+- Land one canonical result through a reviewed PR; never coordinate a direct push or merge into `main`.
 
 ### Phase 1 — `engines/model-profiles.js` (single source of model defaults, both providers)  *(highest leverage, lowest risk — first)*
 - `MODEL_PROFILES` with symmetric `anthropicDefault`/`anthropicPremium` AND `openaiDefault`/`openaiPremium` (optionally `deepseekCheap`), each a tier map `{scout,verify,dedup,refine,logic,summary,timeline}`.
@@ -48,7 +50,7 @@ LatePost-Refiner (renamed from interview-transcriber; repo `Logoutx/latepost-ref
 
 ## Risks
 - **Codex subscription unknowns** (web-search, subagent flexibility/billing) — mitigated by the 3a spike before committing to 3b.
-- **Collaborator force-pushes `main`** — Phase 0 first; `git fetch` before every commit/push; coordinate via branches, not racing force-pushes.
+- **Historical force-push risk** — now retired. Current work must use branches and reviewed PRs; direct or force pushes to `main` are prohibited.
 - **Folder moves** break the skill symlink + `launch.json` absolute paths — deferred to Phase 5, done deliberately.
 - **Cannot drive Codex from this agent** — the spike and the Codex-native runs require running inside Codex and reporting back.
 - On subscription paths you get the harness's model (Claude Code's / Codex's), not a per-stage tier pick; explicit model selection lives on the API-key paths.

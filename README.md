@@ -10,9 +10,15 @@
 
 ## 仓库与协作
 
-`latepost-team/latepost-refiner` 是公司内部唯一权威仓库，设为 private。日常修改从 `main` 新建分支、通过 PR 和 CI 合并；不再自动跟踪或同步其他公开、个人仓库。需要吸收外部改动时，先审阅并以独立 PR 引入。
+`latepost-team/latepost-refiner` 是公司内部唯一权威仓库，设为 private。**禁止直接在 `main` 上 commit、push，或绕过 pull request 把改动 merge 进 `main`。**每项修改都从最新 `main` 新建分支，经过 PR、CI 和至少一位团队成员审阅后，再通过 PR 合并。公司当前 GitHub 方案无法为 private repo 强制 branch protection；这是平台限制，不代表可以跳过上述流程。
 
-生产机器人不会自动跟随 `main`：`lark-refine-bot` 通过 git submodule 固定到一个已验收 commit，只有显式更新 gitlink 并部署后，生产版本才会变化。真实转录稿、运行日志、API key 和私有评测结果不得提交。
+仓库不再自动跟踪或同步其他公开、个人仓库。需要吸收外部改动时，先审阅并以独立 PR 引入。真实转录稿、运行日志、API key 和私有评测结果不得提交。
+
+### 生产支持边界
+
+公司 mac mini 上的 `lark-refine-bot` **目前只支持 Universal 运行时**，即本仓库 `universal/` 的 DeepSeek + Serper/Jina 路径。Claude Code 与 Codex 技能仍是本仓库支持的本地/人工运行接口，但不是 mac mini 的生产后端，也不是生产故障时可直接启用的 fallback。
+
+生产机器人不会自动跟随 refiner `main`：`lark-refine-bot` 通过 git submodule 固定到一个已验收 commit，只有在 bot 仓库显式更新 gitlink、完成集成测试与 canary，并在空闲窗口部署后，生产版本才会变化。若未来要让 mac mini 支持其他运行时，必须先单独修改并验收 bot 路由、凭证、安全和部署契约，不能只改配置或因为仓库里存在相应 skill 就视为已支持。
 
 ## 同一个逻辑，三个模型
 
