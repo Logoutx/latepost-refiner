@@ -466,6 +466,40 @@ test('normalizeQuoteStyleText fixes visible prose/headings but preserves protect
   assert.equal(normalizeQuoteStyleText(out), out, 'normalization is idempotent')
 })
 
+test('normalizeQuoteStyleText decodes literal Unicode quote escapes only in visible Markdown', () => {
+  const doc = [
+    '---',
+    'title: "\\u201c元数据保留\\u201d"',
+    '---',
+    '',
+    '## \\u201c转义标题\\u201d',
+    '',
+    '周砚：他说\\u201c正文引语\\u201d，也提到\\u2018内部方案\\u2019。',
+    '周砚：命令是 `printf "\\u201c代码\\u201d"`。',
+    '周砚：详见 [报告](https://example.com/a "\\u201c链接标题\\u201d")。',
+    '周砚：URL 是 https://example.com/\\u201cpath\\u201d。',
+    '<!-- \\u201c注释保留\\u201d -->',
+    '```js',
+    'const x = "\\u201c代码块\\u201d"',
+    '```',
+  ].join('\n')
+
+  const beforeFinding = checkQuoteStyle(doc).find((f) => f.name === 'quote_style')
+  assert.ok(beforeFinding.count >= 1, 'visible prose escapes are publication-invalid quote residue')
+
+  const out = normalizeQuoteStyleText(doc)
+  assert.match(out, /^## “转义标题”$/m)
+  assert.match(out, /他说“正文引语”，也提到‘内部方案’/)
+  assert.ok(out.includes('title: "\\u201c元数据保留\\u201d"'), 'front matter is unchanged')
+  assert.ok(out.includes('`printf "\\u201c代码\\u201d"`'), 'inline code is unchanged')
+  assert.ok(out.includes('(https://example.com/a "\\u201c链接标题\\u201d")'), 'link target/title is unchanged')
+  assert.ok(out.includes('https://example.com/\\u201cpath\\u201d'), 'URLs are unchanged')
+  assert.ok(out.includes('<!-- \\u201c注释保留\\u201d -->'), 'HTML comments are unchanged')
+  assert.ok(out.includes('const x = "\\u201c代码块\\u201d"'), 'fenced code is unchanged')
+  assert.equal(checkQuoteStyle(out).find((f) => f.name === 'quote_style').count, 0)
+  assert.equal(normalizeQuoteStyleText(out), out, 'escape decoding is idempotent')
+})
+
 test('quote_density_low: a long body with zero 弯引号 emits a soft hint (never a gate)', () => {
   const many = Array.from({ length: 205 }, (_, i) => `周砚：这是第 ${i} 段正文没有任何引号内容。`).join('\n\n')
   const f = checkQuoteStyle(many).find((x) => x.name === 'quote_density_low')

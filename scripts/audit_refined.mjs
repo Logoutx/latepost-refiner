@@ -205,6 +205,34 @@ function emptyCount(text) {
 const CJK_CHAR = /[一-龥]/                       // same Han range the rest of the file uses ([一-龥])
 const CORNER_QUOTES_RE = /[「」『』]/g              // 直角引号 — banned by the typesetting spec
 const CURLY_QUOTE_RE = /[“”]/                     // full-width curly quote (the ONLY sanctioned form)
+const LITERAL_QUOTE_ESCAPES = Object.freeze({
+  '8': '‘',
+  '9': '’',
+  c: '“',
+  d: '”',
+})
+
+// Decode only the four JSON-style Unicode escapes that spell Chinese curly quotes, and only where `mask`
+// still exposes the original bytes. Protected Markdown has already been replaced by spaces in `mask`, so
+// code / links / URLs / comments remain byte-for-byte unchanged. Returning a collapsed mask keeps UTF-16
+// indices aligned for the straight-quote pass that follows; no other \uXXXX sequence is interpreted.
+function decodeVisibleQuoteEscapes(raw, mask) {
+  let text = '', visible = ''
+  for (let i = 0; i < raw.length;) {
+    const match = raw.slice(i).match(/^\\u201([89cd])/i)
+    if (match && mask.slice(i, i + match[0].length) === raw.slice(i, i + match[0].length)) {
+      const quote = LITERAL_QUOTE_ESCAPES[match[1].toLowerCase()]
+      text += quote
+      visible += quote
+      i += match[0].length
+      continue
+    }
+    text += raw[i]
+    visible += mask[i]
+    i += 1
+  }
+  return { text, mask: visible }
+}
 
 // Iterate the refined text as body lines with true 1-based line numbers, skipping regions where a stray
 // quote / colon / label is not prose: YAML front matter, fenced code blocks, HTML comments (可跨行),
@@ -284,9 +312,12 @@ export function normalizeQuoteStyleText(input) {
     mask = mask.replace(/\]\([^)]*\)/g, (m) => ' '.repeat(m.length))
     mask = mask.replace(/https?:\/\/[^\s]+/g, (m) => ' '.repeat(m.length))
 
+    const decoded = decodeVisibleQuoteEscapes(raw, mask)
+    mask = decoded.mask
+
     // `mask` is indexed in UTF-16 code units; keep the editable buffer on the same indexing model so an
     // astral character (emoji, historic glyph) before a quote cannot shift replacements or corrupt text.
-    const chars = raw.split('')
+    const chars = decoded.text.split('')
     let doubleOpen = true, singleOpen = true
     for (let k = 0; k < mask.length; k += 1) {
       const ch = mask[k]
@@ -308,10 +339,11 @@ export function normalizeQuoteStyleText(input) {
   return out.join(eol)
 }
 
-// quote_style: ASCII "/' hugging a CJK char (hard), 直角引号 (hard), and a low-curly-quote density hint.
+// quote_style: ASCII "/' hugging a CJK char (hard), 直角引号 / visible literal Unicode quote escapes
+// (hard), and a low-curly-quote density hint.
 export function checkQuoteStyle(refinedText) {
   const body = bodyLines(refinedText)
-  const straight = [], corner = []
+  const straight = [], corner = [], escaped = []
   let curly = 0
   for (const { no, text } of body) {
     for (let k = 0; k < text.length; k += 1) {
@@ -322,11 +354,12 @@ export function checkQuoteStyle(refinedText) {
       }
     }
     for (const _ of text.matchAll(CORNER_QUOTES_RE)) corner.push({ text: text.trim().slice(0, 60), line: no })
+    for (const _ of text.matchAll(/\\u201[89cd]/gi)) escaped.push({ text: text.trim().slice(0, 60), line: no })
     if (CURLY_QUOTE_RE.test(text)) curly += 1
   }
   const findings = [
-    { name: 'quote_style', severity: 'hard', count: straight.length + corner.length,
-      samples: straight.concat(corner).slice(0, 12) },
+    { name: 'quote_style', severity: 'hard', count: straight.length + corner.length + escaped.length,
+      samples: straight.concat(corner, escaped).slice(0, 12) },
   ]
   // Only when the body is substantial and carries ZERO sanctioned curly quotes do we hint that quoting /
   // term-marking may have been dropped — a soft nudge, never a gate.

@@ -86,6 +86,7 @@ Keep filename and H1 identical where practical.
 
 - Use full-width Chinese punctuation.
 - Use quotes `“”` and inner quotes `‘’`; avoid ASCII straight quotes and `「」`.
+- The runtime enforces this as a deterministic pre-audit normalization on visible prose and headings, including literal `\u201c` / `\u201d` / `\u2018` / `\u2019` residue. It protects fenced/inline code, URLs, Markdown link targets/titles, comments, and front matter; a remaining `quote_style` finding is an unsupported edge case, not a request for broad model rewriting.
 - Convert exact Chinese-character numbers to Arabic numerals: `十六个部门` -> `16 个部门`; `三四百人` -> `300-400 人`.
 - Keep idiomatic small colloquial counts when conversion would look unnatural: `两个人`, `一两句话`, `三五个`.
 - Add one half-width space between Chinese and Latin/numbers: `用 GPT-4 做`, `16 个部门`, `2021 年底`.
