@@ -48,6 +48,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
   --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
                          时间/token 用量/估算成本）
+  --dev-trace            开发模式，记录说话人链路详细过程到 .dev-trace/，仅用于开发排查（也可设 REFINER_DEV_TRACE=1）
   --allow-audit-fail     正文发布门禁未过（忠实性/接缝/清理/排版，定点修复后仍 hard）时，若成稿已生成，
                          仍以退出码 0 结束（默认退出 1）。主成稿照样落盘、派生产物暂停；请查 review.md / run.json
                          的 auditFailed 与 derivativesSkipped 字段逐份核对。逻辑稿自身审计失败不能用此参数豁免
@@ -65,7 +66,7 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--dev-trace': 'devTrace', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
@@ -173,6 +174,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors
     runLog: a.noRunLog ? false : undefined,     // default on: appends one line to ~/.config/latepost-refiner/runs.jsonl
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
+    devTrace: a.devTrace || env.REFINER_DEV_TRACE === '1' || undefined,   // 开发排查用，默认关闭
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
     models: parseModels(a.models),

@@ -101,6 +101,14 @@ DeepSeek 版每个任务最多发起 100 个去重后的搜索请求；同一查
 
 在启用 Clash fake-IP 的机器上，系统 DNS 可能只返回 `198.18.0.0/15` 的保留地址。网页抓取仅在某个主机名的全部系统 DNS 结果都落入该网段时，才会向 Google Public DNS 的 DNS-over-HTTPS 接口查询真实 A/AAAA 地址并继续 SSRF 校验；普通私网地址、私网与公网混合结果仍直接拒绝，DoH 查询失败也不会放宽校验。此兼容路径会把待抓取网页的主机名发送给 Google。
 
+## 排查说话人问题
+
+说话人标签出错时，加 `--dev-trace`（或设 `REFINER_DEV_TRACE=1`）重跑一次，输出目录下会多出 `.dev-trace/speaker-trace.md`：说话人从解析、侦察、映射、改写、兜底到审计的 6 个阶段逐一列出，末尾汇总“疑似问题信号”，看第一处数字对不上的阶段即可定位。只记标签文字、行号和条数，不记访谈正文。
+
+不想跑整条流水线时，用只读小工具先看一眼源稿结构：`node scripts/speaker-inspect.mjs 访谈.md`。读某次运行的记录（含运行中途实时跟看）：`node scripts/dev-trace-view.mjs <运行输出目录> [--follow]`。
+
+这个开关默认关闭，是开发排查工具，生产（飞书机器人）必须保持关闭。详见 [docs/dev-trace.md](docs/dev-trace.md)。
+
 ## 数据去向与信源保护
 
 选版本就是选转录全文发给谁。

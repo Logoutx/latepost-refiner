@@ -16,6 +16,7 @@ import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTE
 import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
 import { makeRunTrace } from './trace.js'
+import { makeSpeakerTrace } from './speaker-trace.js'
 import { extractTranscriptMetadata } from '../core/transcript-metadata.js'
 import {
   detectDeclaredAiSummary,
@@ -143,7 +144,9 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
   const headingWarning = hasHeadings && headingPolicy === 'none'
     ? `${path.basename(src)} 疑似已带小标题，而 headingPolicy=none——可用 headingPolicy=keep|regenerate 重跑该份`
     : null
-  return { entry, hasHeadings, headingWarning }
+  // speakerShape 一并返回，是为了让调用方（runJob 里默认关闭的说话人链路记录）不必把文档再解析一遍。
+  // 它带着全文行数组——只有 speaker-trace.js 从中取结构信息，正文本身永远不会被写出去。
+  return { entry, hasHeadings, headingWarning, speakerShape }
 }
 
 export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files = [], topic = '', scope = [] }) {
@@ -479,6 +482,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   if (!files.length) throw new JobConfigError('未提供任何文件')
   const outDir = path.resolve(outputDir && String(outputDir).trim() ? outputDir : `${process.env.HOME}/Downloads/${topic}`)
   const trace = makeRunTrace(outDir)
+  // 开发模式的说话人链路记录：默认关闭（params.devTrace 未开时是全空操作，一次文件系统调用都不做）。
+  const speakerTrace = makeSpeakerTrace(outDir, { enabled: Boolean(params.devTrace) })
   const heartbeat = setInterval(() => trace.heartbeat(), 15000)
   heartbeat.unref?.()
   let traceClosed = false
@@ -497,7 +502,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   for (const f of files) {
     const prepared = await prepareInputFile(f, { topic, date, headingPolicy, outputDir: outDir, uploadDir, convertedDir })
     if (!prepared) continue
-    const { entry, headingWarning } = prepared
+    const { entry, headingWarning, speakerShape } = prepared
+    speakerTrace.parse(entry.label, speakerShape)
     if (headingWarning) warnings.push(headingWarning)
     if (headingWarning) notice(`提示：${headingWarning}`)
     fileEntries.push(entry)
@@ -612,6 +618,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       valid: enforced.valid !== false,
       violations: enforced.violations || [],
     })
+    speakerTrace.enforce(f.label, phase, enforced)
     return enforced
   }
   const capabilities = {
@@ -625,6 +632,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     prepareSpeakerInput: (f, finding = {}) => {
       const sourceText = fs.readFileSync(f.path, 'utf8')
       const resolved = rewriteSpeakerLabels(sourceText, finding.speakers || [])
+      speakerTrace.mapping(f.label, resolved)
+      speakerTrace.rewrite(f.label, resolved)
       const speakerMode = f.speakerMode || parseSpeakerDocument(sourceText).speakerMode
       if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, speakerMode, ...resolved }
       const resolvedPath = path.join(convertedDir, `${safeName(f.title || f.label)}.speaker-resolved.md`)
@@ -660,6 +669,15 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       }])
       const file = res.files[0]
       recordAuditFile(file)
+      const metrics = (file && file.metrics) || {}
+      speakerTrace.audit(f.label, {
+        phase: opts.phase || (opts.round ? `post_repair_round_${opts.round}` : 'pre_audit'),
+        ...(metrics.attribution || {}),
+        sourceTurns: metrics.sourceTurns,
+        refinedTurns: metrics.refinedTurns,
+        speakerTurnRatio: metrics.speakerTurnRatio,
+        attributionMismatchFailed: (file && (file.failed || []).includes('attribution_mismatch')) || false,
+      })
       return file
     },
     repair: async (f, opts = {}) => {
@@ -736,6 +754,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     fresh, annotate: params.annotate, files: fileEntries,
     plannedChunks: [],
     onChunkPlan: (plan) => trace.plan(plan),
+    // 开发模式的说话人事件出口（关闭时下面这一行是空操作）。目前只有 Scout 会发。
+    onSpeakerEvent: (event) => { if (event && event.type === 'scout_chunks') speakerTrace.scout(event.fileLabel, event) },
   }
 
   {
@@ -809,6 +829,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       },
       eventsPath: trace.eventsPath,
       statePath: trace.statePath,
+      // 只有开了 --dev-trace 才有这一项；默认运行的 run.json 与之前逐字节一致。
+      ...(speakerTrace.enabled ? { devTrace: { eventsPath: speakerTrace.eventsPath, summaryPath: speakerTrace.summaryPath } } : {}),
     }
     const result = { ...r, speakerOutputNormalizations: speakerOutputEnforcements, transcriptMetadata, audit, logicAudit, logicFailed, derivativeAudit, qualityRepair: qualityRepairResult(r), execution, escalation: null, glossaryLint, crossFileConflicts, annotations, anchors, outputDir: outDir, glossaryPath: wroteGlossary ? glossaryPath : null, priorGlossaryPath: priorGlossaryText ? glossaryPath : null, provider: sel.provider, providerInfo: sel.info, modelRouting: effectiveModels, webTelemetry, warnings, usage, startedAt, finishedAt, durationMs }
     const artifacts = writeRunArtifacts(result, {
@@ -823,6 +845,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       usage: result.usage,
       escalation: result.escalation,
     })
+    speakerTrace.finish()
     trace.finish(execution)
     traceClosed = true
     clearInterval(heartbeat)
@@ -844,6 +867,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   } catch (error) {
     clearInterval(heartbeat)
     if (!traceClosed) {
+      speakerTrace.finish()
       const failure = {
         code: error && error.code === 'CONFIG_ERROR' ? 'CONFIG_ERROR' : 'INTERNAL_ERROR',
         retryable: false,

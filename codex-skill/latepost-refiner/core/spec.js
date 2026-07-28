@@ -1,5 +1,5 @@
 // GENERATED FILE — DO NOT EDIT. Source: core/spec.js. Regenerate: npm run sync:skills
-import { parseSpeakerDocument } from '../scripts/speaker-resolver.js'
+import { parseSpeakerDocument, effectiveScoutPersonName } from '../scripts/speaker-resolver.js'
 
 // Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
 export const BODY_FIDELITY_GATES = Object.freeze([
@@ -803,14 +803,22 @@ export function mergeScoutChunks(parts, f) {
     const generic = label.match(/^(?:发言人|说话人|讲者|讲话人|Speaker)\s*([0-9一二三四五六七八九十]+)$/iu)
     return generic ? `generic:${generic[1]}` : label
   }
+  const ROLE_OUTPUT_RE = /^(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)$/iu
   const speakerScore = (speaker) => {
     const output = String((speaker && speaker.output_label) || '').trim()
     const identity = String((speaker && speaker.identity) || '').trim()
     const role = String((speaker && speaker.role) || '').trim()
     const confident = speaker && speaker.output_label_confidence === 'high' && String(speaker.output_label_evidence || '').trim()
-    const outputIsRole = /^(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)$/iu.test(output)
-    return (confident && output && !outputIsRole ? 20 : 0) + (confident && identity ? 10 : 0) + (output ? 4 : 0) + (role ? 2 : 0)
+    return (confident && output && !ROLE_OUTPUT_RE.test(output) ? 20 : 0) + (confident && identity ? 10 : 0) + (output ? 4 : 0) + (role ? 2 : 0)
   }
+  // A high-confidence person name for a track: only these can conflict. Role outputs (记者/受访者…)
+  // never name a person, so they keep competing on score alone. effectiveScoutPersonName is the same
+  // interpretation the resolver uses to pick the final name (output_label first, identity second), so a
+  // disagreement on EITHER naming path is caught. Comparison strips inner whitespace so “张三” and
+  // “张 三” read as the same person, not a contradiction.
+  const confidentName = (speaker) => String(effectiveScoutPersonName(speaker) || '').replace(/\s+/gu, '')
+  const conflicted = new Set()
+  const conflictNotes = []
   for (const p of got) for (const s of p.speakers || []) {
     const k = speakerKey(s && s.label)
     if (!k) continue
@@ -820,7 +828,29 @@ export function mergeScoutChunks(parts, f) {
       continue
     }
     const i = speakerIndex.get(k)
-    if (speakerScore(s) > speakerScore(speakers[i])) speakers[i] = { ...s, label: speakers[i].label }
+    if (conflicted.has(k)) {
+      // The name stays dropped, but a later chunk may still contribute the role the demoted record
+      // lacks — roles are the safe fallback display, so backfilling one cannot re-name the track.
+      const role = String((s && s.role) || '').trim()
+      if (role && !String(speakers[i].role || '').trim()) speakers[i] = { ...speakers[i], role }
+      continue
+    }
+    const kept = speakers[i]
+    const keptName = confidentName(kept)
+    const newName = confidentName(s)
+    // Two chunks naming the same source track as different people is a disagreement, not a ranking
+    // problem: silently keeping either name risks publishing the wrong person. Drop the automatic
+    // name, keep the numbered source label, and surface the conflict for a human.
+    if (keptName && newName && keptName !== newName) {
+      const base = speakerScore(s) > speakerScore(kept) ? { ...s, label: kept.label } : kept
+      // name_conflict travels with the record so the resolver can refuse person names for this track
+      // even when a stray alias record (person-name label + sample pointing here) outscores it.
+      speakers[i] = { ...base, output_label: '', output_label_confidence: 'low', output_label_evidence: '', identity: '', name_conflict: true }
+      conflicted.add(k)
+      conflictNotes.push(`分段侦察对“${kept.label}”给出相互矛盾的高置信姓名（“${keptName}”与“${newName}”），已放弃自动命名，保留原始标签待人工确认。`)
+      continue
+    }
+    if (speakerScore(s) > speakerScore(kept)) speakers[i] = { ...s, label: kept.label }
   }
   const cat = (key) => got.flatMap((p) => p[key] || [])
   const errByKind = {}
@@ -844,7 +874,7 @@ export function mergeScoutChunks(parts, f) {
     themes: uniq('themes'),
     has_existing_headings: got.some((p) => p.has_existing_headings),
     ending_anchor: ending || {},
-    special_notes: uniq('special_notes'),
+    special_notes: [...uniq('special_notes'), ...conflictNotes],
   }
 }
 export const partPath = (outPath, idx) => `${outPath}.part${idx}`

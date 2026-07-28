@@ -10,6 +10,7 @@ import {
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
   endsWithQuestion, parseTurns,
 } from '../core/spec.js'
+import { resolveSpeakerMapping } from '../scripts/speaker-resolver.js'
 import { checkMissingYin, parseGlossaryLite } from '../scripts/audit_refined.mjs'
 import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt, summaryPrompt } from '../core/prompts.js'
 import { concatFiles, makeFilePolicy } from '../engines/fileops.js'
@@ -264,6 +265,73 @@ test('mergeScoutChunks returns null only if every chunk failed; a partial set st
   assert.equal(mergeScoutChunks([null, null], { lines: 2000 }), null, 'all chunks failed → null (→ scoutFailed; refine still runs from source)')
   const m = mergeScoutChunks([null, { speakers: [{ label: '记者' }], people: [{ canonical: '张三' }], ending_anchor: { line: 2000, text: '尾。' } }], { lines: 2000 })
   assert.ok(m && m.people.length === 1, 'one surviving chunk still produces a usable glossary')
+})
+
+// ---------- mergeScoutChunks: 分段侦察对同一说话人给出矛盾高置信姓名时的降级处理 ----------
+
+test('分段侦察对同一轨道给出矛盾高置信姓名时降级并显式记录', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '矛盾姓名一律放弃自动命名')
+  assert.equal(m.speakers[0].output_label_confidence, 'low')
+  assert.equal(m.speakers[0].label, '说话人 1', '仍保留原始数字标签，等人工确认')
+  assert.ok(m.special_notes.some((n) => n.includes('林洄') && n.includes('陈遥')), '矛盾双方姓名都要显式出现在提示里')
+})
+
+test('矛盾姓名即使分数不同也降级', () => {
+  // 第二条记录多带一个 identity，打分会更高；但“分数更高”不能替代“姓名互相矛盾”的判断——
+  // 即使换成分数占优的一方，两个不同的人名本身就是需要人工确认的分歧，不能自动定论。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者', identity: '陈遥' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '分数占优的一方也不能绕过冲突降级')
+  assert.equal(m.speakers[0].output_label_confidence, 'low')
+  assert.ok(m.special_notes.some((n) => n.includes('林洄') && n.includes('陈遥')))
+})
+
+test('同名不冲突，高分替换保留首次拼写', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    // 第二段的标签写法不带空格（说话人1），但按 generic key 仍归到同一轨道；且姓名相同不构成矛盾。
+    { speakers: [{ label: '说话人1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者', identity: '林洄，创始人' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '林洄')
+  assert.equal(m.speakers[0].output_label_confidence, 'high', '同名不触发降级，高分记录正常替换')
+  assert.equal(m.speakers[0].label, '说话人 1', '标签拼写保留第一次出现的写法')
+  assert.ok(!m.special_notes.some((n) => n.includes('矛盾') || n.includes('冲突')), '同名不应产生冲突提示')
+})
+
+test('角色输出不触发姓名冲突', () => {
+  // 记者/受访者这类角色词从不代表某个具体的人，不适用“矛盾姓名”判断——它们只按老逻辑比分数。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '记者', output_label_confidence: 'high', output_label_evidence: '开场自称记者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '受访者', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.ok(!m.special_notes.some((n) => n.includes('矛盾') || n.includes('冲突')), '角色词之间的差异不算姓名冲突')
+  assert.equal(m.speakers[0].output_label, '记者', '两条角色记录分数打平，保留先到的一条（既有比分逻辑不变）')
+})
+
+test('mergeScoutChunks 在无姓名冲突时人物/品牌/术语合并与结尾锚点逻辑保持不变', () => {
+  const parts = [
+    { speakers: [{ label: '记者', role: '记者' }], people: [{ canonical: '苍璧科技' }], brands: [{ canonical: '苍璧牌' }], terms: [{ canonical: '乙术语' }], errors: [], themes: ['开场'], has_existing_headings: false, ending_anchor: { line: 500, text: '中段。' }, special_notes: [] },
+    { speakers: [{ label: '发言人 1', role: '受访者', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }], people: [{ canonical: '陈遥' }], brands: [{ canonical: '苍璧牌' }], terms: [{ canonical: '乙术语' }], errors: [], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 1000, text: '就到这里。' }, special_notes: [] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 1000 })
+  assert.equal(m.speakers.length, 2, '两个不同轨道各自保留，互不冲突')
+  assert.deepEqual(m.people.map((p) => p.canonical), ['苍璧科技', '陈遥'], 'people 按 chunk 顺序拼接，跨 chunk 去重交给下游 clusterEntities')
+  assert.deepEqual(m.brands.map((b) => b.canonical), ['苍璧牌', '苍璧牌'], 'brands 同样直接拼接，不在此处去重')
+  assert.deepEqual(m.ending_anchor, { line: 1000, text: '就到这里。' }, '结尾锚点取覆盖到文件末尾的那个 chunk')
 })
 
 test('partPath derives sibling intermediate paths', () => {
@@ -757,4 +825,75 @@ test('oversized file: if every sub-scout stalls, it degrades to scoutFailed — 
   assert.ok(labels.includes('refine:A'), 'refine still runs even when the whole chunked scout fails')
   assert.deepEqual(r.scoutFailed, ['A'], 'all chunks failed → scoutFailed (same graceful path as a single failed scout)')
   assert.equal(r.refined.length, 1)
+})
+
+test('mergeScoutChunks：仅空格差异的同名不算冲突（张三 vs 张 三）', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '张 三', output_label_confidence: 'high', output_label_evidence: '对方称呼', identity: '张 三' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.notEqual(m.speakers[0].output_label, '', '同名不同空格不应触发降级')
+  assert.equal(m.special_notes.some((n) => n.includes('矛盾')), false)
+})
+
+test('mergeScoutChunks：已冲突轨道仍可回填缺失的角色，但不能翻案命名', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+    { speakers: [{ label: '说话人 1', output_label: '苏澈', output_label_confidence: 'high', output_label_evidence: '再次称呼', role: '受访者' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '冲突后第三个分段不能翻案命名')
+  assert.equal(m.speakers[0].role, '受访者', '角色应从后续分段回填')
+})
+
+test('mergeScoutChunks + resolver：冲突降级不被 sample 别名记录翻案', () => {
+  // 第三个分段把人名当 label、sample 首行指回“说话人 1”——旧逻辑里这条记录会以高分抢回
+  // generic:1 的映射，让刚被降级的轨道重新拿到人名。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+    { speakers: [{ label: '林洄', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '再次称呼', sample: '说话人 1 00:03\n我先说' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  const doc = ['说话人 1 00:01\\', '你好。', '', '说话人 2 00:05\\', '你好。'].join('\n')
+  const { mappings } = resolveSpeakerMapping(doc, m.speakers)
+  const track1 = mappings.find((x) => x.sourceLabel === '说话人 1')
+  assert.notEqual(track1.outputLabel, '林洄', '冲突轨道不能经 sample 别名重新拿到人名')
+  assert.notEqual(track1.outputLabel, '陈遥')
+})
+
+test('mergeScoutChunks：identity 路径的跨段姓名冲突同样降级（评审复现样本）', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', identity: '张三', output_label: '', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '李四', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].name_conflict, true, 'identity 冲突必须打上冲突标记')
+  assert.equal(m.speakers[0].identity, '', '冲突后 identity 必须清空')
+  assert.ok(m.special_notes.some((n) => n.includes('张三') && n.includes('李四')), '冲突备注要点名两个候选')
+  const doc = ['说话人 1 00:01\\', '你好。', '', '说话人 2 00:05\\', '你好。'].join('\n')
+  const { mappings } = resolveSpeakerMapping(doc, m.speakers)
+  const track1 = mappings.find((x) => x.sourceLabel === '说话人 1')
+  assert.notEqual(track1.outputLabel, '张三', '冲突轨道不能经 identity 拿到人名')
+  assert.notEqual(track1.outputLabel, '李四')
+})
+
+test('mergeScoutChunks：output_label 与 identity 交叉给名也按同一套解释比较', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '李四', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers[0].name_conflict, true)
+  const same = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '张三', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m2 = mergeScoutChunks(same, { lines: 100 })
+  assert.notEqual(m2.speakers[0].name_conflict, true, '两条路径给出同一个人不算冲突')
 })

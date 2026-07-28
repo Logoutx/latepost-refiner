@@ -190,12 +190,30 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
 async function scoutFile(engine, f, A, M, labelPrefix = 'scout') {
   const chunks = splitForScout(f)
   if (chunks.length === 1) {
-    return engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+    const finding = await engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+    emitSpeakerScout(A, f, 1, [finding], finding)
+    return finding
   }
   engine.log(`侦察分块：大文件 ${f.label}（约 ${refineSize(f)} 字）拆 ${chunks.length} 段并行侦察，防单代理卡死`)
   const parts = await engine.parallel(chunks.map((c) => () =>
     engine.agent(scoutPrompt(f, A, c), { label: `${labelPrefix}:${f.label}#${c.idx}/${c.count}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
-  return mergeScoutChunks(parts, f)
+  const merged = mergeScoutChunks(parts, f)
+  emitSpeakerScout(A, f, chunks.length, parts, merged)
+  return merged
+}
+
+// Host-side observability hook for the OFF-BY-DEFAULT speaker dev trace (universal/speaker-trace.js). Only
+// speaker labels/roles travel — never transcript text. A missing or throwing callback can never break Scout.
+function emitSpeakerScout(A, f, chunkCount, parts, merged) {
+  if (!A || typeof A.onSpeakerEvent !== 'function') return
+  const pick = (fd) => ((fd && fd.speakers) || []).map((s) => ({ label: s && s.label, output_label: s && s.output_label, output_label_confidence: s && s.output_label_confidence, role: s && s.role }))
+  try {
+    A.onSpeakerEvent({
+      type: 'scout_chunks', fileLabel: (f && f.label) || null, chunkCount,
+      chunks: (parts || []).map((fd, i) => ({ idx: i + 1, ok: !!fd, speakers: pick(fd) })),
+      merged: { speakers: pick(merged), special_notes: (merged && merged.special_notes) || [] },
+    })
+  } catch { /* 开发记录不可影响流水线 */ }
 }
 
 // Resolve the prior-glossary TEXT (P1 persistent 校对表) from the args. Priority: inline priorGlossaryText >

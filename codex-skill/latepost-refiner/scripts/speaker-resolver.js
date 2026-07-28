@@ -24,6 +24,11 @@ const ROLE_RE = new RegExp(`^${ROLE_TOKEN}(?:[／/][一-龥A-Za-z]{1,16})*(?:\\s
 const TITLE_WORD_RE = /(?:创始人|联合创始人|负责人|总裁|董事|经理|老师|先生|女士|博士|教授|CEO|CTO|COO|CFO|公司|团队|产品)/iu
 const AI_SUMMARY_DISCLOSURE_RE = /(?:智能纪要|本(?:份)?纪要|本(?:份)?摘要)\s*(?:由|为)\s*AI\s*(?:生成|整理)|(?:由|使用)\s*AI\s*(?:生成|整理)(?:的)?(?:智能纪要|会议纪要|摘要)/iu
 
+// Pandoc-style docx exports end lines with a Markdown hard break: a trailing backslash, as in
+// `说话人 1 00:01\`. Label-only, end-anchored forms must tolerate it or the generic inline fallback
+// splits the line at the colon inside the timestamp and mints a fake per-minute speaker.
+const stripLineEndHardBreak = (value) => String(value || '').replace(/\s*\\\s*$/u, '')
+
 const normalizeLabel = (value) => String(value || '')
   .normalize('NFKC')
   .replace(/^\*{1,2}|\*{1,2}$/g, '')
@@ -39,10 +44,17 @@ function parseAttrs(raw) {
   return attrs
 }
 
+// Transcript headers carry date/time lines (`2026年7月2日 下午 3:37`) that would otherwise satisfy the
+// name-plus-timestamp form. A date is never a speaker name — but real labels can contain date-adjacent
+// characters (姓周的人名、选手2号), so only a date SHAPE at the label start, or a label that is nothing
+// but a weekday/time-of-day word, is rejected.
+const DATE_LIKE_RE = /^\d{2,4}\s*年|^\d{1,2}\s*月\s*\d{1,2}\s*[日号]|^(?:上午|下午|中午|凌晨|晚上|周[一二三四五六日天]|星期[一二三四五六日天])$/u
+
 function plausibleLabel(value) {
   const label = normalizeLabel(value)
   if (!label || label.length > 32) return false
   if (/^[#*>|<]/u.test(label) || /[：:，。；;！？!?]/u.test(label)) return false
+  if (DATE_LIKE_RE.test(label)) return false
   return /[一-龥A-Za-z]/u.test(label)
 }
 
@@ -62,17 +74,22 @@ export function isRoleSpeakerLabel(value) {
 }
 
 function strongLabel(rawLine) {
-  let match = String(rawLine || '').match(GENERIC_INLINE_RE)
+  const raw = String(rawLine || '')
+  let match = raw.match(GENERIC_INLINE_RE)
   if (match) {
     const label = normalizeLabel(`${match[2]} ${match[3]}`)
     return { indent: match[1], key: speakerKey(label), label, kind: 'generic-inline', body: match[4] || '', generic: true }
   }
-  match = String(rawLine || '').match(GENERIC_LINE_RE)
+  // Only the label-only forms below match against the hard-break-stripped view. The body-capturing
+  // forms above (and the inline fallback) keep the raw line, so a body's own trailing hard break
+  // stays part of the body and survives rewriting untouched.
+  const line = stripLineEndHardBreak(raw)
+  match = line.match(GENERIC_LINE_RE)
   if (match) {
     const label = normalizeLabel(`${match[2]} ${match[3]}`)
     return { indent: match[1], key: speakerKey(label), label, kind: 'generic', body: '', timestamp: match[4] || '', generic: true }
   }
-  match = String(rawLine || '').match(CITE_RE)
+  match = line.match(CITE_RE)
   if (match) {
     const attrs = parseAttrs(match[2])
     const label = normalizeLabel(attrs['user-name'])
@@ -89,11 +106,11 @@ function strongLabel(rawLine) {
       generic: false,
     }
   }
-  match = String(rawLine || '').match(NAMED_TIMESTAMP_RE)
+  match = line.match(NAMED_TIMESTAMP_RE)
   if (match) {
     const label = normalizeLabel(match[2])
     if (!plausibleLabel(label)) return null
-    return { indent: match[1], key: speakerKey(label), label, kind: 'timestamp', body: '', timestamp: match[3] || '', generic: false }
+    return { indent: match[1], key: speakerKey(label), label, kind: 'timestamp', body: '', timestamp: match[3] || '', generic: false, hardBreak: line !== raw }
   }
   return null
 }
@@ -107,6 +124,26 @@ export function parseSpeakerLabels(sourceText) {
   const text = String(sourceText || '')
   const lines = text.split(/\r?\n/)
   const facts = lines.map(strongLabel)
+  // On a clean line, name+timestamp is distinctive evidence even once. In a Pandoc hard-break document
+  // a wrapped body fragment ending in a time (`会议改到下午 3:30\`) reads identically. Markdown itself
+  // separates the two: a hard break means the NEXT line continues the same paragraph, so a line whose
+  // previous line ends with a hard break AND still carries substantive text can never start a speaker
+  // turn — while a real label always opens its own paragraph. A line that is ONLY a backslash is a
+  // paragraph separator in real Pandoc transcript output (production Job-58 shape), not a continuation.
+  // Occurrence counting is wrong here: it silently absorbs a speaker who talks only once into the
+  // previous turn. Demoted fragments are also barred from the inline fallback below — otherwise the
+  // colon inside their timestamp re-mints exactly the truncated fake labels this fix removes.
+  const demotedTimeFragments = new Set()
+  for (let i = 0; i < facts.length; i += 1) {
+    const fact = facts[i]
+    if (!fact || fact.kind !== 'timestamp' || !fact.hardBreak) continue
+    const prev = i > 0 ? stripLineEndHardBreak(lines[i - 1]) : ''
+    const prevHadHardBreak = i > 0 && prev !== String(lines[i - 1] || '')
+    if (prevHadHardBreak && prev.trim()) {
+      facts[i] = null
+      demotedTimeFragments.add(i)
+    }
+  }
   const strongNames = new Set(facts.filter(Boolean).flatMap((fact) => [fact.label, fact.matchKey]).filter(Boolean))
   const inlineCounts = new Map()
   let substantive = 0
@@ -115,6 +152,7 @@ export function parseSpeakerLabels(sourceText) {
   for (let i = 0; i < lines.length; i += 1) {
     if (facts[i] || !substantiveLine(lines[i])) continue
     substantive += 1
+    if (demotedTimeFragments.has(i)) continue
     const match = lines[i].match(INLINE_RE)
     if (!match || !plausibleLabel(match[2])) continue
     const label = normalizeLabel(match[2])
@@ -124,7 +162,7 @@ export function parseSpeakerLabels(sourceText) {
 
   const pureInline = !facts.some(Boolean) && inlineCandidates >= 2 && inlineCandidates === substantive
   for (let i = 0; i < lines.length; i += 1) {
-    if (facts[i]) continue
+    if (facts[i] || demotedTimeFragments.has(i)) continue
     const match = lines[i].match(INLINE_RE)
     if (!match) continue
     const label = normalizeLabel(match[2])
@@ -281,16 +319,31 @@ function recordScore(record) {
 
 function scoutRecordsByKey(speakers) {
   const records = new Map()
+  const conflictKeys = new Set()
   for (const record of speakers || []) {
     if (!record) continue
     const keys = [speakerKey(record.label)]
     const sampleHead = String(record.sample || '').split(/\r?\n/u, 1)[0]
-    if (sampleHead) keys.push(speakerKey(sampleHead.replace(/\s+\d{1,2}:\d{2}(?::\d{2})?\s*$/u, '')))
+    if (sampleHead) keys.push(speakerKey(stripLineEndHardBreak(sampleHead).replace(/\s+\d{1,2}:\d{2}(?::\d{2})?\s*$/u, '')))
     for (const key of keys.filter(Boolean)) {
+      if (record.name_conflict) conflictKeys.add(key)
       if (!records.has(key) || recordScore(record) > recordScore(records.get(key))) records.set(key, record)
     }
   }
-  return records
+  return { records, conflictKeys }
+}
+
+// The one interpretation of "which person does this Scout record name". chooseOutputLabel can turn a
+// record into a person name through exactly two branches — a confident non-role output_label, else a
+// confident identity — and conflict detection in mergeScoutChunks must use the same two branches, or an
+// identity-only disagreement slips past the comparison and the resolver still names the track.
+export function effectiveScoutPersonName(record) {
+  if (!record) return ''
+  const confident = record.output_label_confidence === 'high' && String(record.output_label_evidence || '').trim()
+  if (!confident) return ''
+  const requested = cleanOutputLabel(record.output_label)
+  if (requested && !isRoleSpeakerLabel(requested)) return requested
+  return extractPersonName(record.identity)
 }
 
 function chooseOutputLabel(track, record) {
@@ -308,9 +361,14 @@ function chooseOutputLabel(track, record) {
 
 export function resolveSpeakerMapping(sourceText, scoutSpeakers = []) {
   const parsed = parseSpeakerLabels(sourceText)
-  const records = scoutRecordsByKey(scoutSpeakers)
+  const { records, conflictKeys } = scoutRecordsByKey(scoutSpeakers)
   const mappings = parsed.tracks.map((track) => {
-    const record = records.get(track.key)
+    let record = records.get(track.key)
+    // A track whose Scout chunks disagreed on the person keeps its conflict verdict: no record that
+    // reaches this key — however it got here — may hand the track a person name again.
+    if (record && conflictKeys.has(track.key)) {
+      record = { ...record, output_label: '', output_label_confidence: 'low', output_label_evidence: '', identity: '' }
+    }
     return { ...track, role: normalizeRole(record && record.role), ...chooseOutputLabel(track, record) }
   })
 
@@ -366,6 +424,15 @@ export function rewriteSpeakerLabels(sourceText, scoutSpeakers = [], options = {
   }
 }
 
+// A generic prefix followed by a second number that runs straight into a colon or the line end
+// (`说话人 1 00：…` / `说话人 1 00`) is the signature of a truncated timestamp, never legitimate prose.
+// Requiring the colon/EOL keeps narrative lines like `发言人 2 15 分钟后回来` out of the trap. Enforcement
+// fails closed on the signature even when it occurs too rarely for the inline accept-gate to parse it.
+const TRUNCATED_GENERIC_RE = new RegExp(
+  `^\\s*\\*{0,2}\\s*(?:${GENERIC_PREFIX})\\s*(?:${GENERIC_NUMBER})\\s+\\d{1,4}\\s*(?:[：:]|$)`,
+  'iu',
+)
+
 function aliasKey(value) {
   const label = normalizeLabel(value)
   const role = normalizeRole(label)
@@ -405,6 +472,11 @@ export function enforceCanonicalSpeakerLabels(refinedText, mappings = [], option
     if (out[fact.line - 1] === rewritten) continue
     replacements.push({ line: fact.line, from: fact.label, to: canonical })
     out[fact.line - 1] = rewritten
+  }
+  const factLines = new Set(parsed.labels.map((fact) => fact.line))
+  for (let i = 0; i < parsed.lines.length; i += 1) {
+    if (factLines.has(i + 1) || !TRUNCATED_GENERIC_RE.test(parsed.lines[i])) continue
+    unknownLabels.push({ line: i + 1, label: normalizeLabel(parsed.lines[i].split(/[：:]/u, 1)[0]).slice(0, 40) })
   }
   return {
     text: out.join(newline),
