@@ -6,7 +6,8 @@ Date: 2026-06-23
 
 Status note: this plan was written from the pre-`7519636` audit state. Phase 1 landed on `main` with `speakerTurnRatio` intentionally changed to a confirming/reporting signal only, never an independent failure gate. The 2026-07-19 fidelity branch preserves that calibration and closes the remaining contract gaps:
 
-- One shared publication-gate taxonomy now drives repair, derivative withholding, CLI exit, run scorecards, and installed-skill copies. Body fidelity (`content_gap`, `compression_risk`, `ending_missing`, `attribution_mismatch`, `seam_duplicate`) stays separate from output quality (`residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`) for diagnosis; both receive at most two repair/recheck rounds.
+- 2026-07-29 correction: `ending_missing` has been retired. It inferred completeness from whether a few final characters reappeared and could turn an allowed folded pleasantry into a full-file rewrite. The Scout `ending_anchor`, last-chunk ownership, whole-document compression check, and evidence-backed `content_gap` remain; a substantive ending omission is therefore checked by the same evidence as any middle omission.
+- One shared publication-gate taxonomy now drives repair, derivative withholding, CLI exit, run scorecards, and installed-skill copies. Body fidelity (`content_gap`, `compression_risk`, `attribution_mismatch`, `seam_duplicate`) stays separate from output quality (`residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`) for diagnosis. Universal repair now writes a candidate with a candidate-only file policy and promotes it only after canonical speaker-contract validation plus measurable audit improvement. Runtimes without a transactional repair capability do not auto-overwrite the body.
 - Chunk stitching performs conservative seam dedup, an extended deterministic repair for long replays, then a residual scan. A residual blocks derivatives but never deletes the main transcript.
 - Timeline/summary attribution is clause-scoped, understands Chinese/English money-scale conversions and spoken endpoint→range compaction, and rejects a globally real amount reassigned to another glossary entity.
 - Logic drafts have their own post-generation audit. Same-order copies and missing refined-section provenance block only that logic artifact.
@@ -173,7 +174,7 @@ Review artifacts:
   - `compression_risk`
   - `under_refined`
   - `phrase_repeats`
-  - `ending_missing`
+  - `ending_missing`（历史实现；2026-07-29 已退役，不再是现行门禁）
   - `long_paragraphs`
 - Add detailed metrics to `run.json`.
 
@@ -188,7 +189,7 @@ Recommended loop:
 3. If audit fails:
    - for local residual noise / phrase repeats: repair only flagged paragraphs.
    - for source compression / speaker-turn collapse: rerun the file from source, not from the compressed output.
-   - for ending missing: rerun tail section with source ending anchor.
+   - historical `ending_missing`: this branch originally proposed a tail rerun; the standalone lexical gate was retired on 2026-07-29. A real tail omission now follows the normal `content_gap` / `compression_risk` path.
 4. Re-audit.
 5. Retry at most 2 times.
 6. If still failing, write to `review.md` and final handoff as unresolved.

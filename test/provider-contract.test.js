@@ -159,6 +159,52 @@ test('a denied write cannot be masked by structured_output; the agent must creat
   assert.deepEqual(engine.failures(), [], 'a recovered tool denial is observable but does not fail the agent')
 })
 
+test('an agent-scoped file policy can narrow the job allowlist to one repair candidate', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-repair-scope-'))
+  const finalPath = path.join(base, 'Transcripts', 'A.md')
+  const candidatePath = path.join(base, '.repair-candidates', 'A.round-1.md')
+  fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true })
+  fs.writeFileSync(finalPath, '正式稿：不得改动\n', 'utf8')
+  fs.writeFileSync(candidatePath, '候选稿：待修复\n', 'utf8')
+  const events = []
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('bad-final-write', 'Write', { file_path: finalPath, content: '越权覆盖\n' })] }),
+    completion({ content: '', tool_calls: [toolCall('candidate-write', 'Write', { file_path: candidatePath, content: '候选稿：已修复\n' })] }),
+    completion({ content: 'done' }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    onToolEvent: (event) => events.push(event),
+    filePolicy: {
+      readRoots: [base],
+      writeRoots: [base],
+      writePaths: [finalPath, candidatePath],
+    },
+  })
+
+  const result = await engine.agent('prompt', {
+    model: 'opus',
+    label: 'repair:A:round1',
+    outputPath: candidatePath,
+    filePolicy: {
+      readRoots: [],
+      writeRoots: [base],
+      readPaths: [candidatePath],
+      writePaths: [candidatePath],
+      writePartBases: [],
+    },
+  })
+
+  assert.equal(result, 'done')
+  assert.equal(fs.readFileSync(finalPath, 'utf8'), '正式稿：不得改动\n')
+  assert.equal(fs.readFileSync(candidatePath, 'utf8'), '候选稿：已修复\n')
+  assert.equal(events[0].code, 'TOOL_PATH_DENIED')
+  assert.equal(events[0].path, finalPath)
+  assert.equal(events[1].ok, true)
+})
+
 test('structured_output without the declared artifact becomes a typed non-retryable agent failure', async () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-missing-output-'))
   const outputPath = path.join(base, 'Transcripts', 'A.md')

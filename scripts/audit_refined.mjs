@@ -829,28 +829,6 @@ function consolidatedTurns(text) {
   for (const s of speakerSeq(text)) { if (s !== prev) { turns += 1; prev = s } }
   return turns
 }
-// Lenient ending check: is the source's last sentence reflected in the refined output?
-function endingCovered(sourceText, refinedText) {
-  const structure = parseSpeakerDocument(sourceText)
-  const lastUnit = structure.units[structure.units.length - 1]
-  const lastSrc = (lastUnit && lastUnit.text) || ''
-  const tail = (lastSrc.match(/[一-龥]/g) || []).slice(-24).join('')
-  if (tail.length < 4) return true // can't judge → lenient
-  const refHan = (refinedText.match(/[一-龥]/g) || []).join('')
-  // Four-character windows are too weak for a whole-document search: an earlier phrase such as
-  // “介绍一下” can accidentally mask a dropped closing sentence. Require the longest useful run
-  // up to eight Han characters; short closing lines still use their complete available text.
-  const runLength = Math.min(8, tail.length)
-  for (let i = 0; i + runLength <= tail.length; i += 1) {
-    if (refHan.includes(tail.slice(i, i + runLength))) return true
-  }
-  // Closing pleasantries may be folded under the refine contract, but only when the output leaves an explicit
-  // stage-direction trace near EOF. A silent truncation has no such trace and still fails ending_missing.
-  const refTail = refinedText.split(/\r?\n/).slice(-12).map((x) => x.trim()).filter(Boolean)
-  if (refTail.some((line) => FOLD_TRACE_RE.test(line))) return true
-  return false
-}
-
 // ===== Content-gap detection (coverage scan) =====
 // Detects source sections that never made it into the refined output — the silent-omission failure
 // (observed live: a model content-policy pass dropped a contiguous ~1500-字 segment mid-file; the global
@@ -892,8 +870,7 @@ const MODEL_MARKER_RE = /[⚠!！]?\s*[【\[]?未精校段/
 // Parse the SOURCE transcript into ordered speaker turns with line ranges. Recognizes the three label
 // shapes seen in real transcripts: `**发言人 1 00:03:22**` (bold, optional trailing timestamp, label-only
 // line), `名字 15:12` (bare name+timestamp line, optional bold/trailing spaces), and inline `名字：内容`.
-// Zero turns parsed → caller treats coverage as not assessable (never a gate), same leniency contract as
-// endingCovered.
+// Zero turns parsed → caller treats coverage as not assessable (never a gate).
 export function parseSourceTurns(sourceText) {
   return parseSpeakerDocument(sourceText).units.map((unit) => ({
     ...unit,
@@ -2200,8 +2177,6 @@ export function auditPair({
   const sEmptyDensity = sChars ? emptyCount(sourceText) / sChars : 0
   const rEmptyDensity = rChars ? emptyCount(refinedText) / rChars : 0
   const emptyReduction = sEmptyDensity ? Number((1 - rEmptyDensity / sEmptyDensity).toFixed(3)) : 0
-  const ending = endingCovered(sourceText, refinedText)
-
   const coverage = scanCoverage(sourceText, refinedText)
   // M4 mutation tier: number-atom + hedge fidelity. refine mode only (a summary/timeline legitimately drops
   // qualifiers). All-soft; SOFT findings never enter failed[] this pass (see below).
@@ -2220,7 +2195,6 @@ export function auditPair({
     sourceChars: sChars, refinedChars: rChars, charRatio,
     sourceTurns: sTurns, refinedTurns: rTurns, speakerTurnRatio, // turnRatio is confirming-only, never an independent gate
     sourceEmptyDensity: Number(sEmptyDensity.toFixed(4)), refinedEmptyDensity: Number(rEmptyDensity.toFixed(4)), emptyReduction,
-    endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
     ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
     ...(attribution ? { attribution: { status: attribution.status, assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
@@ -2251,7 +2225,6 @@ export function auditPair({
   if (mode === 'refine') {
     gates.compression_risk = charRatio < REFINE_GATES.CHAR_RATIO_MIN
     gates.under_refined = sEmptyDensity > REFINE_GATES.SOURCE_FILLER_DENSITY && emptyReduction < REFINE_GATES.EMPTY_REDUCTION_MIN
-    gates.ending_missing = !ending
     // content_gap: a substantial contiguous source stretch never surfaced in the refined text and left
     // no fold trace — the silent-omission (possible censorship) failure. Soft gaps and scattered loss
     // are reported as findings below, never gates.

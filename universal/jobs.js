@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
 import { runPipeline, DEFAULT_STAGE_MODELS, QUALITY_REPAIR_MAX_ROUNDS } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
@@ -170,6 +170,11 @@ export function buildFilePolicy({ outputDir, skillDir = DEFAULT_SKILL_DIR, files
   }
 }
 
+export function repairCandidatePath(outputDir, file = {}, round = 1) {
+  const title = safeName(file.title || file.label || path.basename(file.outPath || 'transcript.md', path.extname(file.outPath || '')))
+  return path.join(path.resolve(outputDir), '.repair-candidates', `${title}.round-${Math.max(1, Number(round) || 1)}.md`)
+}
+
 // Build the DeepSeek engine — the only API provider the Universal edition supports. apiKey (if given)
 // overrides the env lookup: the web UI passes the key the user typed; the CLI passes nothing and falls
 // back to DEEPSEEK_API_KEY. Endpoint and the flash/pro model split are fixed inside makeDeepSeekEngine.
@@ -285,27 +290,10 @@ export function persistGlossary(result, glossaryPath) {
   return false
 }
 
-// Standalone audit-repair utility (retry loop). NOTE: as of the M-series merge this is NOT wired into
-// runJob — the headless path deliberately does in-pipeline audit (mark the gap, let the user decide)
-// instead of auto-rewriting a 成稿 (see runJob below). Kept as an exported, unit-tested helper (test/quality-repair.test.js).
-export const QUALITY_REPAIR_MAX_RETRIES = QUALITY_REPAIR_MAX_ROUNDS
-
-function auditListForFiles(files = []) {
-  return files
-    .filter((f) => f && f.path && f.outPath && fs.existsSync(f.path) && fs.existsSync(f.outPath))
-    .map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine' }))
-}
-
 function repairAction(failed = []) {
-  if (failed.includes('compression_risk') || failed.includes('ending_missing')) return 'rerun_from_source'
+  if (failed.includes('compression_risk')) return 'rerun_from_source'
   if (failed.includes('under_refined')) return 'full_cleanup'
   return 'targeted_repair'
-}
-
-function repairModel(A = {}, action) {
-  const models = A.models || {}
-  if (action === 'targeted_repair') return models.repair || models.refine || models.dedup || 'sonnet'
-  return models.repair || models.refine || 'opus'
 }
 
 function summarizeRepairToolEvents(events = []) {
@@ -329,8 +317,10 @@ function summarizeRepairToolEvents(events = []) {
   }
 }
 
-function qualityRepairResult(pipelineResult = {}) {
-  const attempts = (pipelineResult.refined || []).flatMap((entry) => ((entry.audit && entry.audit.repairAttempts) || []))
+export function qualityRepairResult(pipelineResult = {}) {
+  const attempts = Array.isArray(pipelineResult.qualityRepairAttempts)
+    ? pipelineResult.qualityRepairAttempts
+    : (pipelineResult.refined || []).flatMap((entry) => ((entry.audit && entry.audit.repairAttempts) || []))
   const roundsUsed = attempts.reduce((max, attempt) => Math.max(max, Number(attempt.round) || 0), 0)
   let stopReason = 'not_needed'
   if ((pipelineResult.auditUnavailable || []).length || attempts.some((attempt) => attempt.outcome === 'audit_unavailable')) stopReason = 'audit_unavailable'
@@ -356,10 +346,42 @@ function auditPromptSummary(auditFile = {}) {
   }, null, 2)
 }
 
+function repairSpeakerContract(file = {}) {
+  const resolution = file.speakerResolution || {}
+  const mappings = Array.isArray(resolution.mappings) ? resolution.mappings : []
+  const labels = [...new Set(mappings.map((mapping) => mapping && mapping.outputLabel).filter(Boolean))]
+  if ((resolution.speakerMode || file.speakerMode) === 'untracked') {
+    return '本文件是无说话人轨道独白；候选稿不得新增任何说话人标签或对话标签。'
+  }
+  if (!labels.length) {
+    return '本轮没有可用的 canonical 说话人映射；不得猜测或新增姓名，只能保留当前稿已有标签。'
+  }
+  const mappingText = mappings
+    .filter((mapping) => mapping && mapping.sourceLabel && mapping.outputLabel)
+    .map((mapping) => `${mapping.sourceLabel}→${mapping.outputLabel}`)
+    .join('；')
+  return `允许的输出标签只有：${labels.join('、')}。${mappingText ? `源标签映射：${mappingText}。` : ''}禁止新增、猜测或从主题/文件名推断任何姓名。`
+}
+
+function repairIssueCounts(auditFile = {}, hard = []) {
+  const counts = {}
+  for (const finding of auditFile.findings || []) {
+    if (!finding || finding.severity !== 'hard') continue
+    const count = Number(finding.count)
+    if (finding.name && Number.isFinite(count) && count > 0) counts[finding.name] = count
+  }
+  const hardGaps = (auditFile.gaps || []).filter((gap) => gap && gap.severity === 'hard').length
+  if (hardGaps) counts.content_gap = Math.max(counts.content_gap || 0, hardGaps)
+  const longParagraphs = Array.isArray(auditFile.long_paragraphs) ? auditFile.long_paragraphs.length : 0
+  if (longParagraphs) counts.long_paragraphs = Math.max(counts.long_paragraphs || 0, longParagraphs)
+  for (const name of hard) if (!counts[name]) counts[name] = 1
+  return counts
+}
+
 function qualityRepairPrompt(A, f, auditFile, attemptNo) {
   const action = repairAction(auditFile.failed || [])
   const actionGuide = action === 'rerun_from_source'
-    ? '本次属于压缩/结尾缺失风险：不要试图从当前成稿补回丢失内容。重新从源文件完整精校，当前成稿最多只作标题/结构参考。'
+    ? '本次属于全文压缩风险：不要试图从当前成稿补回丢失内容。重新从源文件完整精校，当前成稿最多只作标题/结构参考。'
     : action === 'full_cleanup'
       ? '本次属于欠精校风险：读取源文件与当前成稿，对整份成稿做一轮完整清噪和顺句，保持覆盖与对话体。'
       : (auditFile.failed || []).includes('content_gap')
@@ -376,11 +398,14 @@ function qualityRepairPrompt(A, f, auditFile, attemptNo) {
 【当前成稿】${f.outPath}
 【输出】修复后仍写回 ${f.outPath}
 
+【不可变说话人契约】
+${repairSpeakerContract(f)}
+
 【审计失败摘要】
 ${auditPromptSummary(auditFile)}
 
 【必须遵守】
-- 若 failed 包含 compression_risk 或 ending_missing：Read 源文件全文，重新完整精校；不要从压缩稿中“脑补恢复”。
+- 若 failed 包含 compression_risk：Read 源文件全文，重新完整精校；不要从压缩稿中“脑补恢复”。
 - 若 failed 只是残留噪音 / phrase_repeats / broken_fragment_starts / asr_glue / long_paragraphs：可主要 Read 当前成稿，必要时 Read 源文件核对。
 - 不要删掉事实、数字、时间、产品名、观点、举例和有信息量的表达。
 - 保持发言人标签为纯文本，如“记者：”“王某：”。
@@ -390,54 +415,6 @@ ${auditPromptSummary(auditFile)}
 ${RULES}
 
 完成后只返回一行：已写回 <path>；修复策略=<rerun_from_source|full_cleanup|targeted_repair>；备注=<一句话>。`
-}
-
-export async function auditAndRepairRefined({ A, result, engine, maxRetries = QUALITY_REPAIR_MAX_RETRIES, onLog } = {}) {
-  const files = A.files || []
-  const attempts = []
-  let audit = null
-  const log = (msg) => {
-    if (onLog) onLog(msg)
-    else if (engine && typeof engine.log === 'function') engine.log(msg)
-  }
-
-  for (let round = 0; round <= maxRetries; round += 1) {
-    const pairs = auditListForFiles(files)
-    audit = pairs.length ? auditPairs(pairs) : null
-    if (!audit) break
-    const failed = (audit.files || []).filter((f) => f.status === 'fail')
-    if (!failed.length) break
-    if (round >= maxRetries) {
-      log(`质量审计仍未通过：${failed.map((f) => `${path.basename(f.file)}(${(f.failed || []).join('/')})`).join('、')}`)
-      break
-    }
-
-    if (engine && typeof engine.phase === 'function') engine.phase(`Repair ${round + 1}`)
-    log(`质量修复第 ${round + 1}/${maxRetries} 轮：${failed.length} 份需修复`)
-    const tasks = failed.map((auditFile) => async () => {
-      const file = files.find((f) => path.resolve(f.outPath) === path.resolve(auditFile.file))
-      if (!file) return null
-      const action = repairAction(auditFile.failed || [])
-      const model = repairModel(A, action)
-      const label = `repair:${file.label || path.basename(file.outPath)}`
-      const before = [...(auditFile.failed || [])]
-      try {
-        const response = await engine.agent(qualityRepairPrompt(A, file, auditFile, round + 1), { label, phase: 'Repair', model })
-        const ok = !!response && fs.existsSync(file.outPath)
-        return { file: file.outPath, attempt: round + 1, action, model, failedBefore: before, ok, response: typeof response === 'string' ? response.slice(0, 500) : response }
-      } catch (e) {
-        return { file: file.outPath, attempt: round + 1, action, model, failedBefore: before, ok: false, error: e.message || String(e) }
-      }
-    })
-    const repaired = engine && typeof engine.parallel === 'function'
-      ? await engine.parallel(tasks)
-      : await Promise.all(tasks.map((t) => t()))
-    attempts.push(...repaired.filter(Boolean))
-  }
-
-  result.audit = audit
-  result.qualityRepair = { maxRetries, attempts }
-  return { audit, attempts }
 }
 
 async function prepareInputFile(f, { topic, date, headingPolicy, outputDir, uploadDir, convertedDir }) {
@@ -585,10 +562,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   // results into the accumulators below, so the top-level result.audit / annotations / anchors keep the exact
   // shape writeRunArtifacts (+ cli/server) already consume. runAudit returns an auditPair file-result so the
   // gate can read failed/gaps; annotate writes the visible 缺口 marker (only when the gate hits a still-hard
-  // gap); annotateAnchors writes the invisible source anchors. Universal injects at most two TARGETED repair rounds:
-  // the prompt carries exact source ranges/findings, the agent edits the existing body, and the pipeline
-  // immediately re-audits after every round. Tool failures remain in an append-only metadata ledger even if a
-  // later Edit succeeds; the post-repair audit, not the mere presence of a tool error, decides body quality.
+  // gap); annotateAnchors writes the invisible source anchors. Universal injects at most two candidate repair rounds:
+  // the prompt carries exact source ranges/findings, the agent can write only a disposable candidate, and the
+  // host promotes it after speaker-contract + quality validation. Tool failures remain in an append-only metadata
+  // ledger; the post-repair audit, not the mere presence of a tool error, decides body quality.
   const auditFilesAcc = []   // auditPair file-results, in first-seen order (→ result.audit.files)
   const annotations = []     // [{ path, inserted, skipped }]  (→ result.annotations)
   const anchors = []         // [{ path, updated, skipped }]   (→ result.anchors)
@@ -688,31 +665,106 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const round = Number(opts.round) || 1
       const maxRounds = Number(opts.maxRounds) || QUALITY_REPAIR_MAX_ROUNDS
       const label = `repair:${f.label || path.basename(f.outPath)}#${round}/${maxRounds}`
+      const candidatePath = repairCandidatePath(outDir, f, round)
+      const candidateFile = { ...f, outPath: candidatePath }
+      fs.mkdirSync(path.dirname(candidatePath), { recursive: true })
+      fs.writeFileSync(candidatePath, before, 'utf8')
       let response = null
       let errorCode = null
-      try {
-        response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, f, auditFile, round), {
-          label, phase: 'Audit', model, outputPath: f.outPath,
-        })
-      } catch (error) {
-        errorCode = (error && error.code) || 'REPAIR_AGENT_FAILED'
+      let candidatePromoted = false
+      let candidateSpeakerValid = null
+      let candidateRejectedReason = null
+      let candidateHardFindings = []
+      const agentAttempted = (auditFile.failed || []).some((name) => name !== 'quote_style')
+      if (agentAttempted) {
+        try {
+          response = await sel.engine.agent(qualityRepairPrompt({ topic, models: stageModels }, candidateFile, auditFile, round), {
+            label, phase: 'Audit', model, outputPath: candidatePath,
+            filePolicy: {
+              readRoots: [resolvedSkillDir],
+              writeRoots: [outDir],
+              readPaths: [f.path, candidatePath],
+              writePaths: [candidatePath],
+              writePartBases: [],
+            },
+          })
+        } catch (error) {
+          errorCode = (error && error.code) || 'REPAIR_AGENT_FAILED'
+        }
       }
-      let after = fs.readFileSync(f.outPath, 'utf8')
       let deterministicQuoteFix = false
-      if ((auditFile.failed || []).includes('quote_style')) {
-        const normalized = normalizeQuoteStyleText(after)
-        deterministicQuoteFix = normalized !== after
-        if (deterministicQuoteFix) { fs.writeFileSync(f.outPath, normalized, 'utf8'); after = normalized }
+      if ((!agentAttempted || response != null) && !errorCode && fs.existsSync(candidatePath)) {
+        try {
+          let candidateText = fs.readFileSync(candidatePath, 'utf8')
+          if ((auditFile.failed || []).includes('quote_style')) {
+            const normalized = normalizeQuoteStyleText(candidateText)
+            deterministicQuoteFix = normalized !== candidateText
+            if (deterministicQuoteFix) {
+              fs.writeFileSync(candidatePath, normalized, 'utf8')
+              candidateText = normalized
+            }
+          }
+          const speakerReport = enforceSpeakerOutput(candidateFile, `repair_candidate_round_${round}`)
+          candidateSpeakerValid = speakerReport.valid !== false
+            && !(speakerReport.unknownLabels || []).length
+            && !(speakerReport.violations || []).length
+          if (!candidateSpeakerValid) {
+            candidateRejectedReason = 'speaker_invalid'
+            errorCode = 'REPAIR_CANDIDATE_SPEAKER_INVALID'
+          } else {
+            const resolution = f.speakerResolution || {}
+            const candidateAudit = auditPairs([{
+              sourcePath: f.path,
+              refinedPath: candidatePath,
+              mode: 'refine',
+              glossaryText: opts.glossaryText != null ? opts.glossaryText : glossaryTextFor(),
+              speakerMode: resolution.speakerMode || f.speakerMode,
+              speakerMappings: resolution.mappings || [],
+            }]).files[0]
+            const beforeHard = (auditFile.failed || []).filter((name) => PUBLICATION_BLOCK_GATES.includes(name))
+            candidateHardFindings = (candidateAudit.failed || []).filter((name) => PUBLICATION_BLOCK_GATES.includes(name))
+            const beforeCounts = repairIssueCounts(auditFile, beforeHard)
+            const candidateCounts = repairIssueCounts(candidateAudit, candidateHardFindings)
+            const introducedHard = candidateHardFindings.some((name) => !beforeHard.includes(name))
+            const targetImproved = beforeHard.some((name) => (candidateCounts[name] || 0) < (beforeCounts[name] || 1))
+            if (introducedHard) {
+              candidateRejectedReason = 'introduced_hard_finding'
+              errorCode = 'REPAIR_CANDIDATE_NEW_HARD_FINDING'
+            } else if (!targetImproved) {
+              candidateRejectedReason = 'no_quality_improvement'
+              errorCode = 'REPAIR_CANDIDATE_NO_IMPROVEMENT'
+            } else {
+              fs.renameSync(candidatePath, f.outPath)
+              candidatePromoted = true
+            }
+          }
+        } catch {
+          if (!candidateRejectedReason) {
+            candidateRejectedReason = 'audit_failed'
+            errorCode = 'REPAIR_CANDIDATE_AUDIT_FAILED'
+          }
+        }
+      } else if (agentAttempted && !errorCode) {
+        errorCode = 'REPAIR_AGENT_NO_RESPONSE'
+        candidateRejectedReason = 'agent_no_response'
       }
+      if (!candidatePromoted && fs.existsSync(candidatePath)) {
+        try { fs.unlinkSync(candidatePath) } catch { /* preserve the formal transcript even if scratch cleanup fails */ }
+      }
+      const after = fs.readFileSync(f.outPath, 'utf8')
       const events = repairToolEvents.filter((event) => event.label === label)
       return {
         action,
-        model: effectiveModels.repair,
+        model: agentAttempted ? effectiveModels.repair : 'deterministic',
         bytesBefore: Buffer.byteLength(before, 'utf8'),
         bytesAfter: Buffer.byteLength(after, 'utf8'),
         changed: after !== before,
-        agentCompleted: response != null,
+        agentCompleted: agentAttempted ? response != null : null,
         deterministicQuoteFix,
+        candidatePromoted,
+        candidateSpeakerValid,
+        candidateRejectedReason,
+        candidateHardFindings,
         toolSummary: summarizeRepairToolEvents(events),
         errorCode: errorCode || (response == null ? 'REPAIR_AGENT_NO_RESPONSE' : null),
       }

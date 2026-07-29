@@ -44,7 +44,7 @@ log(msg) -> void
 - Parse argv → assemble `A` (same shape as the Claude Code edition's args — see the contract at the top of `core/meta.js` and `../claude-code-skill/SKILL.md` Step 0): `{ topic, date, background, outputDir, skillDir, scope, verifyDepth, headingPolicy, models, files:[{path,label,lines,bytes,title,subtitle,outPath,...}] }`.
 - **Pre-flight checks**: convert docx/pdf → md (shell out to `markitdown`, or use `mammoth`); fill in `lines`/`bytes` via `wc -l`/`-c`; grep for sub-headings.
 - `skillDir` points to a location where `references/` is readable (reuse `../claude-code-skill/references/`, or copy it in during packaging).
-- Call `runPipeline(A, engine)` and handle the return value (write glossary to disk; handle `failed/incomplete/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions` — same as "return handling" in SKILL.md).
+- Call `runPipeline(A, engine)` and handle the return value (write glossary to disk; handle `failed/auditFailed/auditUnavailable/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions`; `incomplete` is legacy compatibility only — same as "return handling" in SKILL.md).
 
 ### 3. Packaging
 

@@ -185,7 +185,7 @@ const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.
 
 // SF-6 — the process exit code, factored out so it is unit-testable without spawning the CLI.
 //   · a pipeline error → always 1
-//   · audit gate left a file still-hard after auto-repair → 1 by default; with allowAuditFail AND ≥1 成稿 produced
+//   · audit gate left a file still-hard after candidate repair → 1 by default; with allowAuditFail AND ≥1 成稿 produced
 //     (so the ONLY failure is auditFailed and the run otherwise succeeded) → 0
 //   · otherwise → 0
 // The products are written to disk regardless of the exit code; callers should inspect run.json / review.md's
@@ -229,7 +229,7 @@ export function printRunSummary(r) {
   }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
   if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿未经审计，不可视为通过；请求的总结/时间线/逻辑稿已暂停。主成稿已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
-  if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
+  if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（候选修复后仍 hard，或当前运行时不支持安全自动修复）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
   if ((r.logicFailed || []).length) console.error(`\n⚠ 逻辑顺序稿审计未过：` + r.logicFailed.map((x) => `${path.basename(x.path || '')}（${(x.findings || []).join('/')}）`).join('、') + `\n  （精校主成稿不受影响；失败逻辑稿不可作为合格附件，退出码 1，且 --allow-audit-fail 不豁免）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {
@@ -247,8 +247,8 @@ export function printRunSummary(r) {
   console.error(`精校成稿：${(r.refined || []).length} 份`)
   for (const rr of r.refined || []) console.error(`  ✓ ${rr.outPath || rr.path}`)
   if ((r.failed || []).length) console.error(`⚠ 未完成（需手动补做）：${list(r.failed)}`)
-  if ((r.incomplete || []).length) console.error(`⚠ 疑似中途截断（需检查结尾）：${r.incomplete.map((x) => `${x.path}${x.note ? `（${x.note}）` : ''}`).join('；')}`)
-  if ((r.unchecked || []).length) console.error(`⚠ 结尾完整性未核（核对代理失败，请人工抽查结尾）：${list(r.unchecked)}`)
+  if ((r.incomplete || []).length) console.error(`⚠ 旧版 incomplete 标记（请按源比对审计重新核验）：${r.incomplete.map((x) => `${x.path}${x.note ? `（${x.note}）` : ''}`).join('；')}`)
+  if ((r.unchecked || []).length) console.error(`⚠ 源比对审计未核（请人工运行审计后再采信）：${list(r.unchecked)}`)
   if ((r.scoutSuspect || []).length) console.error(`⚠ 侦察疑损坏（成稿正常，但校对表该份不可靠，网络稳定后可重扫）：${r.scoutSuspect.join('、')}`)
   if ((r.headingConflicts || []).length) console.error(`⚠ 源文件已带小标题但 headingPolicy=none：${r.headingConflicts.join('、')}——可用 --heading-policy keep|regenerate 重跑该份`)
   if ((r.suspectedDuplicates || []).length) console.error(`⚠ 疑似同指（已写入校对表“疑似同指”节，待人工确认，未自动合并）：${r.suspectedDuplicates.map((s) => (s.members || []).join('／')).join('；')}`)

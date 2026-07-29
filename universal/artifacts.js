@@ -97,7 +97,6 @@ function formatAudit(f) {
   if (failed.includes('content_gap')) parts.push((f.gaps || []).filter((g) => g.severity === 'hard').map((g) => `内容缺口 第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字（疑被无声略过）`).join('、'))
   if (failed.includes('compression_risk')) parts.push(`疑似压缩成摘要（charRatio ${f.metrics ? f.metrics.charRatio : '?'}）`)
   if (failed.includes('under_refined')) parts.push('欠精校（口癖未删净）')
-  if (failed.includes('ending_missing')) parts.push('结尾缺失')
   const hard = (f.findings || []).filter((x) => x.severity === 'hard' && x.count).map((x) => `${x.name}×${x.count}`)
   if (hard.length) parts.push(hard.join('、'))
   if (f.long_paragraphs && f.long_paragraphs.length) parts.push(`超 900 字段×${f.long_paragraphs.length}`)
@@ -248,8 +247,8 @@ export function reviewSections(result = {}, warnings = []) {
   const sections = [
     { title: '审计未能运行——本次运行失败，产物未经审计（不可采信，请人工运行 audit_refined.mjs 核验）', items: (result.auditUnavailable || []).map((x) => `${x.label ? `${x.label} — ` : ''}${x.path || x}`), priority: 'high' },
     { title: '未完成，需要补做', items: result.failed || [], priority: 'high' },
-    { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
-    { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
+    { title: '旧版 incomplete 标记，需要按现行源比对审计重新核验', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
+    { title: '源比对审计未核，需要人工运行审计', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => publicationFailures(f).length).map(formatAudit), priority: 'high' },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
@@ -400,7 +399,7 @@ export function buildReviewMarkdown(result = {}, context = {}) {
     '',
     `- 状态：${score.label}`,
     `- 硬问题文件：${score.metrics.hardFiles} / 已审计文件：${score.metrics.auditedFiles}`,
-    `- 结尾缺失：${score.metrics.incomplete}；未完成核对：${score.metrics.unchecked}`,
+    `- 旧版 incomplete 标记：${score.metrics.incomplete}；源比对审计未核：${score.metrics.unchecked}`,
     `- 逐节复核：${score.metrics.flaggedSections} / ${score.metrics.totalSections}`,
     `- 联网未核实：${score.metrics.networkUnverified}；收尾待问：${score.metrics.openQuestions}`,
     score.glossaryWarnings.length ? `- 校对表提示：${score.glossaryWarnings.join('、')}` : '- 校对表提示：0',
@@ -440,7 +439,7 @@ function sanitizeProviderInfo(info = {}) {
 }
 
 const REPAIR_STOP_REASONS = new Set(['not_needed', 'passed', 'max_rounds', 'audit_unavailable', 'repair_unavailable'])
-const REPAIR_OUTCOMES = new Set(['passed', 'passed_with_tool_errors', 'audit_failed', 'audit_failed_with_tool_errors', 'no_change', 'agent_failed', 'audit_unavailable'])
+const REPAIR_OUTCOMES = new Set(['passed', 'passed_with_tool_errors', 'audit_failed', 'audit_failed_with_tool_errors', 'no_change', 'agent_failed', 'audit_unavailable', 'candidate_rejected'])
 const safeRepairToken = (value, maxLength = 160) => {
   if (typeof value !== 'string') return null
   const text = value.trim()
@@ -489,6 +488,10 @@ function manifestQualityRepair(value) {
         bytesAfter: Number.isInteger(Number(attempt && attempt.bytesAfter)) && Number(attempt.bytesAfter) >= 0 ? Number(attempt.bytesAfter) : null,
         changed: !!(attempt && attempt.changed),
         agentCompleted: typeof (attempt && attempt.agentCompleted) === 'boolean' ? attempt.agentCompleted : null,
+        candidatePromoted: typeof (attempt && attempt.candidatePromoted) === 'boolean' ? attempt.candidatePromoted : null,
+        candidateSpeakerValid: typeof (attempt && attempt.candidateSpeakerValid) === 'boolean' ? attempt.candidateSpeakerValid : null,
+        candidateRejectedReason: safeRepairToken(attempt && attempt.candidateRejectedReason, 80),
+        candidateHardFindings: (Array.isArray(attempt && attempt.candidateHardFindings) ? attempt.candidateHardFindings : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
         failedAfter: (Array.isArray(attempt && attempt.failedAfter) ? attempt.failedAfter : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
         hardIssueCountsAfter: safeRepairCountMap(attempt && attempt.hardIssueCountsAfter),
         outcome: REPAIR_OUTCOMES.has(attempt && attempt.outcome) ? attempt.outcome : 'agent_failed',

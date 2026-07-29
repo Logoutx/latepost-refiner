@@ -33,7 +33,7 @@ test('reviewSections groups actionable warnings for handoff', () => {
   const titles = sections.map((s) => s.title)
 
   assert.equal(titles.includes('未完成，需要补做'), true)
-  assert.equal(titles.includes('疑似中途截断，需要检查结尾'), true)
+  assert.equal(titles.includes('旧版 incomplete 标记，需要按现行源比对审计重新核验'), true)
   assert.equal(titles.includes('疑似同指，待人工确认'), true)
   assert.equal(titles.includes('预检提示'), true)
 })
@@ -139,6 +139,7 @@ test('run manifest persists only the whitelisted repair ledger and retains earli
         oldString: 'must not persist',
       },
       bytesBefore: 1000, bytesAfter: 1010, changed: true, agentCompleted: true,
+      candidatePromoted: true, candidateSpeakerValid: true, candidateRejectedReason: null, candidateHardFindings: [],
       failedAfter: [], hardIssueCountsAfter: {}, outcome: 'passed_with_tool_errors', errorCode: null,
       response: 'must not persist',
     }],
@@ -148,6 +149,8 @@ test('run manifest persists only the whitelisted repair ledger and retains earli
   assert.equal(manifest.qualityRepair.maxRounds, 2)
   assert.equal(manifest.qualityRepair.attempts[0].toolSummary.failed[0].count, 6)
   assert.equal(manifest.qualityRepair.attempts[0].outcome, 'passed_with_tool_errors')
+  assert.equal(manifest.qualityRepair.attempts[0].candidatePromoted, true)
+  assert.equal(manifest.qualityRepair.attempts[0].candidateSpeakerValid, true)
   assert.equal(JSON.stringify(manifest).includes('must not persist'), false)
 })
 

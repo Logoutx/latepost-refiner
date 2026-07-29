@@ -3,7 +3,7 @@ import { parseSpeakerDocument, effectiveScoutPersonName } from '../scripts/speak
 
 // Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
 export const BODY_FIDELITY_GATES = Object.freeze([
-  'content_gap', 'compression_risk', 'ending_missing', 'attribution_mismatch', 'seam_duplicate',
+  'content_gap', 'compression_risk', 'attribution_mismatch', 'seam_duplicate',
 ])
 
 // Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file

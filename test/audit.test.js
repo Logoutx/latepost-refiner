@@ -89,6 +89,30 @@ test('refine mode passes a faithful, properly-cleaned refine', () => {
   assert.equal(r.failed.length, 0)
 })
 
+test('a cleaned closing pleasantry is not a standalone lexical-tail failure', () => {
+  const sourceText = [
+    '记者：最后还有什么需要补充的吗？',
+    '受访者：核心就是先把产品做好，再考虑扩张。',
+    '记者：好好好，我这边没有别的问题了，非常感谢您的时间。',
+    '受访者：嗯，好好，拜拜。',
+    '记者：嗯嗯，拜拜。',
+  ].join('\n')
+  const refinedText = [
+    '记者：最后还有什么需要补充的吗？',
+    '',
+    '受访者：核心就是先把产品做好，再考虑扩张。',
+    '',
+    '记者：我这边没有其他问题了，非常感谢您的时间。',
+    '',
+    '受访者：拜拜。',
+    '',
+    '记者：拜拜。',
+  ].join('\n')
+  const r = auditPair({ sourceText, refinedText, mode: 'refine' })
+  assert.ok(!r.failed.includes('ending_missing'), '正常去口癖不能被连续字窗口误判成断尾')
+  assert.equal(Object.hasOwn(r.metrics, 'endingCovered'), false, '删除误导性的字面结尾指标')
+})
+
 test('summary mode does NOT apply the compression gate (a summary is meant to be short)', () => {
   const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('compressed.md'), mode: 'summary' })
   assert.ok(!r.failed.includes('compression_risk'), 'no compression gate in summary mode')

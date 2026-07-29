@@ -149,6 +149,7 @@ test('buildFilePolicy only allows this run\'s declared deliverable paths', () =>
   })
   assert.ok(policy.writePaths.includes(refined))
   assert.ok(policy.writePartBases.includes(refined))
+  assert.equal(policy.writePaths.some((p) => p.includes('.repair-candidates')), false, 'repair candidates are not writable outside the repair agent')
   assert.ok(policy.writePaths.includes(path.join(outputDir, '逻辑顺序', 'A.md')))
   assert.ok(policy.writePaths.some((p) => p.endsWith('访谈总结.md')))
   assert.ok(policy.writePaths.some((p) => p.endsWith('时间线.md')))
@@ -306,9 +307,8 @@ test('computeLogicAudit independently blocks a same-order fake logic draft', () 
   assert.ok(audit.files[0].failed.includes('logic_order_unchanged'))
 })
 
-// A source whose distinctive last sentence the refine will DROP, so the deterministic audit's ending_missing
-// gate fires → the file lands in `incomplete`. The omitted tail is a single short closing turn (well under the
-// content_gap single-turn threshold), so ending_missing is the only finding — no hard content_gap, no marker.
+// A short closing pleasantry is deliberately omitted. This is below the substantive coverage threshold and must
+// not be promoted into a publication failure by a separate lexical-tail heuristic.
 const TRUNC_SOURCE = [
   '采访者：先请你介绍一下自己。',
   '受访者：我在一家虚构的工业检测公司做研发，入行差不多十年了，主要负责视觉算法这一块。',
@@ -364,12 +364,12 @@ function truncatedEndingEngine() {
   }
 }
 
-test('runJob writes review queue and manifest artifacts (deterministic audit ending_missing → incomplete)', async () => {
+test('runJob does not hard-fail a short omitted closing pleasantry through lexical tail matching', async () => {
   const outputDir = tmpdir()
   const src = path.join(outputDir, 'tiny-src.md')
   fs.writeFileSync(src, TRUNC_SOURCE, 'utf8')
   // Pre-write the refined output that the refine agent "produces" (the injected engine reports success
-  // but does not itself write a 成稿; the deterministic audit reads this file from disk and detects the dropped ending).
+  // but does not itself write a 成稿; the deterministic audit reads this file from disk).
   const outPath = path.join(outputDir, 'Transcripts', 'tiny-src.md')
   fs.mkdirSync(path.dirname(outPath), { recursive: true })
   fs.writeFileSync(outPath, TRUNC_REFINED, 'utf8')
@@ -389,19 +389,18 @@ test('runJob writes review queue and manifest artifacts (deterministic audit end
   assert.equal(fs.existsSync(result.reviewPath), true)
   assert.equal(fs.existsSync(result.manifestPath), true)
 
-  // Completeness now comes from the deterministic source-aware audit (ending_missing), not a haiku check agent.
-  assert.equal(result.incomplete.length, 1, 'the dropped ending is caught by the deterministic audit')
-  assert.match(result.incomplete[0].note, /ending_missing/)
+  assert.equal(result.incomplete.length, 0, 'legacy incomplete stays empty without an evidence-backed body gap')
+  assert.ok(result.audit.files.every((f) => !(f.failed || []).includes('ending_missing')))
 
   const review = fs.readFileSync(result.reviewPath, 'utf8')
-  assert.match(review, /疑似中途截断，需要检查结尾/)
+  assert.doesNotMatch(review, /疑似中途截断，需要检查结尾/)
   assert.match(review, /确认受访者姓名/)
 
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
   assert.equal(manifest.config.topic, '测试项目')
   assert.equal(manifest.config.files.length, 1)
   assert.equal(manifest.artifacts.reviewPath, result.reviewPath)
-  assert.equal(manifest.result.incomplete.length, 1)
+  assert.equal(manifest.result.incomplete.length, 0)
 })
 
 // End-to-end content-gap annotation: the injected engine "refines" by writing an output that omits a
@@ -485,8 +484,10 @@ function repairableGapEngine() {
   e.agent = async (prompt, opts = {}) => {
     if (opts.label && opts.label.startsWith('repair:')) {
       const m = prompt.match(/【当前成稿】([^\n]+)/)
-      assert.ok(m, 'repair prompt names the exact output file')
+      assert.ok(m && m[1].includes('.repair-candidates'), 'repair writes a bounded candidate, not the current main transcript')
+      assert.deepEqual(opts.filePolicy.writePaths, [m[1].trim()])
       assert.match(prompt, /"startLine"/, 'repair prompt carries exact gap ranges')
+      assert.match(prompt, /允许的输出标签只有：记者、沈其安/, 'repair receives the exact canonical speaker registry')
       fs.writeFileSync(m[1].trim(), covFixture('coverage-refined-good.md'), 'utf8')
       return `已写回 ${m[1].trim()}`
     }
@@ -510,7 +511,80 @@ test('runJob targeted repair closes content_gap, replaces the first audit result
   assert.equal(result.qualityRepair.roundsUsed, 1)
   assert.equal(result.qualityRepair.stopReason, 'passed')
   assert.ok(result.qualityRepair.attempts.every((x) => x.outcome === 'passed' && x.changed === true))
+  assert.ok(result.qualityRepair.attempts.every((x) => x.candidatePromoted === true && x.candidateSpeakerValid === true))
+  assert.equal(fs.existsSync(path.join(outputDir, '.repair-candidates')), true)
+  assert.deepEqual(fs.readdirSync(path.join(outputDir, '.repair-candidates')), [], 'promoted candidates leave no scratch files')
   assert.equal(result.annotations.length, 0, 'a repaired gap needs no visible failure marker')
+})
+
+test('runJob fixes a quote-only failure deterministically without calling the repair model', async () => {
+  const outputDir = tmpdir()
+  const source = [
+    '记者：请介绍一下你们主要做什么？',
+    '沈其安：我们主要做工业检测，为制造业客户提供设备和软件。项目周期通常是半年，交付后还会继续维护。',
+  ].join('\n')
+  let repairCalls = 0
+  const engine = {
+    phase() {}, log() {},
+    usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }),
+    parallel: async (thunks) => Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null))),
+    pipeline: async (items) => items.map((f) => {
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, source.replace('工业检测', '"工业检测"'), 'utf8')
+      return { path: f.outPath, headings: [], key_fixes: [], open_questions: [] }
+    }),
+    agent: async (_prompt, opts = {}) => {
+      if ((opts.label || '').startsWith('repair:')) repairCalls += 1
+      return null
+    },
+  }
+  const result = await runJob({
+    __engine: engine,
+    files: [{ name: '引号.md', base64: Buffer.from(source).toString('base64') }],
+    topic: '确定性引号修复', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+
+  assert.equal(repairCalls, 0)
+  assert.deepEqual(result.auditFailed, [])
+  assert.equal(result.qualityRepair.attempts.length, 1)
+  assert.equal(result.qualityRepair.attempts[0].model, 'deterministic')
+  assert.equal(result.qualityRepair.attempts[0].candidatePromoted, true)
+  assert.match(fs.readFileSync(result.refined[0].outPath, 'utf8'), /“工业检测”/)
+})
+
+function inventedSpeakerRepairEngine() {
+  const e = gapEngine()
+  e.agent = async (prompt, opts = {}) => {
+    if (opts.label && opts.label.startsWith('repair:')) {
+      const m = prompt.match(/【当前成稿】([^\n]+)/)
+      assert.ok(m && m[1].includes('.repair-candidates'))
+      assert.deepEqual(opts.filePolicy.writePaths, [m[1].trim()])
+      const invented = covFixture('coverage-refined-good.md').replaceAll('沈其安：', '温：')
+      fs.writeFileSync(m[1].trim(), invented, 'utf8')
+      return `已写回 ${m[1].trim()}`
+    }
+    return null
+  }
+  return e
+}
+
+test('runJob rejects a repair candidate that invents a speaker and preserves the current transcript', async () => {
+  const outputDir = tmpdir()
+  const src64 = Buffer.from(covFixture('coverage-source.md')).toString('base64')
+  const result = await runJob({
+    __engine: inventedSpeakerRepairEngine(),
+    files: [{ name: '甲.md', base64: src64 }, { name: '乙.md', base64: src64 }],
+    topic: '候选事务测试', date: '2026-07', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+  assert.ok(result.auditFailed.every((x) => x.findings.includes('content_gap')))
+  assert.equal(result.qualityRepair.roundsUsed, 2)
+  assert.ok(result.qualityRepair.attempts.every((x) => x.outcome === 'candidate_rejected'))
+  assert.ok(result.qualityRepair.attempts.every((x) => x.candidatePromoted === false && x.candidateSpeakerValid === false))
+  for (const entry of result.refined) {
+    const text = fs.readFileSync(entry.outPath, 'utf8')
+    assert.doesNotMatch(text, /^温：/m, 'unknown speaker candidate never replaces the current transcript')
+  }
+  assert.deepEqual(fs.readdirSync(path.join(outputDir, '.repair-candidates')), [], 'rejected candidates are removed')
 })
 
 // A clean refine (no gap) must not populate auditFailed, and each refined entry gets audit.status='ok'.

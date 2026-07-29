@@ -1046,16 +1046,10 @@ export function auditNativeResult(args, result) {
     failedByPath.get(p).findings.push(...(item.findings || []))
   }
   const auditFailedAll = [...failedByPath.values()].map((x) => ({ ...x, findings: [...new Set(x.findings)] }))
-  const auditIncomplete = audit
-    ? audit.files
-      .filter((f) => (f.failed || []).includes('ending_missing'))
-      .map((f) => ({ path: f.file || f.refinedFile, note: 'deterministic audit: ending_missing' }))
-    : []
   const auditedPaths = new Set(audit ? (audit.files || []).map((f) => path.resolve(f.file || f.refinedFile || '')).filter(Boolean) : [])
   const unchecked = audit
     ? (result.unchecked || []).filter((p) => !auditedPaths.has(path.resolve(p.path || p)))
     : (result.unchecked || [])
-  const incompleteByPath = new Map([...(result.incomplete || []), ...auditIncomplete].map((x) => [path.resolve(x.path || x), typeof x === 'string' ? { path: x } : x]))
   const audited = {
     ...result,
     refined: refinedNext,
@@ -1063,7 +1057,7 @@ export function auditNativeResult(args, result) {
     audit,
     auditFailed: auditFailedAll,
     derivativeAudit,
-    incomplete: Array.from(incompleteByPath.values()),
+    incomplete: result.incomplete || [],
     unchecked,
     glossaryLint,
     logicAudit,

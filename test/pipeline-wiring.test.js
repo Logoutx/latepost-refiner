@@ -363,6 +363,19 @@ test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a
   assert.equal(r.refined[0].audit.status, 'ok')
 })
 
+test('audit gate without a transactional repair capability never lets a fallback agent overwrite the body', async () => {
+  const labels = []
+  const eng = engine(labels, {
+    '^audit:': () => JSON.stringify({ status: 'fail', files: [{ file: '/o/Transcripts/A.md', status: 'fail', failed: ['residual_noise'], gaps: [], findings: [] }] }),
+    '^anchors:': '已加锚点',
+    '^repair:': '不应运行',
+  })
+  const r = await runPipeline(A(), eng)
+  assert.ok(!labels.some((label) => label.startsWith('repair:')), 'no-fs runtime keeps the hard finding for manual repair')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['residual_noise'] }])
+  assert.deepEqual(r.qualityRepairAttempts, [])
+})
+
 test('audit gate (no capability): unparseable agent output → one retry → FAILS LOUDLY via top-level auditUnavailable, never throws', async () => {
   const labels = []
   const eng = engine(labels, { '^audit': '这不是 JSON，只是一段解释文字。' }) // both the call and the retry fail to parse

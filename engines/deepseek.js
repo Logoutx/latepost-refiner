@@ -237,12 +237,12 @@ export function makeDeepSeekEngine(opts = {}) {
     try { onAgentEvent(event) } catch { /* observability must not fail the run */ }
   }
 
-  async function execTool(call, label) {
+  async function execTool(call, label, activeFilePolicy = safeFilePolicy) {
     const name = call.function && call.function.name
     const args = parseJSON(call.function && call.function.arguments) || {}
     if (name === 'web_search') return { ok: true, text: await web.search(args.query || '') }
     if (name === 'web_fetch') return { ok: true, text: await web.fetch(args.url || '') }
-    const result = runFileTool(name, args, safeFilePolicy)
+    const result = runFileTool(name, args, activeFilePolicy)
     emitToolEvent({ label: label || 'agent', tool: name, ok: !!result.ok, code: result.code || null, path: result.path || (args.file_path ? path.resolve(String(args.file_path)) : null), bytes: result.bytes ?? null })
     return result
   }
@@ -273,8 +273,12 @@ export function makeDeepSeekEngine(opts = {}) {
     }
   }
 
-  async function runAgent(prompt, { model, schema, label, outputPath } = {}) {
+  async function runAgent(prompt, { model, schema, label, outputPath, filePolicy: agentFilePolicy } = {}) {
     const modelId = resolveDeepSeekModel(model)
+    // A stage may narrow the job-wide allowlist for one agent call. Quality repair uses
+    // this as a real write firebreak: the agent can touch its candidate only, never the
+    // already-published transcript that is being evaluated.
+    const activeFilePolicy = agentFilePolicy ? makeFilePolicy(agentFilePolicy) : safeFilePolicy
     const tools = [...FILE_TOOLS]
     if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) tools.push(structuredTool(schema))
@@ -311,7 +315,7 @@ export function makeDeepSeekEngine(opts = {}) {
             if (!structuredValue) messages.push({ role: 'tool', tool_call_id: c.id, content: 'structured_output 参数解析失败，请重新以合法 JSON 调用。' })
             continue
           }
-          const result = await execTool(c, label)
+          const result = await execTool(c, label, activeFilePolicy)
           if (FILE_TOOL_NAMES.has(fname) && !result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = result
           if (FILE_TOOL_NAMES.has(fname) && result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = null
           messages.push({ role: 'tool', tool_call_id: c.id, content: String(result.text) })

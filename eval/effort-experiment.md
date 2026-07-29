@@ -56,7 +56,7 @@ each arm; compare Arm B against Arm A on the metrics below.
    Over-deletion is the hard failure — a single non-empty `overDel` on any Arm-B run is a veto.
 3. **Real-pair spot check:** run one real fixed transcript through the full pipeline at `--effort refine=medium` and
    diff the 成稿 against the default; confirm the source-aware audit surfaces **no new hard gates** (no new
-   `content_gap` / `quote_style` / `ending_missing` / `compression_risk`). The scorers cover micro-properties; this
+   `content_gap` / `quote_style` / `compression_risk`). The scorers cover micro-properties; this
    catches a whole-document compression the tiny fixtures can't.
 
 If any of the three fails → keep `high` (do not change the default; the knob still exists for opt-in use).
