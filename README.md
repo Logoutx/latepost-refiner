@@ -73,7 +73,7 @@ DeepSeek 版默认仍按上表使用 flash/pro。CLI 与 `runJob()` 只为受控
 
 Universal 把“程序是否完成”和“稿件是否可发布”分开记录：`run.json.execution` 只描述执行状态与 typed failure（例如 `TOOL_PATH_DENIED`、`OUTPUT_MISSING`，并标明是否可重试），`run.json.quality` 继续描述 `ready / review_needed / blocked`。DeepSeek 失败另带脱敏的 `providerSignal`：明确拒绝记 `MODEL_REFUSAL`，`finish_reason=content_filter` 记 `CONTENT_FILTER`，无 choice / 空内容分别记 `MODEL_EMPTY_RESPONSE` / `MODEL_EMPTY_CONTENT`，429、5xx 和网络错误记 `API_TRANSIENT`；静默空响应保持“原因不明”，不会推断成内容审查。证据只含 finish reason、是否出现 refusal、choice 数、HTTP 状态、request id，不保存响应正文。`plannedChunks` 在精校代理启动前生成，所以某个分块失败后仍能看到本次计划的全部 `.partN`。每个输出目录还会实时写权限为 `0600` 的 `run-state.json` 与 `events.jsonl`，记录阶段、15 秒心跳、分块计划、agent 和工具成败；不记录 prompt、转录正文、网页正文、provider 响应正文或 API key。
 
-单文件 Universal 运行还会并行提取目录身份，写入 `run.json.transcriptMetadata`：主要受访者、采访时所属公司/机构、稿内别名、一到两句人物介绍、置信度和短依据。该代理只读原稿、标题和背景，不联网补全；`confidence=low` 时姓名、机构和人物介绍在 manifest 边界强制为空。`--metadata-catalog <json>` 可传既有规范名以减少跨任务写法漂移；`latepost-refiner-metadata` 提供只跑该轻量提取、不重跑正文的历史回填入口。
+单文件 Universal 运行会在主稿完成精校、说话人收口和源比对审计后定稿目录身份，写入 `run.json.transcriptMetadata`：核心人物（访谈取主要受访者，独白/演讲取主讲人或作者）、当时所属公司/机构、用于交付命名的简短身份、稿内别名、一到两句人物介绍、置信度和短依据。该代理同时读取原稿、最终精校稿和本次全文说话人映射，但只把原稿与说话人证据当作身份事实，不能采用仅在精校稿中新出现且无法回指源稿的身份；它不联网补全，也没有文件写权限。`confidence=low` 时姓名、机构、简短身份和人物介绍在 manifest 边界强制为空。`--metadata-catalog <json>` 可传既有规范名以减少跨任务写法漂移；`latepost-refiner-metadata` 继续提供只读原稿、只跑该轻量提取、不重跑正文的历史回填入口。
 
 ## 架构
 

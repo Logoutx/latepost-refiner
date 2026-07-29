@@ -541,18 +541,6 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       notice('提示：未设 SERPER_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
     }
   }
-  // The bot submits one transcript per job. Extract its catalog identity concurrently with the editorial
-  // pipeline so the extra lightweight Scout call does not extend the critical path by a full model round-trip.
-  // Multi-file batches deliberately return no single top-level identity: choosing one would silently collapse
-  // several transcripts into one catalog record.
-  const metadataPromise = fileEntries.length === 1
-    ? extractTranscriptMetadata(sel.engine, fileEntries[0], {
-        topic,
-        background,
-        catalog: params.metadataCatalog,
-        model: stageModels.scout,
-      })
-    : Promise.resolve(null)
   notice(`
 开始：${fileEntries.length} 份文件 · scope=${scope.join(',')} · verify=${verifyDepth} · 输出 ${outDir}
 `)
@@ -812,7 +800,34 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
 
   {
     const r = await runPipeline(A, sel.engine)
-    const transcriptMetadata = await metadataPromise
+    // A bot job contains one transcript. Finalize its catalog identity only after the main transcript has
+    // completed Refine, deterministic speaker enforcement and source-aware audit. The source remains the
+    // factual authority; the final transcript and the exact speaker mapping are supporting context. Failed
+    // or multi-file runs deliberately emit no top-level identity instead of polluting the shared catalog.
+    let transcriptMetadata = null
+    const refinedPath = fileEntries.length === 1 && r.refined && r.refined.length === 1
+      ? (r.refined[0].outPath || r.refined[0].path)
+      : null
+    if (!r.error && refinedPath && fs.existsSync(refinedPath)) {
+      const refinedText = fs.readFileSync(refinedPath, 'utf8')
+      const refinedFile = {
+        path: refinedPath,
+        label: `${fileEntries[0].label}精校稿`,
+        lines: refinedText.split('\n').length,
+        bytes: Buffer.byteLength(refinedText, 'utf8'),
+      }
+      const speakerResolution = (r.speakerResolutions || []).find(
+        (item) => item && item.label === fileEntries[0].label,
+      ) || (r.speakerResolutions || [])[0] || null
+      transcriptMetadata = await extractTranscriptMetadata(sel.engine, fileEntries[0], {
+        topic,
+        background,
+        catalog: params.metadataCatalog,
+        model: stageModels.scout,
+        refinedFile,
+        speakerResolution,
+      })
+    }
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
     // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
     // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into

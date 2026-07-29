@@ -83,6 +83,7 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
   ].join('\n')
   fs.writeFileSync(src, source, 'utf8')
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  let metadataCalls = 0
   const engine = {
     phase() {},
     log() {},
@@ -98,7 +99,10 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
     })),
     agent: async (_prompt, opts = {}) => {
       usage.agents += 1
-      if (opts.label && opts.label.startsWith('metadata:')) return null
+      if (opts.label && opts.label.startsWith('metadata:')) {
+        metadataCalls += 1
+        return null
+      }
       if (opts.label && opts.label.startsWith('scout:')) {
         return { speakers: [], people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [] }
       }
@@ -129,6 +133,7 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
 
   assert.equal(result.refined.length, 0, 'an invalid speaker structure is not declared as a deliverable main transcript')
   assert.deepEqual(result.failed, ['独白'])
+  assert.equal(metadataCalls, 0, 'a rejected main transcript must not update catalog identity')
   assert.equal(result.speakerStructuralFailures.length, 1)
   assert.equal(result.speakerStructuralFailures[0].speakerMode, 'untracked')
   assert.ok(result.speakerStructuralFailures[0].violations.every((item) => item.kind === 'invented_speaker_label'))
@@ -698,6 +703,50 @@ test('runJob accepts filesystem path entries and records prepared file metadata'
   assert.equal(manifest.config.files.length, 1)
   assert.equal(manifest.config.files[0].path, src)
   assert.equal(manifest.config.files[0].outPath, path.join(outputDir, 'Transcripts', 'path-fixture.md'))
+})
+
+test('runJob finalizes single-transcript identity after the refined file exists', async () => {
+  const inputDir = tmpdir()
+  const outputDir = tmpdir()
+  const src = path.join(inputDir, 'identity-order.md')
+  fs.writeFileSync(src, '记者：请介绍背景\n受访者：我是沈其安，负责示例公司的研发。\n', 'utf8')
+  const base = mockEngine()
+  const labels = []
+  const originalAgent = base.agent
+  base.agent = async (prompt, opts = {}) => {
+    labels.push(opts.label || '')
+    if ((opts.label || '').startsWith('metadata:')) {
+      const refinedPath = path.join(outputDir, 'Transcripts', 'identity-order.md')
+      assert.equal(fs.existsSync(refinedPath), true, 'identity finalization must wait for the final transcript')
+      assert.match(prompt, new RegExp(refinedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      assert.match(prompt, /源稿是身份事实的最高依据/)
+      return {
+        interviewee_name: '沈其安',
+        organization_name: '示例公司',
+        role_title: '研发负责人',
+        interviewee_intro: '示例公司研发负责人，本次介绍项目背景。',
+        confidence: 'high',
+        evidence: '原稿自我介绍明确。',
+      }
+    }
+    return originalAgent(prompt, opts)
+  }
+
+  const result = await runJob({
+    __engine: base,
+    files: [{ path: src }],
+    topic: '身份顺序样本',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+  })
+
+  assert.ok(labels.findIndex((label) => label.startsWith('metadata:'))
+    > labels.findIndex((label) => label.startsWith('refine:')))
+  assert.equal(result.transcriptMetadata.interviewee_name, '沈其安')
+  assert.equal(result.transcriptMetadata.role_title, '研发负责人')
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.transcriptMetadata.role_title, '研发负责人')
 })
 
 // P1 end-to-end: the produced 时间线 is audited against the interview corpus (source + 成稿). A 【访谈】-tagged
