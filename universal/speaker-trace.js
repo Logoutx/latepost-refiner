@@ -29,7 +29,7 @@ const GENERIC_ONLY_RE = new RegExp(`^${GENERIC_PREFIX}$`, 'iu')
 // 标签后面还能安全带出来的字符：数字、冒号、点、星号、连字符、空格。遇到汉字或字母就停，避免带出正文。
 const SAFE_TAIL_RE = /^[0-9０-９\s:：.．*＊-]*/u
 const TRAILING_DIGITS_RE = /^(.*?)\s*([0-9０-９]{1,4})$/u
-const STRONG_KINDS = new Set(['generic', 'generic-inline', 'cite', 'timestamp'])
+const STRONG_KINDS = new Set(['generic', 'generic-inline', 'cite', 'timestamp', 'scout-evidence'])
 
 function token(value, max = MAX_TOKEN) {
   if (value == null) return ''
@@ -113,6 +113,17 @@ export function scanSpeakerNearMiss(parsed = {}) {
   }
   if (inlineDominates) {
     warnings.push(`弱兜底标签（行内“名字：”）${inline} 条，多过强标签 ${strong} 条——说明这份稿子的说话人是靠冒号猜出来的，容易把正文里的句子误当成标签`)
+  }
+  for (const finding of (Array.isArray(parsed && parsed.structureWarnings) ? parsed.structureWarnings : [])) {
+    const count = posInt(finding && finding.count) || 0
+    const labels = (Array.isArray(finding && finding.labels) ? finding.labels : []).slice(0, MAX_EXAMPLES).map((label) => token(label)).filter(Boolean)
+    if (finding && finding.kind === 'unrecognized_speaker_structure') {
+      warnings.push(`发现 ${count} 行疑似说话人结构，但尚未取得可验证映射${labels.length ? `（候选：${labels.join('、')}）` : ''}`)
+    } else if (finding && finding.kind === 'scout_parser_disagreement') {
+      warnings.push(`侦察识别出 ${count} 条说话人轨道，但原文样例未通过确定性结构验证${labels.length ? `（标签：${labels.join('、')}）` : ''}`)
+    } else if (finding && finding.kind === 'scout_evidence_unmatched') {
+      warnings.push(`已有轨道中仍有 ${count} 条侦察样例无法逐字回查${labels.length ? `（标签：${labels.join('、')}）` : ''}`)
+    }
   }
 
   return {
@@ -254,7 +265,12 @@ export function makeSpeakerTrace(outputDir, { enabled = false, now = () => new D
         out.push('')
       } else {
         const p = state.parse
-        out.push(`- 说话人模式：${p.speakerMode === 'tracked' ? 'tracked（源文件自带说话人标签）' : 'untracked（源文件没有可识别的说话人标签）'}`)
+        const modeLabel = p.speakerMode === 'tracked'
+          ? 'tracked（已确认说话人轨道）'
+          : p.speakerMode === 'ambiguous'
+          ? 'ambiguous（疑似说话人结构待证据确认）'
+          : 'untracked（没有说话人标签证据）'
+        out.push(`- 说话人模式：${modeLabel}`)
         out.push(`- 标签行数：${p.labelLines ?? '—'}　·　说话人轨道数：${p.trackCount ?? '—'}`)
         out.push('')
         out.push(mdTable(['源标签', '归并键', '识别方式', '是否泛称', '是否角色词', '首次出现行', '标签行数'],

@@ -80,6 +80,22 @@ test('M6 legit label unification does NOT flag: every 发言人2 turn faithfully
   assert.equal(r.mismatches, 0, 'a clean, consistently-labeled refine raises no attribution flag')
 })
 
+test('M6 consumes the canonical mapping to audit Scout-recovered unfamiliar source decorators', () => {
+  const source = buildSource()
+    .replace(/^发言人1\s+(00:\d{2})$/gmu, '⟦$1⟧ 沈其安')
+    .replace(/^发言人2\s+(00:\d{2})$/gmu, '⟦$1⟧ 周砚')
+  const mappings = [
+    { sourceLabel: '沈其安', outputLabel: '沈其安' },
+    { sourceLabel: '周砚', outputLabel: '周砚' },
+  ]
+  const r = checkAttribution(source, buildRefined(), { speakerMode: 'tracked', speakerMappings: mappings })
+  assert.equal(r.status, 'assessed')
+  assert.equal(r.mappedSpeakers, 2)
+  assert.equal(r.mismatches, 0)
+  assert.equal(r.map['沈其安'], '沈其安')
+  assert.equal(r.map['周砚'], '周砚')
+})
+
 test('M6 swapped attribution IS flagged: one guest answer placed under the interviewer label', () => {
   // move the 5th guest answer (index 4, a long distinctive turn) under 沈其安
   const refined = buildRefined({ swapTurnIndex: 4, swapTo: '沈其安' })

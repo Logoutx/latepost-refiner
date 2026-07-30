@@ -871,8 +871,10 @@ const MODEL_MARKER_RE = /[⚠!！]?\s*[【\[]?未精校段/
 // shapes seen in real transcripts: `**发言人 1 00:03:22**` (bold, optional trailing timestamp, label-only
 // line), `名字 15:12` (bare name+timestamp line, optional bold/trailing spaces), and inline `名字：内容`.
 // Zero turns parsed → caller treats coverage as not assessable (never a gate).
-export function parseSourceTurns(sourceText) {
-  return parseSpeakerDocument(sourceText).units.map((unit) => ({
+export function parseSourceTurns(sourceText, options = {}) {
+  return parseSpeakerDocument(sourceText, {
+    knownSpeakerLabels: options.knownSpeakerLabels || [],
+  }).units.map((unit) => ({
     ...unit,
     // Keep the audit's long-standing display form (`发言人1`) while the canonical parser internally normalizes
     // variants such as `发言人 1` / `Speaker 1` through speakerKey.
@@ -977,8 +979,8 @@ function bagMatch(turnNorm, rarity, refPositions) {
 // { turns, subs } where subs carry .found and .anchor = { normIdx, line (1-based refined line) }.
 // Both scanCoverage (gap detection) and annotateAnchors (source anchors) consume this, so the two
 // features stay in lock-step forever.
-export function anchorTurns(sourceText, refinedText) {
-  const turns = parseSourceTurns(sourceText)
+export function anchorTurns(sourceText, refinedText, options = {}) {
+  const turns = parseSourceTurns(sourceText, options)
   const subs = turns
     .map((t) => ({ ...t, norm: normalize(t.text) }))
     .filter((t) => t.norm.length >= COVERAGE.MIN_SUBSTANTIVE_CHARS)
@@ -1342,13 +1344,13 @@ const UNIT_FAMILY = new Map([
 ])
 const unitFamily = (u) => (u ? (UNIT_FAMILY.get(u) || u) : '')
 
-export function checkMeaningAtoms(sourceText, refinedText) {
+export function checkMeaningAtoms(sourceText, refinedText, options = {}) {
   const empty = {
     assessed: false, sourceNumbers: 0, refinedNumbers: 0, drifted: 0, driftSamples: [],
     driftNotes: 0, driftNoteSamples: [],
     hedgeTurnsLost: 0, hedgeSamples: [], assessedTurns: 0, sourceHedges: 0, refinedHedges: 0, perTurn: [],
   }
-  const { turns, subs } = anchorTurns(sourceText, refinedText)
+  const { turns, subs } = anchorTurns(sourceText, refinedText, options)
   if (!turns.length || !subs.length) return empty
   const refLines = refinedText.split(/\r?\n/)
   const refAllAtoms = extractNumberAtoms(refinedText)
@@ -1560,11 +1562,14 @@ function attrParagraphNorm(refLines, line1) {
 // still hard-fails (the whole answer sits under the wrong name → full corroboration). Two-party interviews (≤2
 // speakers, where the check was already accurate) keep the exact prior behavior.
 export function checkAttribution(sourceText, refinedText, options = {}) {
-  const sourceStructure = parseSpeakerDocument(sourceText)
+  const knownSpeakerLabels = (Array.isArray(options.speakerMappings) ? options.speakerMappings : [])
+    .map((mapping) => mapping && mapping.sourceLabel)
+    .filter(Boolean)
+  const sourceStructure = parseSpeakerDocument(sourceText, { knownSpeakerLabels })
   const speakerMode = options.speakerMode || sourceStructure.speakerMode
   const empty = { assessed: false, status: 'unassessed', map: {}, speakers: {}, assessedTurns: 0, mappedSpeakers: 0, mismatches: 0, samples: [], review: 0, reviewSamples: [], partyCount: 0, perTurn: [] }
   if (speakerMode === 'untracked') return { ...empty, status: 'not_applicable' }
-  const { subs } = anchorTurns(sourceText, refinedText)
+  const { subs } = anchorTurns(sourceText, refinedText, { knownSpeakerLabels })
   const partyCount = sourceStructure.tracks.length
   if (!subs.length) return { ...empty, partyCount }
   // distinct source speakers among substantive turns — the number of parties in the conversation (P4).
@@ -1877,12 +1882,18 @@ export function detectHeadingRegex(refinedText) {
   return /^##\s+/   // normal case: ## is as dense as anything deeper (may yield 0 sections, which callers handle)
 }
 
-export function buildSections(sourceText, refinedText, { atoms = null, coverage = null, glossary = null, attribution = null } = {}) {
+export function buildSections(sourceText, refinedText, {
+  atoms = null,
+  coverage = null,
+  glossary = null,
+  attribution = null,
+  knownSpeakerLabels = [],
+} = {}) {
   const lines = refinedText.split(/\r?\n/)
   const HEADING_RE = detectHeadingRegex(refinedText)
   const headIdx = lines.map((l, i) => (HEADING_RE.test(l) ? i : -1)).filter((i) => i >= 0)
   if (!headIdx.length) return []
-  const { subs } = anchorTurns(sourceText, refinedText)
+  const { subs } = anchorTurns(sourceText, refinedText, { knownSpeakerLabels })
   // ghost/yin hits carry a refined line already — bucket by section via line ranges.
   const ghostHits = glossary ? checkGhostName(refinedText, glossary).samples : []
   const yinHits = glossary ? checkMissingYin(refinedText, glossary).samples : []
@@ -1942,8 +1953,8 @@ export function buildSections(sourceText, refinedText, { atoms = null, coverage 
 }
 
 // The scan: which substantive source turns never surface in the refined text, grouped into gaps.
-export function scanCoverage(sourceText, refinedText) {
-  const { turns, subs } = anchorTurns(sourceText, refinedText)
+export function scanCoverage(sourceText, refinedText, options = {}) {
+  const { turns, subs } = anchorTurns(sourceText, refinedText, options)
   const empty = { assessed: false, turnsTotal: turns.length, turnsSubstantive: 0, turnsLost: 0, lostChars: 0, lostRatio: 0, modelMarkers: [], gaps: [] }
   if (!turns.length || !subs.length) return empty
   const refLines = refinedText.split(/\r?\n/)
@@ -2084,7 +2095,7 @@ export function sectionRange(matched) {
 // Pure: compute + write the per-section anchor comments into the refined text. Idempotent —
 // an existing anchor comment directly under a heading is REPLACED, never duplicated (fresh scan
 // each run; source line numbers come from the SOURCE so they are invariant across re-runs).
-export function annotateAnchors(sourceText, refinedText) {
+export function annotateAnchors(sourceText, refinedText, options = {}) {
   const eol = /\r\n/.test(refinedText) ? '\r\n' : '\n'
   const lines = refinedText.split(/\r?\n/)
   // Same heading-level fallback as buildSections: a doc that sub-sections with #### (few ## band headers) gets
@@ -2092,7 +2103,7 @@ export function annotateAnchors(sourceText, refinedText) {
   const HEADING_RE = detectHeadingRegex(refinedText)
   const headIdx = lines.map((l, i) => (HEADING_RE.test(l) ? i : -1)).filter((i) => i >= 0)
   if (!headIdx.length) return { text: refinedText, updated: [], skipped: [] }
-  const { subs } = anchorTurns(sourceText, refinedText)
+  const { subs } = anchorTurns(sourceText, refinedText, options)
   const updated = [], skipped = []
   // reverse order so insertions never shift earlier heading indices
   for (let k = headIdx.length - 1; k >= 0; k -= 1) {
@@ -2117,10 +2128,10 @@ export function annotateAnchors(sourceText, refinedText) {
   return { text: lines.join(eol), updated: updated.reverse(), skipped: skipped.reverse() }
 }
 
-export function annotateAnchorsFile(sourcePath, refinedPath) {
+export function annotateAnchorsFile(sourcePath, refinedPath, options = {}) {
   const src = fs.readFileSync(sourcePath, 'utf8')
   const before = fs.readFileSync(refinedPath, 'utf8')
-  const r = annotateAnchors(src, before)
+  const r = annotateAnchors(src, before, options)
   if (r.text !== before) fs.writeFileSync(refinedPath, r.text)
   return { path: path.resolve(refinedPath), updated: r.updated, skipped: r.skipped }
 }
@@ -2166,6 +2177,9 @@ export function auditPair({
   glossaryText = null, strict = false, speakerMode = null, speakerMappings = null,
 }) {
   sourceText = normalizeTranscriptSource(sourceText, { sourceFile })
+  const knownSpeakerLabels = (Array.isArray(speakerMappings) ? speakerMappings : [])
+    .map((mapping) => mapping && mapping.sourceLabel)
+    .filter(Boolean)
   const out = auditText(refinedText, refinedFile) // output-only cleanliness (residual noise / long paras)
 
   const sChars = hanzi(sourceText)
@@ -2177,10 +2191,10 @@ export function auditPair({
   const sEmptyDensity = sChars ? emptyCount(sourceText) / sChars : 0
   const rEmptyDensity = rChars ? emptyCount(refinedText) / rChars : 0
   const emptyReduction = sEmptyDensity ? Number((1 - rEmptyDensity / sEmptyDensity).toFixed(3)) : 0
-  const coverage = scanCoverage(sourceText, refinedText)
+  const coverage = scanCoverage(sourceText, refinedText, { knownSpeakerLabels })
   // M4 mutation tier: number-atom + hedge fidelity. refine mode only (a summary/timeline legitimately drops
   // qualifiers). All-soft; SOFT findings never enter failed[] this pass (see below).
-  const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText) : null
+  const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText, { knownSpeakerLabels }) : null
   // M6 attribution tier: speaker-misattribution via a self-calibrated majority map. refine mode only (a summary /
   // timeline / logic draft has no per-turn labels to defend). Calibrated mismatches are hard; ambiguous cases soft.
   const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText, { speakerMode, speakerMappings }) : null
@@ -2295,7 +2309,7 @@ export function auditPair({
   ])
   // M5 per-section review checklist: one entry per ## section of the refined doc, flags aggregate everything
   // localizable to it (number_drift / hedge_loss / content_gap_soft / ghost_name / missing_yin / weak_anchor).
-  const sections = buildSections(sourceText, refinedText, { atoms, coverage, glossary, attribution })
+  const sections = buildSections(sourceText, refinedText, { atoms, coverage, glossary, attribution, knownSpeakerLabels })
   // unificationList (全局统一清单): every glossary variant→canonical mapping that was globally replaced —
   // see checkEntityMergeReview above. Informational (Tier 1), present regardless of whether Tier 2 fired.
   return { file: out.file, mode, status: failed.length ? 'fail' : 'ok', failed, metrics, long_paragraphs: out.long_paragraphs, findings, gaps: coverage.gaps, modelMarkers: coverage.modelMarkers, sections, numericConflicts: numericConsistency ? numericConsistency.conflicts : [], unificationList: entityMerge.unificationList }

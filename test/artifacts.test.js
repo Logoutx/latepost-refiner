@@ -58,6 +58,27 @@ test('qualityScorecard classifies ready, review-needed, and blocked runs', () =>
   assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['detector_candidate_only'] }] } }).status, 'ready', 'unknown detector failures cannot silently become publication gates')
 })
 
+test('speaker parser/Scout disagreement is visible in review, run quality and per-artifact quality', () => {
+  const result = {
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [], sections: [] }] },
+    speakerStructureWarnings: [{
+      label: '访谈 A',
+      path: '/tmp/out/Transcripts/A.md',
+      speakerMode: 'ambiguous',
+      warnings: [{ kind: 'scout_parser_disagreement', count: 2, labels: ['说话人 1', '说话人 2'] }],
+    }],
+  }
+  const sections = reviewSections(result, [])
+  assert.ok(sections.some((section) => section.title.includes('疑似说话人结构未能完全确认')))
+  const quality = qualityScorecard(result)
+  assert.equal(quality.status, 'review_needed')
+  assert.equal(quality.metrics.speakerStructureWarnings, 1)
+  const artifact = artifactQualityScorecard(result, { outputDir: '/tmp/out' })
+  assert.equal(artifact.refined[0].status, 'review_needed')
+  assert.deepEqual(artifact.refined[0].reviewFindings, ['speaker_structure_ambiguous'])
+})
+
 test('artifactQualityScorecard isolates a blocked timeline from a review-only transcript', () => {
   const result = {
     outputDir: '/tmp/out',
@@ -158,9 +179,12 @@ test('run manifest persists the full-text speaker mapping and every deterministi
   const speakerResolutions = [{
     label: '访谈 A',
     path: '/tmp/out/.converted/A.speaker-resolved.md',
+    speakerMode: 'tracked',
     changedLines: 12,
     labelLines: 12,
     unresolved: [],
+    structureWarnings: [{ kind: 'scout_evidence_unmatched', count: 1, lines: [], labels: ['说话人 2'] }],
+    recoveredByScout: [{ line: 1, label: '说话人 1' }],
     mappings: [{
       key: 'generic:1',
       sourceLabel: '说话人 1',
@@ -185,6 +209,13 @@ test('run manifest persists the full-text speaker mapping and every deterministi
 
   assert.equal(manifest.speaker.resolutions[0].mappings[0].outputLabel, '记者')
   assert.equal(manifest.speaker.resolutions[0].mappings[0].key, undefined, 'internal track keys/Feishu ids are not persisted')
+  assert.deepEqual(manifest.speaker.resolutions[0].structureWarnings[0], {
+    kind: 'scout_evidence_unmatched',
+    count: 1,
+    lines: [],
+    labels: ['说话人 2'],
+  })
+  assert.deepEqual(manifest.speaker.resolutions[0].recoveredByScout[0], { line: 1, label: '说话人 1' })
   assert.equal(manifest.speaker.outputEnforcements[0].phase, 'post_repair_round_1')
   assert.deepEqual(manifest.speaker.outputEnforcements[0].replacements[0], { line: 20, from: '访谈者', to: '记者' })
   assert.deepEqual(manifest.speaker.outputEnforcements[0].unknownLabels[0], { line: 30, label: '神秘人' })

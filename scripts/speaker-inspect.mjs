@@ -56,7 +56,12 @@ function pad(value, width) {
 
 function printHuman(report) {
   console.log(`文件：${report.file}`)
-  console.log(`说话人模式：${report.speakerMode === 'tracked' ? 'tracked（自带说话人标签）' : 'untracked（没有可识别的说话人标签）'}`)
+  const modeLabel = report.speakerMode === 'tracked'
+    ? 'tracked（已确认说话人轨道）'
+    : report.speakerMode === 'ambiguous'
+    ? 'ambiguous（疑似有说话人结构，需 Scout 证据或人工复核）'
+    : 'untracked（没有说话人标签证据）'
+  console.log(`说话人模式：${modeLabel}`)
   console.log(`标签行数：${report.labelLines}　·　说话人轨道数：${report.trackCount}　·　需要靠侦察定身份：${report.needsResolution ? '是' : '否'}`)
   console.log('')
   console.log('逐轨道：')

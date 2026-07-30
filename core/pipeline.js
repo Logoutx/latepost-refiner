@@ -488,6 +488,7 @@ let refinedPairs = []   // [{ f, rep }]: successfully refined files and their re
 let speakerResolutions = []  // one deterministic Scout mapping per file; Refine reads its materialized input copy
 let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
 let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
+let speakerStructureWarnings = [] // parser/Scout disagreement or unresolved label shape; visible review, never silent untracked
 let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
 // Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
@@ -683,6 +684,18 @@ if (useShortFileFastPath) {
           unresolved: resolution.unresolved || [],
           changedLines: resolution.changedLines || 0,
           labelLines: resolution.labelLines || 0,
+          structureWarnings: resolution.structureWarnings || [],
+          recoveredByScout: resolution.recoveredByScout || [],
+        }
+        f.speakerMode = f.speakerResolution.speakerMode
+        if (f.speakerResolution.structureWarnings.length) {
+          speakerStructureWarnings.push({
+            label: f.label,
+            path: f.outPath,
+            speakerMode: f.speakerResolution.speakerMode,
+            warnings: f.speakerResolution.structureWarnings,
+          })
+          engine.log(`发言人结构待复核：${f.label} 有 ${f.speakerResolution.structureWarnings.length} 类解析/侦察不一致——本次质量状态将标记待复核`)
         }
         const renamed = f.speakerResolution.mappings.filter((m) => m.sourceLabel !== m.outputLabel)
         if (renamed.length) engine.log(`发言人统一：${f.label} 已在 Refine 输入中一次性应用 ${renamed.map((m) => `${m.sourceLabel}→${m.outputLabel}`).join('、')}`)
@@ -936,6 +949,7 @@ return {
   speakerResolutions,
   speakerOutputNormalizations,
   speakerStructuralFailures,
+  speakerStructureWarnings,
   qualityRepairAttempts,
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,

@@ -143,6 +143,159 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
   assert.deepEqual(manifest.artifacts.refined, [])
 })
 
+test('runJob recovers unfamiliar speaker decorators from exact Scout evidence and keeps audit/enforcement on one mapping', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '陌生格式.md')
+  const sourceTurns = []
+  const refinedTurns = []
+  for (let i = 0; i < 8; i += 1) {
+    const sec = String(i * 2 + 3).padStart(2, '0')
+    const answer = `这是受访者第 ${i + 1} 次完整回答，包含项目背景、判断依据、执行过程和阶段结果，所有信息均来自本次虚构测试。`
+    const question = `这是记者第 ${i + 1} 次完整提问，请继续解释相关决策的原因、约束条件和后续安排。`
+    sourceTurns.push(`⟦00:${sec}⟧ 张三：${answer}`, `⟦00:${String(i * 2 + 4).padStart(2, '0')}⟧ 李四：${question}`)
+    refinedTurns.push(`张三：${answer}`, '', `李四：${question}`, '')
+  }
+  const source = sourceTurns.join('\n')
+  fs.writeFileSync(src, source, 'utf8')
+
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const engine = {
+    phase() {},
+    log() {},
+    usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((thunk) => thunk())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (_prompt, opts = {}) => {
+      usage.agents += 1
+      if (opts.label && opts.label.startsWith('scout:')) {
+        return {
+          speakers: [
+            {
+              label: '张三',
+              role: '受访者',
+              output_label: '张三',
+              output_label_confidence: 'high',
+              output_label_evidence: '原文直接标注张三',
+              sample: sourceTurns[0],
+            },
+            {
+              label: '李四',
+              role: '记者',
+              output_label: '李四',
+              output_label_confidence: 'high',
+              output_label_evidence: '原文直接标注李四',
+              sample: sourceTurns[1],
+            },
+          ],
+          people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [],
+        }
+      }
+      if (opts.label && opts.label.startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, ['# 陌生格式', '', ...refinedTurns].join('\n'), 'utf8')
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      return null
+    },
+  }
+
+  const result = await runJob({
+    __engine: engine,
+    files: [{ path: src }],
+    topic: '测试项目',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+    anchors: false,
+  })
+
+  assert.equal(result.refined.length, 1)
+  assert.equal(result.speakerResolutions[0].speakerMode, 'tracked')
+  assert.equal(result.speakerResolutions[0].mappings.length, 2)
+  assert.equal(result.speakerResolutions[0].recoveredByScout.length, 16)
+  assert.deepEqual(result.speakerStructureWarnings, [])
+  assert.ok(result.speakerOutputNormalizations.every((item) => item.valid))
+  assert.equal(result.audit.files[0].metrics.attribution.status, 'assessed')
+})
+
+test('runJob keeps unsupported evidence ambiguous and makes the review state user-visible instead of calling it a monologue', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '待确认格式.md')
+  const source = [
+    '[00:03] 张三：这是第一段完整回答，说明项目背景、实际约束和当前判断。',
+    '[00:05] 李四：这是第二段完整提问，希望继续解释执行过程和后续安排。',
+  ].join('\n')
+  fs.writeFileSync(src, source, 'utf8')
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const engine = {
+    phase() {},
+    log() {},
+    usage: () => ({ ...usage }),
+    parallel: async (thunks) => Promise.all(thunks.map((thunk) => thunk())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (_prompt, opts = {}) => {
+      usage.agents += 1
+      if (opts.label && opts.label.startsWith('scout:')) {
+        return {
+          speakers: [
+            confidentScout('张三', '受访者', '张三：这是第一段完整回答。'),
+            confidentScout('李四', '记者', '李四：这是第二段完整提问。'),
+          ],
+          people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [],
+        }
+      }
+      if (opts.label && opts.label.startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, ['# 待确认格式', '', source].join('\n'), 'utf8')
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      return null
+    },
+  }
+  function confidentScout(label, role, sample) {
+    return {
+      label,
+      role,
+      output_label: label,
+      output_label_confidence: 'high',
+      output_label_evidence: `原文疑似显示 ${label}`,
+      sample,
+    }
+  }
+
+  const result = await runJob({
+    __engine: engine,
+    files: [{ path: src }],
+    topic: '测试项目',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+    anchors: false,
+  })
+
+  assert.equal(result.refined.length, 1, 'the source is preserved rather than discarded')
+  assert.equal(result.speakerResolutions[0].speakerMode, 'ambiguous')
+  assert.ok(result.speakerStructureWarnings.some((item) =>
+    item.warnings.some((warning) => warning.kind === 'scout_parser_disagreement')))
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.quality.status, 'review_needed')
+  assert.ok(Object.keys(manifest.issues).some((title) => title.includes('疑似说话人结构未能完全确认')))
+})
+
 test('buildFilePolicy only allows this run\'s declared deliverable paths', () => {
   const outputDir = tmpdir()
   const refined = path.join(outputDir, 'Transcripts', 'A.md')

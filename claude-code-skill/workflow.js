@@ -32,7 +32,13 @@ export const meta = {
 // Refine invent a second mapping: it rewrites only recognized speaker-label lines in a disposable model-input
 // copy. The untouched source remains the ground truth for the downstream source-aware audit.
 
-const TIMESTAMP = '\\d{1,2}:\\d{2}(?::\\d{2})?'
+// A timecode is metadata around a speaker turn, never proof that the line is (or is not) a speaker label.
+// Keep the grammar bounded enough to reject prose, but accept the common precision/wrapper variants emitted by
+// transcript tools. Speaker detection may still recover an unfamiliar decorator through exact Scout evidence;
+// successful timestamp normalization is deliberately NOT a prerequisite for establishing a speaker track.
+const COLON_TIMECODE = '\\d{1,3}:\\d{2}(?::\\d{2})?(?:[.,]\\d{1,3})?'
+const PRIME_TIMECODE = "\\d{1,3}\\s*[′']\\s*\\d{1,2}(?:\\s*[″\"])?"
+const TIMESTAMP = `(?:${COLON_TIMECODE}|${PRIME_TIMECODE})`
 const GENERIC_PREFIX = '(?:发言人|说话人|讲者|讲话人|Speaker)'
 const GENERIC_NUMBER = '[0-9０-９一二三四五六七八九十]+'
 const GENERIC_LINE_RE = new RegExp(
@@ -44,8 +50,13 @@ const GENERIC_INLINE_RE = new RegExp(
   'iu',
 )
 const CITE_RE = new RegExp(`^(\\s*)<cite\\b([^>]*)>\\s*</cite>\\s+(${TIMESTAMP})\\s*$`, 'iu')
+const CITE_ONLY_RE = /^(\s*)<cite\b([^>]*)>\s*<\/cite>\s*$/iu
 const NAMED_TIMESTAMP_RE = new RegExp(`^(\\s*)\\*{0,2}\\s*(.{1,40}?)\\s+(${TIMESTAMP})\\s*\\*{0,2}\\s*$`, 'u')
 const INLINE_RE = /^(\s*)([^：:\r\n]{1,40})[：:]\s*(.*)$/u
+const LEADING_TIMESTAMP_RE = new RegExp(
+  `^(\\s*)(?:\\[(${TIMESTAMP})\\]|\\((${TIMESTAMP})\\)|【(${TIMESTAMP})】|((?:T\\+)?${TIMESTAMP}))\\s+`,
+  'iu',
+)
 const ROLE_TOKEN = '(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)'
 const ROLE_RE = new RegExp(`^${ROLE_TOKEN}(?:[／/][一-龥A-Za-z]{1,16})*(?:\\s*\\d+)?$`, 'iu')
 const TITLE_WORD_RE = /(?:创始人|联合创始人|负责人|总裁|董事|经理|老师|先生|女士|博士|教授|CEO|CTO|COO|CFO|公司|团队|产品)/iu
@@ -55,6 +66,18 @@ const AI_SUMMARY_DISCLOSURE_RE = /(?:智能纪要|本(?:份)?纪要|本(?:份)?�
 // `说话人 1 00:01\`. Label-only, end-anchored forms must tolerate it or the generic inline fallback
 // splits the line at the colon inside the timestamp and mints a fake per-minute speaker.
 const stripLineEndHardBreak = (value) => String(value || '').replace(/\s*\\\s*$/u, '')
+
+function splitLeadingTimestamp(value) {
+  const source = String(value || '')
+  const match = source.match(LEADING_TIMESTAMP_RE)
+  if (!match) return { matched: false, timestamp: '', rest: source }
+  const timestamp = [match[2], match[3], match[4], match[5]].find(Boolean) || ''
+  return {
+    matched: true,
+    timestamp: timestamp.replace(/^T\+/iu, ''),
+    rest: `${match[1] || ''}${source.slice(match[0].length)}`,
+  }
+}
 
 const normalizeLabel = (value) => String(value || '')
   .normalize('NFKC')
@@ -80,7 +103,8 @@ const DATE_LIKE_RE = /^\d{2,4}\s*年|^\d{1,2}\s*月\s*\d{1,2}\s*[日号]|^(?:上
 function plausibleLabel(value) {
   const label = normalizeLabel(value)
   if (!label || label.length > 32) return false
-  if (/^[#*>|<]/u.test(label) || /[：:，。；;！？!?]/u.test(label)) return false
+  // normalizeLabel runs NFKC first, so a source full-width comma becomes ASCII "," before this guard.
+  if (/^[#*>|<]/u.test(label) || /[：:,，。；;！？!?]/u.test(label)) return false
   if (DATE_LIKE_RE.test(label)) return false
   return /[一-龥A-Za-z]/u.test(label)
 }
@@ -102,21 +126,39 @@ function isRoleSpeakerLabel(value) {
 
 function strongLabel(rawLine) {
   const raw = String(rawLine || '')
-  let match = raw.match(GENERIC_INLINE_RE)
+  const leading = splitLeadingTimestamp(raw)
+  const classificationRaw = leading.matched ? leading.rest : raw
+  let match = classificationRaw.match(GENERIC_INLINE_RE)
   if (match) {
     const label = normalizeLabel(`${match[2]} ${match[3]}`)
-    return { indent: match[1], key: speakerKey(label), label, kind: 'generic-inline', body: match[4] || '', generic: true }
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'generic-inline',
+      body: match[4] || '',
+      timestamp: leading.timestamp || '',
+      generic: true,
+    }
   }
   // Only the label-only forms below match against the hard-break-stripped view. The body-capturing
   // forms above (and the inline fallback) keep the raw line, so a body's own trailing hard break
   // stays part of the body and survives rewriting untouched.
-  const line = stripLineEndHardBreak(raw)
+  const line = stripLineEndHardBreak(classificationRaw)
   match = line.match(GENERIC_LINE_RE)
   if (match) {
     const label = normalizeLabel(`${match[2]} ${match[3]}`)
-    return { indent: match[1], key: speakerKey(label), label, kind: 'generic', body: '', timestamp: match[4] || '', generic: true }
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'generic',
+      body: '',
+      timestamp: leading.timestamp || match[4] || '',
+      generic: true,
+    }
   }
-  match = line.match(CITE_RE)
+  match = leading.matched ? line.match(CITE_ONLY_RE) : line.match(CITE_RE)
   if (match) {
     const attrs = parseAttrs(match[2])
     const label = normalizeLabel(attrs['user-name'])
@@ -129,17 +171,209 @@ function strongLabel(rawLine) {
       label,
       kind: 'cite',
       body: '',
-      timestamp: match[3] || '',
+      timestamp: leading.timestamp || match[3] || '',
       generic: false,
     }
   }
+  // A bare name after a leading timecode (`00:03 张三`) is deliberately NOT promoted here. It is
+  // indistinguishable from an agenda marker (`00:03 开场`) on one line, so it needs exact Scout evidence below.
   match = line.match(NAMED_TIMESTAMP_RE)
   if (match) {
     const label = normalizeLabel(match[2])
     if (!plausibleLabel(label)) return null
-    return { indent: match[1], key: speakerKey(label), label, kind: 'timestamp', body: '', timestamp: match[3] || '', generic: false, hardBreak: line !== raw }
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'timestamp',
+      body: '',
+      timestamp: leading.timestamp || match[3] || '',
+      generic: false,
+      hardBreak: line !== classificationRaw,
+    }
   }
   return null
+}
+
+function inlineView(rawLine) {
+  const raw = String(rawLine || '')
+  const leading = splitLeadingTimestamp(raw)
+  const view = leading.matched ? leading.rest : raw
+  return { leading, match: view.match(INLINE_RE) }
+}
+
+function decoratedSpeakerCandidate(rawLine) {
+  const raw = String(rawLine || '')
+  const leading = splitLeadingTimestamp(raw)
+  if (leading.matched) {
+    const tail = stripLineEndHardBreak(leading.rest)
+    const inline = tail.match(INLINE_RE)
+    const label = normalizeLabel(inline ? inline[2] : tail)
+    return plausibleLabel(label) || isGenericSpeakerLabel(label) ? { label } : null
+  }
+
+  // Do not try to understand every vendor's wrapper. Find a split where the left side is numeric decoration
+  // and the right side is a plausible label-only token. Two or more such lines are ambiguity evidence, not
+  // confirmed tracks: `⟦00:03⟧ 张三` and an agenda marker can look identical without Scout/full-text context.
+  const normalized = stripLineEndHardBreak(raw).normalize('NFKC')
+  const boundaries = [...normalized.matchAll(/\s+/gu)]
+  for (const boundary of boundaries) {
+    const at = boundary.index
+    const prefix = normalized.slice(0, at)
+    const tail = normalized.slice(at + boundary[0].length)
+    const inline = tail.match(INLINE_RE)
+    const label = normalizeLabel(inline ? inline[2] : tail)
+    if (!decorativePrefix(prefix)) continue
+    if (plausibleLabel(label) || isGenericSpeakerLabel(label)) return { label }
+  }
+  return null
+}
+
+function evidenceLine(value) {
+  return stripLineEndHardBreak(String(value || ''))
+    .normalize('NFKC')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
+function decorativePrefix(value) {
+  const clean = String(value || '').replace(/\*{1,2}/gu, '').trim()
+  if (!clean || clean.length > 48 || !/\d/u.test(clean)) return false
+  // Unknown vendor timecodes may use punctuation or a literal T+, but semantic prose before a mentioned name
+  // must never qualify as a decorator.
+  if (/[一-龥]/u.test(clean) || /[A-SU-Z]/iu.test(clean)) return false
+  return /[:：.,，′″'"\[\]()【】+\-–—>]/u.test(clean)
+}
+
+function knownLabelFact(rawLine, requestedLabel) {
+  const raw = String(rawLine || '')
+  const label = normalizeLabel(requestedLabel)
+  if (!plausibleLabel(label) && !isGenericSpeakerLabel(label)) return null
+
+  const leading = splitLeadingTimestamp(raw)
+  const view = leading.matched ? leading.rest : raw
+  const inline = view.match(INLINE_RE)
+  if (inline && speakerKey(inline[2]) === speakerKey(label)) {
+    return {
+      indent: inline[1],
+      key: speakerKey(label),
+      label,
+      kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'scout-evidence',
+      body: inline[3] || '',
+      timestamp: leading.timestamp || '',
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+
+  // For an unfamiliar leading decorator, locate the Scout-provided label without understanding the timestamp.
+  // The prefix must be decoration-only and the suffix must be a label boundary, so prose such as
+  // `他在 00:03 问张三：...` cannot become a speaker turn.
+  const normalizedRaw = stripLineEndHardBreak(raw).normalize('NFKC')
+  const normalizedRequested = label.normalize('NFKC')
+  const at = normalizedRaw.indexOf(normalizedRequested)
+  if (at < 0) return null
+  const prefix = normalizedRaw.slice(0, at)
+  if (prefix.trim() && !decorativePrefix(prefix)) return null
+  const suffix = normalizedRaw.slice(at + normalizedRequested.length)
+  const inlineSuffix = suffix.match(/^\s*[：:]\s*(.*)$/u)
+  if (inlineSuffix) {
+    return {
+      indent: (raw.match(/^\s*/u) || [''])[0],
+      key: speakerKey(label),
+      label,
+      kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'scout-evidence',
+      body: inlineSuffix[1] || '',
+      timestamp: leading.timestamp || prefix.trim(),
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+  if (/^\s*(?:\\\s*)?$/u.test(suffix)) {
+    return {
+      indent: (raw.match(/^\s*/u) || [''])[0],
+      key: speakerKey(label),
+      label,
+      kind: 'scout-evidence',
+      body: '',
+      timestamp: leading.timestamp || prefix.trim(),
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+  return null
+}
+
+function scoutStructureRecord(record) {
+  if (!record || !normalizeLabel(record.label) || !String(record.sample || '').trim()) return false
+  const output = cleanOutputLabel(record.output_label)
+  return Boolean(
+    isGenericSpeakerLabel(record.label)
+    || normalizeRole(record.role)
+    || normalizeRole(output)
+    || effectiveScoutPersonName(record),
+  )
+}
+
+function scoutRecordKeys(record) {
+  const keys = new Set()
+  const label = normalizeLabel(record && record.label)
+  const direct = speakerKey(label)
+  if (direct) keys.add(direct)
+
+  // Feishu Scout records are instructed to keep the source label verbatim, so `label` may be the
+  // bare cite element while the deterministic parser represents that same track by user-name.
+  // Treat these as two views of one already-parsed track; this is identity matching, not structure recovery.
+  const cite = stripLineEndHardBreak(String(record && record.label || '')).match(CITE_ONLY_RE)
+  if (cite) {
+    const attrs = parseAttrs(cite[2])
+    const nameKey = speakerKey(attrs['user-name'])
+    if (nameKey) keys.add(nameKey)
+  }
+  return keys
+}
+
+function recoverScoutFacts(lines, facts, scoutSpeakers = []) {
+  const recovered = []
+  const evidenceMisses = []
+  for (const record of scoutSpeakers || []) {
+    if (!scoutStructureRecord(record)) continue
+    const recordKeys = scoutRecordKeys(record)
+    const knownKeys = new Set(facts.filter(Boolean).flatMap((fact) => [fact.key, fact.matchKey]).filter(Boolean))
+    const alreadyParsed = [...recordKeys].some((key) => knownKeys.has(key))
+    const samples = String(record.sample || '').split(/\r?\n/u).map(evidenceLine).filter(Boolean)
+    const evidenceIndexes = []
+    for (let i = 0; i < lines.length; i += 1) {
+      if (samples.includes(evidenceLine(lines[i]))) evidenceIndexes.push(i)
+    }
+    const exactEvidence = evidenceIndexes.some((i) => knownLabelFact(lines[i], record.label))
+    if (!exactEvidence && !alreadyParsed) {
+      evidenceMisses.push(normalizeLabel(record.label))
+      continue
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      if (facts[i]) continue
+      const fact = knownLabelFact(lines[i], record.label)
+      if (!fact) continue
+      facts[i] = fact
+      recovered.push({ line: i + 1, label: fact.label })
+    }
+  }
+  return { recovered, evidenceMisses }
+}
+
+function recoverKnownFacts(lines, facts, knownSpeakerLabels = []) {
+  const recovered = []
+  for (const requestedLabel of [...new Set((knownSpeakerLabels || []).map(normalizeLabel).filter(Boolean))]) {
+    for (let i = 0; i < lines.length; i += 1) {
+      if (facts[i]) continue
+      const fact = knownLabelFact(lines[i], requestedLabel)
+      if (!fact) continue
+      facts[i] = fact
+      recovered.push({ line: i + 1, label: fact.label })
+    }
+  }
+  return recovered
 }
 
 function substantiveLine(value) {
@@ -147,7 +381,7 @@ function substantiveLine(value) {
   return Boolean(line && !/^<!--/u.test(line) && !/^[#*>|]/u.test(line))
 }
 
-function parseSpeakerLabels(sourceText) {
+function parseSpeakerLabels(sourceText, options = {}) {
   const text = String(sourceText || '')
   const lines = text.split(/\r?\n/)
   const facts = lines.map(strongLabel)
@@ -175,26 +409,43 @@ function parseSpeakerLabels(sourceText) {
   const inlineCounts = new Map()
   let substantive = 0
   let inlineCandidates = 0
+  let plainInlineCandidates = 0
+  const leadingInlineCandidates = []
+  const unresolvedDecoratedCandidates = []
 
   for (let i = 0; i < lines.length; i += 1) {
     if (facts[i] || !substantiveLine(lines[i])) continue
     substantive += 1
     if (demotedTimeFragments.has(i)) continue
-    const match = lines[i].match(INLINE_RE)
-    if (!match || !plausibleLabel(match[2])) continue
+    const { leading, match } = inlineView(lines[i])
+    if (!match || !plausibleLabel(match[2])) {
+      const decorated = decoratedSpeakerCandidate(lines[i])
+      if (decorated) unresolvedDecoratedCandidates.push({ line: i + 1, label: decorated.label })
+      continue
+    }
     const label = normalizeLabel(match[2])
     inlineCandidates += 1
+    if (leading.matched) leadingInlineCandidates.push({ line: i + 1, label })
+    else plainInlineCandidates += 1
     inlineCounts.set(label, (inlineCounts.get(label) || 0) + 1)
   }
 
-  const pureInline = !facts.some(Boolean) && inlineCandidates >= 2 && inlineCandidates === substantive
+  // The all-lines-are-inline shortcut is safe only when the label starts the source line. Once a time/decorator
+  // precedes a weak name, the same surface shape also describes agenda/prose lines and needs recurrence, a role,
+  // an existing strong track, or exact Scout evidence.
+  const pureInline = !facts.some(Boolean)
+    && plainInlineCandidates >= 2
+    && plainInlineCandidates === substantive
+    && inlineCandidates === plainInlineCandidates
   for (let i = 0; i < lines.length; i += 1) {
     if (facts[i] || demotedTimeFragments.has(i)) continue
-    const match = lines[i].match(INLINE_RE)
+    const { leading, match } = inlineView(lines[i])
     if (!match) continue
     const label = normalizeLabel(match[2])
     if (!plausibleLabel(label)) continue
-    const accepted = strongNames.has(label) || (inlineCounts.get(label) || 0) >= 2 || isRoleSpeakerLabel(label) || pureInline
+    const accepted = strongNames.has(label)
+      || isRoleSpeakerLabel(label)
+      || (!leading.matched && ((inlineCounts.get(label) || 0) >= 2 || pureInline))
     if (!accepted) continue
     facts[i] = {
       indent: match[1],
@@ -202,10 +453,21 @@ function parseSpeakerLabels(sourceText) {
       label,
       kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'inline',
       body: match[3] || '',
+      timestamp: leading.timestamp || '',
       generic: isGenericSpeakerLabel(label),
     }
   }
 
+  // Once one occurrence has established a label, the label itself is structural evidence for the same
+  // track under another timestamp wrapper. This avoids enumerating every vendor decorator while keeping
+  // unknown labels fail-closed: knownLabelFact still accepts decoration-only prefixes and exact label
+  // boundaries, never arbitrary prose.
+  const parsedLabels = facts.filter(Boolean).map((fact) => fact.label)
+  const knownRecovery = recoverKnownFacts(lines, facts, [
+    ...parsedLabels,
+    ...(options.knownSpeakerLabels || []),
+  ])
+  const scoutRecovery = recoverScoutFacts(lines, facts, options.scoutSpeakers || [])
   const tracks = new Map()
   const labels = []
   for (let i = 0; i < facts.length; i += 1) {
@@ -221,12 +483,49 @@ function parseSpeakerLabels(sourceText) {
     track.labelLines += 1
   }
 
+  const structureWarnings = []
+  const unresolvedLeadingInline = leadingInlineCandidates.filter((candidate) => !facts[candidate.line - 1])
+  const unresolvedDecorated = [
+    ...unresolvedLeadingInline,
+    ...unresolvedDecoratedCandidates.filter((candidate) => !facts[candidate.line - 1]),
+  ]
+  if (unresolvedDecorated.length >= 2) {
+    structureWarnings.push({
+      kind: 'unrecognized_speaker_structure',
+      count: unresolvedDecorated.length,
+      lines: unresolvedDecorated.slice(0, 8).map((item) => item.line),
+      labels: [...new Set(unresolvedDecorated.map((item) => item.label))].slice(0, 8),
+    })
+  }
+  const scoutSignals = [...new Set((options.scoutSpeakers || [])
+    .filter(scoutStructureRecord)
+    .map((record) => speakerKey(record.label))
+    .filter(Boolean))]
+  if (!tracks.size && scoutSignals.length >= 2) {
+    structureWarnings.push({
+      kind: 'scout_parser_disagreement',
+      count: scoutSignals.length,
+      lines: [],
+      labels: (options.scoutSpeakers || []).filter(scoutStructureRecord).map((record) => normalizeLabel(record.label)).slice(0, 8),
+    })
+  } else if (tracks.size && scoutRecovery.evidenceMisses.length) {
+    structureWarnings.push({
+      kind: 'scout_evidence_unmatched',
+      count: scoutRecovery.evidenceMisses.length,
+      lines: [],
+      labels: [...new Set(scoutRecovery.evidenceMisses)].slice(0, 8),
+    })
+  }
+
   return {
     lines,
     labels,
     tracks: [...tracks.values()],
     labelLines: labels.length,
     needsResolution: [...tracks.values()].some((track) => track.generic || track.roleLike),
+    recoveredByScout: scoutRecovery.recovered,
+    recoveredByKnownLabel: knownRecovery,
+    structureWarnings,
   }
 }
 
@@ -283,11 +582,12 @@ function untrackedUnits(lines) {
   return units
 }
 
-// One canonical structural parse for every downstream consumer. `tracked` means the source itself carries
-// parseable speaker labels; `untracked` only means no such labels exist — it may still be a valid monologue.
-function parseSpeakerDocument(sourceText) {
-  const parsed = parseSpeakerLabels(sourceText)
-  const speakerMode = parsed.tracks.length ? 'tracked' : 'untracked'
+// One canonical structural parse for every downstream consumer. `tracked` means complete verified tracks,
+// `ambiguous` means speaker-shaped structure is still unresolved, and `untracked` means no label evidence exists
+// (it may still be a valid monologue).
+function parseSpeakerDocument(sourceText, options = {}) {
+  const parsed = parseSpeakerLabels(sourceText, options)
+  const speakerMode = parsed.structureWarnings.length ? 'ambiguous' : parsed.tracks.length ? 'tracked' : 'untracked'
   return {
     ...parsed,
     speakerMode,
@@ -387,7 +687,7 @@ function chooseOutputLabel(track, record) {
 }
 
 function resolveSpeakerMapping(sourceText, scoutSpeakers = []) {
-  const parsed = parseSpeakerLabels(sourceText)
+  const parsed = parseSpeakerLabels(sourceText, { scoutSpeakers })
   const { records, conflictKeys } = scoutRecordsByKey(scoutSpeakers)
   const mappings = parsed.tracks.map((track) => {
     let record = records.get(track.key)
@@ -420,13 +720,16 @@ function resolveSpeakerMapping(sourceText, scoutSpeakers = []) {
     parsed,
     mappings,
     unresolved: mappings.filter((mapping) => mapping.basis === 'unresolved').map((mapping) => mapping.sourceLabel),
+    speakerMode: parsed.structureWarnings.length ? 'ambiguous' : parsed.tracks.length ? 'tracked' : 'untracked',
+    structureWarnings: parsed.structureWarnings,
+    recoveredByScout: parsed.recoveredByScout,
   }
 }
 
 function rewriteSpeakerLabels(sourceText, scoutSpeakers = [], options = {}) {
   const source = String(sourceText || '')
   const newline = source.includes('\r\n') ? '\r\n' : '\n'
-  const { parsed, mappings, unresolved } = resolveSpeakerMapping(source, scoutSpeakers)
+  const { parsed, mappings, unresolved, speakerMode, structureWarnings, recoveredByScout } = resolveSpeakerMapping(source, scoutSpeakers)
   const byKey = new Map(mappings.map((mapping) => [mapping.key, mapping]))
   const out = [...parsed.lines]
   let changedLines = 0
@@ -448,6 +751,9 @@ function rewriteSpeakerLabels(sourceText, scoutSpeakers = [], options = {}) {
     changedLines,
     labelLines: parsed.labelLines,
     needsResolution: parsed.needsResolution,
+    speakerMode,
+    structureWarnings,
+    recoveredByScout,
   }
 }
 
@@ -470,7 +776,9 @@ function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {})
   const source = String(refinedText || '')
   const newline = source.includes('\r\n') ? '\r\n' : '\n'
   const parsed = parseSpeakerLabels(source)
-  const speakerMode = options.speakerMode === 'untracked' ? 'untracked' : 'tracked'
+  const speakerMode = ['tracked', 'ambiguous', 'untracked'].includes(options.speakerMode)
+    ? options.speakerMode
+    : 'tracked'
   const aliases = new Map()
   const register = (alias, canonical) => {
     const key = aliasKey(alias)
@@ -515,7 +823,11 @@ function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {})
     valid: unknownLabels.length === 0,
     violations: unknownLabels.map((item) => ({
       ...item,
-      kind: speakerMode === 'untracked' ? 'invented_speaker_label' : 'unknown_speaker_label',
+      kind: speakerMode === 'untracked'
+        ? 'invented_speaker_label'
+        : speakerMode === 'ambiguous'
+        ? 'unverified_speaker_label'
+        : 'unknown_speaker_label',
     })),
   }
 }
@@ -578,7 +890,7 @@ const SCOUT_SCHEMA = {
       output_label: { type: 'string', description: '精校稿最终应显示的纯标签：能判断真名则只写真名，否则写可区分角色；拿不准留空' },
       output_label_confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '真名归属置信度；只有全文内有直接证据才可 high' },
       output_label_evidence: { type: 'string', description: '支持 output_label 的一处原文证据；写真名时必须说明为何这是本人而非被提到/被喊话的人' },
-      sample: { type: 'string', description: '一处原文标签样例' },
+      sample: { type: 'string', description: '一整行原文标签样例，必须逐字照抄该行（含行首时间码/括号、标签、冒号与同行正文），供确定性代码回查；不得省略或改写' },
     } } },
     people: { type: 'array', items: entitySchema({ public_figure: { type: 'boolean', description: '公众人物，可公开核实' } }) },
     brands: { type: 'array', items: entitySchema({ category: { type: 'string', description: '自家/竞品/供应商/平台/产品/机构' } }) },
@@ -2643,7 +2955,7 @@ ${knownNote(a)}
 
 ${readBlock}
 读完后按 schema 返回结构化侦察结果：
-- speakers：为源转录的**每一条发言轨道**填写 label（源标签原样）、role、identity、output_label、output_label_confidence、output_label_evidence 和一处 sample。output_label 是精校稿最终可见的纯标签：能从全文判断具体是谁时，**只写真名**（如「刘益枫」，不要带公司/title）；真名不确定时才写可区分角色（如「记者」「受访者」「PR」）；连角色也拿不准则留空，绝不猜人名。相同源标签在全文只能对应同一个 output_label。
+- speakers：为源转录的**每一条发言轨道**填写 label（源标签原样）、role、identity、output_label、output_label_confidence、output_label_evidence 和一处 sample。sample 必须是该轨道一整行**逐字照抄**的原文标签样例，保留行首时间码/括号、标签、冒号及同行正文，不能省略或改写；代码只会用能在原稿逐字回查的 sample 恢复陌生格式。output_label 是精校稿最终可见的纯标签：能从全文判断具体是谁时，**只写真名**（如「刘益枫」，不要带公司/title）；真名不确定时才写可区分角色（如「记者」「受访者」「PR」）；连角色也拿不准则留空，绝不猜人名。相同源标签在全文只能对应同一个 output_label。
   · 具体姓名只有在**本人自我介绍、speakerHints 明示、或另一条清楚分轨的发言直接称呼此人**等直接证据成立时，才可标 output_label_confidence=high，并把依据原句写进 output_label_evidence。只是在该轨道正文里提到某个名字、转述某人观点、或混轨段里出现“赵磊，你们组……”一类喊话，不能证明该轨道本人就是赵磊；这种情况 confidence 只能 medium/low，output_label 应退回角色。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
@@ -2684,6 +2996,7 @@ function resolvedSpeakerBlock(f, finding = {}) {
     ? JSON.stringify(finding.speakers)
     : '侦察未提取到发言人'
   if (speakerMode === 'untracked') return `【全文结构契约：无说话人轨道】源文没有说话人标签，可能是独白、口述或无标签笔记。保持这种无标签形式：不要改写成问答，不要添加“记者/受访者/姓名：”等任何说话人标签，也不要把转述改造成新的直接引语。本条覆盖通用规范 1、4a、7 中关于对话体和标签的要求。`
+  if (speakerMode === 'ambiguous') return `【全文结构契约：疑似说话人格式未确认】源文出现了疑似发言轨道，但确定性代码与侦察证据未能建立可靠映射。逐字保留源稿中已有的标签、时间码和轮次边界；不要把它改成独白，也不得猜姓名、创造标签、合并轨道或把转述改成直接引语。本稿会进入人工复核，不要自行“修好”结构。`
   if (!mappings.length) return `【全文发言人统一结果】未取得身份映射。只能保留源稿已有标签；不得据语境猜姓名、创造新标签或合并轨道。`
   const rows = mappings.map((mapping) => `${mapping.sourceLabel} → ${mapping.outputLabel}`).join('；')
   return `【全文发言人统一结果】${rows}
@@ -2706,9 +3019,10 @@ function refinePrompt(f, glossary, finding, a, chunk) {
     const headBlock = chunk.isFirst
       ? `【抬头】你是第 1 块：第一行写 \`# ${f.title}\`，第二行写 \`${f.subtitle}\`，然后从第一个 \`##\` 小标题开始正文。`
       : `【抬头】你是第 ${chunk.idx} 块（非首块）：**不要写 H1 标题、不要写说明行**，直接从一个 \`##\` 小标题开始正文。`
-    const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
-    const boundaryRules = untracked
-      ? `- 本文没有说话人标签；以段落或列表内容块为边界。一个内容块归属于其首行行号落入的分块，整块归一处、绝不拆开。
+    const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+    const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+    const boundaryRules = trackless
+      ? `- 本文没有可作为分块依据的已确认说话人轨道；以段落或列表内容块为边界。一个内容块归属于其首行行号落入的分块，整块归一处、绝不拆开。
 - 你的起点：从行号 ≥ ${chunk.startLine} 的第一个完整内容块开始。${chunk.isFirst ? '你是第 1 块，从文件开头正常处理。' : `若第 ${chunk.startLine} 行位于上一内容块中间，跳过该块，从下一个完整块开始。`}
 - 你的终点：凡首行行号 ≤ ${chunk.endLine} 的内容块都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `最后一个内容块即使越过第 ${chunk.endLine} 行也要处理完整，但不要开始首行号 > ${chunk.endLine} 的下一块。`}`
       : `- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
@@ -2716,7 +3030,7 @@ function refinePrompt(f, glossary, finding, a, chunk) {
 - 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}`
     const tailNote = chunk.isLast
       ? `【收尾】你这一块覆盖到源文件结尾（约第 ${f.lines} 行${anchor.text ? `，最后一句「${anchor.text}」` : ''}）——必须精校到最后，正文绝不能中途断掉（结尾客套可折成一句说明）。`
-      : `【收尾】你不是最后一块，正常精校到你负责的最后一${untracked ? '内容块' : '轮发言'}即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。`
+      : `【收尾】你不是最后一块，正常精校到你负责的最后一${trackless ? '内容块' : '轮发言'}即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。`
     return `你是访谈转录「精校」子代理（分块并行：本份共 ${chunk.count} 块，你负责第 ${chunk.idx} 块）。
 
 【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
@@ -2807,13 +3121,18 @@ ${listText}
 }
 
 function singlePassPrompt(f, a, overrideNote) {
-  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const structureInstruction = speakerMode === 'untracked'
+    ? '本文没有说话人标签；按独白/无标签文本精校，保持无标签形式，不得改成问答或新增说话人。'
+    : speakerMode === 'ambiguous'
+    ? '本文疑似有未确认的说话人格式；保留原有标签、时间码与结构，不得猜人名、合并轨道或补造问答。'
+    : '边读边记发言人对应，统一全文标签。'
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
 
 【源文件】${f.path}（约 ${f.lines} 行）。先把全文**整份读完**。${readPlan(f)}
-${untracked ? '本文没有说话人标签；按独白/无标签文本精校，保持无标签形式，不得改成问答或新增说话人。' : '边读边记发言人对应，统一全文标签。'}同时记下人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
+${structureInstruction}同时记下人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
 【输出】Write 到 ${f.outPath}
 【抬头】第一行 \`# ${f.title}\`；第二行 \`${f.subtitle}\`
 ${resolvedSpeakerBlock(f)}
@@ -2835,10 +3154,11 @@ ${RULES}
 // written to f.outPath verbatim by JS, so it MUST be pure document text: first line the H1, no preamble/epilogue,
 // no code fence, no report — the deterministic source-aware audit then gates it exactly as any other 成稿.
 function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote, finding = {}) {
-  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
   const glossary = (glossaryBlock && glossaryBlock.trim())
     ? `【统一校对表】（“联网核实结论”与“写法统一”优先级最高；标 ⚠ 的条目未采纳、勿套用；术语/品牌请初次落笔即写对）：\n${glossaryBlock}\n`
-    : `边读边在心里建一张迷你校对表（${untracked ? '文本结构' : '发言人对应'}、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。`
+    : `边读边在心里建一张迷你校对表（${trackless ? '文本结构' : '发言人对应'}、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。`
   return `你是访谈转录「精校」子代理（单请求一次成稿）。
 
 采访背景：${a.background}
@@ -2882,12 +3202,15 @@ function summaryPrompt(a, refined, sectionMapPath) {
     ? `\n先 Read 结构索引 ${sectionMapPath}，用它定位每份成稿的小标题、行号、主题标签和关键实体；需要引用原文时再按索引只读相关成稿小节，避免反复通读全文。`
     : ''
   const summaryTitle = String(a.topic || '').trim().endsWith('访谈') ? `${a.topic}总结` : `${a.topic}访谈总结`
-  const hasUntracked = (a.files || []).some((file) => ((file.speakerResolution && file.speakerResolution.speakerMode) || file.speakerMode) === 'untracked')
+  const hasTrackless = (a.files || []).some((file) => {
+    const mode = (file.speakerResolution && file.speakerResolution.speakerMode) || file.speakerMode
+    return mode === 'untracked' || mode === 'ambiguous'
+  })
   return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${summaryTitle}》：
 ${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
-三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（${hasUntracked ? '有说话人标签的成稿按发言人归类；无标签独白按来源文件/章节归类，绝不补造发言人；' : '按发言人归类，'}忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
+三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（${hasTrackless ? '有可靠说话人标签的成稿按发言人归类；无标签或结构待复核的稿件按来源文件/章节归类，绝不补造发言人；' : '按发言人归类，'}忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
 
 ${TYPESET}
@@ -2953,8 +3276,9 @@ function logicWritePrompt(f, a, missing, planPath) {
   const planNote = planPath
     ? `\n【已审重排方案】先 Read ${planPath}。最终稿必须严格按这个 JSON 里的 threads 顺序、source_sections 和 logic 执行；如果方案里 no_reorder_needed=true，就不要写假重排稿，改为返回 open_questions 说明无需另出逻辑稿。`
     : ''
-  const untracked = ((f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode) === 'untracked'
-  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${untracked ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${untracked ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${trackless ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${trackless ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
@@ -2964,7 +3288,7 @@ function logicWritePrompt(f, a, missing, planPath) {
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。
 2. 每条线索选一个**内部顺序逻辑**：讲历史按时间，讲决策按 问题→洞察→决定→结果，讲产品/事件按 起因→经过→结果。
-3. 把精校稿里属于该线索的${untracked ? '内容块' : '问答'}**整段照原文搬过来**，按上面的逻辑排好——${untracked ? '保持无说话人标签，不得改成问答或补造发言人，' : '保留 `发言人：` 标签及其在精校稿里的原样式（精校稿是 `张三：` 就写 `张三：`，别改成 `**张三：**` 加粗或其它样式）、'}保留全部事实细节与原话措辞，**只换位置，不改一字**。
+3. 把精校稿里属于该线索的${trackless ? '内容块' : '问答'}**整段照原文搬过来**，按上面的逻辑排好——${trackless ? '保持原有无标签或待复核结构，不得改成问答、补造发言人或猜测标签，' : '保留 `发言人：` 标签及其在精校稿里的原样式（精校稿是 `张三：` 就写 `张三：`，别改成 `**张三：**` 加粗或其它样式）、'}保留全部事实细节与原话措辞，**只换位置，不改一字**。
 4. **指代修复（克制）**：仅当某段被移走后、开头的“他 / 那个 / 上面说的 / 然后”等指代或承接断了，才加一句 \`> [编者] …\` 衔接（如“此段原在访谈后段，承前文同属早期创业”），或把孤立的“他”补成名字。**绝不**改写原话、绝不补受访者没说的、绝不替他下结论。
 5. **不丢不重**：精校稿里每一段实质问答都要在重排稿里出现且**只出现一次**（纯客套/重复可省，与精校稿口径一致）。一段问答若横跨两条线索，放进主线索一次，必要时另一处用一句 \`> [编者]\` 指路。
 6. 开头加一节 \`## 主线脉络（导读）\`：一段话讲清这次访谈的主线与你的重排逻辑。
@@ -3462,6 +3786,7 @@ let refinedPairs = []   // [{ f, rep }]: successfully refined files and their re
 let speakerResolutions = []  // one deterministic Scout mapping per file; Refine reads its materialized input copy
 let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
 let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
+let speakerStructureWarnings = [] // parser/Scout disagreement or unresolved label shape; visible review, never silent untracked
 let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
 // Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
@@ -3657,6 +3982,18 @@ if (useShortFileFastPath) {
           unresolved: resolution.unresolved || [],
           changedLines: resolution.changedLines || 0,
           labelLines: resolution.labelLines || 0,
+          structureWarnings: resolution.structureWarnings || [],
+          recoveredByScout: resolution.recoveredByScout || [],
+        }
+        f.speakerMode = f.speakerResolution.speakerMode
+        if (f.speakerResolution.structureWarnings.length) {
+          speakerStructureWarnings.push({
+            label: f.label,
+            path: f.outPath,
+            speakerMode: f.speakerResolution.speakerMode,
+            warnings: f.speakerResolution.structureWarnings,
+          })
+          engine.log(`发言人结构待复核：${f.label} 有 ${f.speakerResolution.structureWarnings.length} 类解析/侦察不一致——本次质量状态将标记待复核`)
         }
         const renamed = f.speakerResolution.mappings.filter((m) => m.sourceLabel !== m.outputLabel)
         if (renamed.length) engine.log(`发言人统一：${f.label} 已在 Refine 输入中一次性应用 ${renamed.map((m) => `${m.sourceLabel}→${m.outputLabel}`).join('、')}`)
@@ -3910,6 +4247,7 @@ return {
   speakerResolutions,
   speakerOutputNormalizations,
   speakerStructuralFailures,
+  speakerStructureWarnings,
   qualityRepairAttempts,
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,

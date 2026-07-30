@@ -251,6 +251,14 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '旧版 incomplete 标记，需要按现行源比对审计重新核验', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
     { title: '源比对审计未核，需要人工运行审计', items: result.unchecked || [], priority: 'high' },
     { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => publicationFailures(f).length).map(formatAudit), priority: 'high' },
+    {
+      title: '疑似说话人结构未能完全确认（保留原结构，禁止按独白或自行猜人）',
+      items: (result.speakerStructureWarnings || []).map((item) => {
+        const kinds = [...new Set((item.warnings || []).map((warning) => warning && warning.kind).filter(Boolean))]
+        return `${item.label || path.basename(item.path || '')}${kinds.length ? ` — ${kinds.join('、')}` : ''}`
+      }),
+      priority: 'high',
+    },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
@@ -295,10 +303,11 @@ export function qualityScorecard(result = {}) {
     : []
   const logicFailed = result.logicFailed || []
   const auditUnavailable = result.auditUnavailable || []
+  const speakerStructureWarnings = result.speakerStructureWarnings || []
   // P7: an audit that could not run blocks the run — the deliverables are unaudited, which is worse than a
   // known hard finding, so it must never grade below "blocked".
   const blocked = hardFiles.size || incomplete.length || logicFailed.length || auditUnavailable.length
-  const reviewNeeded = blocked || unchecked.length || sectionSummary.flagged || networkUnverified.length || openQuestions.length || glossaryWarnings.length
+  const reviewNeeded = blocked || unchecked.length || sectionSummary.flagged || networkUnverified.length || openQuestions.length || glossaryWarnings.length || speakerStructureWarnings.length
   const status = blocked ? 'blocked' : reviewNeeded ? 'review_needed' : 'ready'
   const label = status === 'ready' ? 'Ready' : status === 'blocked' ? 'Blocked' : 'Review Needed'
   return {
@@ -316,6 +325,7 @@ export function qualityScorecard(result = {}) {
       openQuestions: openQuestions.length,
       logicFailed: logicFailed.length,
       glossaryWarnings: glossaryWarnings.length,
+      speakerStructureWarnings: speakerStructureWarnings.length,
     },
     glossaryWarnings,
   }
@@ -337,6 +347,7 @@ export function artifactQualityScorecard(result = {}, context = {}) {
   const incomplete = new Set((result.incomplete || []).map((x) => resolvedPath(x.path || x)))
   const unavailable = new Set((result.auditUnavailable || []).map((x) => resolvedPath(x.path || x)))
   const unchecked = new Set((result.unchecked || []).map((x) => resolvedPath(x.path || x)))
+  const speakerWarnings = new Set((result.speakerStructureWarnings || []).map((x) => resolvedPath(x.path || x)))
 
   const refined = (result.refined || []).map((r) => {
     const p = resolvedPath(r.outPath || r.path)
@@ -352,6 +363,7 @@ export function artifactQualityScorecard(result = {}, context = {}) {
       ...((af && (af.sections || []).some((s) => (s.flags || []).length)) ? ['section_review'] : []),
       ...(unchecked.has(p) ? ['unchecked'] : []),
       ...(!af && !unavailable.has(p) ? ['audit_missing'] : []),
+      ...(speakerWarnings.has(p) ? ['speaker_structure_ambiguous'] : []),
     ]))
     return { path: p, kind: 'transcript', status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
   })
@@ -530,6 +542,16 @@ function manifestSpeakerTrace(result = {}) {
       changedLines: Number(item && item.changedLines) || 0,
       labelLines: Number(item && item.labelLines) || 0,
       speakerMode: safeRepairToken(item && item.speakerMode, 40),
+      structureWarnings: (Array.isArray(item && item.structureWarnings) ? item.structureWarnings : []).slice(0, 20).map((warning) => ({
+        kind: safeRepairToken(warning && warning.kind, 80),
+        count: Number(warning && warning.count) || 0,
+        lines: (Array.isArray(warning && warning.lines) ? warning.lines : []).slice(0, 20).map((line) => Number(line) || null).filter(Boolean),
+        labels: (Array.isArray(warning && warning.labels) ? warning.labels : []).slice(0, 20).map((label) => text(label, 80)).filter(Boolean),
+      })),
+      recoveredByScout: (Array.isArray(item && item.recoveredByScout) ? item.recoveredByScout : []).slice(0, 100).map((entry) => ({
+        line: Number(entry && entry.line) || null,
+        label: text(entry && entry.label, 80),
+      })),
       unresolved: (Array.isArray(item && item.unresolved) ? item.unresolved : []).slice(0, 50).map((x) => text(x, 80)).filter(Boolean),
       mappings: (Array.isArray(item && item.mappings) ? item.mappings : []).slice(0, 50).map((mapping) => ({
         sourceLabel: text(mapping && mapping.sourceLabel, 80),

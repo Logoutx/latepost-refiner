@@ -128,6 +128,8 @@ export async function prepareFile(src, { topic, date, headingPolicy, outputDir, 
       unresolved: speakerBase.unresolved,
       changedLines: 0,
       labelLines: speakerShape.labelLines,
+      structureWarnings: speakerShape.structureWarnings || [],
+      recoveredByScout: [],
     },
     subtitle: `*${topic}访谈${date ? ` · 采访时间 ${date}` : ''}*`,
     outPath: path.join(outputDir, 'Transcripts', `${title}.md`),
@@ -350,8 +352,12 @@ function repairSpeakerContract(file = {}) {
   const resolution = file.speakerResolution || {}
   const mappings = Array.isArray(resolution.mappings) ? resolution.mappings : []
   const labels = [...new Set(mappings.map((mapping) => mapping && mapping.outputLabel).filter(Boolean))]
-  if ((resolution.speakerMode || file.speakerMode) === 'untracked') {
+  const speakerMode = resolution.speakerMode || file.speakerMode
+  if (speakerMode === 'untracked') {
     return '本文件是无说话人轨道独白；候选稿不得新增任何说话人标签或对话标签。'
+  }
+  if (speakerMode === 'ambiguous') {
+    return '本文件疑似有未确认的说话人结构；候选稿必须保留原有标签/时间码，不得新增、猜测、合并或改名任何说话人。'
   }
   if (!labels.length) {
     return '本轮没有可用的 canonical 说话人映射；不得猜测或新增姓名，只能保留当前稿已有标签。'
@@ -599,12 +605,11 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const resolved = rewriteSpeakerLabels(sourceText, finding.speakers || [])
       speakerTrace.mapping(f.label, resolved)
       speakerTrace.rewrite(f.label, resolved)
-      const speakerMode = f.speakerMode || parseSpeakerDocument(sourceText).speakerMode
-      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, speakerMode, ...resolved }
+      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, ...resolved }
       const resolvedPath = path.join(convertedDir, `${safeName(f.title || f.label)}.speaker-resolved.md`)
       fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })
       fs.writeFileSync(resolvedPath, resolved.text, 'utf8')
-      return { path: resolvedPath, speakerMode, ...resolved }
+      return { path: resolvedPath, ...resolved }
     },
     // Refine normally preserves the already-canonical input labels. If it nevertheless reintroduces a source
     // number or a role synonym, collapse that alias through the SAME mapping before audit. Unknown names are
@@ -765,7 +770,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     },
     annotateAnchors: (f) => {
       if (params.anchors === false) return { updated: [], skipped: [] }
-      const a = annotateAnchorsFile(f.path, f.outPath)
+      const resolution = f.speakerResolution || {}
+      const a = annotateAnchorsFile(f.path, f.outPath, {
+        knownSpeakerLabels: (resolution.mappings || []).map((mapping) => mapping && mapping.sourceLabel).filter(Boolean),
+      })
       if (a.updated.length) anchors.push(a)
       return a
     },

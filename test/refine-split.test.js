@@ -454,6 +454,20 @@ test('refinePrompt without a chunk arg is the unchanged single-agent prompt (wri
   assert.ok(!p.includes('分块'), 'no chunk framing in single mode')
 })
 
+test('ambiguous speaker structure uses content-block boundaries and forbids guessing labels', () => {
+  const ambiguous = {
+    ...F,
+    speakerMode: 'ambiguous',
+    speakerResolution: { speakerMode: 'ambiguous', mappings: [], structureWarnings: [{ kind: 'scout_parser_disagreement' }] },
+  }
+  const chunks = splitForRefine(ambiguous, 'speed')
+  const p = refinePrompt(ambiguous, '校对表', FINDING, A, chunks[0])
+  assert.match(p, /疑似说话人格式未确认/)
+  assert.match(p, /以段落或列表内容块为边界/)
+  assert.match(p, /不得猜姓名、创造标签、合并轨道/)
+  assert.doesNotMatch(p, /源文没有说话人标签/)
+})
+
 test('first chunk writes the H1 title, its part file, and the non-last end-boundary rule', () => {
   const chunks = splitForRefine(F, 'speed')
   const p = refinePrompt(F, '校对表', FINDING, A, chunks[0])
@@ -607,6 +621,7 @@ test('scoutPrompt instructs knowledge-canonical and the suspect_asr flag', () =>
   const p = scoutPrompt({ path: '/s/A.txt', label: 'A', lines: 100 }, { background: 'bg' })
   assert.ok(p.includes('知名实体用你已知的正确写法') && p.includes('苍璧科技'), 'knowledge-canonical instruction present')
   assert.ok(p.includes('suspect_asr=true'), 'suspect-flag instruction present')
+  assert.ok(p.includes('一整行') && p.includes('逐字照抄') && p.includes('行首时间码'), 'Scout sample is an exact source-line evidence contract')
 })
 
 test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {

@@ -57,7 +57,7 @@ export const SCOUT_SCHEMA = {
       output_label: { type: 'string', description: '精校稿最终应显示的纯标签：能判断真名则只写真名，否则写可区分角色；拿不准留空' },
       output_label_confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '真名归属置信度；只有全文内有直接证据才可 high' },
       output_label_evidence: { type: 'string', description: '支持 output_label 的一处原文证据；写真名时必须说明为何这是本人而非被提到/被喊话的人' },
-      sample: { type: 'string', description: '一处原文标签样例' },
+      sample: { type: 'string', description: '一整行原文标签样例，必须逐字照抄该行（含行首时间码/括号、标签、冒号与同行正文），供确定性代码回查；不得省略或改写' },
     } } },
     people: { type: 'array', items: entitySchema({ public_figure: { type: 'boolean', description: '公众人物，可公开核实' } }) },
     brands: { type: 'array', items: entitySchema({ category: { type: 'string', description: '自家/竞品/供应商/平台/产品/机构' } }) },
