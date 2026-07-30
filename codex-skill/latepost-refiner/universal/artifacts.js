@@ -580,6 +580,20 @@ function manifestSpeakerTrace(result = {}) {
         label: text(unknown && unknown.label, 80),
       })),
     })),
+    candidateAdjudications: (Array.isArray(result.speakerCandidateAdjudications) ? result.speakerCandidateAdjudications : []).slice(0, 100).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      status: safeRepairToken(item && item.status, 40),
+      model: safeRepairToken(item && item.model, 80),
+      decisions: (Array.isArray(item && item.decisions) ? item.decisions : []).slice(0, 200).map((decision) => ({
+        line: Number(decision && decision.line) || null,
+        label: text(decision && decision.label, 80),
+        verdict: safeRepairToken(decision && decision.verdict, 80),
+        confidence: safeRepairToken(decision && decision.confidence, 20),
+        reason: safeRepairToken(decision && decision.reason, 80),
+        outcome: safeRepairToken(decision && decision.outcome, 20),
+      })),
+    })),
     structuralFailures: (Array.isArray(result.speakerStructuralFailures) ? result.speakerStructuralFailures : []).slice(0, 50).map((item) => ({
       label: text(item && item.label, 200),
       path: text(item && item.path, 1000),

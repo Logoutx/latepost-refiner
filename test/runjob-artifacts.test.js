@@ -117,6 +117,17 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
         ].join('\n'), 'utf8')
         return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
       }
+      if (opts.label && opts.label.startsWith('speaker-adjudicate:')) {
+        return {
+          decisions: [3, 5].map((line) => ({
+            line,
+            label: '记者',
+            verdict: 'invented_speaker',
+            confidence: 'high',
+            reason: 'dialogue_turn_without_source',
+          })),
+        }
+      }
       return null
     },
   }
@@ -136,7 +147,7 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
   assert.equal(metadataCalls, 0, 'a rejected main transcript must not update catalog identity')
   assert.equal(result.speakerStructuralFailures.length, 1)
   assert.equal(result.speakerStructuralFailures[0].speakerMode, 'untracked')
-  assert.ok(result.speakerStructuralFailures[0].violations.every((item) => item.kind === 'invented_speaker_label'))
+  assert.ok(result.speakerStructuralFailures[0].violations.every((item) => item.verdict === 'invented_speaker' && item.outcome === 'block'))
   assert.equal(fs.existsSync(path.join(outputDir, 'Transcripts', '独白.md')), true, 'the rejected draft remains server-side for diagnosis')
 
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
@@ -720,6 +731,17 @@ function inventedSpeakerRepairEngine() {
       const invented = covFixture('coverage-refined-good.md').replaceAll('沈其安：', '温：')
       fs.writeFileSync(m[1].trim(), invented, 'utf8')
       return `已写回 ${m[1].trim()}`
+    }
+    if (opts.label && opts.label.startsWith('speaker-adjudicate:')) {
+      return {
+        decisions: [{
+          line: 1,
+          label: '温',
+          verdict: 'invented_speaker',
+          confidence: 'high',
+          reason: 'dialogue_turn_without_source',
+        }],
+      }
     }
     return null
   }

@@ -75,6 +75,33 @@ export const SCOUT_SCHEMA = {
   },
 }
 
+export const SPEAKER_CANDIDATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    decisions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          line: { type: 'number', description: '候选在精校稿中的 1-based 行号；必须原样返回输入候选行号' },
+          label: { type: 'string', description: '候选标签；必须原样返回输入候选标签' },
+          verdict: {
+            type: 'string',
+            enum: ['invented_speaker', 'not_speaker', 'source_supported_alias', 'uncertain'],
+            description: 'invented_speaker=确为对话发言轮且源稿/映射均不支持；not_speaker=标题、说明、元信息等非发言轮；source_supported_alias=源稿支持但映射遗漏；uncertain=证据不足',
+          },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          reason: {
+            type: 'string',
+            enum: ['dialogue_turn_without_source', 'document_metadata', 'heading_or_caption', 'list_quote_or_table', 'source_label_or_alias', 'insufficient_context'],
+            description: '只返回最贴近直接文本证据的一类原因，不写自由文本',
+          },
+        },
+      },
+    },
+  },
+}
+
 export const VERIFY_SCHEMA = {
   type: 'object',
   properties: {

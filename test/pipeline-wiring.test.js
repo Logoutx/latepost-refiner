@@ -188,6 +188,77 @@ test('generic speakers bypass the short-file fast path and every Refine read use
   assert.equal(result.speakerOutputNormalizations[0].changedLines, 1)
 })
 
+function unknownSpeakerCapabilities() {
+  return {
+    enforceSpeakerOutput: () => ({
+      changedLines: 0,
+      replacements: [],
+      unknownLabels: [{ line: 3, label: '王小明' }],
+      valid: false,
+      violations: [{ line: 3, label: '王小明', kind: 'unknown_speaker_label' }],
+    }),
+    runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+}
+
+test('a high-confidence LLM verdict is required before an unknown output label blocks delivery', async () => {
+  const labels = []
+  const r = await runPipeline(A({ capabilities: unknownSpeakerCapabilities() }), engine(labels, {
+    '^speaker-adjudicate': {
+      decisions: [{
+        line: 3,
+        label: '王小明',
+        verdict: 'invented_speaker',
+        confidence: 'high',
+        reason: 'dialogue_turn_without_source',
+      }],
+    },
+  }))
+  assert.equal(labels.filter((label) => label === 'speaker-adjudicate:A').length, 1)
+  assert.deepEqual(r.failed, ['A'])
+  assert.equal(r.refined.length, 0)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['speaker_structure'] }])
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'blocked')
+  assert.equal(r.speakerStructuralFailures[0].labels[0], '王小明')
+})
+
+test('an unavailable or uncertain LLM verdict becomes review-needed instead of a hard failure', async () => {
+  const labels = []
+  const r = await runPipeline(A({
+    scope: ['refine', 'summary'],
+    capabilities: unknownSpeakerCapabilities(),
+  }), engine(labels))
+  assert.equal(labels.filter((label) => label === 'speaker-adjudicate:A').length, 1)
+  assert.deepEqual(r.failed, [])
+  assert.equal(r.refined.length, 1)
+  assert.deepEqual(r.auditFailed, [])
+  assert.ok(r.summary, 'review-tier speaker ambiguity does not suppress requested derivatives')
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'unavailable')
+  assert.ok(r.speakerStructureWarnings[0].warnings.some((item) => item.kind === 'speaker_candidate_adjudication_unavailable'))
+  assert.ok(r.openQuestions.some((item) => item.includes('第 3 行“王小明”')))
+})
+
+test('a high-confidence non-speaker verdict clears the candidate without a warning', async () => {
+  const labels = []
+  const r = await runPipeline(A({ capabilities: unknownSpeakerCapabilities() }), engine(labels, {
+    '^speaker-adjudicate': {
+      decisions: [{
+        line: 3,
+        label: '王小明',
+        verdict: 'not_speaker',
+        confidence: 'high',
+        reason: 'heading_or_caption',
+      }],
+    },
+  }))
+  assert.deepEqual(r.failed, [])
+  assert.equal(r.refined.length, 1)
+  assert.deepEqual(r.auditFailed, [])
+  assert.deepEqual(r.speakerStructureWarnings, [])
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'cleared')
+})
+
 // ---------- §2 in-pipeline audit gate (capability injection) ----------
 
 test('an exact double remains reviewable without repair or derivative suppression', async () => {

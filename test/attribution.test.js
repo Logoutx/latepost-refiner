@@ -345,6 +345,31 @@ test('auditPair: a calibrated attribution swap is a body-fidelity gate', () => {
   assert.ok(r.failed.includes('attribution_mismatch'), 'a high-confidence speaker swap blocks final-body status')
 })
 
+test('auditPair: a pre-adjudicated unknown speaker candidate cannot hard-fail through attribution', () => {
+  const source = buildSource()
+  const refined = buildRefined({ swapTurnIndex: 4, swapTo: '王小明' })
+  const baseline = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  assert.ok(baseline.failed.includes('attribution_mismatch'), 'control: the raw parser would treat the candidate as a hard swap')
+
+  const review = auditPair({
+    sourceText: source,
+    refinedText: refined,
+    mode: 'refine',
+    speakerReviewLabels: ['王小明'],
+  })
+  assert.ok(!review.failed.includes('attribution_mismatch'))
+  assert.equal(review.findings.find((f) => f.name === 'attribution_review').count, 1)
+
+  const dismissed = auditPair({
+    sourceText: source,
+    refinedText: refined,
+    mode: 'refine',
+    speakerDismissedLabels: ['王小明'],
+  })
+  assert.ok(!dismissed.failed.includes('attribution_mismatch'))
+  assert.ok(!dismissed.findings.some((f) => f.name === 'attribution_review'))
+})
+
 test('auditPair: entity_substitution_risk is absent by default and present only under strict', () => {
   const source = ['沈其安 00:12', '我们最近在跟磐石科技谈合作，聊了整整一个下午关于传感器标定的方案细节安排。', '',
     '沈其安 02:30', '另外云洲仪器的老客户也在催新版本，这个季度的交付压力确实不小需要加班。'].join('\n')

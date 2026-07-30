@@ -205,7 +205,21 @@ test('run manifest persists the full-text speaker mapping and every deterministi
     replacements: [{ line: 20, from: '访谈者', to: '记者' }],
     unknownLabels: [{ line: 30, label: '神秘人' }],
   }]
-  const manifest = buildRunManifest({ ...baseResult, speakerResolutions, speakerOutputNormalizations }, { outputDir: '/tmp/out', topic: 'T' })
+  const speakerCandidateAdjudications = [{
+    label: '访谈 A',
+    path: '/tmp/out/Transcripts/A.md',
+    status: 'review_needed',
+    model: 'opus',
+    decisions: [{
+      line: 30,
+      label: '神秘人',
+      verdict: 'uncertain',
+      confidence: 'low',
+      reason: 'insufficient_context',
+      outcome: 'review',
+    }],
+  }]
+  const manifest = buildRunManifest({ ...baseResult, speakerResolutions, speakerOutputNormalizations, speakerCandidateAdjudications }, { outputDir: '/tmp/out', topic: 'T' })
 
   assert.equal(manifest.speaker.resolutions[0].mappings[0].outputLabel, '记者')
   assert.equal(manifest.speaker.resolutions[0].mappings[0].key, undefined, 'internal track keys/Feishu ids are not persisted')
@@ -219,6 +233,14 @@ test('run manifest persists the full-text speaker mapping and every deterministi
   assert.equal(manifest.speaker.outputEnforcements[0].phase, 'post_repair_round_1')
   assert.deepEqual(manifest.speaker.outputEnforcements[0].replacements[0], { line: 20, from: '访谈者', to: '记者' })
   assert.deepEqual(manifest.speaker.outputEnforcements[0].unknownLabels[0], { line: 30, label: '神秘人' })
+  assert.deepEqual(manifest.speaker.candidateAdjudications[0].decisions[0], {
+    line: 30,
+    label: '神秘人',
+    verdict: 'uncertain',
+    confidence: 'low',
+    reason: 'insufficient_context',
+    outcome: 'review',
+  })
 })
 
 test('writeRunArtifacts writes review.md and run.json', () => {

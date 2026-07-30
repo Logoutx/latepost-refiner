@@ -1,5 +1,5 @@
-import { entitySchema, SCOUT_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
-import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
+import { entitySchema, SCOUT_SCHEMA, SPEAKER_CANDIDATE_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, speakerCandidatePrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
   scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', repair: 'opus',
@@ -261,6 +261,117 @@ export function normalizeAuditResult(raw, f) {
   return raw
 }
 
+const SPEAKER_VERDICTS = new Set(['invented_speaker', 'not_speaker', 'source_supported_alias', 'uncertain'])
+const SPEAKER_CONFIDENCE = new Set(['high', 'medium', 'low'])
+const SPEAKER_REASONS = new Set(['dialogue_turn_without_source', 'document_metadata', 'heading_or_caption', 'list_quote_or_table', 'source_label_or_alias', 'insufficient_context'])
+
+export function outputSpeakerCandidates(report) {
+  const out = []
+  const seen = new Set()
+  for (const item of [...((report && report.unknownLabels) || []), ...((report && report.violations) || [])]) {
+    const line = Number(item && item.line)
+    const label = typeof (item && item.label) === 'string' ? item.label.trim().slice(0, 80) : ''
+    if (!Number.isInteger(line) || line <= 0 || !label) continue
+    const key = `${line}\u0000${label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ line, label })
+  }
+  return out
+}
+
+export function normalizeSpeakerCandidateDecisions(raw, candidates) {
+  const rows = Array.isArray(raw && raw.decisions) ? raw.decisions : []
+  return candidates.map((candidate) => {
+    const row = rows.find((item) => (
+      Number(item && item.line) === candidate.line
+      && String((item && item.label) || '').trim() === candidate.label
+    ))
+    const verdict = SPEAKER_VERDICTS.has(row && row.verdict) ? row.verdict : 'uncertain'
+    const confidence = SPEAKER_CONFIDENCE.has(row && row.confidence) ? row.confidence : 'low'
+    const reason = SPEAKER_REASONS.has(row && row.reason) ? row.reason : 'insufficient_context'
+    const outcome = verdict === 'invented_speaker' && confidence === 'high'
+      ? 'block'
+      : verdict === 'not_speaker' && confidence === 'high'
+        ? 'dismiss'
+        : 'review'
+    return { ...candidate, verdict, confidence, reason, outcome }
+  })
+}
+
+export async function adjudicateOutputSpeakerCandidates(engine, f, report, M = DEFAULT_STAGE_MODELS) {
+  const candidates = outputSpeakerCandidates(report)
+  if (!candidates.length) return null
+  let raw = null
+  try {
+    raw = await engine.agent(speakerCandidatePrompt(f, candidates), {
+      label: `speaker-adjudicate:${f.label}`,
+      phase: 'Audit',
+      // Reuse the existing high-quality repair route instead of adding a new independently configurable stage.
+      // This is a rare publication decision, not a bulk extraction pass.
+      model: M.repair,
+      schema: SPEAKER_CANDIDATE_SCHEMA,
+      // A classifier must never inherit the normal job-wide write allowlist. It may inspect only this source/output
+      // pair and submit structured data; model/tool failure is review-tier, not permission to mutate the draft.
+      filePolicy: {
+        readRoots: [],
+        writeRoots: [],
+        readPaths: [f.path, f.outPath].filter(Boolean),
+        writePaths: [],
+        writePartBases: [],
+      },
+    })
+  } catch {
+    // Fail open only to the explicit review tier. The final contract below still blocks deterministic
+    // unavailability and a high-confidence invented speaker; classifier failure never masquerades as clearance.
+  }
+  const decisions = normalizeSpeakerCandidateDecisions(raw, candidates)
+  const status = decisions.some((item) => item.outcome === 'block')
+    ? 'blocked'
+    : decisions.some((item) => item.outcome === 'review')
+      ? (raw ? 'review_needed' : 'unavailable')
+      : 'cleared'
+  return { label: f.label, path: f.outPath, status, model: M.repair, decisions }
+}
+
+function reuseSpeakerCandidateAdjudication(previous, f, report) {
+  const candidates = outputSpeakerCandidates(report)
+  const prior = Array.isArray(previous && previous.decisions) ? previous.decisions : []
+  if (!candidates.length || !prior.length) return null
+  const decisions = []
+  for (const candidate of candidates) {
+    const match = prior.find((item) => item.label === candidate.label)
+    if (!match) return null
+    decisions.push({ ...match, ...candidate })
+  }
+  const status = decisions.some((item) => item.outcome === 'block')
+    ? 'blocked'
+    : decisions.some((item) => item.outcome === 'review')
+      ? (previous.status === 'unavailable' ? 'unavailable' : 'review_needed')
+      : 'cleared'
+  return { ...previous, label: f.label, path: f.outPath, status, decisions }
+}
+
+function unavailableSpeakerCandidateAdjudication(f, report, M = DEFAULT_STAGE_MODELS) {
+  const candidates = outputSpeakerCandidates(report)
+  if (!candidates.length) return null
+  return {
+    label: f.label,
+    path: f.outPath,
+    status: 'unavailable',
+    model: M.repair,
+    decisions: normalizeSpeakerCandidateDecisions(null, candidates),
+  }
+}
+
+function speakerAuditLabels(adjudication) {
+  const decisions = Array.isArray(adjudication && adjudication.decisions) ? adjudication.decisions : []
+  return {
+    speakerDismissedLabels: [...new Set(decisions.filter((item) => item.outcome === 'dismiss').map((item) => item.label).filter(Boolean))],
+    speakerReviewLabels: [...new Set(decisions.filter((item) => item.outcome === 'review').map((item) => item.label).filter(Boolean))],
+  }
+}
+
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
@@ -282,12 +393,13 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
 
   // 1) obtain an audit file-result ({ status, failed[], gaps[], findings[], modelMarkers[] })
   async function audit(auditContext = {}) {
+    const speakerContext = speakerAuditLabels(f.speakerCandidateAdjudication)
     if (typeof cap.runAudit === 'function') {
       // Pass the in-memory glossary so the capability doesn't have to read a not-yet-persisted file (risk a).
       // Fail-loud (P7): a thrown direct audit is retried ONCE (parity with the CC agent path's one retry); still
       // throwing → null, which the caller turns into a LOUD run failure instead of a quiet "audit unavailable".
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary, ...auditContext }), f) }
+        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary, ...speakerContext, ...auditContext }), f) }
         catch { if (attempt >= 1) return null }
       }
       return null
@@ -301,7 +413,13 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       glossaryArg = ` --glossary ${JSON.stringify(scratch)}`
       stagePreamble = `先用 Write 把下面这段“校对表全文”一字不改写到临时文件 ${JSON.stringify(scratch)}，再运行审计命令。\n<校对表全文>\n${memGlossary}\n</校对表全文>\n\n`
     }
-    const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
+    const dismissedArg = speakerContext.speakerDismissedLabels.length
+      ? ` --speaker-dismissed-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerDismissedLabels))}`
+      : ''
+    const reviewArg = speakerContext.speakerReviewLabels.length
+      ? ` --speaker-review-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerReviewLabels))}`
+      : ''
+    const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}${dismissedArg}${reviewArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
     let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
     let parsed = parseAuditJson(raw)
@@ -489,6 +607,7 @@ let speakerResolutions = []  // one deterministic Scout mapping per file; Refine
 let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
 let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
 let speakerStructureWarnings = [] // parser/Scout disagreement or unresolved label shape; visible review, never silent untracked
+let speakerCandidateAdjudications = [] // LLM verdicts for residual output candidates; only high-confidence invention blocks
 let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
 // Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
@@ -737,6 +856,7 @@ if (scope.includes('refine') && refinedPairs.length && capabilities && typeof ca
   normalized.forEach((report, i) => {
     if (!report) return
     const { f, rep } = refinedPairs[i]
+    f.speakerOutputReport = report
     const entry = {
       label: f.label,
       path: f.outPath,
@@ -750,8 +870,7 @@ if (scope.includes('refine') && refinedPairs.length && capabilities && typeof ca
     if (entry.changedLines) engine.log(`发言人输出收口：${entry.label} 按全文统一映射修正 ${entry.changedLines} 个标签别名`)
     if (entry.unknownLabels.length) {
       const labels = [...new Set(entry.unknownLabels.map((x) => x.label))]
-      engine.log(`发言人输出出现映射外标签：${entry.label} 的 ${labels.join('、')}——未自动猜改，最终结构契约将拒绝该草稿`)
-      rep.open_questions = [...(rep.open_questions || []), `成稿出现全文发言人映射外标签：${labels.join('、')}，请复核。`]
+      engine.log(`发言人输出出现映射外候选：${entry.label} 的 ${labels.join('、')}——未自动猜改，将在最终结构契约中按需调用模型裁决`)
     }
   })
 }
@@ -770,6 +889,16 @@ speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
 // resume), so every captured rep is excluded from the audit gate here — resume runs the full audit after fetch.
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
+  // Adjudicate residual shape candidates before the source-aware audit. Attribution uses the same parser, so
+  // waiting until the final contract would let an uncertain label become a hard attribution mismatch first.
+  const initialAdjudications = await engine.parallel(pairsToAudit.map(({ f }) => () => (
+    adjudicateOutputSpeakerCandidates(engine, f, f.speakerOutputReport, M)
+  )))
+  pairsToAudit.forEach(({ f }, index) => {
+    f.speakerCandidateAdjudication = initialAdjudications[index]
+      || unavailableSpeakerCandidateAdjudication(f, f.speakerOutputReport, M)
+  })
+
   engine.phase('Audit')
   engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量；有事务能力时最多候选修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮并逐轮复检；仍未过记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
@@ -822,15 +951,52 @@ if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof ca
       return { contractUnavailable: true, valid: false, unknownLabels: [], violations: [] }
     }
   }))
+  const adjudications = await engine.parallel(finalContracts.map((report, index) => async () => {
+    if (!report || report.contractUnavailable || !outputSpeakerCandidates(report).length) return Promise.resolve(null)
+    const f = pairsToAudit[index].f
+    return reuseSpeakerCandidateAdjudication(f.speakerCandidateAdjudication, f, report)
+      || adjudicateOutputSpeakerCandidates(engine, f, report, M)
+  }))
   const rejectedPaths = new Set()
   finalContracts.forEach((report, index) => {
     const { f } = pairsToAudit[index]
-    const unknownLabels = (report && report.unknownLabels) || []
-    const violations = (report && report.violations) || []
-    const invalid = !report || report.contractUnavailable || report.valid === false || unknownLabels.length > 0 || violations.length > 0
+    const adjudication = adjudications[index] || unavailableSpeakerCandidateAdjudication(f, report, M)
+    f.speakerCandidateAdjudication = adjudication || null
+    if (adjudication) speakerCandidateAdjudications.push(adjudication)
+    const decisions = (adjudication && adjudication.decisions) || []
+    const blockedCandidates = decisions.filter((item) => item.outcome === 'block')
+    const reviewCandidates = decisions.filter((item) => item.outcome === 'review')
+    const rawCandidates = outputSpeakerCandidates(report)
+    const invalid = !report
+      || report.contractUnavailable
+      || blockedCandidates.length > 0
+      || (report.valid === false && rawCandidates.length === 0)
+    if (reviewCandidates.length) {
+      const labels = [...new Set(reviewCandidates.map((item) => item.label))]
+      const lines = [...new Set(reviewCandidates.map((item) => item.line))]
+      speakerStructureWarnings.push({
+        label: f.label,
+        path: f.outPath,
+        speakerMode: (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || null,
+        warnings: [{
+          kind: adjudication && adjudication.status === 'unavailable'
+            ? 'speaker_candidate_adjudication_unavailable'
+            : 'output_speaker_candidate_unresolved',
+          count: reviewCandidates.length,
+          lines,
+          labels,
+        }],
+      })
+      const question = `成稿有 ${reviewCandidates.length} 处疑似映射外说话人候选，模型未能高置信确认是否为新增说话人：${reviewCandidates.map((item) => `第 ${item.line} 行“${item.label}”`).join('、')}。请人工复核。`
+      const pair = refinedPairs.find((item) => item.f.outPath === f.outPath)
+      if (pair && pair.rep) pair.rep.open_questions = [...(pair.rep.open_questions || []), question]
+      const refinedEntry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+      if (refinedEntry) refinedEntry.open_questions = [...(refinedEntry.open_questions || []), question]
+      engine.log(`发言人候选待复核：${f.label} 的 ${labels.join('、')}——模型裁决不确定或不可用，不阻断成稿`)
+    }
     if (!invalid) return
     rejectedPaths.add(f.outPath)
-    const labels = [...new Set(unknownLabels.map((item) => item.label).filter(Boolean))]
+    const labels = [...new Set(blockedCandidates.map((item) => item.label).filter(Boolean))]
     const reason = report && report.contractUnavailable
       ? 'speaker_contract_unavailable'
       : 'speaker_structure'
@@ -840,7 +1006,7 @@ if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof ca
       finding: reason,
       speakerMode: (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || null,
       labels,
-      violations,
+      violations: blockedCandidates,
     })
     const existing = auditFailed.find((item) => item.path === f.outPath)
     if (existing) existing.findings = [...new Set([...(existing.findings || []), reason])]
@@ -851,7 +1017,7 @@ if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof ca
       refinedEntry.audit.hardFindings = [...new Set([...(refinedEntry.audit.hardFindings || []), reason])]
     }
     failed.push(f.label)
-    engine.log(`发言人结构契约未通过：${f.label}${labels.length ? `（${labels.join('、')}）` : ''}——草稿仅留服务端诊断，不声明为可交付主稿`)
+    engine.log(`发言人结构契约未通过：${f.label}${labels.length ? `（模型高置信确认新增说话人：${labels.join('、')}）` : ''}——草稿仅留服务端诊断，不声明为可交付主稿`)
   })
   if (rejectedPaths.size) {
     failed = [...new Set(failed)]
@@ -950,6 +1116,7 @@ return {
   speakerOutputNormalizations,
   speakerStructuralFailures,
   speakerStructureWarnings,
+  speakerCandidateAdjudications,
   qualityRepairAttempts,
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,

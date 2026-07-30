@@ -1584,6 +1584,8 @@ export function checkAttribution(sourceText, refinedText, options = {}) {
   const refLines = refinedText.split(/\r?\n/)
   const refinedStructure = parseSpeakerDocument(refinedText)
   const labelsByLine = new Map(refinedStructure.labels.map((fact) => [fact.line, fact]))
+  const dismissedCandidateLabels = new Set((options.speakerDismissedLabels || []).map(speakerKey).filter(Boolean))
+  const reviewCandidateLabels = new Set((options.speakerReviewLabels || []).map(speakerKey).filter(Boolean))
   // rarity over the same substantive source text anchorTurns used, so pickShingles reproduces the anchor shingles.
   const freq = new Map()
   let total = 0
@@ -1654,27 +1656,46 @@ export function checkAttribution(sourceText, refinedText, options = {}) {
     assessedTurns += 1
     const isMismatch = g.label !== expected
     let flagged = false      // hard mismatch (attribution_mismatch)
-    let reviewed = false     // warning-tier 复核 item (attribution_review) — multi-party low-confidence only
+    let reviewed = false     // warning-tier 复核 item (attribution_review): multi-party drift or unresolved candidate
+    let candidateReviewed = false
     if (isMismatch) {
-      const isBoundaryTurn = t === firstSub || t === lastSub
-      const onHeading = ATTR_HEAD_RE.test(refLines[t.anchor.line - 1] || '')
-      const longEnough = t.norm.length >= ATTR.MIN_TURN_CHARS
-      // corroboration: shingles of this turn that land inside the wrong-label paragraph
-      const paraNorm = attrParagraphNorm(refLines, t.anchor.line)
-      const shingles = pickShingles(t.norm, rarity)
-      const corroboration = shingles.filter((w) => paraNorm.includes(w)).length
-      const baseOk = !isBoundaryTurn && !onHeading && longEnough && corroboration >= ATTR.MIN_CORROBORATION
-      if (baseOk) {
-        // Multi-party: HARD only when the wrong-label paragraph corroborates the WHOLE turn (a genuine relabel);
-        // a weaker (single-/partial-anchor) mismatch is alignment drift → 复核 warning, not an accusation.
-        // Two-party: the base bar already sufficed (accurate there), so it stays hard exactly as before.
-        const strong = corroboration >= ATTR.MULTI_STRONG_CORROBORATION
-          && corroboration >= Math.ceil(shingles.length * ATTR.MULTI_CORROBORATION_FRACTION)
-        if (!multiParty || strong) flagged = true
-        else reviewed = true
+      const candidateLabel = speakerKey(g.label)
+      // Residual short-prefix candidates are adjudicated before this audit. A high-confidence non-speaker must
+      // not govern attribution at all; an unresolved candidate may surface as review, but cannot become a hard
+      // speaker swap through this deterministic side door.
+      if (dismissedCandidateLabels.has(candidateLabel)) {
+        perTurn.push({ startLine: t.startLine, endLine: t.endLine, anchorLine: t.anchor.line, speaker: t.speaker, label: g.label, expected, mismatch: false, review: false })
+        continue
+      }
+      if (reviewCandidateLabels.has(candidateLabel)) {
+        reviewed = true
+        candidateReviewed = true
+      } else {
+        const isBoundaryTurn = t === firstSub || t === lastSub
+        const onHeading = ATTR_HEAD_RE.test(refLines[t.anchor.line - 1] || '')
+        const longEnough = t.norm.length >= ATTR.MIN_TURN_CHARS
+        // corroboration: shingles of this turn that land inside the wrong-label paragraph
+        const paraNorm = attrParagraphNorm(refLines, t.anchor.line)
+        const shingles = pickShingles(t.norm, rarity)
+        const corroboration = shingles.filter((w) => paraNorm.includes(w)).length
+        const baseOk = !isBoundaryTurn && !onHeading && longEnough && corroboration >= ATTR.MIN_CORROBORATION
+        if (baseOk) {
+          // Multi-party: HARD only when the wrong-label paragraph corroborates the WHOLE turn (a genuine relabel);
+          // a weaker (single-/partial-anchor) mismatch is alignment drift → 复核 warning, not an accusation.
+          // Two-party: the base bar already sufficed (accurate there), so it stays hard exactly as before.
+          const strong = corroboration >= ATTR.MULTI_STRONG_CORROBORATION
+            && corroboration >= Math.ceil(shingles.length * ATTR.MULTI_CORROBORATION_FRACTION)
+          if (!multiParty || strong) flagged = true
+          else reviewed = true
+        }
       }
       if (flagged && samples.length < 12) samples.push({ text: mkText(t, g, expected), line: t.anchor.line })
-      if (reviewed && reviewSamples.length < 12) reviewSamples.push({ text: `${mkText(t, g, expected)}（多方访谈·对齐存疑，请复核而非直接改）`, line: t.anchor.line })
+      if (reviewed && reviewSamples.length < 12) {
+        const note = candidateReviewed
+          ? '说话人候选裁决不确定，请先复核候选性质'
+          : '多方访谈·对齐存疑，请复核而非直接改'
+        reviewSamples.push({ text: `${mkText(t, g, expected)}（${note}）`, line: t.anchor.line })
+      }
     }
     if (flagged) mismatches += 1
     if (reviewed) review += 1
@@ -2183,6 +2204,7 @@ export function auditFiles(paths) {
 export function auditPair({
   sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine',
   glossaryText = null, strict = false, speakerMode = null, speakerMappings = null,
+  speakerDismissedLabels = null, speakerReviewLabels = null,
 }) {
   sourceText = normalizeTranscriptSource(sourceText, { sourceFile })
   const knownSpeakerLabels = (Array.isArray(speakerMappings) ? speakerMappings : [])
@@ -2205,7 +2227,12 @@ export function auditPair({
   const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText, { knownSpeakerLabels }) : null
   // M6 attribution tier: speaker-misattribution via a self-calibrated majority map. refine mode only (a summary /
   // timeline / logic draft has no per-turn labels to defend). Calibrated mismatches are hard; ambiguous cases soft.
-  const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText, { speakerMode, speakerMappings }) : null
+  const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText, {
+    speakerMode,
+    speakerMappings,
+    speakerDismissedLabels,
+    speakerReviewLabels,
+  }) : null
   // M7 quote-integrity guard: manufactured-quote detection. refine mode only, SOFT. Reliably quiet on faithful
   // quotes (verified on real pairs), so it is default-on.
   const quoteFab = mode === 'refine' ? checkQuoteFabrication(sourceText, refinedText) : null
@@ -2356,6 +2383,8 @@ export function auditPairs(pairs) {
     strict: !!p.strict,   // opt-in entity_substitution_risk
     speakerMode: p.speakerMode || null,
     speakerMappings: Array.isArray(p.speakerMappings) ? p.speakerMappings : null,
+    speakerDismissedLabels: Array.isArray(p.speakerDismissedLabels) ? p.speakerDismissedLabels : null,
+    speakerReviewLabels: Array.isArray(p.speakerReviewLabels) ? p.speakerReviewLabels : null,
   }))
   return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
 }
@@ -2993,6 +3022,17 @@ function getOpt(argv, name) {
   return i >= 0 ? argv[i + 1] : undefined
 }
 
+function getJsonArrayOpt(argv, name) {
+  const raw = getOpt(argv, name)
+  if (!raw) return null
+  try {
+    const value = JSON.parse(raw)
+    return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()) : null
+  } catch {
+    return null
+  }
+}
+
 function main() {
   const argv = process.argv.slice(2)
   if (!argv.length || argv.includes('-h') || argv.includes('--help')) { console.log(usage()); return 0 }
@@ -3035,7 +3075,17 @@ function main() {
   }
   if (source && refined) {
     const glossary = getOpt(argv, '--glossary')
-    const result = auditPairs([{ sourcePath: source, refinedPath: refined, mode: getOpt(argv, '--mode') || 'refine', glossaryPath: glossary, strict: argv.includes('--strict') }])
+    const result = auditPairs([{
+      sourcePath: source,
+      refinedPath: refined,
+      mode: getOpt(argv, '--mode') || 'refine',
+      glossaryPath: glossary,
+      strict: argv.includes('--strict'),
+      // Internal orchestration options: a pre-audit classifier has already decided these residual labels are
+      // non-blocking. JSON arrays avoid comma/space ambiguity in Chinese labels.
+      speakerDismissedLabels: getJsonArrayOpt(argv, '--speaker-dismissed-labels'),
+      speakerReviewLabels: getJsonArrayOpt(argv, '--speaker-review-labels'),
+    }])
     if (argv.includes('--annotate')) {
       const gaps = result.files[0].gaps || []
       if (argv.includes('--dry-run')) {

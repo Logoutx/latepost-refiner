@@ -8,7 +8,12 @@ import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import mammoth from 'mammoth'
 import { resolveSkillDir } from './assets.js'
-import { runPipeline, DEFAULT_STAGE_MODELS, QUALITY_REPAIR_MAX_ROUNDS } from '../core/pipeline.js'
+import {
+  runPipeline,
+  DEFAULT_STAGE_MODELS,
+  QUALITY_REPAIR_MAX_ROUNDS,
+  adjudicateOutputSpeakerCandidates,
+} from '../core/pipeline.js'
 import { RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
@@ -636,6 +641,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
         glossaryText,
         speakerMode: resolution.speakerMode || f.speakerMode,
         speakerMappings: resolution.mappings || [],
+        speakerDismissedLabels: opts.speakerDismissedLabels || [],
+        speakerReviewLabels: opts.speakerReviewLabels || [],
       }])
       const file = res.files[0]
       recordAuditFile(file)
@@ -655,6 +662,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const action = repairAction(auditFile.failed || [])
       const model = stageModels.repair || stageModels.refine || 'opus'
       const before = fs.readFileSync(f.outPath, 'utf8')
+      const resolution = f.speakerResolution || {}
+      const beforeSpeakerReport = enforceCanonicalSpeakerLabels(before, resolution.mappings || [], {
+        speakerMode: resolution.speakerMode || f.speakerMode,
+      })
+      const beforeSpeakerCandidateKeys = new Set((beforeSpeakerReport.unknownLabels || [])
+        .map((item) => `${Number(item.line)}\u0000${item.label}`))
       const round = Number(opts.round) || 1
       const maxRounds = Number(opts.maxRounds) || QUALITY_REPAIR_MAX_ROUNDS
       const label = `repair:${f.label || path.basename(f.outPath)}#${round}/${maxRounds}`
@@ -666,6 +679,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       let errorCode = null
       let candidatePromoted = false
       let candidateSpeakerValid = null
+      let candidateSpeakerAdjudication = null
       let candidateRejectedReason = null
       let candidateHardFindings = []
       const agentAttempted = (auditFile.failed || []).some((name) => name !== 'quote_style')
@@ -698,14 +712,22 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
             }
           }
           const speakerReport = enforceSpeakerOutput(candidateFile, `repair_candidate_round_${round}`)
-          candidateSpeakerValid = speakerReport.valid !== false
-            && !(speakerReport.unknownLabels || []).length
-            && !(speakerReport.violations || []).length
+          candidateSpeakerAdjudication = await adjudicateOutputSpeakerCandidates(sel.engine, candidateFile, speakerReport, stageModels)
+          const speakerDecisions = (candidateSpeakerAdjudication && candidateSpeakerAdjudication.decisions) || []
+          const newReviewCandidates = speakerDecisions.filter((item) => (
+            item.outcome === 'review'
+            && !beforeSpeakerCandidateKeys.has(`${Number(item.line)}\u0000${item.label}`)
+          ))
+          candidateSpeakerValid = !speakerDecisions.some((item) => item.outcome === 'block')
+            && newReviewCandidates.length === 0
           if (!candidateSpeakerValid) {
-            candidateRejectedReason = 'speaker_invalid'
-            errorCode = 'REPAIR_CANDIDATE_SPEAKER_INVALID'
+            candidateRejectedReason = speakerDecisions.some((item) => item.outcome === 'block')
+              ? 'speaker_invented'
+              : 'speaker_candidate_review'
+            errorCode = speakerDecisions.some((item) => item.outcome === 'block')
+              ? 'REPAIR_CANDIDATE_SPEAKER_INVENTED'
+              : 'REPAIR_CANDIDATE_SPEAKER_REVIEW'
           } else {
-            const resolution = f.speakerResolution || {}
             const candidateAudit = auditPairs([{
               sourcePath: f.path,
               refinedPath: candidatePath,
@@ -713,6 +735,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
               glossaryText: opts.glossaryText != null ? opts.glossaryText : glossaryTextFor(),
               speakerMode: resolution.speakerMode || f.speakerMode,
               speakerMappings: resolution.mappings || [],
+              speakerDismissedLabels: speakerDecisions.filter((item) => item.outcome === 'dismiss').map((item) => item.label),
+              speakerReviewLabels: speakerDecisions.filter((item) => item.outcome === 'review').map((item) => item.label),
             }]).files[0]
             const beforeHard = (auditFile.failed || []).filter((name) => PUBLICATION_BLOCK_GATES.includes(name))
             candidateHardFindings = (candidateAudit.failed || []).filter((name) => PUBLICATION_BLOCK_GATES.includes(name))
@@ -729,6 +753,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
             } else {
               fs.renameSync(candidatePath, f.outPath)
               candidatePromoted = true
+              f.speakerCandidateAdjudication = candidateSpeakerAdjudication
             }
           }
         } catch {

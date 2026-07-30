@@ -281,6 +281,35 @@ ${listText}
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
 }
 
+export function speakerCandidatePrompt(f, candidates = []) {
+  const resolution = f.speakerResolution || {}
+  const mappings = (resolution.mappings || [])
+    .filter((item) => item && item.sourceLabel && item.outputLabel)
+    .map((item) => `- ${item.sourceLabel} → ${item.outputLabel}${item.role ? `（${item.role}）` : ''}`)
+  const rows = candidates.map((item) => `- 第 ${item.line} 行：${item.label}`).join('\n')
+  return `你是“说话人候选裁决”代理。程序只依据“短前缀 + 冒号”的表面形状找到了候选；候选不是事实，不能因为标签不在映射中就直接判错。
+
+【只读文件】
+- 原始转录：${f.path}
+- 精校成稿：${f.outPath}
+
+【本轮已由源稿确认的说话人映射】
+${mappings.length ? mappings.join('\n') : '- 无已确认映射'}
+
+【待裁决候选】
+${rows}
+
+逐项 Read 精校稿候选行前后文；只有需要确认来源标签或别名时才 Read 原始转录。禁止 Write / Edit / Concat，禁止改稿、猜姓名或重做说话人映射。
+
+verdict 必须按以下边界：
+- invented_speaker：同时满足“该行确实开启一轮对话发言”与“原始转录及既有映射都没有这个说话人/别名的直接证据”。
+- not_speaker：标题、副标题、斜体说明、主题/日期等文档元信息、列表项、引用、表格、章节名或其它非发言轮结构。
+- source_supported_alias：该行确实是发言轮，且原始转录直接支持同一标签或别名，但既有映射遗漏。
+- uncertain：上下文或来源证据不足，不能满足以上任一结论。
+
+confidence=high 只允许用于直接文本证据充分的结论；仅凭名称像人名、位置像对话或“映射中没有”都不够。按 schema 返回 decisions；每个输入候选恰好返回一项，line 和 label 原样照抄。`
+}
+
 export function singlePassPrompt(f, a, overrideNote) {
   const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
   const structureInstruction = speakerMode === 'untracked'

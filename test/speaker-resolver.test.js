@@ -213,6 +213,29 @@ test('output enforcement leaves an unknown invented name untouched for audit ins
   assert.deepEqual(result.unknownLabels, [{ line: 1, label: '王小明' }, { line: 2, label: '王小明' }])
 })
 
+test('Markdown structure with colons is not promoted by inline shortcuts or recurrence', () => {
+  const refined = [
+    '# 示例访谈',
+    '',
+    '*文字记录：示例主题访谈*',
+    '- 文字记录：内部编辑备注',
+    '> 文字记录：引用来源说明',
+    '| 文字记录：表格字段 |',
+    '',
+    '## 新话题',
+    '记者：请介绍一下。',
+    '受访者：我们先说产品。',
+  ].join('\n')
+  const result = enforceCanonicalSpeakerLabels(refined, [
+    { sourceLabel: '记者', outputLabel: '记者', role: '记者' },
+    { sourceLabel: '受访者', outputLabel: '受访者', role: '受访者' },
+  ])
+  assert.equal(result.text, refined)
+  assert.equal(result.labelLines, 2)
+  assert.deepEqual(result.unknownLabels, [])
+  assert.equal(result.valid, true)
+})
+
 test('untracked source contract rejects model-invented speaker labels and accepts a label-free monologue', () => {
   const invented = enforceCanonicalSpeakerLabels('记者：第一段。\n记者：第二段。', [], { speakerMode: 'untracked' })
   assert.equal(invented.valid, false)

@@ -350,7 +350,11 @@ function recoverKnownFacts(lines, facts, knownSpeakerLabels = []) {
 
 function substantiveLine(value) {
   const line = String(value || '').trim()
-  return Boolean(line && !/^<!--/u.test(line) && !/^[#*>|]/u.test(line))
+  return Boolean(
+    line
+    && !/^<!--/u.test(line)
+    && !/^(?:[#*>|`~_]|[-+]\s|\d+[.)、]\s)/u.test(line),
+  )
 }
 
 export function parseSpeakerLabels(sourceText, options = {}) {
@@ -410,7 +414,10 @@ export function parseSpeakerLabels(sourceText, options = {}) {
     && plainInlineCandidates === substantive
     && inlineCandidates === plainInlineCandidates
   for (let i = 0; i < lines.length; i += 1) {
-    if (facts[i] || demotedTimeFragments.has(i)) continue
+    // The counting pass above defines the structural boundary: Markdown headings, blockquotes, tables and
+    // emphasis/list rows are document structure, not dialogue turns. Re-apply it here before any recurrence,
+    // role-name or pure-inline shortcut can promote an individual row.
+    if (facts[i] || demotedTimeFragments.has(i) || !substantiveLine(lines[i])) continue
     const { leading, match } = inlineView(lines[i])
     if (!match) continue
     const label = normalizeLabel(match[2])
