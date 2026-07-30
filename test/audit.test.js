@@ -10,14 +10,50 @@ const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audi
 // ---------- output-only audit (cleanliness) ----------
 
 test('hard-fails on leftover filler, confirmation/stutter repeats, and run-on paragraphs', () => {
-  const bad = '李明：对对对，嗯，我我觉得是这样。\n\n王某：' + '这是一段很长的独白内容反复说。'.repeat(200)
+  const bad = '李明：对对对，嗯，我我我觉得是这样。\n\n王某：' + '这是一段很长的独白内容反复说。'.repeat(200)
   const r = auditText(bad, 'bad.md')
   assert.equal(r.status, 'fail')
   const hard = r.findings.filter((f) => f.severity === 'hard' && f.count).map((f) => f.name)
   assert.ok(hard.includes('confirmation_repeats'), '对对对')
   assert.ok(hard.includes('filler_particles'), '嗯')
-  assert.ok(hard.includes('stutter_repeats'), '我我')
+  assert.ok(hard.includes('stutter_repeats'), '我我我')
   assert.equal(r.long_paragraphs.length, 1) // the >900-char monologue
+})
+
+test('exactly two adjacent target characters are review-only, including lexical boundaries and ambiguous stutters', () => {
+  for (const text of [
+    '记者：请告诉我我的安排。',
+    '受访者：这个选择可以，但是是另一种方案。',
+    '记者：但是是不是适合，只有合作之后才知道。',
+    '受访者：我们需要面对对象的差异。',
+    '受访者：这个方案可能能够解决问题。',
+    '受访者：那那个时候还没有想好。',
+    '受访者：我我觉得还要再看看。',
+    '受访者：对对，这个结论没问题。',
+  ]) {
+    const r = auditText(text, 'double-review.md')
+    const review = r.findings.find((f) => f.name === 'contextual_repeat_review')
+    assert.equal(r.status, 'ok', `${text} → an ambiguous double must not block publication`)
+    assert.equal(r.hard_issues, 0, `${text} → an ambiguous double is not a hard issue`)
+    assert.equal(review.count, 1, `${text} → the double remains visible for review`)
+  }
+})
+
+test('three-or-more target characters remain hard while a contained pair is not double-reported as soft', () => {
+  const r = auditText('受访者：我我我觉得可以。记者：对对对。受访者：是是是。记者：嗯嗯。', 'triple-hard.md')
+  assert.equal(r.status, 'fail')
+  assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(r.findings.find((f) => f.name === 'confirmation_repeats').count, 2)
+  assert.equal(r.findings.find((f) => f.name === 'filler_particles').count, 2, '嗯嗯 remains hard through the pure-filler rule')
+  assert.equal(r.findings.find((f) => f.name === 'contextual_repeat_review').count, 0)
+})
+
+test('long paragraphs have their own gate and do not also masquerade as residual_noise', () => {
+  const long = `受访者：${'这是一段完整而连贯的访谈内容。'.repeat(100)}`
+  const r = auditPair({ sourceText: long, refinedText: long, mode: 'logic' })
+  assert.deepEqual(r.failed, ['long_paragraphs'])
+  assert.equal(r.findings.filter((f) => f.severity === 'hard' && f.count).length, 0)
+  assert.equal(r.long_paragraphs.length, 1)
 })
 
 test('sentence-final modal particles 啊/哦/欸 and 这个/那个 are soft — they do NOT fail the audit', () => {

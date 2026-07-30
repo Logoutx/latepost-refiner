@@ -10,10 +10,12 @@
 //      the two real failures — compression (refine became summary) and
 //      under-refinement (filler barely removed).
 //
-// Hard residual noise (output-only, always a fail): 嗯/呃, 对对对/是是是, stutter
-// repeats 我我/就就, phrase repeats 因为因为/涂鸦涂鸦, ASR glue such as
-// 20182018/SaaSAPP, broken fragment starts, paragraphs > ~900 chars.
-// Soft (never fails): 啊/哦/欸 modal particles, 那个/这个/就是说 (context-dependent).
+// Hard residual noise (output-only, always a fail): 嗯/呃, 对对对/是是是, runs of
+// 3+ stutter characters, phrase repeats 因为因为/涂鸦涂鸦, ASR glue such as
+// 20182018/SaaSAPP, and broken fragment starts. Paragraphs > ~900 chars use
+// their own hard gate instead of being counted again as residual noise.
+// Soft (never fails): 啊/哦/欸 modal particles, 那个/这个/就是说, and exactly two
+// adjacent repeat-candidate characters (ambiguous between a stutter and a lexical boundary).
 //
 // Source-aware gates (mode: 'refine'):
 //   - compression_risk: charRatio < 0.55  (PRIMARY gate; faithful ~0.83, summary ~0.21)
@@ -156,24 +158,29 @@ const YEAR_REPEAT = /(?:20)?(\d{2})\s*年[，,、]\s*(?:20)?\1\s*年/g
 const BROKEN_FRAGMENT_START = /^(?![#*>|])(?:[^：:\n]{1,12}[：:]\s*)?(?:呢[，,、]|那个全国|你说那个是\s*$|当时呢只是说[。.]?)/gm
 const ASR_GLUE = /(?:20\d{2}){2}|一\s*20\d{2}(?:20\d{2})?|SaaSAPP/g
 
-// 能能 lexical guard: a doubled 能 is a real stutter (吃 → 能……能) only at a phrase start. When it is preceded by
-// ANOTHER hanzi it is almost always a word ending in 能 (可能/智能/性能/功能/才能/职能/本能/技能/效能/异能/热能/动能…)
-// abutting a word beginning with 能 (能够/能力/能耗/能量/能级…): 可能能够 / 智能能力 / 性能能耗 are correct Chinese, not
-// tics. These false-failed two graded outputs. So a 能能 match keeps firing ONLY when the char just before it is
-// NOT a hanzi (line start, whitespace, punctuation, latin, digit) — i.e. 能能… at a phrase start. 我我 / 就就 /
-// 对对对 / 是是是 are untouched (different chars / a different CHECK). 能能能 (triple) still flags: the guard looks at
-// the char before the matched PAIR, and for the leading pair that char is the phrase-initial context, not 能.
-const STUTTER_LEXICAL_GUARD = {
-  stutter_repeats: (m, text) => {
-    if (m.match[0] !== '能') return true              // only the 能能 case is guarded
-    const prev = text[(m.index ?? 0) - 1] || ''
-    return !CJK_CHAR.test(prev)                        // keep (real stutter) only when not preceded by a hanzi
-  },
+// An adjacent pair is intrinsically ambiguous in unsegmented Chinese: `请告诉我|我的安排`, `但是|是另一种方案`,
+// `面对|对象`, and a real `我我觉得` all have the same output-only shape. A publication gate must be
+// high-precision, so an exact pair is review-only regardless of the character. Runs of 3+ remain hard.
+// This replaces the old per-character `能能` allowlist with one confidence contract.
+const STUTTER_REPEAT = /([我你他她它这那就有没不能会要再先])\1{2,}/g
+const CONFIRMATION_REPEAT = /([对是])\1{2,}/g
+const ADJACENT_REPEAT_CANDIDATE = /([我你他她它这那就有没不能会要再先对是])\1/g
+function isExactDouble(m, text) {
+  const repeated = m.match || ''
+  const ch = repeated[0] || ''
+  const index = m.index ?? 0
+  return repeated.length === 2
+    && text[index - 1] !== ch
+    && text[index + repeated.length] !== ch
+}
+const REPEAT_GUARDS = {
+  contextual_repeat_review: isExactDouble,
 }
 
 const CHECKS = [
-  { name: 'confirmation_repeats', severity: 'hard', pattern: /(?:对){2,}|(?:是){2,}|嗯嗯/g },
-  { name: 'stutter_repeats',      severity: 'hard', pattern: /([我你他她它这那就有没不能会要再先])\1/g },
+  { name: 'confirmation_repeats', severity: 'hard', pattern: CONFIRMATION_REPEAT },
+  { name: 'stutter_repeats',      severity: 'hard', pattern: STUTTER_REPEAT },
+  { name: 'contextual_repeat_review', severity: 'soft', pattern: ADJACENT_REPEAT_CANDIDATE },
   { name: 'phrase_repeats',       severity: 'hard', pattern: PHRASE_REPEAT },
   { name: 'repeated_years',        severity: 'hard', pattern: YEAR_REPEAT },
   { name: 'broken_fragment_starts', severity: 'hard', pattern: BROKEN_FRAGMENT_START },
@@ -2144,7 +2151,7 @@ export function auditText(text, file = '<text>') {
     .filter((p) => p.text && !/^[#*>|]/.test(p.text))
 
   const findings = CHECKS.map((c) => {
-    const found = matches(c.pattern, text, STUTTER_LEXICAL_GUARD[c.name])
+    const found = matches(c.pattern, text, REPEAT_GUARDS[c.name])
     return {
       name: c.name,
       severity: c.severity,
@@ -2157,8 +2164,9 @@ export function auditText(text, file = '<text>') {
     .filter((p) => p.text.length > HARD_LONG_CHARS)
     .map((p) => ({ paragraph: p.index, chars: p.text.length, starts_with: p.text.slice(0, 80).replace(/\s+/g, ' ') }))
 
-  const hard_issues = findings.filter((f) => f.severity === 'hard').reduce((s, f) => s + f.count, 0) + long_paragraphs.length
-  return { file, status: hard_issues ? 'fail' : 'ok', hard_issues, paragraph_count: paragraphs.length, long_paragraphs, findings }
+  const hard_noise_issues = findings.filter((f) => f.severity === 'hard').reduce((s, f) => s + f.count, 0)
+  const hard_issues = hard_noise_issues + long_paragraphs.length
+  return { file, status: hard_issues ? 'fail' : 'ok', hard_issues, hard_noise_issues, paragraph_count: paragraphs.length, long_paragraphs, findings }
 }
 
 export function auditFile(filePath) {
@@ -2233,7 +2241,7 @@ export function auditPair({
   const entitySub = (strict && mode === 'refine') ? checkEntitySubstitution(sourceText, refinedText, glossary) : null
 
   const gates = {
-    residual_noise: out.hard_issues > 0,
+    residual_noise: out.hard_noise_issues > 0,
     long_paragraphs: (out.long_paragraphs || []).length > 0,
     quote_style: (quoteHard ? quoteHard.count : 0) > 0,
   }

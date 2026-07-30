@@ -348,7 +348,7 @@ node "<this skill dir>/scripts/audit_refined.mjs" --source <源稿.md> --refined
 - A real ending omission is reported as `content_gap` or `compression_risk`; a lexical mismatch against the source's final characters is not an independent failure.
 - `attribution_mismatch` — a high-confidence source turn appears under the wrong speaker in the refined body.
 - `seam_duplicate` — deterministic chunk stitching and its extended repair still leave a high-confidence repeated seam.
-- residual pure filler (嗯/呃, 对对对/是是是, 我我/就就) or a dialogue paragraph over ~900 characters.
+- residual pure filler (嗯/呃), confirmation/stutter runs of 3+ (对对对/是是是/我我我), or a dialogue paragraph over ~900 characters. Exactly two adjacent repeat-candidate characters remain review-only because they can also be normal lexical boundaries.
 
 啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete. (Output-only form `node …/audit_refined.mjs <file.md>` still works when no source is at hand, but it cannot detect compression.)
 

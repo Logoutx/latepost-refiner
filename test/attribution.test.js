@@ -282,28 +282,33 @@ test('M7b is dormant (assessed:false) when the glossary yields no parseable cano
   assert.equal(r.assessed, false, 'no canonicals → dormant, never a false flag')
 })
 
-// ---------- micro-fix #7: 能能 stutter guard ----------
+// ---------- adjacent-character repeat confidence tiers ----------
 
-test('micro-fix 能能: 可能能够 / 智能能力 / 性能能耗 / 功能能 PASS (word ending in 能 + word starting with 能)', () => {
-  for (const s of ['我觉得可能能够解决这个问题', '这套系统的智能能力很强', '它的性能能耗比做得不错', '这个功能能覆盖大部分场景']) {
+test('exact doubles are one review tier across characters instead of a growing lexical allowlist', () => {
+  for (const s of [
+    '我觉得可能能够解决这个问题',
+    '这套系统的智能能力很强',
+    '它的性能能耗比做得不错',
+    '这个功能能覆盖大部分场景',
+    '请告诉我我的安排',
+    '但是是另一种方案',
+    '我我觉得',
+    '就就是说',
+  ]) {
     const r = auditText(s)
-    const stut = r.findings.find((f) => f.name === 'stutter_repeats')
-    assert.equal(stut.count, 0, `${s} → 能能 is legitimate, not a stutter`)
+    assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 0, `${s} → no double is a hard stutter`)
+    assert.equal(r.findings.find((f) => f.name === 'confirmation_repeats').count, 0, `${s} → no double is a hard confirmation`)
+    assert.equal(r.findings.find((f) => f.name === 'contextual_repeat_review').count, 1, `${s} → the double remains reviewable`)
     assert.equal(r.status, 'ok')
   }
 })
 
-test('micro-fix 能能: a standalone 能能 stutter at phrase start STILL fails', () => {
-  const r = auditText('周砚：能能，这个我得想想。')  // 能能 at phrase start (after ：) → real stutter
-  assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 1)
-  assert.equal(r.status, 'fail')
-})
-
-test('micro-fix 能能: 我我 / 就就 stutters and 对对对 / 是是是 confirmations are unchanged', () => {
-  assert.equal(auditText('我我觉得').findings.find((f) => f.name === 'stutter_repeats').count, 1, '我我 still flags')
-  assert.equal(auditText('就就是说').findings.find((f) => f.name === 'stutter_repeats').count, 1, '就就 still flags')
-  assert.equal(auditText('对对对好的').findings.find((f) => f.name === 'confirmation_repeats').count, 1, '对对对 unchanged')
-  assert.equal(auditText('是是是没错').findings.find((f) => f.name === 'confirmation_repeats').count, 1, '是是是 unchanged')
+test('triple repetitions stay hard regardless of phrase position', () => {
+  assert.equal(auditText('周砚：能能能，这个我得想想。').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('我我我觉得').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('就就就是说').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('对对对好的').findings.find((f) => f.name === 'confirmation_repeats').count, 1)
+  assert.equal(auditText('是是是没错').findings.find((f) => f.name === 'confirmation_repeats').count, 1)
 })
 
 // ---------- micro-fix #8: heading-level fallback ----------

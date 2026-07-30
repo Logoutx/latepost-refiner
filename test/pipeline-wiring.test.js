@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { runPipeline, normalizeAuditResult } from '../core/pipeline.js'
+import { auditPair } from '../scripts/audit_refined.mjs'
 
 // All fixtures are fictional (王总/王志远, 苍碧/苍璧科技, 沈其安/沈总, 陈涛/陈焘 — 仓库既有虚构占位).
 // These tests drive runPipeline with a mock engine (zero tokens) + mock capabilities, exercising the Wave 2
@@ -188,6 +189,38 @@ test('generic speakers bypass the short-file fast path and every Refine read use
 })
 
 // ---------- §2 in-pipeline audit gate (capability injection) ----------
+
+test('an exact double remains reviewable without repair or derivative suppression', async () => {
+  const labels = []
+  let repairs = 0
+  const sourceText = '记者：请告诉我我的安排。\n\n受访者：这个选择可以，但是是另一种方案。'
+  const capabilities = {
+    runAudit: (f) => auditPair({ sourceText, refinedText: sourceText, refinedFile: f.outPath, mode: 'logic' }),
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'summary'], capabilities }), engine(labels))
+  assert.equal(repairs, 0, 'a review-only double does not spend a repair round')
+  assert.deepEqual(r.auditFailed, [])
+  assert.ok(r.summary, 'a review-only double does not suppress requested derivatives')
+  assert.deepEqual(r.refined[0].audit.hardFindings, [])
+})
+
+test('a triple repeat still receives capped repair and suppresses derivatives when it persists', async () => {
+  const labels = []
+  let repairs = 0
+  const sourceText = '受访者：我我我觉得这个方向可以。'
+  const capabilities = {
+    runAudit: (f) => auditPair({ sourceText, refinedText: sourceText, refinedFile: f.outPath, mode: 'logic' }),
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'summary'], capabilities }), engine(labels))
+  assert.equal(repairs, 2)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['residual_noise'] }])
+  assert.equal(r.summary, null)
+  assert.deepEqual(r.derivativesSkipped.map((x) => x.kind), ['summary'])
+})
 
 test('audit gate: content_gap hard → auto-repair → re-audit passes → not auditFailed', async () => {
   const labels = []

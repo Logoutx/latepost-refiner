@@ -99,7 +99,7 @@ Keep filename and H1 identical where practical.
 - Do not stop mid-topic.
 - Write large blocks correctly on first pass instead of many tiny edits — but keep paragraph boundaries: don't merge separate source turns just because one speaker keeps talking. Split long monologues into coherent 200-600-character paragraphs; any single dialogue paragraph over about 900 characters needs re-splitting.
 - Verify the output ending matches the source ending.
-- Before handoff, run the deterministic source-aware audit when available (`audit_refined.mjs --source <source> --refined <refined> --mode refine`): fix or surface compression, under-refinement, missing endings, leftover pure filler/repeats/ASR glue, and over-long paragraphs. 啊/哦/欸 and 这个/那个 are soft candidates — inspect context, don't blanket-delete. Without shell, do the same as a weaker model-side checklist and say if uncertainty remains.
+- Before handoff, run the deterministic source-aware audit when available (`audit_refined.mjs --source <source> --refined <refined> --mode refine`): fix or surface compression, under-refinement, missing endings, pure filler, confirmation/stutter runs of 3+, explicit phrase repeats, ASR glue, and over-long paragraphs. Exactly two adjacent repeat-candidate characters are review-only because output text alone cannot distinguish a real stutter from a lexical boundary such as `请告诉我我的安排` or `但是是另一种方案`; inspect them in context instead of blocking publication. 啊/哦/欸 and 这个/那个 are also soft candidates. Without shell, do the same as a weaker model-side checklist and say if uncertainty remains.
 
 ## Never Skip Silently
 
