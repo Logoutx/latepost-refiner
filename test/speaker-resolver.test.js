@@ -157,6 +157,52 @@ test('output enforcement applies the same canonical mapping without re-inferring
   assert.deepEqual(result.unknownLabels, [])
 })
 
+test('output enforcement moves a confirmed label-only turn body onto the label line', () => {
+  const refined = [
+    '记者：',
+    '请介绍一下。',
+    '',
+    '受访者：',
+    '',
+    '我们先说产品。',
+    '这是同一轮的第二段。',
+  ].join('\n')
+  const mappings = [
+    { sourceLabel: '说话人 1', outputLabel: '记者', role: '记者' },
+    { sourceLabel: '说话人 2', outputLabel: '受访者', role: '受访者' },
+  ]
+  const result = enforceCanonicalSpeakerLabels(refined, mappings)
+  assert.equal(result.text, [
+    '记者：请介绍一下。',
+    '',
+    '受访者：我们先说产品。',
+    '这是同一轮的第二段。',
+  ].join('\n'))
+  assert.equal(result.labelLines, 2)
+  assert.equal(result.valid, true)
+})
+
+test('output enforcement leaves inline turns and structural followers unchanged', () => {
+  const refined = [
+    '记者：已经同行。',
+    '',
+    '受访者：',
+    '## 新话题',
+    '',
+    '记者：',
+    '<!-- 源 L10-L20 -->',
+  ].join('\n')
+  const mappings = [
+    { sourceLabel: '说话人 1', outputLabel: '记者', role: '记者' },
+    { sourceLabel: '说话人 2', outputLabel: '受访者', role: '受访者' },
+  ]
+  const once = enforceCanonicalSpeakerLabels(refined, mappings)
+  const twice = enforceCanonicalSpeakerLabels(once.text, mappings)
+  assert.equal(once.text, refined)
+  assert.equal(twice.text, refined)
+  assert.equal(once.valid, true)
+})
+
 test('output enforcement leaves an unknown invented name untouched for audit instead of guessing', () => {
   const refined = '王小明：这句话是谁说的并不确定。\n王小明：第二次出现后可确认它是一个未知标签。'
   const result = enforceCanonicalSpeakerLabels(refined, [

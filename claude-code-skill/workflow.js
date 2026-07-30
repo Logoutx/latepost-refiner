@@ -772,6 +772,29 @@ function aliasKey(value) {
   return role ? `role:${role}` : speakerKey(label)
 }
 
+function inlineableTurnBody(value) {
+  const line = String(value || '')
+  const trimmed = line.trim()
+  if (!trimmed || line !== line.trimStart()) return false
+  return !/^(?:#{1,6}\s|<!--|<title\b|```|~~~|>|[-*+]\s|\d+[.)、]\s|\|)/iu.test(trimmed)
+}
+
+function inlineCanonicalSpeakerBodies(lines, labels, canonicalLabelLines) {
+  const out = [...lines]
+  const removals = new Set()
+  for (let i = 0; i < labels.length; i += 1) {
+    const fact = labels[i]
+    if (!canonicalLabelLines.has(fact.line) || String(fact.body || '').trim()) continue
+    const nextLabelLine = labels[i + 1] ? labels[i + 1].line : out.length + 1
+    let bodyIndex = fact.line
+    while (bodyIndex < nextLabelLine - 1 && !String(out[bodyIndex] || '').trim()) bodyIndex += 1
+    if (bodyIndex >= nextLabelLine - 1 || !inlineableTurnBody(out[bodyIndex])) continue
+    out[fact.line - 1] = `${out[fact.line - 1]}${out[bodyIndex]}`
+    for (let lineIndex = fact.line; lineIndex <= bodyIndex; lineIndex += 1) removals.add(lineIndex)
+  }
+  return out.filter((_line, index) => !removals.has(index))
+}
+
 function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {}) {
   const source = String(refinedText || '')
   const newline = source.includes('\r\n') ? '\r\n' : '\n'
@@ -797,12 +820,15 @@ function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {})
   const out = [...parsed.lines]
   const replacements = []
   const unknownLabels = []
+  const canonicalLabelLines = new Set()
   for (const fact of parsed.labels) {
     const canonical = aliases.get(aliasKey(fact.label))
     if (!canonical) {
       if (!canonicalSet.has(fact.label)) unknownLabels.push({ line: fact.line, label: fact.label })
+      else canonicalLabelLines.add(fact.line)
       continue
     }
+    canonicalLabelLines.add(fact.line)
     const rewritten = `${fact.indent || ''}${canonical}：${fact.body || ''}`
     if (out[fact.line - 1] === rewritten) continue
     replacements.push({ line: fact.line, from: fact.label, to: canonical })
@@ -814,7 +840,7 @@ function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {})
     unknownLabels.push({ line: i + 1, label: normalizeLabel(parsed.lines[i].split(/[：:]/u, 1)[0]).slice(0, 40) })
   }
   return {
-    text: out.join(newline),
+    text: inlineCanonicalSpeakerBodies(out, parsed.labels, canonicalLabelLines).join(newline),
     speakerMode,
     replacements,
     changedLines: replacements.length,
