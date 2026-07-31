@@ -454,6 +454,28 @@ test('refinePrompt without a chunk arg is the unchanged single-agent prompt (wri
   assert.ok(!p.includes('分块'), 'no chunk framing in single mode')
 })
 
+test('contracted Refine maps stable source turns to output blocks while the host owns labels and rendering', () => {
+  const contracted = {
+    ...F,
+    refinePath: '/out/.converted/A.turns.md',
+    refineContract: { records: [{ id: 'T000001' }, { id: 'T000002' }] },
+  }
+  const chunk = {
+    idx: 1, count: 2, inputPath: '/out/.converted/A.turns.part1.md',
+    turnIds: ['T000001'],
+  }
+  const p = refinePrompt(contracted, '校对表', FINDING, A, chunk)
+  assert.match(p, /不可变的 source turn 账本/u)
+  assert.match(p, /output block/u)
+  assert.match(p, /来源 ID 必须按原顺序完整记账/u)
+  assert.match(p, /keep.*merge.*split.*fold_noise/u)
+  assert.match(p, /不要输出或猜测 speaker_track_id/u)
+  assert.match(p, /不要输出 H1、说明行/u)
+  assert.match(p, /不要再按原稿行号自行切边界/u)
+  assert.ok(p.includes(`Write 到 ${F.outPath}.part1`))
+  assert.ok(p.includes(chunk.inputPath))
+})
+
 test('ambiguous speaker structure uses content-block boundaries and forbids guessing labels', () => {
   const ambiguous = {
     ...F,

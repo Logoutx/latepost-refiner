@@ -14,7 +14,7 @@ import {
   QUALITY_REPAIR_MAX_ROUNDS,
   adjudicateOutputSpeakerCandidates,
 } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
+import { RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, endsWithQuestion, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
 import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
@@ -23,6 +23,18 @@ import { buildRunLogEntry, appendRunLog } from './runlog.js'
 import { makeRunTrace } from './trace.js'
 import { makeSpeakerTrace } from './speaker-trace.js'
 import { extractTranscriptMetadata } from '../core/transcript-metadata.js'
+import {
+  applySpeakerIdentityAssignments,
+  bindOutputBlocksToSourceRecords,
+  buildTurnContract,
+  makeInitialOutputBlocks,
+  mergeOutputBlockEnvelopes,
+  parseOutputBlockEnvelope,
+  reconcileSpeakerResolutionWithRegistry,
+  recordsForChunk,
+  renderTurnContract,
+  serializeOutputBlockEnvelope,
+} from './output-contract.js'
 import {
   detectDeclaredAiSummary,
   enforceCanonicalSpeakerLabels,
@@ -400,6 +412,32 @@ function qualityRepairPrompt(A, f, auditFile, attemptNo) {
         : (auditFile.failed || []).includes('attribution_mismatch')
           ? '本次属于发言人串位：按 finding 样本与源行核对，只调整对应轮次的标签和段落归属，不改写发言内容。'
           : '本次属于局部质量问题：优先修复 audit 标出的残留口癖、重复、乱码粘连或超长段；如需判断是否改义，再对照源文件。'
+  if (f.refineContractFinalized && f.refineContract) {
+    return `你是访谈精校质量修复代理。当前文件不是最终 Markdown，而是宿主生成的 output-block contract 修复候选；source turn 是不可变来源账本，output block 可以在来源关系可验证、不造假的前提下重排版式。
+
+【第 ${attemptNo} 次修复】
+【主题】${A.topic || 'untitled'}
+【策略】${actionGuide}
+【原始源文件】${f.path}（约 ${f.lines || '?'} 行）
+【结构化候选】${f.outPath}
+【输出】修复后仍写回 ${f.outPath}
+
+【审计失败摘要】
+${auditPromptSummary(auditFile)}
+
+【不可变数据契约】
+- 第一条非空行必须是 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
+- 只使用 \`LRB_OUTPUT_BLOCK sources=... disposition=keep|merge|split|fold_noise\` 与对应 close 标记；\`LRB_SOURCE_REFS\` 是宿主只读源行范围，可保留。
+- 全部 source turn ID 必须按原顺序完整记账：keep 一对一；merge 只合并相邻同轨来源；split 把同一来源连续映射到至少两个 block；fold_noise 只折叠无实质内容的相邻来源。不得把事实或观点搬到不相干来源。
+- 修复超长段时可把一个来源改成多个 split block；修复 ASR 碎轮时可把相邻同轨来源改成 merge block；不需要改变来源关系时沿用现有 disposition。
+- output block 外只能保留或添加 \`## \` 小标题。不要输出 H1、说明行、speaker_track_id 或说话人标签；宿主从 sources 推导并确定性渲染。
+- 若 failed 包含 compression_risk 或 content_gap，必须按每个 block 的 source refs 行范围补回实质内容，不能把别轮内容挪来填数。
+- 不要删掉事实、数字、时间、产品名、观点、举例和有信息量的表达。
+
+${RULES}
+
+完成后只返回一行：已写回 <path>；修复策略=<rerun_from_source|full_cleanup|targeted_repair>；备注=<一句话>。`
+  }
   return `你是访谈精校质量修复代理。目标不是总结，而是让既有精校稿通过质量审计，同时保留全部事实细节与对话体。
 
 【第 ${attemptNo} 次修复】
@@ -576,6 +614,38 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   }
   const glossaryTextFor = () => (fs.existsSync(glossaryPath) ? fs.readFileSync(glossaryPath, 'utf8') : null)
   const enforceSpeakerOutput = (f, phase = 'post_refine') => {
+    if (f.refineContractFinalized && f.refineContract) {
+      const labelLines = f.refineContract.mode === 'tracked'
+        ? (f.refineContract.blocks || []).filter((block) => block.body && block.speaker && block.disposition !== 'fold_noise')
+          .reduce((count, block) => count + block.body.split(/\n\s*\n/u).filter((paragraph) => paragraph.trim()).length, 0)
+        : 0
+      const enforced = {
+        text: fs.readFileSync(f.outPath, 'utf8'),
+        speakerMode: f.refineContract.mode,
+        replacements: [],
+        changedLines: 0,
+        unknownLabels: [],
+        labelLines,
+        valid: true,
+        violations: [],
+        contract: 'turn_ir_v2',
+      }
+      speakerOutputEnforcements.push({
+        sequence: speakerOutputEnforcements.length + 1,
+        phase,
+        label: f.label,
+        path: f.outPath,
+        changedLines: 0,
+        labelLines,
+        replacements: [],
+        unknownLabels: [],
+        valid: true,
+        violations: [],
+        contract: 'turn_ir_v2',
+      })
+      speakerTrace.enforce(f.label, phase, enforced)
+      return enforced
+    }
     const refinedText = fs.readFileSync(f.outPath, 'utf8')
     const resolution = f.speakerResolution || {}
     const enforced = enforceCanonicalSpeakerLabels(refinedText, resolution.mappings || [], {
@@ -598,6 +668,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     return enforced
   }
   const capabilities = {
+    requireTurnContract: true,
     readFile: (p) => fs.readFileSync(p, 'utf8'),
     // M11a single-shot refine writes the model's response text straight to the 成稿 (no Write-tool agent). Only
     // the single-shot path uses this; the agentic path still writes via the model's Write tool. mkdir -p first
@@ -610,11 +681,143 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const resolved = rewriteSpeakerLabels(sourceText, finding.speakers || [])
       speakerTrace.mapping(f.label, resolved)
       speakerTrace.rewrite(f.label, resolved)
-      if (!resolved.labelLines || resolved.text === sourceText) return { path: f.path, ...resolved }
-      const resolvedPath = path.join(convertedDir, `${safeName(f.title || f.label)}.speaker-resolved.md`)
+      const base = safeName(f.title || f.label)
+      const resolvedPath = path.join(convertedDir, `${base}.speaker-resolved.md`)
+      const sourcePath = (!resolved.labelLines || resolved.text === sourceText) ? f.path : resolvedPath
       fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })
-      fs.writeFileSync(resolvedPath, resolved.text, 'utf8')
-      return { path: resolvedPath, ...resolved }
+      if (sourcePath === resolvedPath) fs.writeFileSync(resolvedPath, resolved.text, 'utf8')
+      const refineContract = buildTurnContract(sourceText, {
+        title: f.title,
+        subtitle: f.subtitle,
+        speakerMode: resolved.speakerMode,
+        speakerResolution: resolved,
+        parseOptions: { scoutSpeakers: finding.speakers || [] },
+      })
+      const contractPath = path.join(convertedDir, `${base}.turns.md`)
+      fs.writeFileSync(
+        contractPath,
+        serializeOutputBlockEnvelope(makeInitialOutputBlocks(refineContract), { sourceMeta: true }),
+        'utf8',
+      )
+      return {
+        path: sourcePath,
+        refinePath: contractPath,
+        refineContract,
+        turns: refineContract.records.map((record) => ({
+          startLine: record.startLine,
+          q: endsWithQuestion(record.sourceText),
+        })),
+        ...resolved,
+      }
+    },
+    prepareRefineChunks: (f, chunks = []) => chunks.map((chunk) => {
+      const expectedRecords = recordsForChunk(f.refineContract, chunk)
+      const inputPath = chunks.length === 1
+        ? f.refinePath
+        : path.join(convertedDir, `${safeName(f.title || f.label)}.turns.part${chunk.idx}.md`)
+      if (chunks.length > 1) {
+        fs.writeFileSync(
+          inputPath,
+          serializeOutputBlockEnvelope(makeInitialOutputBlocks({
+            mode: f.refineContract.mode,
+            records: expectedRecords,
+          }), { sourceMeta: true }),
+          'utf8',
+        )
+      }
+      return {
+        ...chunk,
+        inputPath,
+        turnIds: expectedRecords.map((record) => record.id),
+      }
+    }),
+    validateRefineContractOutput: (f, chunk, outputPath) => {
+      const byId = new Map((f.refineContract.records || []).map((record) => [record.id, record]))
+      const expectedRecords = (chunk.turnIds || []).map((id) => byId.get(id)).filter(Boolean)
+      try {
+        parseOutputBlockEnvelope(fs.readFileSync(outputPath, 'utf8'), {
+          mode: f.refineContract.mode,
+          records: expectedRecords,
+          speakerTracks: f.refineContract.speakerTracks || [],
+        })
+        return { ok: true }
+      } catch (error) {
+        const line = Number(error && error.details && error.details.line)
+        return {
+          ok: false,
+          code: (error && error.code) || 'TURN_CONTRACT_INVALID',
+          message: `${(error && error.message) || 'turn contract 校验失败'}${line > 0 ? `（第 ${line} 行）` : ''}`,
+        }
+      }
+    },
+    finalizeRefineContract: (f, chunks = []) => {
+      const contract = f.refineContract
+      const byId = new Map((contract.records || []).map((record) => [record.id, record]))
+      const parts = chunks.map((chunk) => {
+        const expectedRecords = (chunk.turnIds || []).map((id) => byId.get(id)).filter(Boolean)
+        const outputPath = chunks.length > 1 ? partPath(f.outPath, chunk.idx) : f.outPath
+        return { text: fs.readFileSync(outputPath, 'utf8'), expectedRecords, outputPath }
+      })
+      const merged = mergeOutputBlockEnvelopes(contract, parts)
+      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
+      fs.writeFileSync(f.outPath, merged.text, 'utf8')
+      if (chunks.length > 1) {
+        for (const part of parts) { try { fs.rmSync(part.outputPath, { force: true }) } catch { /* ignore */ } }
+      }
+      f.refineContract = { ...contract, blocks: merged.blocks }
+      f.refineContractFinalized = true
+      return {
+        path: f.outPath,
+        merged: parts.length,
+        bytes: Buffer.byteLength(merged.text, 'utf8'),
+        headings: merged.headings,
+        turnCount: contract.records.length,
+        outputBlockCount: merged.blocks.length,
+        contract: 'turn_ir_v2',
+      }
+    },
+    finalizeSpeakerIdentity: async (f) => {
+      if (!f.refineContractFinalized || !f.refineContract) return null
+      const before = fs.readFileSync(f.outPath, 'utf8')
+      const refinedFile = {
+        path: f.outPath,
+        label: `${f.label}精校稿`,
+        lines: before.split('\n').length,
+        bytes: Buffer.byteLength(before, 'utf8'),
+      }
+      const metadata = await extractTranscriptMetadata(sel.engine, f, {
+        topic,
+        background,
+        catalog: params.metadataCatalog,
+        model: stageModels.scout,
+        refinedFile,
+        speakerResolution: f.speakerResolution || null,
+        speakerRegistry: f.refineContract.speakerTracks || [],
+      })
+      const applied = applySpeakerIdentityAssignments(
+        f.refineContract,
+        metadata.speaker_assignments || [],
+      )
+      f.refineContract = applied.contract
+      f.speakerResolution = reconcileSpeakerResolutionWithRegistry(
+        f.speakerResolution,
+        applied.speakerTracks,
+      )
+      const rendered = renderTurnContract(f.refineContract, f.refineContract.blocks || [])
+      fs.writeFileSync(f.outPath, rendered, 'utf8')
+      return {
+        label: f.label,
+        path: f.outPath,
+        contract: 'speaker_registry_v1',
+        metadata,
+        speakerTracks: applied.speakerTracks,
+        changes: applied.changes,
+        rejected: applied.rejected,
+        rendered: true,
+        bytesBefore: Buffer.byteLength(before, 'utf8'),
+        bytesAfter: Buffer.byteLength(rendered, 'utf8'),
+        changed: rendered !== before,
+      }
     },
     // Refine normally preserves the already-canonical input labels. If it nevertheless reintroduces a source
     // number or a role synonym, collapse that alias through the SAME mapping before audit. Unknown names are
@@ -630,8 +833,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       // Normalize a model-created duplicate topic boundary before any quality or derivative audit consumes it.
       // This preserves all distinct prose and only removes a repeated H2 plus an optional exact replayed turn.
       const before = fs.readFileSync(f.outPath, 'utf8')
-      const normalized = collapseAdjacentDuplicateHeadings(before)
-      if (normalized.text !== before) fs.writeFileSync(f.outPath, normalized.text, 'utf8')
+      if (!f.refineContractFinalized) {
+        const normalized = collapseAdjacentDuplicateHeadings(before)
+        if (normalized.text !== before) fs.writeFileSync(f.outPath, normalized.text, 'utf8')
+      }
       const glossaryText = opts.glossaryText != null ? opts.glossaryText : glossaryTextFor()
       const resolution = f.speakerResolution || {}
       const res = auditPairs([{
@@ -641,6 +846,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
         glossaryText,
         speakerMode: resolution.speakerMode || f.speakerMode,
         speakerMappings: resolution.mappings || [],
+        turnRecords: f.refineContractFinalized && f.refineContract
+          ? bindOutputBlocksToSourceRecords(f.refineContract)
+          : null,
         speakerDismissedLabels: opts.speakerDismissedLabels || [],
         speakerReviewLabels: opts.speakerReviewLabels || [],
       }])
@@ -674,7 +882,13 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       const candidatePath = repairCandidatePath(outDir, f, round)
       const candidateFile = { ...f, outPath: candidatePath }
       fs.mkdirSync(path.dirname(candidatePath), { recursive: true })
-      fs.writeFileSync(candidatePath, before, 'utf8')
+      fs.writeFileSync(
+        candidatePath,
+        f.refineContractFinalized && f.refineContract
+          ? serializeOutputBlockEnvelope(f.refineContract.blocks, { sourceMeta: true })
+          : before,
+        'utf8',
+      )
       let response = null
       let errorCode = null
       let candidatePromoted = false
@@ -703,7 +917,22 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       if ((!agentAttempted || response != null) && !errorCode && fs.existsSync(candidatePath)) {
         try {
           let candidateText = fs.readFileSync(candidatePath, 'utf8')
-          if ((auditFile.failed || []).includes('quote_style')) {
+          let candidateBlocks = null
+          if (f.refineContractFinalized && f.refineContract) {
+            candidateBlocks = parseOutputBlockEnvelope(candidateText, f.refineContract)
+            if ((auditFile.failed || []).includes('quote_style')) {
+              candidateBlocks = candidateBlocks.map((block) => ({
+                ...block,
+                body: normalizeQuoteStyleText(block.body),
+                headingsBefore: (block.headingsBefore || []).map((heading) => normalizeQuoteStyleText(heading)),
+              }))
+              deterministicQuoteFix = serializeOutputBlockEnvelope(candidateBlocks) !== serializeOutputBlockEnvelope(parseOutputBlockEnvelope(candidateText, f.refineContract))
+            }
+            candidateFile.refineContract = { ...f.refineContract, blocks: candidateBlocks }
+            candidateFile.refineContractFinalized = true
+            candidateText = renderTurnContract(candidateFile.refineContract, candidateBlocks)
+            fs.writeFileSync(candidatePath, candidateText, 'utf8')
+          } else if ((auditFile.failed || []).includes('quote_style')) {
             const normalized = normalizeQuoteStyleText(candidateText)
             deterministicQuoteFix = normalized !== candidateText
             if (deterministicQuoteFix) {
@@ -735,6 +964,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
               glossaryText: opts.glossaryText != null ? opts.glossaryText : glossaryTextFor(),
               speakerMode: resolution.speakerMode || f.speakerMode,
               speakerMappings: resolution.mappings || [],
+              turnRecords: candidateFile.refineContractFinalized && candidateFile.refineContract
+                ? bindOutputBlocksToSourceRecords(candidateFile.refineContract)
+                : null,
               speakerDismissedLabels: speakerDecisions.filter((item) => item.outcome === 'dismiss').map((item) => item.label),
               speakerReviewLabels: speakerDecisions.filter((item) => item.outcome === 'review').map((item) => item.label),
             }]).files[0]
@@ -752,6 +984,10 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
               errorCode = 'REPAIR_CANDIDATE_NO_IMPROVEMENT'
             } else {
               fs.renameSync(candidatePath, f.outPath)
+              if (candidateFile.refineContractFinalized && candidateFile.refineContract) {
+                f.refineContract = candidateFile.refineContract
+                f.refineContractFinalized = true
+              }
               candidatePromoted = true
               f.speakerCandidateAdjudication = candidateSpeakerAdjudication
             }
@@ -833,34 +1069,9 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
 
   {
     const r = await runPipeline(A, sel.engine)
-    // A bot job contains one transcript. Finalize its catalog identity only after the main transcript has
-    // completed Refine, deterministic speaker enforcement and source-aware audit. The source remains the
-    // factual authority; the final transcript and the exact speaker mapping are supporting context. Failed
-    // or multi-file runs deliberately emit no top-level identity instead of polluting the shared catalog.
-    let transcriptMetadata = null
-    const refinedPath = fileEntries.length === 1 && r.refined && r.refined.length === 1
-      ? (r.refined[0].outPath || r.refined[0].path)
-      : null
-    if (!r.error && refinedPath && fs.existsSync(refinedPath)) {
-      const refinedText = fs.readFileSync(refinedPath, 'utf8')
-      const refinedFile = {
-        path: refinedPath,
-        label: `${fileEntries[0].label}精校稿`,
-        lines: refinedText.split('\n').length,
-        bytes: Buffer.byteLength(refinedText, 'utf8'),
-      }
-      const speakerResolution = (r.speakerResolutions || []).find(
-        (item) => item && item.label === fileEntries[0].label,
-      ) || (r.speakerResolutions || [])[0] || null
-      transcriptMetadata = await extractTranscriptMetadata(sel.engine, fileEntries[0], {
-        topic,
-        background,
-        catalog: params.metadataCatalog,
-        model: stageModels.scout,
-        refinedFile,
-        speakerResolution,
-      })
-    }
+    // Identity finalization now lives inside the pipeline before derivatives: the model submits only
+    // track-ID assignments, the host re-renders from the registry, and that rendered body is audited again.
+    const transcriptMetadata = r.transcriptMetadata || null
     const wroteGlossary = !r.error && persistGlossary(r, glossaryPath)
     // E13: soft structural lint of the rendered 校对表 (条目数/身份线索/变体比例). Runs on the in-memory glossary
     // (skipped for the single-file sentinel, which builds no independent table); any fired warning flows into
@@ -906,10 +1117,12 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     const durationMs = finishedMs - startedMs
     const usage = sel.engine.usage()
     const engineFailures = typeof sel.engine.failures === 'function' ? sel.engine.failures() : []
+    const contractFailures = Array.isArray(r.turnContractFailures) ? r.turnContractFailures : []
+    const executionFailures = [...engineFailures, ...contractFailures]
     const webTelemetry = typeof sel.engine.webTelemetry === 'function' ? sel.engine.webTelemetry() : null
     const executionFailed = !!r.error || (r.failed || []).length > 0
     const primaryFailure = executionFailed
-      ? (engineFailures.at(-1) || {
+      ? (contractFailures.at(-1) || engineFailures.at(-1) || {
           code: r.error ? 'PIPELINE_ERROR' : 'PIPELINE_INCOMPLETE',
           retryable: false,
           message: r.error || `未完成正文：${(r.failed || []).join('、')}`,
@@ -920,7 +1133,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
       status: executionFailed ? 'failed' : 'completed',
       stage: 'finished',
       failure: primaryFailure,
-      failures: engineFailures,
+      failures: executionFailures,
       progress: {
         filesTotal: fileEntries.length,
         filesRefined: (r.refined || []).length,

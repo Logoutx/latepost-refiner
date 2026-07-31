@@ -274,7 +274,14 @@ export function makeDeepSeekEngine(opts = {}) {
     }
   }
 
-  async function runAgent(prompt, { model, schema, label, outputPath, filePolicy: agentFilePolicy } = {}) {
+  async function runAgent(prompt, {
+    model,
+    schema,
+    label,
+    outputPath,
+    validateOutput,
+    filePolicy: agentFilePolicy,
+  } = {}) {
     const modelId = resolveDeepSeekModel(model)
     // A stage may narrow the job-wide allowlist for one agent call. Quality repair uses
     // this as a real write firebreak: the agent can touch its candidate only, never the
@@ -292,6 +299,26 @@ export function makeDeepSeekEngine(opts = {}) {
     let unrecoveredWriteFailure = null
     let lastProviderSignal = null
     const beforeOutput = outputSnapshot(outputPath)
+
+    const checkDeclaredOutput = async () => {
+      const post = checkOutputPostcondition(outputPath, beforeOutput)
+      if (!post.ok || typeof validateOutput !== 'function') return post
+      try {
+        const validation = await validateOutput(post)
+        if (validation === true || (validation && validation.ok === true)) return post
+        return {
+          ok: false,
+          code: (validation && validation.code) || 'OUTPUT_VALIDATION_FAILED',
+          message: (validation && validation.message) || '声明产物未通过结构校验',
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          code: (error && error.code) || 'OUTPUT_VALIDATION_FAILED',
+          message: (error && error.message) || '声明产物结构校验异常',
+        }
+      }
+    }
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const comp = await create({ model: modelId, messages, tools, max_tokens: maxTokensFor(label) })
@@ -325,7 +352,7 @@ export function makeDeepSeekEngine(opts = {}) {
           messages.push({ role: 'tool', tool_call_id: c.id, content: String(result.text) })
         }
         if (structuredValue) {
-          const post = checkOutputPostcondition(outputPath, beforeOutput)
+          const post = await checkDeclaredOutput()
           const failure = post.ok && !outputPath && unrecoveredWriteFailure
             ? { ok: false, code: unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', message: unrecoveredWriteFailure.text }
             : post
@@ -341,7 +368,7 @@ export function makeDeepSeekEngine(opts = {}) {
       // No tool calls → the model ended its turn.
       if (choice.finish_reason === 'content_filter') throw agentError('CONTENT_FILTER', `${label || 'agent'} 被内容过滤`, false, lastProviderSignal)
       if (!schema) {
-        const post = checkOutputPostcondition(outputPath, beforeOutput)
+        const post = await checkDeclaredOutput()
         if (!post.ok) throw agentError(post.code, post.message, false, lastProviderSignal)
         if (!outputPath && unrecoveredWriteFailure) throw agentError(unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', unrecoveredWriteFailure.text, false, lastProviderSignal)
         const text = (m.content || '').trim()
@@ -358,7 +385,7 @@ export function makeDeepSeekEngine(opts = {}) {
         if (forced.failure) throw agentError(forced.failure.code, forced.failure.message, forced.failure.retryable, forced.failure.providerSignal || lastProviderSignal)
         throw agentError('STRUCTURED_OUTPUT_MISSING', `${label || 'agent'} 未返回结构化结果`, true, forced.signal || lastProviderSignal)
       }
-      const post = checkOutputPostcondition(outputPath, beforeOutput)
+      const post = await checkDeclaredOutput()
       if (!post.ok) throw agentError(post.code, post.message, false, forced.signal || lastProviderSignal)
       return forced.value
     }

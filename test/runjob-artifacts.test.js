@@ -12,6 +12,14 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-runjob-'))
 }
 
+function writeContractOutput(prompt, outputPath, transform = (text) => text) {
+  const match = String(prompt || '').match(/【结构化输入】([^\n]+)/u)
+  assert.ok(match, 'Refine prompt exposes the host-generated turn contract path')
+  const defaultOutput = fs.readFileSync(match[1].trim(), 'utf8')
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+  fs.writeFileSync(outputPath, transform(defaultOutput), 'utf8')
+}
+
 test('prepareFile normalizes SRT sources before the model sees them', async () => {
   const outputDir = tmpdir()
   const src = path.join(outputDir, '2026-07-01_示例字幕.srt')
@@ -73,7 +81,7 @@ test('runJob rejects an explicitly declared AI smart summary before selecting or
   assert.equal(fs.existsSync(path.join(outputDir, 'Transcripts')), false, 'the pre-model gate emits no refined main draft')
 })
 
-test('runJob keeps a valid untracked monologue untracked and rejects model-invented speaker labels', async () => {
+test('runJob keeps a valid untracked monologue untracked through the turn contract', async () => {
   const outputDir = tmpdir()
   const src = path.join(outputDir, '独白.md')
   const source = [
@@ -107,14 +115,7 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
         return { speakers: [], people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [] }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
-        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
-        fs.writeFileSync(opts.outputPath, [
-          '# 独白',
-          '',
-          '记者：这是第一段独白，完整说明项目背景和当前进展。',
-          '',
-          '记者：这是第二段独白，完整说明下一步安排和最终结论。',
-        ].join('\n'), 'utf8')
+        writeContractOutput(_prompt, opts.outputPath)
         return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
       }
       if (opts.label && opts.label.startsWith('speaker-adjudicate:')) {
@@ -142,29 +143,73 @@ test('runJob keeps a valid untracked monologue untracked and rejects model-inven
     anchors: false,
   })
 
-  assert.equal(result.refined.length, 0, 'an invalid speaker structure is not declared as a deliverable main transcript')
-  assert.deepEqual(result.failed, ['独白'])
-  assert.equal(metadataCalls, 0, 'a rejected main transcript must not update catalog identity')
-  assert.equal(result.speakerStructuralFailures.length, 1)
-  assert.equal(result.speakerStructuralFailures[0].speakerMode, 'untracked')
-  assert.ok(result.speakerStructuralFailures[0].violations.every((item) => item.verdict === 'invented_speaker' && item.outcome === 'block'))
-  assert.equal(fs.existsSync(path.join(outputDir, 'Transcripts', '独白.md')), true, 'the rejected draft remains server-side for diagnosis')
+  assert.equal(result.refined.length, 1)
+  assert.deepEqual(result.failed, [])
+  assert.equal(result.speakerResolutions[0].speakerMode, 'untracked')
+  assert.equal(result.speakerStructuralFailures.length, 0)
+  assert.doesNotMatch(fs.readFileSync(result.refined[0].outPath, 'utf8'), /^记者：/mu)
 
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
-  assert.deepEqual(manifest.artifacts.refined, [])
+  assert.equal(manifest.artifacts.refined.length, 1)
+  assert.ok(manifest.speaker.outputEnforcements.every((entry) => entry.contract === 'turn_ir_v2'))
+})
+
+test('runJob reports a typed contract failure instead of falling back to Markdown speaker inference', async () => {
+  const outputDir = tmpdir()
+  const source = '记者：请介绍背景。\n\n沈其安：这是完整回答，包含研发过程、判断依据和后续安排。'
+  const engine = {
+    phase() {}, log() {},
+    usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }),
+    parallel: async (thunks) => Promise.all(thunks.map((task) => task())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (_prompt, opts = {}) => {
+      if ((opts.label || '').startsWith('scout:')) {
+        return {
+          speakers: [
+            { label: '记者', role: '记者', output_label: '记者' },
+            { label: '沈其安', role: '受访者', output_label: '沈其安' },
+          ],
+          people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [],
+        }
+      }
+      if ((opts.label || '').startsWith('refine:')) {
+        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
+        fs.writeFileSync(opts.outputPath, '# 模型自行生成的旧 Markdown\n\n文字记录：错误结构\n', 'utf8')
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      return null
+    },
+  }
+  const result = await runJob({
+    __engine: engine,
+    files: [{ name: '契约失败.md', base64: Buffer.from(source).toString('base64') }],
+    topic: '契约失败', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+
+  assert.deepEqual(result.failed, ['契约失败'])
+  assert.equal(result.refined.length, 0)
+  assert.equal(result.execution.failure.code, 'TURN_CONTRACT_HEADER_MISSING')
+  assert.equal(result.execution.failure.retryable, false)
+  assert.equal(result.turnContractFailures.length, 1)
+  assert.equal(result.speakerStructuralFailures.length, 0, 'legacy speaker inference never runs on a rejected envelope')
 })
 
 test('runJob recovers unfamiliar speaker decorators from exact Scout evidence and keeps audit/enforcement on one mapping', async () => {
   const outputDir = tmpdir()
   const src = path.join(outputDir, '陌生格式.md')
   const sourceTurns = []
-  const refinedTurns = []
   for (let i = 0; i < 8; i += 1) {
     const sec = String(i * 2 + 3).padStart(2, '0')
     const answer = `这是受访者第 ${i + 1} 次完整回答，包含项目背景、判断依据、执行过程和阶段结果，所有信息均来自本次虚构测试。`
     const question = `这是记者第 ${i + 1} 次完整提问，请继续解释相关决策的原因、约束条件和后续安排。`
     sourceTurns.push(`⟦00:${sec}⟧ 张三：${answer}`, `⟦00:${String(i * 2 + 4).padStart(2, '0')}⟧ 李四：${question}`)
-    refinedTurns.push(`张三：${answer}`, '', `李四：${question}`, '')
   }
   const source = sourceTurns.join('\n')
   fs.writeFileSync(src, source, 'utf8')
@@ -209,8 +254,7 @@ test('runJob recovers unfamiliar speaker decorators from exact Scout evidence an
         }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
-        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
-        fs.writeFileSync(opts.outputPath, ['# 陌生格式', '', ...refinedTurns].join('\n'), 'utf8')
+        writeContractOutput(_prompt, opts.outputPath)
         return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
       }
       return null
@@ -270,8 +314,7 @@ test('runJob keeps unsupported evidence ambiguous and makes the review state use
         }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
-        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
-        fs.writeFileSync(opts.outputPath, ['# 待确认格式', '', source].join('\n'), 'utf8')
+        writeContractOutput(_prompt, opts.outputPath)
         return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
       }
       return null
@@ -437,8 +480,10 @@ function mockEngine() {
         }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
-        fs.mkdirSync(path.dirname(opts.outputPath), { recursive: true })
-        fs.writeFileSync(opts.outputPath, '# path-fixture\n*路径样本访谈*\n\n## 开场\n\n采访者：请介绍背景。\n\n受访者：这是虚构样本。\n', 'utf8')
+        writeContractOutput(_prompt, opts.outputPath, (input) => input.replace(
+          '<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->',
+          '## 开场\n\n<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->',
+        ))
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }
       return null
@@ -486,23 +531,6 @@ const TRUNC_SOURCE = [
   '采访者：好的，那今天就先聊到这里，非常感谢你抽空接受这次访谈。',
 ].join('\n') + '\n'
 
-// The refined output faithfully covers everything EXCEPT the closing "今天就先聊到这里，非常感谢……" line.
-const TRUNC_REFINED = [
-  '# tiny',
-  '*测试项目访谈*',
-  '',
-  '## 开场',
-  '',
-  '采访者：先请你介绍一下自己。',
-  '',
-  '受访者：我在一家虚构的工业检测公司做研发，入行差不多十年了，主要负责视觉算法这一块。',
-  '',
-  '采访者：这些年最大的变化是什么？',
-  '',
-  '受访者：客户从只看价格，变成开始认真评估检测精度和交付周期，这对我们其实是好事。',
-  '',
-].join('\n')
-
 function truncatedEndingEngine() {
   const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
   return {
@@ -513,8 +541,8 @@ function truncatedEndingEngine() {
       for (const stage of stages) { value = await stage(value, item, i); if (!value) return null }
       return value
     })),
-    // Role-only speaker labels now force Scout before Refine even on a short file. The refine agent reports
-    // success; the test pre-writes the 成稿 on disk for the deterministic audit to read.
+    // Role-only speaker labels force Scout before Refine even on a short file. The refine agent preserves every
+    // stable turn ID but deliberately leaves the final pure-pleasantry body empty.
     agent: async (_prompt, opts = {}) => {
       usage.agents++
       if (opts.label && opts.label.startsWith('scout:')) {
@@ -526,6 +554,15 @@ function truncatedEndingEngine() {
         }
       }
       if (opts.label && opts.label.startsWith('refine:')) {
+        writeContractOutput(_prompt, opts.outputPath, (input) => input
+          .replace(
+            '<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->',
+            '## 开场\n\n<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->',
+          )
+          .replace(
+            /<!-- LRB_OUTPUT_BLOCK sources=T000005 disposition=keep -->\n[\s\S]*?\n<!-- \/LRB_OUTPUT_BLOCK -->/u,
+            '<!-- LRB_OUTPUT_BLOCK sources=T000005 disposition=fold_noise -->\n<!-- /LRB_OUTPUT_BLOCK -->',
+          ))
         return { path: 'unused.md', headings: ['## 开场'], key_fixes: [], open_questions: ['确认受访者姓名'] }
       }
       return null
@@ -537,12 +574,6 @@ test('runJob does not hard-fail a short omitted closing pleasantry through lexic
   const outputDir = tmpdir()
   const src = path.join(outputDir, 'tiny-src.md')
   fs.writeFileSync(src, TRUNC_SOURCE, 'utf8')
-  // Pre-write the refined output that the refine agent "produces" (the injected engine reports success
-  // but does not itself write a 成稿; the deterministic audit reads this file from disk).
-  const outPath = path.join(outputDir, 'Transcripts', 'tiny-src.md')
-  fs.mkdirSync(path.dirname(outPath), { recursive: true })
-  fs.writeFileSync(outPath, TRUNC_REFINED, 'utf8')
-
   const result = await runJob({
     __engine: truncatedEndingEngine(),
     files: [{ path: src }],
@@ -686,6 +717,77 @@ test('runJob targeted repair closes content_gap, replaces the first audit result
   assert.equal(result.annotations.length, 0, 'a repaired gap needs no visible failure marker')
 })
 
+test('structured repair preserves turn IDs while restoring a hard content gap', async () => {
+  const outputDir = tmpdir()
+  const longAnswer = Array.from(
+    { length: 12 },
+    (_, index) => `这一部分说明研发约束、客户反馈、判断依据和执行结果，细节序号为 ${index + 1}，不能被摘要掉。`,
+  ).join('')
+  const source = [
+    '记者：请完整介绍这段研发过程。',
+    `沈其安：${longAnswer}`,
+    '记者：这段过程最后得到什么结论？',
+    '沈其安：结论是先完成内部验证，再逐步扩大客户范围，同时保留每次复盘记录。',
+  ].join('\n\n')
+  let fullEnvelope = ''
+  let repairCalls = 0
+  const engine = {
+    phase() {}, log() {},
+    usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }),
+    parallel: async (thunks) => Promise.all(thunks.map((task) => Promise.resolve().then(task).catch(() => null))),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (prompt, opts = {}) => {
+      if ((opts.label || '').startsWith('scout:')) {
+        return {
+          speakers: [
+            { label: '记者', role: '记者', output_label: '记者' },
+            { label: '沈其安', role: '受访者', output_label: '沈其安' },
+          ],
+          people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [],
+        }
+      }
+      if ((opts.label || '').startsWith('refine:')) {
+        writeContractOutput(prompt, opts.outputPath, (input) => {
+          fullEnvelope = input
+          return input.replace(
+            /<!-- LRB_OUTPUT_BLOCK sources=T000002 disposition=keep -->\n[\s\S]*?\n<!-- \/LRB_OUTPUT_BLOCK -->/u,
+            '<!-- LRB_OUTPUT_BLOCK sources=T000002 disposition=fold_noise -->\n<!-- /LRB_OUTPUT_BLOCK -->',
+          )
+        })
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      if ((opts.label || '').startsWith('repair:')) {
+        repairCalls += 1
+        const match = prompt.match(/【结构化候选】([^\n]+)/u)
+        assert.ok(match && fullEnvelope)
+        fs.writeFileSync(match[1].trim(), fullEnvelope, 'utf8')
+        return `已写回 ${match[1].trim()}`
+      }
+      return null
+    },
+  }
+  const result = await runJob({
+    __engine: engine,
+    files: [{ name: '结构修复.md', base64: Buffer.from(source).toString('base64') }],
+    topic: '结构修复', outputDir, scope: ['refine'], verifyDepth: 'none',
+  })
+
+  assert.equal(repairCalls, 1)
+  assert.deepEqual(result.auditFailed, [])
+  assert.equal(result.qualityRepair.attempts[0].candidatePromoted, true)
+  assert.equal(result.qualityRepair.attempts[0].candidateSpeakerValid, true)
+  assert.match(fs.readFileSync(result.refined[0].outPath, 'utf8'), /研发约束、客户反馈/u)
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.ok(manifest.speaker.outputEnforcements.every((entry) => entry.contract === 'turn_ir_v2'))
+})
+
 test('runJob fixes a quote-only failure deterministically without calling the repair model', async () => {
   const outputDir = tmpdir()
   const source = [
@@ -697,12 +799,28 @@ test('runJob fixes a quote-only failure deterministically without calling the re
     phase() {}, log() {},
     usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null))),
-    pipeline: async (items) => items.map((f) => {
-      fs.mkdirSync(path.dirname(f.outPath), { recursive: true })
-      fs.writeFileSync(f.outPath, source.replace('工业检测', '"工业检测"'), 'utf8')
-      return { path: f.outPath, headings: [], key_fixes: [], open_questions: [] }
-    }),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
     agent: async (_prompt, opts = {}) => {
+      if ((opts.label || '').startsWith('scout:')) {
+        return {
+          speakers: [
+            { label: '记者', role: '记者', output_label: '记者' },
+            { label: '沈其安', role: '受访者', output_label: '沈其安' },
+          ],
+          people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [],
+        }
+      }
+      if ((opts.label || '').startsWith('refine:')) {
+        writeContractOutput(_prompt, opts.outputPath, (input) => input.replace('工业检测', '"工业检测"'))
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
       if ((opts.label || '').startsWith('repair:')) repairCalls += 1
       return null
     },
@@ -922,6 +1040,94 @@ test('runJob finalizes single-transcript identity after the refined file exists'
   assert.equal(result.transcriptMetadata.role_title, '研发负责人')
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
   assert.equal(manifest.transcriptMetadata.role_title, '研发负责人')
+})
+
+test('runJob applies final track identity through the registry, re-renders, and re-audits', async () => {
+  const outputDir = tmpdir()
+  const src = path.join(outputDir, '逐轨身份.md')
+  const source = [
+    '说话人 1 00:01',
+    '请介绍一下你的背景和目前负责的工作。',
+    '说话人 2 00:02',
+    '我是田渊栋，主要研究人工智能；这里提到“说话人 2”只是正文里的原始称呼。',
+    '说话人 1 00:03',
+    '你如何判断这一轮技术变化？',
+    '说话人 2 00:04',
+    '我的判断来自长期研究和实际观察，今天先完整说明这些依据。',
+  ].join('\n')
+  fs.writeFileSync(src, source, 'utf8')
+  const labels = []
+  const engine = {
+    phase() {}, log() {},
+    usage: () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, agents: labels.length, failed: 0 }),
+    parallel: async (thunks) => Promise.all(thunks.map((thunk) => thunk())),
+    pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
+      let value = item
+      for (const stage of stages) {
+        value = await stage(value, item, index)
+        if (!value) return null
+      }
+      return value
+    })),
+    agent: async (prompt, opts = {}) => {
+      labels.push(opts.label || '')
+      if ((opts.label || '').startsWith('scout:')) {
+        return { speakers: [], people: [], brands: [], terms: [], errors: [], themes: [], special_notes: [] }
+      }
+      if ((opts.label || '').startsWith('refine:')) {
+        writeContractOutput(prompt, opts.outputPath)
+        assert.deepEqual(await opts.validateOutput(), { ok: true })
+        return { path: opts.outputPath, headings: [], key_fixes: [], open_questions: [] }
+      }
+      if ((opts.label || '').startsWith('metadata:')) {
+        assert.match(prompt, /"speaker_track_id":"S000002"/)
+        return {
+          interviewee_name: '田渊栋',
+          organization_name: '',
+          role_title: '人工智能研究者',
+          interviewee_intro: '人工智能研究者，本次讨论技术变化。',
+          speaker_assignments: [
+            { speaker_track_id: 'S000001', canonical_name: '', role: '记者', confidence: 'low', evidence: '源稿没有记者姓名。' },
+            { speaker_track_id: 'S000002', canonical_name: '田渊栋', role: '受访者', confidence: 'high', evidence: '该轨道直接说“我是田渊栋”。' },
+          ],
+          confidence: 'high',
+          evidence: '源稿有直接自我介绍。',
+        }
+      }
+      return null
+    },
+  }
+
+  const result = await runJob({
+    __engine: engine,
+    files: [{ path: src }],
+    topic: '逐轨身份',
+    outputDir,
+    scope: ['refine'],
+    verifyDepth: 'none',
+    anchors: false,
+  })
+
+  assert.equal(result.refined.length, 1)
+  const finalText = fs.readFileSync(result.refined[0].outPath, 'utf8')
+  assert.match(finalText, /^田渊栋：我是田渊栋/mu)
+  assert.doesNotMatch(finalText, /^说话人 2：/mu)
+  assert.match(finalText, /这里提到“说话人 2”只是正文里的原始称呼/u, 'body content is not string-replaced')
+  assert.equal(result.speakerResolutions[0].mappings[1].outputLabel, '田渊栋')
+  assert.deepEqual(result.speakerResolutions[0].unresolved, ['说话人 1'])
+  assert.ok(result.speakerOutputNormalizations.some((entry) => entry.phase === 'post_identity_finalization'))
+  assert.equal(result.audit.status, 'ok')
+  assert.ok(labels.findIndex((label) => label.startsWith('metadata:'))
+    > labels.findIndex((label) => label.startsWith('refine:')))
+
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
+  assert.equal(manifest.speaker.identityFinalizations[0].contract, 'speaker_registry_v1')
+  assert.deepEqual(manifest.speaker.identityFinalizations[0].changes, [{
+    speakerTrackId: 'S000002',
+    from: '说话人 2',
+    to: '田渊栋',
+  }])
+  assert.equal(manifest.speaker.identityFinalizations[0].speakerTracks[1].canonicalLabel, '田渊栋')
 })
 
 // P1 end-to-end: the produced 时间线 is audited against the interview corpus (source + 成稿). A 【访谈】-tagged

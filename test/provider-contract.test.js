@@ -298,6 +298,43 @@ test('an unchanged stale artifact cannot satisfy the output postcondition', asyn
   assert.equal(engine.failures()[0].code, 'OUTPUT_NOT_UPDATED')
 })
 
+test('a declared artifact must pass its structural validator before structured_output is accepted', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-output-validator-'))
+  const outputPath = path.join(base, 'A.md')
+  const invalid = '<!-- contract -->\n# 模型擅自添加的标题\n<!-- block -->\n'
+  const valid = '<!-- contract -->\n<!-- block -->\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-invalid', 'Write', { file_path: outputPath, content: invalid }),
+      toolCall('submit-invalid', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-valid', 'Edit', { file_path: outputPath, old_string: invalid, new_string: valid }),
+      toolCall('submit-valid', 'structured_output', { ok: true }),
+    ] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] },
+  })
+
+  const result = await engine.agent('prompt', {
+    model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath,
+    validateOutput: () => fs.readFileSync(outputPath, 'utf8').includes('# ')
+      ? { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: 'output block 外出现 H1' }
+      : { ok: true },
+  })
+
+  assert.deepEqual(result, { ok: true })
+  assert.equal(fs.readFileSync(outputPath, 'utf8'), valid)
+  assert.match(
+    client.calls[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-invalid').content,
+    /TURN_CONTRACT_OUTSIDE_CONTENT/u,
+  )
+  assert.equal(engine.usage().failed, 0)
+})
+
 test('web tools are only exposed to online (verify/timeline) labels', async () => {
   const offlineClient = mockClient([
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),

@@ -63,11 +63,14 @@ docx/pdf 自动转格式；新机器先跑一次 `bash scripts/setup-converters.
 | 精校 | 逐份精校：删除口癖和无意义重复、修复 ASR 噪声、增加小标题，并按校对表统一写法 | Opus | gpt-5.5（high） | deepseek-v4-pro；超过 10,000 字自动分块 |
 | 源比对审计 | 纯 JS 比对源文与精校稿，检查压缩、实质内容缺口（包括发生在末尾的缺口）、说话人错归、残留噪音、欠精校、长段和引号排版；不再用“末尾连续几个字是否出现”单独判失败。数字漂移等低置信度问题进入复核，不直接冒充确定错误。若残留映射外“说话人候选”，才按需调用判断模型：只有高置信确认是原稿没有的新说话人才阻断，其余清除误报或进入人工复核 | 按需 Opus | 按需 gpt-5.5 | 按需 deepseek-v4-pro |
 | 审计修复 | 正文发布门禁未过时，只有支持候选稿事务的运行时才自动修复：候选稿通过说话人契约和质量复检后才替换正式稿；否则保留原正式稿。无事务能力的运行时只报告问题，留待人工修复。分块接缝另做确定性去重和残留复查 | 人工修复 | 人工修复 | deepseek-v4-pro，最多两轮 |
+| 最终逐轨身份 | 正文首次审计通过后，读取源稿、成稿与 `speakerTracks` 注册表，按稳定轨道 ID 提交逐轨身份裁决；只有源稿直接支持的 high 人名才能更新注册表。宿主据此确定性重渲染整稿并重新审计，派生件只能读取这份最终稿 | — | — | deepseek-v4-flash |
 | 逻辑重排（可选） | 在不改写正文的前提下，把问答从录音顺序重排为叙事顺序；独立检查是否只是同序复制、是否漏掉精校稿来源小节 | Opus | gpt-5.5（high） | deepseek-v4-pro |
 | 总结（可选） | 从精校稿生成分类要点、核心判断和金句，不以总结替代完整精校稿 | Opus | gpt-5.4（medium） | deepseek-v4-pro |
 | 时间线（可选） | 结合精校稿和公开资料，整理人物、公司、产品与事件的发展时间线 | Opus | gpt-5.4（high） | deepseek-v4-pro |
 
-说话人结构采用“模型提议、程序验真”的混合方案：常见时间戳、标签和飞书引用格式由同一解析器直接识别；未见过的格式可由侦察阶段提交“源标签 + 完整原文行”，只有逐字命中源稿后才会恢复为说话人轨道。结构状态分为 `tracked`（已确认轨道）、`untracked`（确实没有轨道）和 `ambiguous`（疑似有轨道但证据不足）。`ambiguous` 不会被当成独白静默放行，也不会让模型猜标签，而是保留原结构并进入人工复核；精校、说话人收口和源比对审计共用同一份已验证映射。
+说话人结构采用“模型提议、程序验真”的混合方案：常见时间戳、标签和飞书引用格式由同一解析器直接识别；未见过的格式可由侦察阶段提交“源标签 + 完整原文行”，只有逐字命中源稿后才会恢复为说话人轨道。结构状态分为 `tracked`（已确认轨道）、`untracked`（确实没有轨道）和 `ambiguous`（疑似有轨道但证据不足）。`ambiguous` 不会被当成独白静默放行，也不会让模型猜标签，而是保留原结构并进入人工复核。
+
+Universal 在这次解析后立即建立带稳定 `T000001…` ID 的 source turn 账本和 `S000001…` ID 的 `speakerTracks` 注册表，并把原始轨道归属、规范身份与成稿版式分开。source turn 只保存来源属于哪条轨道；轨道当前应显示的名字只在注册表的 `canonicalLabel` 里维护。宿主先生成一份默认一对一 `keep` 的 output-block 草稿，模型直接在已有 marker 上精校；确有需要时，才把相邻同轨碎轮合并、把长轮拆成多块，或显式折叠纯口癖/寒暄。renderer、审计绑定和对外映射都从同一注册表派生标签。程序约束的是来源完整记账、顺序单调和不同说话人不得静默合并，而不是要求输入一轮机械对应输出一轮。每个 Refine agent 提交完成时先跑自己分块的宿主结构后置校验；H1、漏失/乱序来源、非法合并或 block 外自由文本会立即拒绝 `structured_output`，要求同一 agent 在原上下文中修正，全部分块完成后再做一次全稿覆盖校验。最终 Markdown 不再送进“短前缀 + 冒号”解析器猜结构。候选修复沿用同一来源关系，源比对审计把各 output block 聚合回对应 source turn 后检查内容与归属；只有旧接口或未进入 contract 的兼容路径保留历史 Markdown 收口。
 
 可选的逻辑稿、总结和时间线只会在所有正文完成精校、候选修复并通过发布复检后生成。正文仍有硬问题时，主成稿和 `review.md` 照常交付，派生产物暂停，并在 `run.json` 的 `derivativesSkipped` 里说明原因。生成后，逻辑稿还会检查“假重排/漏来源”，总结和时间线会逐事实子句核对来源标签与数字归属；金额审计识别 `1.03 billion = 10.3 亿` 等等值量级换算，不把浮点舍入误差当成炮制。一份附件失败不会把已经通过的主成稿标成失败，`run.json.artifactQuality` 逐件记录 `ready / review_needed / blocked`。Universal 的常规模型调用只能写入本次声明的主稿、它派生出的 `.part正整数` 分块、逻辑稿、总结和时间线路径，不能在输出目录另建测试或临时文件；修复调用的权限会进一步收窄为单个 `.repair-candidates/…` 候选稿，不能写正式稿。候选稿只有在沿用同一套 canonical 说话人映射、未新增硬问题且目标问题确实改善后，才由确定性代码原子替换正式稿；失败候选会删除，正式稿保持不变。成功拼接后删除本次实际分块，拼接失败则保留已写成的分块供诊断和定向续跑。
 
@@ -75,7 +78,7 @@ DeepSeek 版默认仍按上表使用 flash/pro。CLI 与 `runJob()` 只为受控
 
 Universal 把“程序是否完成”和“稿件是否可发布”分开记录：`run.json.execution` 只描述执行状态与 typed failure（例如 `TOOL_PATH_DENIED`、`OUTPUT_MISSING`，并标明是否可重试），`run.json.quality` 继续描述 `ready / review_needed / blocked`。DeepSeek 失败另带脱敏的 `providerSignal`：明确拒绝记 `MODEL_REFUSAL`，`finish_reason=content_filter` 记 `CONTENT_FILTER`，无 choice / 空内容分别记 `MODEL_EMPTY_RESPONSE` / `MODEL_EMPTY_CONTENT`，429、5xx 和网络错误记 `API_TRANSIENT`；静默空响应保持“原因不明”，不会推断成内容审查。证据只含 finish reason、是否出现 refusal、choice 数、HTTP 状态、request id，不保存响应正文。`plannedChunks` 在精校代理启动前生成，所以某个分块失败后仍能看到本次计划的全部 `.partN`。每个输出目录还会实时写权限为 `0600` 的 `run-state.json` 与 `events.jsonl`，记录阶段、15 秒心跳、分块计划、agent 和工具成败；不记录 prompt、转录正文、网页正文、provider 响应正文或 API key。
 
-单文件 Universal 运行会在主稿完成精校、说话人收口和源比对审计后定稿目录身份，写入 `run.json.transcriptMetadata`：核心人物（访谈取主要受访者，独白/演讲取主讲人或作者）、当时所属公司/机构、用于交付命名的简短身份、稿内别名、一到两句人物介绍、置信度和短依据。该代理同时读取原稿、最终精校稿和本次全文说话人映射，但只把原稿与说话人证据当作身份事实，不能采用仅在精校稿中新出现且无法回指源稿的身份；它不联网补全，也没有文件写权限。`confidence=low` 时姓名、机构、简短身份和人物介绍在 manifest 边界强制为空。`--metadata-catalog <json>` 可传既有规范名以减少跨任务写法漂移；`latepost-refiner-metadata` 继续提供只读原稿、只跑该轻量提取、不重跑正文的历史回填入口。
+单文件 Universal 运行会在主稿完成精校、说话人收口和首次源比对审计后定稿目录身份，写入 `run.json.transcriptMetadata`：核心人物（访谈取主要受访者，独白/演讲取主讲人或作者）、当时所属公司/机构、用于交付命名的简短身份、稿内别名、一到两句人物介绍、置信度和短依据，以及按稳定 `speaker_track_id` 表达的逐轨身份裁决。该代理同时读取原稿、首次审计后的精校稿和本次 `speakerTracks` 注册表，但只提交结构化裁决、没有文件写权限；不能采用仅在精校稿中新出现且无法回指源稿的身份，也不联网补全。宿主只接受“已有轨道 + high + 具体源稿证据 + 规范人名”的更新，拒绝弱证据、角色词、未知轨道和对已确认姓名的冲突覆盖；随后从 output blocks 与新注册表重渲染完整 Markdown，再跑一次不追加修复预算的源比对审计，最后才允许逻辑稿、总结和时间线读取正文。这个过程不做“说话人 1”的全文字符串替换，因此正文中正常出现的相同文字不会被误改。`confidence=low` 时顶层姓名、机构、简短身份和人物介绍在 manifest 边界强制为空；逐轨身份按各自证据独立判断。`run.json.speaker.identityFinalizations` 记录最终注册表、采纳变化和拒绝原因。`--metadata-catalog <json>` 可传既有规范名以减少跨任务写法漂移；`latepost-refiner-metadata` 继续提供只读原稿、只跑该轻量提取、不重跑正文的历史回填入口。
 
 ## 架构
 
@@ -95,6 +98,7 @@ build/build-cc.mjs   把 core 和 Claude Code 引擎打包成自包含的 workfl
 claude-code-skill/   Claude Code 版（workflow.js 是 build 产物，别手改）
 codex-skill/         Codex 版（latepost-refiner/ 下自带一份 core/ 同步副本）
 universal/           命令行 + 网页 + 单文件 App（DeepSeek 版）
+  output-contract.js Universal 的 source turn / speaker track 注册表、output block 来源关系、逐轨身份提交校验与确定性 Markdown renderer
 ```
 
 **改了逻辑**：改 `core/*`，跑 `node build/build-cc.mjs`，别手改 `workflow.js`（build 产物，下次 build 会覆盖）。

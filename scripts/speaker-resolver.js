@@ -595,7 +595,7 @@ function normalizeRole(value) {
   return ROLE_RE.test(role) ? role.replace(/\s*\d+$/u, '') : ''
 }
 
-function extractPersonName(value) {
+export function extractPersonName(value) {
   let head = normalizeLabel(value).replace(/^(?:姓名|名字)\s*[：:]\s*/u, '')
   head = head.split(/[，,；;（(\n]/u, 1)[0].trim()
   if (!head || TITLE_WORD_RE.test(head) || isRoleSpeakerLabel(head) || isGenericSpeakerLabel(head)) return ''

@@ -3071,6 +3071,45 @@ function refinePrompt(f, glossary, finding, a, chunk) {
   const sourcePath = f.refinePath || f.path
   const speakers = resolvedSpeakerBlock(f, finding)
 
+  if (f.refineContract) {
+    const contractPath = (chunk && chunk.inputPath) || sourcePath
+    const outPath = chunk && chunk.count > 1 ? partPath(f.outPath, chunk.idx) : f.outPath
+    const turnCount = (chunk && Array.isArray(chunk.turnIds))
+      ? chunk.turnIds.length
+      : ((f.refineContract.records || []).length)
+    const chunkNote = chunk && chunk.count > 1
+      ? `这是第 ${chunk.idx}/${chunk.count} 块；输入文件已经只保留本块拥有的 ${turnCount} 个 source turn，不要再按原稿行号自行切边界。`
+      : `这是整份文件，共 ${turnCount} 个 source turn。`
+    return `你是访谈转录「精校」子代理。宿主程序已经把原稿转换成不可变的 source turn 账本；你把它们映射成可变的 output block，文档结构与说话人标签由宿主程序最终渲染。
+
+【统一校对表】（「联网核实结论」与「写法统一」优先；标 ⚠ 的条目未采纳、勿套用）：
+${glossary}
+
+【结构化输入】${contractPath}
+【输出】Write 到 ${outPath}
+${chunkNote}
+先完整 Read 结构化输入；它已经是宿主生成的默认 \`keep\` output-block 草稿。直接在这份 envelope 上精校，只有确实发生合并、拆分或折叠时才修改来源关系。
+
+【不可变数据契约】
+- 输出第一条非空行必须逐字为 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
+- 每个现有 block 都对应不可变 source turn 账本中的一项。输出只使用：
+  \`<!-- LRB_OUTPUT_BLOCK sources=Txxxxxx disposition=keep -->\`
+  正文
+  \`<!-- /LRB_OUTPUT_BLOCK -->\`
+- \`LRB_SOURCE_REFS\` 是宿主提供的只读轨道与源行元数据，可以原样保留；最终解析后会由宿主重建，不进入成稿。
+- \`sources\` 填该 block 实际承接的 source turn ID，多个 ID 用英文逗号连接。全部来源 ID 必须按原顺序完整记账，不能虚构、漏掉或把实质内容移到不相干来源。
+- \`keep\`：一个来源对应一个 block；\`merge\`：相邻且属于同一已确认说话人轨道的多个来源合成一个 block；\`split\`：同一来源连续写成至少两个 block；\`fold_noise\`：一个或多个相邻纯口癖/纯寒暄来源折成一句括号说明或空正文。不同说话人的实质发言绝不能合并；跨说话人只允许显式 \`fold_noise\`，不得保留其中任何事实或观点。
+- 宿主会从 sources 推导说话人，不要输出或猜测 speaker_track_id。普通 block 不要写发言人标签；标题、说明行、canonical 标签与分块合并均由宿主确定性生成。
+- output block 外只能放 \`## \` 开头的小标题，且小标题属于它后面的 block；不要输出 H1、说明行、前言、结语、分隔线或其它自由文本。
+- 分段不等于改来源：长 turn 可以用多个 \`split\` block；同说话人 ASR 碎轮可以用一个 \`merge\` block。来源关系服务于回溯，不要求成稿机械一对一。
+
+${notes ? `【该份特别提醒】\n${notes}\n` : ''}${headingNote(a.headingPolicy)}
+
+${RULES}
+
+完成后按 schema 返回 path（=${outPath}）、headings（你添加的 ## 小标题）、key_fixes、open_questions。`
+  }
+
   // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
   // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
   if (chunk && chunk.count > 1) {
@@ -3399,6 +3438,20 @@ const QUALITY_REPAIR_MAX_ROUNDS = 2
 // One shared publication contract: body-fidelity and output-quality groups stay separate for diagnostics, while
 // their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
 
+function recordTurnContractFailure(A, f, error, phase) {
+  if (!Array.isArray(A.turnContractFailures)) A.turnContractFailures = []
+  const failure = {
+    code: (error && error.code) || 'TURN_CONTRACT_INVALID',
+    retryable: false,
+    message: (error && error.message) || 'turn contract 校验失败',
+    phase,
+    label: (f && f.label) || null,
+    path: (f && f.outPath) || null,
+  }
+  A.turnContractFailures.push(failure)
+  return failure
+}
+
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
 // 字) → parallel chunk agents writing <outPath>.part{idx}, merged deterministically. Speed mode has its own
 // small cap; provider-budget and explicit-size chunking are intentionally uncapped.
@@ -3460,10 +3513,14 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
 async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // M11a: single-shot mode builds ONE request per file (source inlined, response = 成稿). Falls back to agentic
   // when the runtime can't support it (no fs / no complete primitive — e.g. the CC sandbox).
-  if (A.refineMode === 'single-shot') {
+  // A structured turn contract needs a host-side parse + deterministic render after the model write, so the
+  // legacy response-as-final-Markdown single-shot path is intentionally bypassed for contracted files.
+  if (A.refineMode === 'single-shot' && !f.refineContract) {
     const r = await refineFileSingleShot(engine, f, glossary, finding, A, M)
     if (!r || !r.degrade) return r
     engine.log(`单请求精校不可用（运行时无 fs / complete 能力）：${f.label} 回退代理式精校`)
+  } else if (A.refineMode === 'single-shot' && f.refineContract) {
+    engine.log(`单请求精校不承载 turn contract：${f.label} 改走结构化代理式精校`)
   }
   // M12: per-category reasoning effort (smart tier). effortFor = user override ?? per-phase default cap. Passed
   // straight to agent opts; the API engine emits output_config.effort only for allowed models, the CC Workflow
@@ -3478,7 +3535,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   const budget = rb ? rb.budget : undefined
   // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
   // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
-  const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
+  let chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
+  const cap = (A && A.capabilities) || {}
+  const contractValidator = (chunk, outputPath) => (
+    f.refineContract && typeof cap.validateRefineContractOutput === 'function'
+      ? () => cap.validateRefineContractOutput(f, chunk, outputPath)
+      : undefined
+  )
+  if (f.refineContract && typeof cap.prepareRefineChunks === 'function') {
+    try {
+      chunks = await cap.prepareRefineChunks(f, chunks)
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'prepare_chunks')
+      engine.log(`精校 turn contract 分块准备失败：${f.label}（${(e && e.message) || e}）`)
+      return null
+    }
+  }
   // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
   // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
   // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
@@ -3513,8 +3585,32 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   if (typeof A.onChunkPlan === 'function') A.onChunkPlan(plan)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
-    return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
+    const rep = await engine.agent(refinePrompt(f, glossary, finding, A, chunks[0]),
+      {
+        label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+        schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath,
+        validateOutput: contractValidator(chunks[0], f.outPath),
+      })
+    if (!rep || !f.refineContract) return rep
+    if (typeof cap.finalizeRefineContract !== 'function') {
+      recordTurnContractFailure(A, f, { code: 'TURN_CONTRACT_CAPABILITY_MISSING', message: '宿主缺少 turn contract 收口能力' }, 'finalize')
+      engine.log(`精校 turn contract 缺少宿主收口能力：${f.label}`)
+      return null
+    }
+    try {
+      const finalized = await cap.finalizeRefineContract(f, chunks)
+      engine.log(`精校 turn contract：${f.label} 已校验 ${finalized.turnCount} 个 source turn，并从 ${finalized.outputBlockCount} 个 output block 确定性渲染`)
+      return {
+        ...rep,
+        path: f.outPath,
+        headings: finalized.headings || [],
+        turnContract: finalized.contract,
+      }
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'finalize')
+      engine.log(`精校 turn contract 校验失败：${f.label}（${(e && e.code) || 'TURN_CONTRACT_INVALID'}：${(e && e.message) || e}）`)
+      return null
+    }
   }
   const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
     : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
@@ -3523,14 +3619,22 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
   let partReps = await engine.parallel(chunks.map((c) => () =>
     engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })))
+      {
+        label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+        schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
+        validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
+      })))
   const missing = chunks.map((c, i) => (!partReps[i] ? i : -1)).filter((i) => i >= 0)
   if (missing.length) {
     engine.log(`精校分块：${f.label} 首轮 ${missing.length}/${chunks.length} 块未返回——只重试缺失块一次`)
     const retries = await engine.parallel(missing.map((i) => {
       const c = chunks[i]
       return () => engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-        { label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx) })
+        {
+          label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+          schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
+          validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
+        })
     }))
     partReps = partReps.slice()
     missing.forEach((i, k) => { if (retries[k]) partReps[i] = retries[k] })
@@ -3541,9 +3645,17 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
     return null
   }
   const good = partReps.filter(Boolean)
-  const cap = (A && A.capabilities) || {}
   let stitchReport = null
-  if (typeof cap.stitch === 'function') {
+  if (f.refineContract && typeof cap.finalizeRefineContract === 'function') {
+    try {
+      stitchReport = await cap.finalizeRefineContract(f, chunks)
+      engine.log(`精校 turn contract：${f.label} 已按 ${stitchReport.turnCount} 个 source turn / ${stitchReport.outputBlockCount} 个 output block 校验并合并 ${chunks.length} 块`)
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'merge')
+      engine.log(`精校 turn contract 合并失败：${f.label}（${(e && e.code) || 'TURN_CONTRACT_INVALID'}：${(e && e.message) || e}）`)
+      return null
+    }
+  } else if (typeof cap.stitch === 'function') {
     try {
       const stitched = await cap.stitch(f, chunks)
       if (stitched == null) { engine.log(`精校分块：${f.label} 确定性拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
@@ -3559,10 +3671,11 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   }
   return {
     path: f.outPath,
-    headings: good.flatMap((r) => r.headings || []),
+    headings: (stitchReport && stitchReport.headings) || good.flatMap((r) => r.headings || []),
     key_fixes: good.flatMap((r) => r.key_fixes || []),
     open_questions: good.flatMap((r) => r.open_questions || []),
     chunked: chunks.length,
+    ...((stitchReport && stitchReport.contract) ? { turnContract: stitchReport.contract } : {}),
     ...((stitchReport && stitchReport.seamRepairs && stitchReport.seamRepairs.length) ? { seamRepairs: stitchReport.seamRepairs } : {}),
     ...((stitchReport && stitchReport.seamDuplicates && stitchReport.seamDuplicates.length) ? { seamDuplicates: stitchReport.seamDuplicates } : {}),
     ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
@@ -3766,7 +3879,7 @@ function speakerAuditLabels(adjudication) {
 // transactional repair capability, re-audit after each round, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
-async function runAuditStep(A, engine, f, capabilities, glossaryText) {
+async function runAuditStep(A, engine, f, capabilities, glossaryText, options = {}) {
   const src = f.path, out = f.outPath
   const skillDir = A.skillDir || '.'
   const cap = capabilities || {}
@@ -3817,7 +3930,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     return normalizeAuditResult(parsed, f)
   }
 
-  const first = await audit({ phase: 'pre_audit' })
+  const first = await audit({ phase: options.phase || 'pre_audit' })
   // Fail-loud (P7): the audit could not run after one retry. Previously this "degraded to record-only, non-blocking"
   // and the run reported success with an "audit unavailable" note — a quality gate that can be skipped silently.
   // Now the per-file result still carries auditUnavailable (the 成稿 is kept, not destroyed), but the orchestration
@@ -3846,7 +3959,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const repairAttempts = []
   // A runtime without fs cannot stage, audit and atomically promote a candidate. Do not let a fallback model
   // overwrite the current transcript in place; keep the hard finding for explicit/manual repair instead.
-  const repairAvailable = typeof cap.repair === 'function'
+  const repairAvailable = options.allowRepair !== false && typeof cap.repair === 'function'
 
   if (hard.length && repairAvailable) engine.log(`审计 hard：${f.label} → ${hard.join('、')}——最多候选修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮，每轮后复检`)
   for (let round = 1; hard.length && repairAvailable && round <= QUALITY_REPAIR_MAX_ROUNDS; round += 1) {
@@ -3950,7 +4063,7 @@ const M = Object.assign(
 )
 const scope = A.scope || ['refine']
 const capabilities = A.capabilities || null
-const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, auditFailed: [], auditUnavailable: [], qualityRepairAttempts: [] })
+const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, transcriptMetadata: null, speakerIdentityFinalizations: [], auditFailed: [], auditUnavailable: [], qualityRepairAttempts: [] })
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
@@ -3995,6 +4108,8 @@ let speakerOutputNormalizations = [] // same mapping re-applied to model output 
 let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
 let speakerStructureWarnings = [] // parser/Scout disagreement or unresolved label shape; visible review, never silent untracked
 let speakerCandidateAdjudications = [] // LLM verdicts for residual output candidates; only high-confidence invention blocks
+let speakerIdentityFinalizations = [] // post-refine track registry decisions + deterministic render ledger
+let transcriptMetadata = null // single-file catalog metadata produced by the same final identity pass
 let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
 // Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
@@ -4176,6 +4291,7 @@ if (useShortFileFastPath) {
       const prepared = await engine.parallel(A.files.map((f, i) => async () => {
         const finding = cleanFindings[i] || {}
         try { return await capabilities.prepareSpeakerInput(f, finding) } catch (e) {
+          if (capabilities.requireTurnContract) return { turnContractFailure: e }
           engine.log(`发言人统一输入生成失败：${f.label}（${(e && e.message) || e}）——保留原稿进入 Refine`)
           return null
         }
@@ -4183,7 +4299,16 @@ if (useShortFileFastPath) {
       prepared.forEach((resolution, i) => {
         if (!resolution) return
         const f = A.files[i]
-        f.refinePath = resolution.path || f.path
+        if (resolution.turnContractFailure) {
+          f.refinePreparationFailed = true
+          const failure = recordTurnContractFailure(A, f, resolution.turnContractFailure, 'prepare')
+          engine.log(`精校 turn contract 输入生成失败：${f.label}（${failure.code}：${failure.message}）`)
+          return
+        }
+        f.refinePath = resolution.refinePath || resolution.path || f.path
+        f.refineSourcePath = resolution.path || f.path
+        f.refineContract = resolution.refineContract || null
+        if (Array.isArray(resolution.turns) && resolution.turns.length) f.turns = resolution.turns
         f.speakerResolution = {
           speakerMode: resolution.speakerMode || f.speakerMode || (resolution.labelLines ? 'tracked' : 'untracked'),
           mappings: resolution.mappings || [],
@@ -4214,7 +4339,9 @@ if (useShortFileFastPath) {
     // the glossary is only an aid, so a stalled cheap scout degrades the glossary but
     // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
-      (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, cleanFindings[i] || {}, A, M))
+      (f, _f, i) => f.refinePreparationFailed
+        ? Promise.resolve(null)
+        : refineFile(engine, f, glossary, refineGlossary, cleanFindings[i] || {}, A, M))
   }
   scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
   if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
@@ -4263,7 +4390,7 @@ if (scope.includes('refine') && refinedPairs.length && capabilities && typeof ca
 }
 speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
   label: f.label,
-  path: f.refinePath || f.path,
+  path: f.refineSourcePath || f.path,
   ...f.speakerResolution,
 }))
 
@@ -4413,6 +4540,88 @@ if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof ca
   }
 }
 
+// Final identity is a registry update, never a Markdown edit. Only bodies that already passed the normal
+// source-aware gate are eligible. The host asks for stable track-ID assignments, updates the one speakerTracks
+// registry, deterministically renders the complete transcript from output blocks, then this pipeline audits that
+// exact rendered body again (without opening a new repair budget) before any derivative may read it.
+if (scope.includes('refine') && refinedPairs.length && capabilities && typeof capabilities.finalizeSpeakerIdentity === 'function') {
+  const identityPairs = refinedPairs.filter(({ f }) => {
+    const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+    return f.refineContractFinalized && f.refineContract
+      && entry && entry.audit && entry.audit.status === 'ok'
+      && !auditFailed.some((item) => item.path === f.outPath)
+      && !auditUnavailable.some((item) => item.path === f.outPath)
+  })
+  if (identityPairs.length) {
+    engine.phase('Audit')
+    engine.log(`▶ 最终身份：${identityPairs.length} 份按 speaker track 注册表定稿，确定性重渲染后重新审计`)
+    const finalizations = await engine.parallel(identityPairs.map(({ f }) => async () => {
+      try { return await capabilities.finalizeSpeakerIdentity(f) } catch (error) {
+        engine.log(`最终身份定稿失败：${f.label}（${(error && error.message) || error}）`)
+        return null
+      }
+    }))
+    finalizations.forEach((finalization, index) => {
+      const { f } = identityPairs[index]
+      if (finalization) {
+        speakerIdentityFinalizations.push(finalization)
+        const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+        if (entry) entry.speakerResolution = f.speakerResolution || null
+      } else {
+        const finding = 'speaker_identity_finalization_unavailable'
+        const existing = auditFailed.find((item) => item.path === f.outPath)
+        if (existing) existing.findings = [...new Set([...(existing.findings || []), finding])]
+        else auditFailed.push({ path: f.outPath, findings: [finding] })
+      }
+    })
+
+    const finalizedPairs = identityPairs.filter((_pair, index) => finalizations[index])
+    const finalAudits = await engine.parallel(finalizedPairs.map(({ f, onePassGlossaryText }) => () => (
+      runAuditStep(
+        A,
+        engine,
+        f,
+        capabilities,
+        onePassGlossaryText || glossary,
+        { allowRepair: false, phase: 'post_identity_finalization' },
+      )
+    )))
+    finalizedPairs.forEach(({ f }, index) => {
+      const result = finalAudits[index] || {
+        status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [],
+        repaired: false, repairAttempts: [], anchorsAdded: 0, directAudit: false,
+      }
+      auditFailed = auditFailed.filter((item) => item.path !== f.outPath)
+      auditUnavailable = auditUnavailable.filter((item) => item.path !== f.outPath)
+      const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+      if (entry) {
+        entry.audit = {
+          status: result.status,
+          hardFindings: result.hardFindings || [],
+          softFindings: result.softFindings || [],
+          repaired: !!result.repaired,
+          repairAttempts: result.repairAttempts || [],
+          anchorsAdded: result.anchorsAdded || 0,
+          auditUnavailable: !!result.auditUnavailable,
+        }
+      }
+      if (result.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
+      if ((result.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: result.auditFailed })
+    })
+    if (A.files.length === 1 && refined.length === 1 && speakerIdentityFinalizations.length === 1) {
+      transcriptMetadata = speakerIdentityFinalizations[0].metadata || null
+    }
+  }
+}
+
+// Re-read the public mapping view from the registry after final identity. This view is derived metadata for
+// manifests and downstream naming; renderer and audit never consume it as an authority.
+speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
+  label: f.label,
+  path: f.refineSourcePath || f.path,
+  ...f.speakerResolution,
+}))
+
 // Derivatives may only read FINAL bodies. The main transcript is still delivered when blocked (with review /
 // visible markers), but logic/summary/timeline are withheld rather than fossilising a known gap or speaker swap.
 const derivativesRequested = ['logic', 'summary', 'timeline'].filter((x) => scope.includes(x))
@@ -4504,7 +4713,10 @@ return {
   speakerStructuralFailures,
   speakerStructureWarnings,
   speakerCandidateAdjudications,
+  speakerIdentityFinalizations,
+  transcriptMetadata,
   qualityRepairAttempts,
+  turnContractFailures: A.turnContractFailures || [],
   autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
   derivativesSkipped,

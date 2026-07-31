@@ -171,6 +171,45 @@ export function refinePrompt(f, glossary, finding, a, chunk) {
   const sourcePath = f.refinePath || f.path
   const speakers = resolvedSpeakerBlock(f, finding)
 
+  if (f.refineContract) {
+    const contractPath = (chunk && chunk.inputPath) || sourcePath
+    const outPath = chunk && chunk.count > 1 ? partPath(f.outPath, chunk.idx) : f.outPath
+    const turnCount = (chunk && Array.isArray(chunk.turnIds))
+      ? chunk.turnIds.length
+      : ((f.refineContract.records || []).length)
+    const chunkNote = chunk && chunk.count > 1
+      ? `这是第 ${chunk.idx}/${chunk.count} 块；输入文件已经只保留本块拥有的 ${turnCount} 个 source turn，不要再按原稿行号自行切边界。`
+      : `这是整份文件，共 ${turnCount} 个 source turn。`
+    return `你是访谈转录「精校」子代理。宿主程序已经把原稿转换成不可变的 source turn 账本；你把它们映射成可变的 output block，文档结构与说话人标签由宿主程序最终渲染。
+
+【统一校对表】（「联网核实结论」与「写法统一」优先；标 ⚠ 的条目未采纳、勿套用）：
+${glossary}
+
+【结构化输入】${contractPath}
+【输出】Write 到 ${outPath}
+${chunkNote}
+先完整 Read 结构化输入；它已经是宿主生成的默认 \`keep\` output-block 草稿。直接在这份 envelope 上精校，只有确实发生合并、拆分或折叠时才修改来源关系。
+
+【不可变数据契约】
+- 输出第一条非空行必须逐字为 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
+- 每个现有 block 都对应不可变 source turn 账本中的一项。输出只使用：
+  \`<!-- LRB_OUTPUT_BLOCK sources=Txxxxxx disposition=keep -->\`
+  正文
+  \`<!-- /LRB_OUTPUT_BLOCK -->\`
+- \`LRB_SOURCE_REFS\` 是宿主提供的只读轨道与源行元数据，可以原样保留；最终解析后会由宿主重建，不进入成稿。
+- \`sources\` 填该 block 实际承接的 source turn ID，多个 ID 用英文逗号连接。全部来源 ID 必须按原顺序完整记账，不能虚构、漏掉或把实质内容移到不相干来源。
+- \`keep\`：一个来源对应一个 block；\`merge\`：相邻且属于同一已确认说话人轨道的多个来源合成一个 block；\`split\`：同一来源连续写成至少两个 block；\`fold_noise\`：一个或多个相邻纯口癖/纯寒暄来源折成一句括号说明或空正文。不同说话人的实质发言绝不能合并；跨说话人只允许显式 \`fold_noise\`，不得保留其中任何事实或观点。
+- 宿主会从 sources 推导说话人，不要输出或猜测 speaker_track_id。普通 block 不要写发言人标签；标题、说明行、canonical 标签与分块合并均由宿主确定性生成。
+- output block 外只能放 \`## \` 开头的小标题，且小标题属于它后面的 block；不要输出 H1、说明行、前言、结语、分隔线或其它自由文本。
+- 分段不等于改来源：长 turn 可以用多个 \`split\` block；同说话人 ASR 碎轮可以用一个 \`merge\` block。来源关系服务于回溯，不要求成稿机械一对一。
+
+${notes ? `【该份特别提醒】\n${notes}\n` : ''}${headingNote(a.headingPolicy)}
+
+${RULES}
+
+完成后按 schema 返回 path（=${outPath}）、headings（你添加的 ## 小标题）、key_fixes、open_questions。`
+  }
+
   // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
   // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
   if (chunk && chunk.count > 1) {

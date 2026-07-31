@@ -1704,6 +1704,121 @@ export function checkAttribution(sourceText, refinedText, options = {}) {
   return { assessed: assessedTurns > 0, status: assessedTurns > 0 ? 'assessed' : 'unassessed', map, speakers, assessedTurns, mappedSpeakers, mismatches, samples, review, reviewSamples, partyCount, perTurn }
 }
 
+// Provenance-contract attribution audit. The host already owns speaker identity and rendering, so contracted
+// output must never be parsed again to guess who a `名字：` line belongs to. Each immutable source turn receives
+// the aggregate body of every output block that references it (one-to-many split and many-to-one same-speaker
+// merge are both valid). A hard mismatch requires the source turn to be absent from every referenced block and
+// strongly co-located in a different speaker's block; ordinary rephrasing stays unassessed.
+export function checkContractAttribution(turnRecords = [], refinedText = '', options = {}) {
+  const empty = {
+    assessed: false, status: 'unassessed', map: {}, speakers: {}, assessedTurns: 0,
+    mappedSpeakers: 0, mismatches: 0, samples: [], review: 0, reviewSamples: [],
+    partyCount: 0, perTurn: [], contract: 'turn_ir_v2',
+  }
+  const records = (Array.isArray(turnRecords) ? turnRecords : [])
+    .filter((record) => record && record.id)
+    .map((record) => ({
+      ...record,
+      sourceNorm: normalize(String(record.sourceText || '')),
+      bodyNorm: normalize(String(record.body || '')),
+    }))
+  const speakersList = [...new Set(records.map((record) => record.speaker).filter(Boolean))]
+  const partyCount = speakersList.length
+  const speakerMode = options.speakerMode || (partyCount ? 'tracked' : 'untracked')
+  if (speakerMode !== 'tracked') return { ...empty, status: 'not_applicable', partyCount }
+  if (!records.length || !partyCount) return { ...empty, partyCount }
+
+  const freq = new Map()
+  let total = 0
+  for (const record of records) {
+    for (const ch of record.sourceNorm) {
+      freq.set(ch, (freq.get(ch) || 0) + 1)
+      total += 1
+    }
+  }
+  const rarity = new Map()
+  for (const [ch, count] of freq) rarity.set(ch, Math.log(Math.max(total, 1) / count))
+  const map = Object.fromEntries(speakersList.map((speaker) => [speaker, speaker]))
+  const speakers = Object.fromEntries(speakersList.map((speaker) => [
+    speaker,
+    {
+      sampled: records.filter((record) => record.speaker === speaker && record.sourceNorm.length >= ATTR.MIN_TURN_CHARS).length,
+      label: speaker,
+      frac: 1,
+      trusted: true,
+      basis: 'turn_contract',
+    },
+  ]))
+  const refinedLines = String(refinedText || '').split(/\r?\n/u)
+  const lineForBody = (record) => {
+    const first = String(record && record.body || '').split(/\r?\n/u).find((line) => line.trim())
+    if (!first) return 1
+    const sample = first.trim().slice(0, 80)
+    const index = refinedLines.findIndex((line) => line.includes(sample))
+    return index >= 0 ? index + 1 : 1
+  }
+
+  let assessedTurns = 0
+  let mismatches = 0
+  const samples = []
+  const perTurn = []
+  for (const record of records) {
+    if (!record.speaker || record.sourceNorm.length < ATTR.MIN_TURN_CHARS) continue
+    const anchors = pickShingles(record.sourceNorm, rarity)
+    if (!anchors.length) continue
+    const scored = records.map((candidate) => ({
+      candidate,
+      count: anchors.filter((anchor) => candidate.bodyNorm.includes(anchor)).length,
+    })).sort((a, b) => b.count - a.count)
+    const own = scored.find((item) => item.candidate.id === record.id)
+    const best = scored[0]
+    const need = Math.max(ATTR.MIN_CORROBORATION, Math.ceil(anchors.length * ATTR.MULTI_CORROBORATION_FRACTION))
+    const ownGrounded = !!(own && own.count > 0)
+    const misplaced = !ownGrounded
+      && best
+      && best.candidate.id !== record.id
+      && best.candidate.speaker
+      && best.candidate.speaker !== record.speaker
+      && best.count >= need
+    if (!ownGrounded && (!best || best.count < need)) continue
+    assessedTurns += 1
+    if (misplaced) mismatches += 1
+    const anchorLine = lineForBody(misplaced ? best.candidate : record)
+    if (misplaced && samples.length < 12) {
+      samples.push({
+        text: `源第 ${record.startLine}-${record.endLine} 行（${record.speaker}，${record.id}）的内容出现在 ${best.candidate.id}（${best.candidate.speaker}）正文内`,
+        line: anchorLine,
+      })
+    }
+    perTurn.push({
+      startLine: record.startLine,
+      endLine: record.endLine,
+      anchorLine,
+      speaker: record.speaker,
+      label: misplaced ? best.candidate.speaker : record.speaker,
+      expected: record.speaker,
+      mismatch: misplaced,
+      review: false,
+      turnId: record.id,
+    })
+  }
+  return {
+    assessed: assessedTurns > 0,
+    status: assessedTurns > 0 ? 'assessed' : 'unassessed',
+    map,
+    speakers,
+    assessedTurns,
+    mappedSpeakers: speakersList.length,
+    mismatches,
+    samples,
+    review: 0,
+    reviewSamples: [],
+    partyCount,
+    perTurn,
+    contract: 'turn_ir_v2',
+  }
+}
+
 // ===== Quote-integrity + entity-substitution guards (M7) =====
 // M6 defends WHO said it; these two defend WHAT is inside a quote and WHICH entity a local mention names. Both
 // deterministic, refine mode only, SOFT only.
@@ -2203,7 +2318,7 @@ export function auditFiles(paths) {
 // two checks are silently skipped (count 0), same leniency contract as the coverage scan.
 export function auditPair({
   sourceText, refinedText, sourceFile = '<source>', refinedFile = '<refined>', mode = 'refine',
-  glossaryText = null, strict = false, speakerMode = null, speakerMappings = null,
+  glossaryText = null, strict = false, speakerMode = null, speakerMappings = null, turnRecords = null,
   speakerDismissedLabels = null, speakerReviewLabels = null,
 }) {
   sourceText = normalizeTranscriptSource(sourceText, { sourceFile })
@@ -2215,8 +2330,9 @@ export function auditPair({
   const sChars = hanzi(sourceText)
   const rChars = hanzi(refinedText)
   const charRatio = sChars ? Number((rChars / sChars).toFixed(3)) : 1
-  const sTurns = consolidatedTurns(sourceText)
-  const rTurns = consolidatedTurns(refinedText)
+  const contractedTurns = Array.isArray(turnRecords) ? turnRecords : null
+  const sTurns = contractedTurns ? contractedTurns.length : consolidatedTurns(sourceText)
+  const rTurns = contractedTurns ? contractedTurns.filter((record) => String(record && record.body || '').trim()).length : consolidatedTurns(refinedText)
   const speakerTurnRatio = sTurns ? Number((rTurns / sTurns).toFixed(3)) : 1
   const sEmptyDensity = sChars ? emptyCount(sourceText) / sChars : 0
   const rEmptyDensity = rChars ? emptyCount(refinedText) / rChars : 0
@@ -2227,12 +2343,16 @@ export function auditPair({
   const atoms = mode === 'refine' ? checkMeaningAtoms(sourceText, refinedText, { knownSpeakerLabels }) : null
   // M6 attribution tier: speaker-misattribution via a self-calibrated majority map. refine mode only (a summary /
   // timeline / logic draft has no per-turn labels to defend). Calibrated mismatches are hard; ambiguous cases soft.
-  const attribution = mode === 'refine' ? checkAttribution(sourceText, refinedText, {
-    speakerMode,
-    speakerMappings,
-    speakerDismissedLabels,
-    speakerReviewLabels,
-  }) : null
+  const attribution = mode === 'refine'
+    ? (contractedTurns
+        ? checkContractAttribution(contractedTurns, refinedText, { speakerMode })
+        : checkAttribution(sourceText, refinedText, {
+            speakerMode,
+            speakerMappings,
+            speakerDismissedLabels,
+            speakerReviewLabels,
+          }))
+    : null
   // M7 quote-integrity guard: manufactured-quote detection. refine mode only, SOFT. Reliably quiet on faithful
   // quotes (verified on real pairs), so it is default-on.
   const quoteFab = mode === 'refine' ? checkQuoteFabrication(sourceText, refinedText) : null
@@ -2255,7 +2375,7 @@ export function auditPair({
   // ghost_name/missing_yin and label-style observations remain review-tier and need a glossary parsed here.
   const glossary = parseGlossaryLite(glossaryText)
   const quoteFindings = checkQuoteStyle(refinedText)
-  const speakerFindings = checkSpeakerLabelStyle(refinedText)
+  const speakerFindings = contractedTurns ? [] : checkSpeakerLabelStyle(refinedText)
   const ghostFinding = checkGhostName(refinedText, glossary)
   const yinFinding = checkMissingYin(refinedText, glossary)
   // wholesale-substitution tripwire: unificationList (Tier 1, informational) + entity_merge_review (Tier 2, soft)
@@ -2383,6 +2503,7 @@ export function auditPairs(pairs) {
     strict: !!p.strict,   // opt-in entity_substitution_risk
     speakerMode: p.speakerMode || null,
     speakerMappings: Array.isArray(p.speakerMappings) ? p.speakerMappings : null,
+    turnRecords: Array.isArray(p.turnRecords) ? p.turnRecords : null,
     speakerDismissedLabels: Array.isArray(p.speakerDismissedLabels) ? p.speakerDismissedLabels : null,
     speakerReviewLabels: Array.isArray(p.speakerReviewLabels) ? p.speakerReviewLabels : null,
   }))
