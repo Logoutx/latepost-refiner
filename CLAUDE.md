@@ -12,8 +12,8 @@
 
 - `latepost-team/latepost-refiner` 是公司 private 权威源，`main` 是唯一权威主干。
 - **禁止直接在 `main` 上 commit、push、force push，或绕过 pull request 把改动 merge 进 `main`。**
-- 每项修改从最新 `main` 新建分支，经过 PR、CI 和至少一位团队成员审阅后，只通过 PR 合并。
-- 公司当前 GitHub 方案不能为 private repo 强制 branch protection；平台没有拦截不代表允许跳过流程。
+- 每项修改从最新 `main` 新建分支，CI 通过后只通过 PR 合并。人工 reviewer 不是合并前置条件，默认不主动请求；只有用户明确要求时才发起 review 请求。
+- 公司当前 GitHub 方案不能为 private repo 强制 branch protection；平台没有拦截不代表允许跳过分支、CI 和 PR 流程。
 - 原始公开仓库和旧个人镜像不是当前构建、部署或日常协作依赖；外部改动须审阅后以独立 PR 引入。
 
 ## mac mini 生产边界

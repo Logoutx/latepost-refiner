@@ -10,7 +10,7 @@
 
 ## 仓库与协作
 
-`latepost-team/latepost-refiner` 是公司内部唯一权威仓库，设为 private。**禁止直接在 `main` 上 commit、push，或绕过 pull request 把改动 merge 进 `main`。**每项修改都从最新 `main` 新建分支，经过 PR、CI 和至少一位团队成员审阅后，再通过 PR 合并。公司当前 GitHub 方案无法为 private repo 强制 branch protection；这是平台限制，不代表可以跳过上述流程。
+`latepost-team/latepost-refiner` 是公司内部唯一权威仓库，设为 private。**禁止直接在 `main` 上 commit、push，或绕过 pull request 把改动 merge 进 `main`。**每项修改都从最新 `main` 新建分支，CI 通过后只通过 PR 合并。人工 reviewer 不是合并前置条件，默认不主动请求团队成员 review；只有用户明确要求时才发起 review 请求。公司当前 GitHub 方案无法为 private repo 强制 branch protection；这是平台限制，不代表可以跳过分支、CI 和 PR 流程。
 
 仓库不再自动跟踪或同步其他公开、个人仓库。需要吸收外部改动时，先审阅并以独立 PR 引入。真实转录稿、运行日志、API key 和私有评测结果不得提交。
 

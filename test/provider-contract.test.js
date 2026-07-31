@@ -111,7 +111,7 @@ test('file tool calls feed local tool results back to the model', async () => {
   const source = path.join(base, 'source.txt')
   fs.writeFileSync(source, 'hello from transcript\n', 'utf8')
   const client = mockClient([
-    completion({ content: '', tool_calls: [toolCall('read1', 'Read', { file_path: source })] }),
+    completion({ content: '', reasoning_content: 'tool-call reasoning', tool_calls: [toolCall('read1', 'Read', { file_path: source })] }),
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
   ])
   const engine = makeDeepSeekEngine({
@@ -125,6 +125,8 @@ test('file tool calls feed local tool results back to the model', async () => {
   assert.deepEqual(result, { ok: true })
   const toolMessage = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'read1')
   assert.match(toolMessage.content, /hello from transcript/)
+  const assistantMessage = client.calls[1].messages.find((m) => m.role === 'assistant' && m.tool_calls?.[0]?.id === 'read1')
+  assert.equal(assistantMessage.reasoning_content, 'tool-call reasoning', 'V4 thinking tool turns replay reasoning_content')
 })
 
 test('a denied write cannot be masked by structured_output; the agent must create the declared artifact', async () => {
@@ -366,7 +368,7 @@ test('formatSearchResults renders the normalized search contract (empty → 无�
   assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(501)), false)
 })
 
-test('DeepSeek forces structured_output via tool_choice after two nudges', async () => {
+test('DeepSeek requests structured_output without unsupported thinking-mode tool_choice after two nudges', async () => {
   const client = mockClient([
     completion({ content: 'plain answer' }),
     completion({ content: 'still plain' }),
@@ -379,10 +381,10 @@ test('DeepSeek forces structured_output via tool_choice after two nudges', async
 
   assert.deepEqual(result, { ok: true })
   const forced = client.calls.at(-1)
-  assert.deepEqual(forced.tool_choice, { type: 'function', function: { name: 'structured_output' } })
+  assert.equal(forced.tool_choice, undefined, 'V4 thinking mode rejects explicit tool_choice')
   assert.equal(forced.max_tokens, 64000, 'summary is a big-output label')
   assert.equal('max_completion_tokens' in forced, false)
-  // No Kimi-style json_object fallback: forcing the tool is the only last resort DeepSeek uses.
+  // No json_object fallback: a tools-only structured request is the last resort DeepSeek uses.
   assert.equal(forced.response_format, undefined)
 })
 

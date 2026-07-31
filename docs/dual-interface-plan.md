@@ -2,7 +2,7 @@
 
 > **已收敛**（2026-07-14 起收敛为三 edition：Claude Code / Codex / DeepSeek API——本文其余内容为历史记录）。
 >
-> **当前操作边界**：公司协作以 `README.md`、`AGENTS.md` / `CLAUDE.md` 和 `CONTRIBUTING.md` 为准。禁止直接 commit、push 或 merge 到 `main`，所有修改走分支 + PR + CI + 同事审阅。公司 mac mini 当前只支持 Universal；本文的 Claude/Codex 订阅接口不属于生产后端。
+> **当前操作边界**：公司协作以 `README.md`、`AGENTS.md` / `CLAUDE.md` 和 `CONTRIBUTING.md` 为准。禁止直接 commit、push 或 merge 到 `main`，所有修改走分支 + PR + CI；人工 reviewer 按需且默认不主动请求。公司 mac mini 当前只支持 Universal；本文的 Claude/Codex 订阅接口不属于生产后端。
 
 _Drafted 2026-06-22. Companion to `docs/streamlining-proposal.md` (the collaborator's structure proposal). This is the agreed execution plan._
 
@@ -25,7 +25,7 @@ LatePost-Refiner (renamed from interview-transcriber; repo `Logoutx/latepost-ref
 - Historical prerequisite: `git fetch` first, then diff the collaborator checkout and `origin/main` against local.
 - Both sides currently have **uncommitted** work touching the **same files** (`README`, `package.json`, `universal/{cli,jobs,server}.js`, `universal/web/index.html`, `test/server.test.js`). Resolution path: each side commits to its own branch first, then a real 3-way merge — not a working-tree fix.
 - Decide the rename strategy (recommend keeping `transcriber` aliases for a deprecation window), fold in our binary + de-jargon and their `codex-skill/` + `model-profiles.js` + `artifacts.js` + resume/cancel/pricing work.
-- Land one canonical result through a reviewed PR; never coordinate a direct push or merge into `main`.
+- Land one canonical result through a CI-passing PR; human review is optional and requested only when the user explicitly asks. Never coordinate a direct push or merge into `main`.
 
 ### Phase 1 — `engines/model-profiles.js` (single source of model defaults, both providers)  *(highest leverage, lowest risk — first)*
 - `MODEL_PROFILES` with symmetric `anthropicDefault`/`anthropicPremium` AND `openaiDefault`/`openaiPremium` (optionally `deepseekCheap`), each a tier map `{scout,verify,dedup,refine,logic,summary,timeline}`.
@@ -50,7 +50,7 @@ LatePost-Refiner (renamed from interview-transcriber; repo `Logoutx/latepost-ref
 
 ## Risks
 - **Codex subscription unknowns** (web-search, subagent flexibility/billing) — mitigated by the 3a spike before committing to 3b.
-- **Historical force-push risk** — now retired. Current work must use branches and reviewed PRs; direct or force pushes to `main` are prohibited.
+- **Historical force-push risk** — now retired. Current work must use branches and CI-passing PRs; direct or force pushes to `main` are prohibited. Human review is optional and not requested by default.
 - **Folder moves** break the skill symlink + `launch.json` absolute paths — deferred to Phase 5, done deliberately.
 - **Cannot drive Codex from this agent** — the spike and the Codex-native runs require running inside Codex and reporting back.
 - On subscription paths you get the harness's model (Claude Code's / Codex's), not a per-stage tier pick; explicit model selection lives on the API-key paths.

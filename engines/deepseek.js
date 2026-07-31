@@ -8,10 +8,11 @@
 //   • Endpoint  https://api.deepseek.com ; key from DEEPSEEK_API_KEY.
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
-//               Non-thinking tiers on purpose: DeepSeek's thinking mode disables function calling.
+//               V4 defaults to thinking mode; tool-call turns therefore replay reasoning_content.
 //   • Web       Job-scoped runtime: Serper search → Jina Reader → SSRF-safe local fallback. Optional
 //               programmatic searchFn/fetch injections remain for tests and benchmarks.
-//   • Structured output via a forced function call (tool_choice), which DeepSeek supports.
+//   • Structured output via a function tool. The final fallback asks again with only that tool exposed;
+//               it does not send tool_choice because V4 thinking mode rejects that parameter.
 //
 // Client tools Read/Write/Edit share fileops.js. Offline stages never receive web tools.
 
@@ -247,15 +248,15 @@ export function makeDeepSeekEngine(opts = {}) {
     return result
   }
 
-  // Last-resort structured output when the model won't call the tool on its own: force the specific
-  // function via tool_choice (DeepSeek supports this). Returns the parsed args, or null on failure.
+  // Last-resort structured output when the model will not call the tool after two nudges. V4 thinking mode
+  // rejects explicit tool_choice, so expose only structured_output and ask for it again. Returns parsed args,
+  // or null on failure.
   async function forceStructured_(messages, schema, modelId, label) {
     try {
       const comp = await create({
         model: modelId,
         messages: [...messages, { role: 'user', content: '请调用 structured_output 工具提交结果。' }],
         tools: [structuredTool(schema)],
-        tool_choice: { type: 'function', function: { name: 'structured_output' } },
         max_tokens: maxTokensFor(label),
       })
       const choice = comp.choices?.[0]
@@ -301,6 +302,9 @@ export function makeDeepSeekEngine(opts = {}) {
       if (m.refusal) throw agentError('MODEL_REFUSAL', `${label || 'agent'} 被模型明确拒绝`, false, lastProviderSignal)
 
       const asst = { role: 'assistant', content: m.content ?? '' }
+      // DeepSeek V4 thinking tool turns are a single protocol unit: the next request must replay the model's
+      // reasoning_content together with content and tool_calls, otherwise the provider rejects it with HTTP 400.
+      if (m.reasoning_content != null) asst.reasoning_content = m.reasoning_content
       const calls = m.tool_calls || []
       if (calls.length) asst.tool_calls = calls
       messages.push(asst)

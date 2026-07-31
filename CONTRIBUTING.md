@@ -2,7 +2,7 @@
 
 ## 分支与合并
 
-`main` 是公司内部唯一权威主干。禁止直接在 `main` 上 commit、push、force push，或绕过 pull request 把改动 merge 进 `main`。每项修改都从最新 `main` 新建功能或修复分支，经过 CI 和至少一位团队成员审阅后，只通过 PR 合并。
+`main` 是公司内部唯一权威主干。禁止直接在 `main` 上 commit、push、force push，或绕过 pull request 把改动 merge 进 `main`。每项修改都从最新 `main` 新建功能或修复分支，CI 通过后只通过 PR 合并。人工 reviewer 不是合并前置条件，默认不主动请求团队成员 review；只有用户明确要求时才发起 review 请求。
 
 公司当前 GitHub 方案无法为 private repo 强制 branch protection；这是平台限制，不是流程豁免。无论使用者还是自动化 Agent，都不得因此直接修改或合并 `main`。
 
