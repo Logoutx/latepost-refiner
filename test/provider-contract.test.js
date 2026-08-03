@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, REFINE_CHAR_BUDGET, SOURCE_PROTECTION_NOTE, formatSearchResults } from '../engines/deepseek.js'
+import { TURN_CONTRACT_HEADER, buildTurnContract, validateOutputBlockEnvelope } from '../universal/output-contract.js'
 
 // The Universal edition supports exactly ONE API provider — DeepSeek — with two FIXED models: v4-flash for the
 // mechanical tiers (scout/check/dedup/stitch → haiku/sonnet) and v4-pro for the writing tiers (refine/logic/
@@ -333,6 +334,82 @@ test('a declared artifact must pass its structural validator before structured_o
     /TURN_CONTRACT_OUTSIDE_CONTENT/u,
   )
   assert.equal(engine.usage().failed, 0)
+})
+
+test('structural recovery sends every advancing diagnostic back to the same agent context', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-progress-'))
+  const outputPath = path.join(base, 'A.md')
+  const contract = buildTurnContract('记者：问题。\n\n受访者：回答。')
+  const body = '<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->\n问题。\n<!-- /LRB_OUTPUT_BLOCK -->\n\n<!-- LRB_OUTPUT_BLOCK sources=T000002 disposition=keep -->\n回答。\n<!-- /LRB_OUTPUT_BLOCK -->\n'
+  const first = `# 模型标题\n\n*模型说明行*\n\n${body}`
+  const second = `${TURN_CONTRACT_HEADER}\n${first}`
+  const valid = `${TURN_CONTRACT_HEADER}\n${body}`
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-first', 'Write', { file_path: outputPath, content: first }),
+      toolCall('submit-first', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-second', 'Edit', { file_path: outputPath, old_string: first, new_string: second }),
+      toolCall('submit-second', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-valid', 'Edit', { file_path: outputPath, old_string: second, new_string: valid }),
+      toolCall('submit-valid', 'structured_output', { ok: true }),
+    ] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] },
+  })
+  const validateOutput = () => validateOutputBlockEnvelope(fs.readFileSync(outputPath, 'utf8'), contract)
+
+  assert.deepEqual(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput }), { ok: true })
+  assert.equal(client.calls.length, 3)
+  const firstFeedback = client.calls[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-first').content
+  const secondFeedback = client.calls[2].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-second').content
+  assert.match(firstFeedback, /TURN_CONTRACT_HEADER_MISSING[\s\S]*TURN_CONTRACT_OUTSIDE_CONTENT/u)
+  assert.match(secondFeedback, /TURN_CONTRACT_OUTSIDE_CONTENT/u)
+  assert.deepEqual(engine.failures(), [])
+})
+
+test('structural recovery stops on an unchanged artifact and error fingerprint', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-stalled-'))
+  const outputPath = path.join(base, 'A.md')
+  const invalid = '# 标题\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-invalid', 'Write', { file_path: outputPath, content: invalid }),
+      toolCall('submit-first', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [toolCall('submit-again', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+  const invalidResult = { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: '仍有 H1', errors: [{ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', line: 1 }] }
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput: () => invalidResult }), null)
+  assert.equal(client.calls.length, 2)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_VALIDATION_NO_PROGRESS')
+  assert.match(engine.failures()[0].message, /TURN_CONTRACT_OUTSIDE_CONTENT/u)
+})
+
+test('structural recovery detects an artifact/error-state oscillation', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-oscillation-'))
+  const outputPath = path.join(base, 'A.md')
+  const stateA = '# 标题 A\n'
+  const stateB = '# 标题 B\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('write-a1', 'Write', { file_path: outputPath, content: stateA }), toolCall('submit-a1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('write-b', 'Write', { file_path: outputPath, content: stateB }), toolCall('submit-b', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('write-a2', 'Write', { file_path: outputPath, content: stateA }), toolCall('submit-a2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+  const invalidResult = { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: '仍有 H1', errors: [{ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', line: 1 }] }
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput: () => invalidResult }), null)
+  assert.equal(client.calls.length, 3)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_VALIDATION_OSCILLATION')
 })
 
 test('web tools are only exposed to online (verify/timeline) labels', async () => {

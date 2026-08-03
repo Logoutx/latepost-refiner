@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, SPEAKER_CANDIDATE_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, RULES, TYPESET, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, SPEAKER_CANDIDATE_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, speakerCandidatePrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
@@ -24,6 +24,16 @@ function recordTurnContractFailure(A, f, error, phase) {
   }
   A.turnContractFailures.push(failure)
   return failure
+}
+
+function retryableAgentFailure(engine, label) {
+  if (!engine || typeof engine.failures !== 'function') return false
+  const failures = engine.failures()
+  if (!Array.isArray(failures)) return false
+  const failure = failures.findLast
+    ? failures.findLast((entry) => entry && entry.label === label)
+    : failures.slice().reverse().find((entry) => entry && entry.label === label)
+  return !!(failure && failure.retryable === true)
 }
 
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
@@ -159,12 +169,17 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   if (typeof A.onChunkPlan === 'function') A.onChunkPlan(plan)
   if (chunks.length <= 1) {
     // Single agent → full glossary (no token multiplication on one agent).
-    const rep = await engine.agent(refinePrompt(f, glossary, finding, A, chunks[0]),
-      {
-        label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort,
-        schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath,
-        validateOutput: contractValidator(chunks[0], f.outPath),
-      })
+    const prompt = refinePrompt(f, glossary, finding, A, chunks[0])
+    const opts = {
+      label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+      schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath,
+      validateOutput: contractValidator(chunks[0], f.outPath),
+    }
+    let rep = await engine.agent(prompt, opts)
+    if (!rep && retryableAgentFailure(engine, opts.label)) {
+      engine.log(`精校单元：${f.label} 遇到可重试 provider 故障——只重跑该单元一次`)
+      rep = await engine.agent(prompt, { ...opts, label: `refine-retry:${f.label}` })
+    }
     if (!rep || !f.refineContract) return rep
     if (typeof cap.finalizeRefineContract !== 'function') {
       recordTurnContractFailure(A, f, { code: 'TURN_CONTRACT_CAPABILITY_MISSING', message: '宿主缺少 turn contract 收口能力' }, 'finalize')
@@ -191,31 +206,23 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
-  let partReps = await engine.parallel(chunks.map((c) => () =>
-    engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      {
-        label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
-        schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
-        validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
-      })))
-  const missing = chunks.map((c, i) => (!partReps[i] ? i : -1)).filter((i) => i >= 0)
-  if (missing.length) {
-    engine.log(`精校分块：${f.label} 首轮 ${missing.length}/${chunks.length} 块未返回——只重试缺失块一次`)
-    const retries = await engine.parallel(missing.map((i) => {
-      const c = chunks[i]
-      return () => engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-        {
-          label: `refine-retry:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
-          schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
-          validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
-        })
-    }))
-    partReps = partReps.slice()
-    missing.forEach((i, k) => { if (retries[k]) partReps[i] = retries[k] })
-  }
+  const partReps = await engine.parallel(chunks.map((c) => async () => {
+    const prompt = refinePrompt(f, refineGlossary, finding, A, c)
+    const opts = {
+      label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+      schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
+      validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
+    }
+    let rep = await engine.agent(prompt, opts)
+    if (!rep && retryableAgentFailure(engine, opts.label)) {
+      engine.log(`精校单元：${f.label}#${c.idx}/${chunks.length} 遇到可重试 provider 故障——只重跑该单元一次`)
+      rep = await engine.agent(prompt, { ...opts, label: `refine-retry:${f.label}#${c.idx}/${chunks.length}` })
+    }
+    return rep
+  }))
   const stillMissing = chunks.filter((c, i) => !partReps[i])
   if (stillMissing.length) {
-    engine.log(`精校分块：${f.label} 重试后仍缺 ${stillMissing.map((c) => `${c.idx}（源第 ${c.startLine}-${c.endLine} 行）`).join('、')}——拒绝拼接残缺正文`)
+    engine.log(`精校分块：${f.label} 处理后仍缺 ${stillMissing.map((c) => `${c.idx}（源第 ${c.startLine}-${c.endLine} 行）`).join('、')}——拒绝拼接残缺正文`)
     return null
   }
   const good = partReps.filter(Boolean)

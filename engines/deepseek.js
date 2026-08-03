@@ -19,6 +19,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import OpenAI from 'openai'
 import pLimit from 'p-limit'
 import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
@@ -56,6 +57,8 @@ export const REFINE_CHAR_BUDGET = { 'deepseek-v4-pro': 10000, 'deepseek-v4-flash
 export const SOURCE_PROTECTION_NOTE = '信源保护提示：DeepSeek 由中国境内公司运营，转录全文将传输至其服务器处理并受当地法规约束（含内容审查——审查即意味着内容被服务端读取）。涉敏感话题或需保护信源的访谈请慎用。'
 
 const MAX_TURNS = 100
+const MAX_OUTPUT_POSTCONDITION_NUDGES = 2
+const MAX_OUTPUT_VALIDATION_STATES = 8
 const toFn = (s) => ({ type: 'function', function: { name: s.name, description: s.description, parameters: s.parameters } })
 const FILE_TOOLS = TOOL_SPECS.map(toFn)
 const WEB_SEARCH_TOOL = toFn({ name: 'web_search', description: '联网搜索，返回若干结果（标题 / 网址 / 摘要）。', parameters: { type: 'object', properties: { query: { type: 'string', description: '搜索词' } }, required: ['query'] } })
@@ -117,9 +120,17 @@ function outputSnapshot(filePath) {
   const resolved = path.resolve(String(filePath))
   try {
     const stat = fs.statSync(resolved)
-    return { path: resolved, exists: stat.isFile(), bytes: stat.isFile() ? stat.size : 0, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs }
+    const exists = stat.isFile()
+    return {
+      path: resolved,
+      exists,
+      bytes: exists ? stat.size : 0,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      sha256: exists ? createHash('sha256').update(fs.readFileSync(resolved)).digest('hex') : null,
+    }
   } catch {
-    return { path: resolved, exists: false, bytes: 0, mtimeMs: null, ctimeMs: null }
+    return { path: resolved, exists: false, bytes: 0, mtimeMs: null, ctimeMs: null, sha256: null }
   }
 }
 
@@ -128,10 +139,21 @@ function checkOutputPostcondition(filePath, before) {
   const after = outputSnapshot(filePath)
   if (!after.exists) return { ok: false, code: 'OUTPUT_MISSING', message: `声明产物未生成：${after.path}` }
   if (after.bytes <= 0) return { ok: false, code: 'OUTPUT_EMPTY', message: `声明产物为空：${after.path}` }
-  if (before && before.exists && before.bytes === after.bytes && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs) {
+  if (before && before.exists && before.sha256 === after.sha256) {
     return { ok: false, code: 'OUTPUT_NOT_UPDATED', message: `声明产物未在本代理调用中更新：${after.path}` }
   }
-  return { ok: true, path: after.path, bytes: after.bytes }
+  return { ok: true, path: after.path, bytes: after.bytes, artifactHash: after.sha256 }
+}
+
+function validationFingerprint(failure = {}) {
+  const errors = Array.isArray(failure.errors)
+    ? failure.errors.map((error) => ({ code: error && error.code, line: error && error.line }))
+    : []
+  return JSON.stringify({ code: failure.code || null, errors, message: failure.message || null })
+}
+
+function validationStateKey(failure = {}) {
+  return `${failure.artifactHash || 'no-artifact-hash'}\n${validationFingerprint(failure)}`
 }
 
 function classifyAgentError(error) {
@@ -295,28 +317,80 @@ export function makeDeepSeekEngine(opts = {}) {
       : prompt
     const messages = [{ role: 'user', content }]
     let nudges = 0
-    let outputNudges = 0
+    let outputPostconditionNudges = 0
+    const outputValidationStates = []
     let unrecoveredWriteFailure = null
     let lastProviderSignal = null
     const beforeOutput = outputSnapshot(outputPath)
 
     const checkDeclaredOutput = async () => {
       const post = checkOutputPostcondition(outputPath, beforeOutput)
-      if (!post.ok || typeof validateOutput !== 'function') return post
+      if (!post.ok) return { ...post, kind: 'postcondition' }
+      if (typeof validateOutput !== 'function') return post
       try {
         const validation = await validateOutput(post)
         if (validation === true || (validation && validation.ok === true)) return post
         return {
+          ...(validation && typeof validation === 'object' ? validation : {}),
           ok: false,
           code: (validation && validation.code) || 'OUTPUT_VALIDATION_FAILED',
           message: (validation && validation.message) || '声明产物未通过结构校验',
+          kind: 'validation',
+          artifactHash: post.artifactHash,
         }
       } catch (error) {
         return {
           ok: false,
           code: (error && error.code) || 'OUTPUT_VALIDATION_FAILED',
           message: (error && error.message) || '声明产物结构校验异常',
+          kind: 'validation',
+          artifactHash: post.artifactHash,
         }
+      }
+    }
+
+    const rejectStructuredOutput = (failure, toolCallId) => {
+      log(`⚠ ${label || 'agent'} 拒绝 structured_output：${failure.code} ${failure.message}`)
+      const instruction = failure.kind === 'validation'
+        ? '请按以上全部结构诊断修改同一产物，再重新提交 structured_output。'
+        : '请先成功写入声明产物，再重新提交 structured_output。'
+      messages.push({ role: 'tool', tool_call_id: toolCallId, content: `${failure.code}: ${failure.message}。${instruction}` })
+
+      if (failure.kind !== 'validation') {
+        outputPostconditionNudges += 1
+        if (outputPostconditionNudges >= MAX_OUTPUT_POSTCONDITION_NUDGES) {
+          throw agentError(failure.code, failure.message, false, lastProviderSignal)
+        }
+        return
+      }
+
+      const stateKey = validationStateKey(failure)
+      const previousIndex = outputValidationStates.lastIndexOf(stateKey)
+      const immediatelyPrevious = previousIndex >= 0 && previousIndex === outputValidationStates.length - 1
+      outputValidationStates.push(stateKey)
+      if (immediatelyPrevious) {
+        throw agentError(
+          'OUTPUT_VALIDATION_NO_PROGRESS',
+          `声明产物结构修正没有推进；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
+      }
+      if (previousIndex >= 0) {
+        throw agentError(
+          'OUTPUT_VALIDATION_OSCILLATION',
+          `声明产物结构修正在已见状态之间振荡；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
+      }
+      if (outputValidationStates.length >= MAX_OUTPUT_VALIDATION_STATES) {
+        throw agentError(
+          'OUTPUT_VALIDATION_LIMIT',
+          `声明产物结构修正达到安全上限（${MAX_OUTPUT_VALIDATION_STATES} 个不同状态）；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
       }
     }
 
@@ -357,10 +431,7 @@ export function makeDeepSeekEngine(opts = {}) {
             ? { ok: false, code: unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', message: unrecoveredWriteFailure.text }
             : post
           if (failure.ok) return structuredValue
-          outputNudges++
-          log(`⚠ ${label || 'agent'} 拒绝 structured_output：${failure.code} ${failure.message}`)
-          messages.push({ role: 'tool', tool_call_id: so.id, content: `${failure.code}: ${failure.message}。请先成功写入声明产物，再重新提交 structured_output。` })
-          if (outputNudges >= 2) throw agentError(failure.code, failure.message, false, lastProviderSignal)
+          rejectStructuredOutput(failure, so.id)
         }
         continue
       }

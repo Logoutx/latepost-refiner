@@ -13,9 +13,12 @@ import {
   recordsForChunk,
   renderTurnContract,
   serializeOutputBlockEnvelope,
+  validateOutputBlockEnvelope,
 } from '../universal/output-contract.js'
 import { auditPair, checkContractAttribution } from '../scripts/audit_refined.mjs'
 import { endsWithQuestion, splitForRefine } from '../core/spec.js'
+import { refinePrompt, turnIrV2PromptBlock } from '../core/prompts.js'
+import { qualityRepairPrompt } from '../universal/jobs.js'
 
 const TRACKED_SOURCE = `# 文字记录：产品访谈
 
@@ -170,6 +173,41 @@ test('output contract rejects free text outside blocks instead of guessing docum
     () => parseOutputBlockEnvelope(output, contract),
     (error) => error instanceof TurnContractError && error.code === 'TURN_CONTRACT_OUTSIDE_CONTENT',
   )
+})
+
+test('turn contract syntax validation reports missing header, H1 and subtitle in one diagnostic pass', () => {
+  const contract = buildTurnContract(TRACKED_SOURCE)
+  const output = `# 模型标题
+
+*模型说明行*
+
+<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->
+正文。
+<!-- /LRB_OUTPUT_BLOCK -->
+`
+  const validation = validateOutputBlockEnvelope(output, contract)
+  assert.equal(validation.ok, false)
+  assert.equal(validation.phase, 'syntax')
+  assert.deepEqual(validation.errors.map((error) => [error.code, error.line]), [
+    ['TURN_CONTRACT_HEADER_MISSING', 1],
+    ['TURN_CONTRACT_OUTSIDE_CONTENT', 1],
+    ['TURN_CONTRACT_OUTSIDE_CONTENT', 3],
+  ])
+  assert.doesNotMatch(validation.message, /TURN_CONTRACT_COVERAGE_INVALID/u, 'relation checks wait for clean syntax')
+})
+
+test('initial Refine and contracted quality repair share one Turn IR block without legacy Markdown ownership', () => {
+  const f = {
+    path: '/src/A.md', refinePath: '/work/A.turns.md', outPath: '/out/A.md', label: 'A', title: 'A', subtitle: '*A*', lines: 20,
+    refineContract: { records: [{ id: 'T000001' }] }, refineContractFinalized: true,
+  }
+  const common = turnIrV2PromptBlock()
+  const initial = refinePrompt(f, '校对表', { special_notes: [] }, { headingPolicy: 'none' }, { idx: 1, count: 1, turnIds: ['T000001'] })
+  const repair = qualityRepairPrompt({ topic: 'A' }, f, { failed: ['content_gap'], findings: [], gaps: [], metrics: {} }, 1)
+  for (const prompt of [initial, repair]) {
+    assert.ok(prompt.includes(common))
+    assert.doesNotMatch(prompt, /传统 Markdown 输出规范|文件抬头由模型写入|先 Write 抬头|发言人标签一律/u)
+  }
 })
 
 test('output relation rejects missing, duplicate, unknown and out-of-order source IDs', () => {

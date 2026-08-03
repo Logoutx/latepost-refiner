@@ -409,26 +409,53 @@ export function makeInitialOutputBlocks(contractOrRecords = []) {
   })), contract)
 }
 
-export function parseOutputBlockEnvelope(text, contractOrRecords = []) {
+function envelopeDiagnostic(code, message, details = {}) {
+  return {
+    code,
+    message,
+    ...(Number(details.line) > 0 ? { line: Number(details.line) } : {}),
+  }
+}
+
+function envelopeFailure(phase, errors = []) {
+  const first = errors[0] || envelopeDiagnostic('TURN_CONTRACT_INVALID', 'turn contract 校验失败')
+  const summary = errors
+    .map((error) => `${error.code}${error.line ? `（第 ${error.line} 行）` : ''}: ${error.message}`)
+    .join('；')
+  return {
+    ok: false,
+    phase,
+    code: first.code,
+    message: `${phase === 'syntax' ? '结构化成稿语法校验失败' : '结构化成稿来源关系校验失败'}（${errors.length} 项）：${summary}`,
+    errors,
+  }
+}
+
+// Two-phase compiler boundary: collect every envelope-syntax diagnostic first, and only if syntax is clean
+// validate source relations. This lets one model correction see e.g. a missing header, H1 and subtitle together
+// instead of discovering them one rejection at a time.
+export function validateOutputBlockEnvelope(text, contractOrRecords = []) {
   const contract = contractView(contractOrRecords)
   const recordById = new Map(contract.records.map((record) => [record.id, record]))
   const lines = String(text || '').split(/\r?\n/u)
   const blocks = []
-  let headerSeen = false
+  const errors = []
   let current = null
   let pendingHeadings = []
+  const firstContent = lines.findIndex((line) => String(line || '').trim())
+  const headerSeen = firstContent >= 0 && lines[firstContent].trim() === TURN_CONTRACT_HEADER
+  if (!headerSeen) {
+    errors.push(envelopeDiagnostic(
+      'TURN_CONTRACT_HEADER_MISSING',
+      firstContent >= 0 ? '第一条非空行不是 turn contract v2 头' : '结构化成稿为空或缺少 turn contract v2 头',
+      firstContent >= 0 ? { line: firstContent + 1 } : {},
+    ))
+  }
+  const startIndex = headerSeen ? firstContent + 1 : Math.max(0, firstContent)
 
-  for (let index = 0; index < lines.length; index += 1) {
+  for (let index = startIndex; index < lines.length; index += 1) {
     const line = lines[index]
     const trimmed = line.trim()
-    if (!headerSeen) {
-      if (!trimmed) continue
-      if (trimmed !== TURN_CONTRACT_HEADER) {
-        throw new TurnContractError('TURN_CONTRACT_HEADER_MISSING', '结构化成稿缺少 turn contract v2 头', { line: index + 1 })
-      }
-      headerSeen = true
-      continue
-    }
 
     if (current) {
       if (trimmed === OUTPUT_CLOSE) {
@@ -445,12 +472,11 @@ export function parseOutputBlockEnvelope(text, contractOrRecords = []) {
       } else if (SOURCE_META_RE.test(trimmed)) {
         // Repair candidates may retain host-owned source references. They never become transcript prose.
       } else if (/^#{1,6}\s+\S/u.test(trimmed)) {
-        throw new TurnContractError('TURN_CONTRACT_HEADING_IN_BODY', '小标题不能写进 output block 正文', {
-          line: index + 1,
-        })
+        errors.push(envelopeDiagnostic('TURN_CONTRACT_HEADING_IN_BODY', 'Markdown 标题不能写进 output block 正文', { line: index + 1 }))
       } else {
         if (OUTPUT_OPEN_RE.test(trimmed)) {
-          throw new TurnContractError('TURN_CONTRACT_NESTED', 'output block 尚未结束又出现新 block', { line: index + 1 })
+          errors.push(envelopeDiagnostic('TURN_CONTRACT_NESTED', 'output block 尚未结束又出现新 block', { line: index + 1 }))
+          continue
         }
         current.body.push(line)
       }
@@ -471,16 +497,34 @@ export function parseOutputBlockEnvelope(text, contractOrRecords = []) {
       pendingHeadings.push(trimmed)
       continue
     }
-    throw new TurnContractError('TURN_CONTRACT_OUTSIDE_CONTENT', 'output block 外只能出现二级标题，不能出现自由文本', {
-      line: index + 1,
-      sample: trimmed.slice(0, 80),
-    })
+    errors.push(envelopeDiagnostic('TURN_CONTRACT_OUTSIDE_CONTENT', 'output block 外只能出现二级标题，不能出现自由文本', { line: index + 1 }))
   }
 
-  if (!headerSeen) throw new TurnContractError('TURN_CONTRACT_HEADER_MISSING', '结构化成稿为空或缺少 turn contract v2 头')
-  if (current) throw new TurnContractError('TURN_CONTRACT_UNCLOSED', 'output block 未闭合')
-  if (pendingHeadings.length) throw new TurnContractError('TURN_CONTRACT_TRAILING_HEADING', '末尾标题没有归属到任何 output block')
-  return validateOutputBlocks(blocks, contract)
+  if (current) errors.push(envelopeDiagnostic('TURN_CONTRACT_UNCLOSED', 'output block 未闭合'))
+  if (pendingHeadings.length) errors.push(envelopeDiagnostic('TURN_CONTRACT_TRAILING_HEADING', '末尾标题没有归属到任何 output block'))
+  if (errors.length) return envelopeFailure('syntax', errors)
+
+  try {
+    return { ok: true, phase: 'relation', blocks: validateOutputBlocks(blocks, contract), errors: [] }
+  } catch (error) {
+    const details = (error && error.details) || {}
+    return envelopeFailure('relation', [envelopeDiagnostic(
+      (error && error.code) || 'TURN_CONTRACT_INVALID',
+      (error && error.message) || 'turn contract 来源关系校验失败',
+      details,
+    )])
+  }
+}
+
+export function parseOutputBlockEnvelope(text, contractOrRecords = []) {
+  const validation = validateOutputBlockEnvelope(text, contractOrRecords)
+  if (validation.ok) return validation.blocks
+  const first = validation.errors[0] || {}
+  throw new TurnContractError(validation.code, validation.message, {
+    phase: validation.phase,
+    errors: validation.errors,
+    ...(first.line ? { line: first.line } : {}),
+  })
 }
 
 export function renderTurnContract(contract, blocks = contract.blocks || []) {

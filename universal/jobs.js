@@ -14,9 +14,9 @@ import {
   QUALITY_REPAIR_MAX_ROUNDS,
   adjudicateOutputSpeakerCandidates,
 } from '../core/pipeline.js'
-import { RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, endsWithQuestion, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
+import { EDITORIAL_RULES, RULES, SINGLE_FILE_GLOSSARY, PUBLICATION_BLOCK_GATES, partPath, contentLength, stitchPartsWithReport, parseTurns, endsWithQuestion, safeName, collapseAdjacentDuplicateHeadings } from '../core/spec.js'
 import { auditPairs, annotateFile, annotateAnchorsFile, auditGlossary, auditLogicFile, checkCrossFileClaims, parseGlossaryLite, normalizeSrtTranscript, auditDerivativeFile, normalizeQuoteStyleText } from '../scripts/audit_refined.mjs'
-import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
+import { summaryDeliverableName, timelineDeliverableName, turnIrV2PromptBlock } from '../core/prompts.js'
 import { makeDeepSeekEngine, DEEPSEEK_MODEL_IDS, DEEPSEEK_BASE_URL, SOURCE_PROTECTION_NOTE, resolveDeepSeekRouting } from '../engines/deepseek.js'
 import { writeRunArtifacts } from './artifacts.js'
 import { buildRunLogEntry, appendRunLog } from './runlog.js'
@@ -34,6 +34,7 @@ import {
   recordsForChunk,
   renderTurnContract,
   serializeOutputBlockEnvelope,
+  validateOutputBlockEnvelope,
 } from './output-contract.js'
 import {
   detectDeclaredAiSummary,
@@ -401,7 +402,7 @@ function repairIssueCounts(auditFile = {}, hard = []) {
   return counts
 }
 
-function qualityRepairPrompt(A, f, auditFile, attemptNo) {
+export function qualityRepairPrompt(A, f, auditFile, attemptNo) {
   const action = repairAction(auditFile.failed || [])
   const actionGuide = action === 'rerun_from_source'
     ? '本次属于全文压缩风险：不要试图从当前成稿补回丢失内容。重新从源文件完整精校，当前成稿最多只作标题/结构参考。'
@@ -425,16 +426,11 @@ function qualityRepairPrompt(A, f, auditFile, attemptNo) {
 【审计失败摘要】
 ${auditPromptSummary(auditFile)}
 
-【不可变数据契约】
-- 第一条非空行必须是 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
-- 只使用 \`LRB_OUTPUT_BLOCK sources=... disposition=keep|merge|split|fold_noise\` 与对应 close 标记；\`LRB_SOURCE_REFS\` 是宿主只读源行范围，可保留。
-- 全部 source turn ID 必须按原顺序完整记账：keep 一对一；merge 只合并相邻同轨来源；split 把同一来源连续映射到至少两个 block；fold_noise 只折叠无实质内容的相邻来源。不得把事实或观点搬到不相干来源。
-- 修复超长段时可把一个来源改成多个 split block；修复 ASR 碎轮时可把相邻同轨来源改成 merge block；不需要改变来源关系时沿用现有 disposition。
-- output block 外只能保留或添加 \`## \` 小标题。不要输出 H1、说明行、speaker_track_id 或说话人标签；宿主从 sources 推导并确定性渲染。
+${turnIrV2PromptBlock()}
 - 若 failed 包含 compression_risk 或 content_gap，必须按每个 block 的 source refs 行范围补回实质内容，不能把别轮内容挪来填数。
 - 不要删掉事实、数字、时间、产品名、观点、举例和有信息量的表达。
 
-${RULES}
+${EDITORIAL_RULES}
 
 完成后只返回一行：已写回 <path>；修复策略=<rerun_from_source|full_cleanup|targeted_repair>；备注=<一句话>。`
   }
@@ -734,21 +730,13 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     validateRefineContractOutput: (f, chunk, outputPath) => {
       const byId = new Map((f.refineContract.records || []).map((record) => [record.id, record]))
       const expectedRecords = (chunk.turnIds || []).map((id) => byId.get(id)).filter(Boolean)
-      try {
-        parseOutputBlockEnvelope(fs.readFileSync(outputPath, 'utf8'), {
-          mode: f.refineContract.mode,
-          records: expectedRecords,
-          speakerTracks: f.refineContract.speakerTracks || [],
-        })
-        return { ok: true }
-      } catch (error) {
-        const line = Number(error && error.details && error.details.line)
-        return {
-          ok: false,
-          code: (error && error.code) || 'TURN_CONTRACT_INVALID',
-          message: `${(error && error.message) || 'turn contract 校验失败'}${line > 0 ? `（第 ${line} 行）` : ''}`,
-        }
-      }
+      const validation = validateOutputBlockEnvelope(fs.readFileSync(outputPath, 'utf8'), {
+        mode: f.refineContract.mode,
+        records: expectedRecords,
+        speakerTracks: f.refineContract.speakerTracks || [],
+      })
+      if (validation.ok) return { ok: true }
+      return validation
     },
     finalizeRefineContract: (f, chunks = []) => {
       const contract = f.refineContract

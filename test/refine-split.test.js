@@ -658,6 +658,7 @@ test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {
 // ---------- pipeline routing (mock engine, zero tokens) ----------
 
 function mockEngine(labels, opts = {}) {
+  const failures = []
   const reply = (label) => {
     if (/^scout/.test(label)) return { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 1467, text: '就到这里。' }, special_notes: [] }
     if (/^refine/.test(label)) return { path: 'x', headings: ['某节'], key_fixes: [], open_questions: [] }
@@ -667,7 +668,15 @@ function mockEngine(labels, opts = {}) {
     return null
   }
   const e = {
-    agent: async (_p, o) => { labels.push(o.label); return (opts.fail && opts.fail(o.label)) ? null : reply(o.label) },
+    agent: async (_p, o) => {
+      labels.push(o.label)
+      if (opts.fail && opts.fail(o.label)) {
+        const failure = opts.failureFor && opts.failureFor(o.label)
+        if (failure) failures.push({ label: o.label, ...failure })
+        return null
+      }
+      return reply(o.label)
+    },
     parallel: (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null))),
     pipeline: async (items, ...stages) => Promise.all((items || []).map(async (item, i) => {
       let v = item
@@ -676,6 +685,7 @@ function mockEngine(labels, opts = {}) {
     })),
     phase: () => {}, log: () => {},
   }
+  if (opts.failureFor) e.failures = () => failures.map((failure) => ({ ...failure }))
   // Only a budgeted engine (DeepSeek etc.) exposes refineBudget; omitting it mirrors Anthropic / the CC sandbox.
   if (opts.refineBudget) e.refineBudget = opts.refineBudget
   return e
@@ -727,6 +737,37 @@ test('cost mode (default): pipeline keeps a single refine agent even for a large
   assert.ok(labels.includes('refine:A') && labels.includes('refine:B'), 'single refine agent per file')
   assert.ok(!labels.some((l) => /#/.test(l)), 'no chunk agents in cost mode')
   assert.ok(!labels.some((l) => /^stitch/.test(l)), 'no stitch agent in cost mode')
+})
+
+test('single refine units rerun once only for a typed transient provider failure', async () => {
+  const labels = []
+  const files = [
+    { path: '/src/A.txt', label: 'A', lines: 100, chars: 1000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' },
+    { path: '/src/B.txt', label: 'B', lines: 100, chars: 1000, title: 'B', subtitle: '*s*', outPath: '/out/Transcripts/B.md' },
+  ]
+  const eng = mockEngine(labels, {
+    fail: (label) => label === 'refine:A',
+    failureFor: () => ({ code: 'API_TRANSIENT', retryable: true, message: 'HTTP 429' }),
+  })
+  const result = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files }, eng)
+
+  assert.ok(labels.includes('refine-retry:A'))
+  assert.equal(labels.filter((label) => label === 'refine-retry:A').length, 1)
+  assert.equal(result.refined.length, 2)
+})
+
+test('chunked refine does not fresh-retry a non-retryable contract failure', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const eng = mockEngine(labels, {
+    refineBudget: stubBudget('stub-pro', 10000),
+    fail: (label) => label === 'refine:A#2/3',
+    failureFor: () => ({ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', retryable: false, message: 'contract invalid' }),
+  })
+  const result = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, eng)
+
+  assert.equal(labels.some((label) => label === 'refine-retry:A#2/3'), false)
+  assert.deepEqual(result.failed, ['A'])
 })
 
 // ---------- provider-aware auto-chunk (pipeline wiring, mock engine) ----------

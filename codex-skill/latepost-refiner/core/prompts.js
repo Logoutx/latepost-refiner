@@ -1,5 +1,5 @@
 // GENERATED FILE — DO NOT EDIT. Source: core/prompts.js. Regenerate: npm run sync:skills
-import { RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath, safeName } from './spec.js'
+import { EDITORIAL_RULES, RULES, TURN_IR_V2_RULES, TYPESET, SINGLE_FILE_GLOSSARY, partPath, safeName } from './spec.js'
 
 // Detect a phonetic-suspicion signal in a verify chunk's entity table, to decide whether the hypothesis-driven
 // heavy protocol is warranted (kept OFF for clean chunks so the prompt stays lean). Signals:
@@ -165,6 +165,14 @@ function resolvedSpeakerBlock(f, finding = {}) {
 【Scout 识别依据】${scout}`
 }
 
+// One serialization contract for every turn-ir-v2 editing pass. Initial Refine and quality repair both
+// interpolate this exact block; neither may import the legacy direct-Markdown wrapper rules.
+export function turnIrV2PromptBlock() {
+  return `【不可变数据契约】
+${TURN_IR_V2_RULES}
+- 分段不等于改来源：长 turn 可以用多个 split block；同说话人 ASR 碎轮可以用一个 merge block。来源关系服务于回溯，不要求成稿机械一对一。`
+}
+
 export function refinePrompt(f, glossary, finding, a, chunk) {
   // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
@@ -191,22 +199,11 @@ ${glossary}
 ${chunkNote}
 先完整 Read 结构化输入；它已经是宿主生成的默认 \`keep\` output-block 草稿。直接在这份 envelope 上精校，只有确实发生合并、拆分或折叠时才修改来源关系。
 
-【不可变数据契约】
-- 输出第一条非空行必须逐字为 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
-- 每个现有 block 都对应不可变 source turn 账本中的一项。输出只使用：
-  \`<!-- LRB_OUTPUT_BLOCK sources=Txxxxxx disposition=keep -->\`
-  正文
-  \`<!-- /LRB_OUTPUT_BLOCK -->\`
-- \`LRB_SOURCE_REFS\` 是宿主提供的只读轨道与源行元数据，可以原样保留；最终解析后会由宿主重建，不进入成稿。
-- \`sources\` 填该 block 实际承接的 source turn ID，多个 ID 用英文逗号连接。全部来源 ID 必须按原顺序完整记账，不能虚构、漏掉或把实质内容移到不相干来源。
-- \`keep\`：一个来源对应一个 block；\`merge\`：相邻且属于同一已确认说话人轨道的多个来源合成一个 block；\`split\`：同一来源连续写成至少两个 block；\`fold_noise\`：一个或多个相邻纯口癖/纯寒暄来源折成一句括号说明或空正文。不同说话人的实质发言绝不能合并；跨说话人只允许显式 \`fold_noise\`，不得保留其中任何事实或观点。
-- 宿主会从 sources 推导说话人，不要输出或猜测 speaker_track_id。普通 block 不要写发言人标签；标题、说明行、canonical 标签与分块合并均由宿主确定性生成。
-- output block 外只能放 \`## \` 开头的小标题，且小标题属于它后面的 block；不要输出 H1、说明行、前言、结语、分隔线或其它自由文本。
-- 分段不等于改来源：长 turn 可以用多个 \`split\` block；同说话人 ASR 碎轮可以用一个 \`merge\` block。来源关系服务于回溯，不要求成稿机械一对一。
+${turnIrV2PromptBlock()}
 
 ${notes ? `【该份特别提醒】\n${notes}\n` : ''}${headingNote(a.headingPolicy)}
 
-${RULES}
+${EDITORIAL_RULES}
 
 完成后按 schema 返回 path（=${outPath}）、headings（你添加的 ## 小标题）、key_fixes、open_questions。`
   }
