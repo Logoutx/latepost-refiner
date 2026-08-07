@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JobConfigError, runJob, normalizeModelOverrides } from './jobs.js'
+import { parseInternalDirectory } from '../core/spec.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -28,6 +29,10 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --background <文本>     采访背景（指导侦察/核实）
   --background-file <路径> 从文件读取背景（背景较长时用）
   --metadata-catalog <路径> 既有人物/机构规范名 JSON，供目录元数据统一写法
+  --internal-directory <路径> 内部通讯录名单（纯文本，每行一个姓名，# 开头为注释，姓名后可跟部门等列）。
+                         飞书 ASR 常把听不清的名字写成上传方同事名，命中名单的人名会被标为存疑并强制
+                         联网+上下文核实（名单只作存疑依据，不作白名单）。文件只在本地读取，内容绝不进入
+                         prompt、输出或仓库——请放在仓库外或 local/ 目录（已 gitignore）
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
@@ -73,6 +78,7 @@ export function parseArgs(argv) {
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile',
     '--metadata-catalog': 'metadataCatalogPath',
+    '--internal-directory': 'internalDirectoryPath',
     '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
   }
   let i = 0
@@ -153,6 +159,19 @@ export function buildRunParams(a, { env = process.env } = {}) {
     }
   }
 
+  let internalDirectory
+  if (a.internalDirectoryPath) {
+    const dirPath = path.resolve(a.internalDirectoryPath)
+    let dirText
+    try {
+      dirText = fs.readFileSync(dirPath, 'utf8')
+    } catch (e) {
+      throw new JobConfigError(`无法读取内部通讯录 ${dirPath}：${e.message}`)
+    }
+    internalDirectory = parseInternalDirectory(dirText)
+    if (!internalDirectory.length) throw new JobConfigError(`内部通讯录 ${dirPath} 未解析出任何姓名（每行一个姓名，# 开头为注释）`)
+  }
+
   return {
     apiKey: env.DEEPSEEK_API_KEY,
     serperKey: env.SERPER_API_KEY,
@@ -161,6 +180,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     date,
     background,
     metadataCatalog,
+    internalDirectory,
     outputDir,
     skillDir,
     scope: parseScope(a.scope),

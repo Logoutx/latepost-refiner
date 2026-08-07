@@ -490,6 +490,72 @@ export function mergeHints(a, b) {
   return [...kept, ...warns, ...(truncated ? [HINT_TRUNC_MARK] : [])].join(HINT_SEP)
 }
 
+// ---------- internal-directory suspicion (飞书 ASR 同事名偏置) ----------
+// 飞书/Lark ASR 会把听不清的人名优先写成上传方租户内的同事名（热词表来自企业通讯录）。因此转录里一个与内部
+// 通讯录完全同名的人名反而【更可疑】：真实说话对象可能是外部同音他人，被 ASR「吸附」成了同事。通讯录在这里
+// 只作【存疑名单】，绝不是白名单或改名依据——命中者置 suspect_asr=true（强制联网核实，哪怕 verify=key），
+// 改不改仍由既有的两把钥匙规则裁决。匹配全部在代码里完成：通讯录内容不进任何 prompt、输出或日志，
+// 只有转录里本来就出现的名字会被标记。名单文件由宿主本地读取（--internal-directory），不入库。
+// hint 措辞刻意只描述 ASR 的失误模式，不断言「此人在我方通讯录里」——hint 会进核实/精校 prompt 与校对表，
+// 措辞越少确认名单成员身份越好（残余信号见 README 该节说明）。
+export const INTERNAL_DIRECTORY_HINT = '⚠ 疑为飞书 ASR 同事名偏置产物（ASR 常把听不清的名字写成文件上传方的同事名），此写法可能是同音他人——须凭上下文与联网证据核实正身，勿仅因像真名而采信'
+// 匹配归一化：NFKC 折叠全角/半角，去掉全部空白，拉丁字母不分大小写——「张　三」「ZHANG san」都能对上。
+const normalizeDirName = (n) => String(n || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase()
+const CJK_RE = /[㐀-鿿]/
+export function parseInternalDirectory(text) {
+  const names = new Set()
+  for (const raw of String(text || '').replace(/^﻿/, '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    // 分号/顿号是【姓名列表】分隔（一行多个名字：「蔡梅梅; 杜静; 龚格」）；tab/逗号/竖线是【列】分隔
+    // （姓名后跟部门等列，只取首列）。空格不算任何分隔，否则英文全名（Mary Jane）会被腰斩。
+    for (const item of line.split(/[;；、]+/)) {
+      let name = item.split(/[\t,，|]+/)[0].trim()
+      // 中文条目内若用空格隔开部门或英文别名（「沈其安 市场部」「申远 neil」），姓名取首个空格前的字段；英文条目保留整段。
+      if (CJK_RE.test(name)) name = name.split(/\s+/)[0]
+      if (name && normalizeDirName(name).length >= 2) names.add(name)
+    }
+  }
+  return Array.from(names)
+}
+// merged: mergeFindings 输出（people/brands/terms）。就地标记 people 中命中通讯录的条目并返回命中条目数组
+// （{canonical, writings}：writings 供 forceReopen 撬开核实缓存，canonical 供日志）。locked（用户钦定）条目跳过
+// ——decree 是明确的人工指令，终局（README 记载此例外）。hint 追加走 mergeHints（幂等，⚠ 子句永不被截断），
+// 累积批次里 parse→render 往返也不会重复膨胀。只查 people：品牌/术语不受同事名偏置影响。
+export function applyInternalDirectorySuspicion(merged, dirNames) {
+  const dir = new Set((dirNames || []).map((n) => normalizeDirName(stripDesc(String(n)))).filter(Boolean))
+  if (!dir.size) return []
+  const matched = []
+  for (const e of (merged && merged.people) || []) {
+    if (!e || e.locked) continue
+    const forms = [e.canonical, ...(e.variants || [])].map((n) => stripDesc(String(n || ''))).filter(Boolean)
+    if (!forms.some((n) => dir.has(normalizeDirName(n)))) continue
+    e.suspect_asr = true
+    e.hint = mergeHints(e.hint, INTERNAL_DIRECTORY_HINT)
+    matched.push({ canonical: e.canonical, writings: forms })
+  }
+  return matched
+}
+// 侦察漏网补扫：通讯录名字若在源文本里出现、却没进侦察的 people 清单（侦察分块失败/漏抽/只当成说话人标签），
+// 逐字扫描把它找回来。中文名用子串匹配（≥2 字全名撞进别的词的概率低，误报的代价只是多一次核实）；
+// 拉丁名要求词边界、不分大小写。excludeForms 传已在 people 里的全部写法，避免重复注入。纯函数，宿主读文件。
+export function scanTextForDirectoryNames(text, dirNames, excludeForms) {
+  const t = String(text || '')
+  if (!t) return []
+  const tNorm = t.normalize('NFKC').toLowerCase()
+  const seen = new Set((excludeForms || []).map((n) => normalizeDirName(stripDesc(String(n)))))
+  const out = []
+  for (const name of dirNames || []) {
+    const key = normalizeDirName(name)
+    if (!key || seen.has(key)) continue
+    let hit
+    if (CJK_RE.test(name)) hit = t.includes(name) || tNorm.includes(key)
+    else hit = new RegExp(`(?<![A-Za-z])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z])`, 'i').test(t)
+    if (hit) { seen.add(key); out.push(name) }
+  }
+  return out
+}
+
 export function clusterEntities(entries) {
   const clusters = []
   for (const e of entries) {

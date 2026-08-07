@@ -1,4 +1,4 @@
-import { entitySchema, SCOUT_SCHEMA, SPEAKER_CANDIDATE_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
+import { entitySchema, SCOUT_SCHEMA, SPEAKER_CANDIDATE_SCHEMA, VERIFY_SCHEMA, REFINE_REPORT_SCHEMA, DEDUP_SCHEMA, LOGIC_REPORT_SCHEMA, SINGLE_FILE_GLOSSARY, BODY_FIDELITY_GATES, OUTPUT_QUALITY_GATES, PUBLICATION_BLOCK_GATES, canonicalHeadingKey, effortFor, isWeakKey, stripDesc, longestHanziRun, scoutLooksGarbled, clusterEntities, mergeFindings, VERIFY_CHUNK, MAX_CHUNKS, entityWorth, verifyChunks, dedupListText, splitForRefine, splitForScout, mergeScoutChunks, refineSize, ONE_PASS_CHARS, SINGLE_SHOT_MAX_CHARS, singleShotMaxTokens, contentLength, findHeadingConflicts, renderGlossary, renderRefineGlossary, cleanSuspects, splitSuspects, pickNetworkUnverified, suspectUnverified, contestedQuestions, dedupQuestions, parseGlossary, mergeIntoPrior, mergeVerified, mergeDedup, excludeVerified, buildSpeakerRegistry, glossaryConflicts, weakDupFlags, applyOverridesToMerged, applyInternalDirectorySuspicion, scanTextForDirectoryNames, dropLocked, safeName, partPath, contradictionReopen, rotateReverify, ROTATE_REVERIFY } from './spec.js'
 import { READ_PAGE, READ_BYTES_PER_PAGE, readPlan, headingNote, scoutPrompt, verifyPrompt, refinePrompt, stitchPrompt, dedupPrompt, speakerCandidatePrompt, singlePassPrompt, singleShotPrompt, summaryPrompt, summaryDeliverableName, timelinePrompt, timelineDeliverableName, logicWritePrompt } from './prompts.js'
 
 export const DEFAULT_STAGE_MODELS = Object.freeze({
@@ -774,6 +774,35 @@ if (useShortFileFastPath) {
   const mergedThisBatch = applyOverridesToMerged(mergeFindings(cleanFindings, A.files), A.canonicalOverrides)
   const lockedCount = [...(mergedThisBatch.people || []), ...(mergedThisBatch.brands || []), ...(mergedThisBatch.terms || [])].filter((e) => e && e.locked).length
   if (lockedCount) engine.log(`用户钦定正名：${lockedCount} 条已锁定（强制 canonical、跳联网核实、渲染带〔用户钦定〕）`)
+  // 飞书 ASR 同事名偏置：与内部通讯录同名的人名标 suspect_asr（强制联网核实）。放在 overrides 之后——
+  // locked（用户钦定）条目不受名单影响（decree 是明确人工指令）。名单只在代码里比对，内容不进任何 prompt
+  // （hint 只描述失误模式，不断言名单成员身份，见 spec.js 该节注释）。
+  let dirReopenWritings = []
+  if (Array.isArray(A.internalDirectory) && A.internalDirectory.length) {
+    if (A.verifyDepth === 'none') engine.log('⚠ 已传内部通讯录但 verify=none：命中名单的人名只能标记存疑、写进 openQuestions，无法联网核实——建议至少用 --verify key')
+    // 侦察漏网补扫：名单名字出现在源文本、却没进侦察 people 清单时，代码级逐字扫描把它找回来注入
+    // （侦察分块失败/漏抽/只当成说话人标签都会漏）。宿主没有 readFile 能力（CC sandbox）时跳过——侦察结果仍然覆盖。
+    const cap = A.capabilities || {}
+    if (typeof cap.readFile === 'function') {
+      const existingForms = mergedThisBatch.people.flatMap((e) => [e.canonical, ...(e.variants || [])])
+      for (const f of A.files) {
+        let text = null
+        try { text = await cap.readFile(f.refinePath || f.path) } catch { /* 单文件读失败不致命——该文件只失去补扫 */ }
+        if (!text) continue
+        for (const name of scanTextForDirectoryNames(text, A.internalDirectory, existingForms)) {
+          existingForms.push(name)
+          mergedThisBatch.people.push({ canonical: name, variants: [], hint: '', files: [f.label], public_figure: false, suspect_asr: false, category: '', crossFile: false })
+        }
+      }
+    }
+    const dirMatched = applyInternalDirectorySuspicion(mergedThisBatch, A.internalDirectory)
+    if (dirMatched.length) {
+      engine.log(`内部通讯录同名预警：${dirMatched.map((m) => m.canonical).join('、')}——已标⚠强制联网核实（飞书 ASR 常把听不清的名字写成上传方同事名）`)
+      // 撬开核实缓存：往批已〔核实〕的条目会被 excludeVerified 跳过，但名单命中者必须每批重核——
+      // 上一批核实时可能还没传名单，且这类名字被 ASR 吸附的先验概率高，宁可多核。
+      dirReopenWritings = dirMatched.flatMap((m) => m.writings)
+    }
+  }
   // SF-2: a single cluster claimed by ≥2 competing decrees was merged into one locked cluster (canonical = first
   // decree) — surface the disagreement. Risk(c): a decree that hit nothing in its declared category but whose
   // writing appears in another category's cluster — likely a mis-declared category. Both go into openQuestions.
@@ -799,7 +828,7 @@ if (useShortFileFastPath) {
     const reopen = contradictionReopen(prior, mergedThisBatch)   // M9a: scout-evidence contradiction (no model call)
     const rot = rotateReverify(prior, ROTATE_REVERIFY)           // M9b: oldest-N age rotation
     reopenNotes = reopen.notes
-    forceReopen = Array.from(new Set([...reopen.writings, ...rot.writings]))
+    forceReopen = Array.from(new Set([...reopen.writings, ...rot.writings, ...dirReopenWritings]))
     if (reopen.notes.length) engine.log(`往批核实复核（M9a）：${reopen.notes.length} 项旧核实结论遇新写法证据，已重新入队核实`)
     if (rot.count) engine.log(`轮换复核：${rot.count} 项旧核实结论重新入队（最早 ${rot.oldest || '无日期（视为最旧）'}）`)
   }

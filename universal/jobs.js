@@ -1043,6 +1043,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     effort,   // M12: { refine?, logic?, summary?, timeline? } reasoning-effort per smart-tier category
     priorGlossaryText, priorGlossaryPath: (!fresh && fs.existsSync(glossaryPath)) ? glossaryPath : undefined,
     canonicalOverrides: params.canonicalOverrides,
+    internalDirectory: params.internalDirectory,   // 内部通讯录姓名数组（飞书 ASR 同事名偏置存疑名单）——只在 pipeline 代码里比对，不进 prompt
+
     models: stageModels,
     modelOverrides,
     effectiveModels,
