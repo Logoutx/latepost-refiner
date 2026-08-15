@@ -501,11 +501,16 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText, options = 
       ? ` --speaker-review-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerReviewLabels))}`
       : ''
     const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}${dismissedArg}${reviewArg}`
-    const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
-    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
+    const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON 解析后原样交回（结构化返回；字段一律照抄，不要改写任何字符串——尤其不要把弯引号改成直引号）：\n${cmd}`
+    // Free-text echo is NOT trusted here: a relay model can silently normalize curly quotes inside JSON string
+    // values into ASCII quotes, breaking the escaping (hit live 2026-08-16 on a heading containing “…”). The
+    // schema forces a validated tool-call return, so malformed JSON is rejected at the harness layer and retried
+    // there — parseAuditJson stays only as the belt for exotic hosts that ignore schemas.
+    const AUDIT_ECHO_SCHEMA = { type: 'object', additionalProperties: true, properties: { status: { type: 'string' }, files: { type: 'array' } } }
+    let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku', schema: AUDIT_ECHO_SCHEMA })
     let parsed = parseAuditJson(raw)
     if (!parsed) { // one retry
-      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'haiku' })
+      raw = await engine.agent(prompt, { label: `audit-retry:${f.label}`, phase: 'Audit', model: 'haiku', schema: AUDIT_ECHO_SCHEMA })
       parsed = parseAuditJson(raw)
     }
     return normalizeAuditResult(parsed, f)
