@@ -89,28 +89,37 @@ test('override: excludeVerified via prior confidence coexists with a fresh decre
   assert.ok(/新人/.test(verifyPrompts), 'a genuinely new entity still gets verified')
 })
 
-// ---------- every file enters Scout, including one short file ----------
+// ---------- CC short-file fast path; host-capability runtimes keep the full path ----------
 
-test('short single file always enters Scout and carries canonicalOverrides into the normal Refine prompt', async () => {
+test('CC short single file uses one-pass Refine and carries canonicalOverrides into its prompt', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
   await runPipeline(A({
-    files: [F({ chars: 1000 })],
+    files: [F({ chars: 1000, needsSpeakerResolution: false })],
     canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘', '陈涛（同音）'] }],
   }), eng)
-  assert.ok(labels.includes('scout:A'), 'a short single file still runs full-text Scout')
+  assert.ok(!labels.includes('scout:A'), 'the CC short-file path skips Scout')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
-  assert.ok(/用户钦定/.test(refinePrompt), 'the normal Refine prompt carries the locked glossary entry')
+  assert.match(refinePrompt, /单文件一遍过/)
+  assert.ok(/用户钦定/.test(refinePrompt), 'the one-pass Refine prompt carries the locked glossary entry')
   assert.ok(refinePrompt.includes('陈涛') && refinePrompt.includes('陈焘'), 'both canonical and variant are named')
 })
 
-test('short single file without canonicalOverrides still enters Scout', async () => {
+test('CC short single file without canonicalOverrides still uses one-pass Refine', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
-  await runPipeline(A({ files: [F({ chars: 1000 })] }), eng)
-  assert.ok(labels.includes('scout:A'), 'there is no short-file Scout bypass')
+  await runPipeline(A({ files: [F({ chars: 1000, needsSpeakerResolution: false })] }), eng)
+  assert.ok(!labels.includes('scout:A'), 'the short-file Scout bypass is active in CC')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
   assert.ok(!/用户钦定正名/.test(refinePrompt), 'no decree section appears when there is no override')
+})
+
+test('CC freeform Refine does not receive the Turn IR v2 envelope contract', async () => {
+  const labels = [], prompts = []
+  await runPipeline(A({ files: [F({ chars: 5000 })] }), engine(labels, {}, prompts))
+  const prompt = prompts.find((item) => item.label === 'refine:A').prompt
+  assert.doesNotMatch(prompt, /Turn IR v2|不可变数据契约|output block/)
+  assert.match(prompt, /小标题/)
 })
 
 test('short single file hands the normal in-memory glossary to audit', async () => {
@@ -467,7 +476,7 @@ test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a
   assert.equal(r.refined[0].audit.status, 'ok')
 })
 
-test('audit gate without a transactional repair capability never lets a fallback agent overwrite the body', async () => {
+test('CC sandbox keeps non-spot hard findings for manual repair', async () => {
   const labels = []
   const eng = engine(labels, {
     '^audit:': () => JSON.stringify({ status: 'fail', files: [{ file: '/o/Transcripts/A.md', status: 'fail', failed: ['residual_noise'], gaps: [], findings: [] }] }),
@@ -478,6 +487,29 @@ test('audit gate without a transactional repair capability never lets a fallback
   assert.ok(!labels.some((label) => label.startsWith('repair:')), 'no-fs runtime keeps the hard finding for manual repair')
   assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['residual_noise'] }])
   assert.deepEqual(r.qualityRepairAttempts, [])
+})
+
+test('CC sandbox spot-repairs content_gap once with Read/Edit and re-audits', async () => {
+  const labels = [], prompts = []
+  let audits = 0
+  const eng = engine(labels, {
+    '^audit:': () => {
+      audits += 1
+      const file = audits === 1
+        ? { file: '/o/Transcripts/A.md', status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 12, endLine: 20, chars: 200, severity: 'hard' }], findings: [] }
+        : { file: '/o/Transcripts/A.md', status: 'ok', failed: [], gaps: [], findings: [] }
+      return JSON.stringify({ status: file.status, files: [file] })
+    },
+    '^repair:': '已定点修复',
+    '^anchors:': '已加锚点',
+  }, prompts)
+  const r = await runPipeline(A(), eng)
+  assert.equal(labels.filter((label) => label === 'repair:A').length, 1)
+  assert.equal(audits, 2)
+  assert.match(prompts.find((item) => item.label === 'repair:A').prompt, /只修下面点名的位置.*不得改动其它任何内容/s)
+  assert.deepEqual(r.auditFailed, [])
+  assert.equal(r.refined[0].audit.repaired, true)
+  assert.equal(r.qualityRepairAttempts[0].action, 'sandbox_spot_repair')
 })
 
 test('audit gate (no capability): unparseable agent output → one retry → FAILS LOUDLY via top-level auditUnavailable, never throws', async () => {

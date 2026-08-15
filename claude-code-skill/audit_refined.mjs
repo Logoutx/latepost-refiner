@@ -20,13 +20,12 @@
 // Source-aware gates (mode: 'refine'):
 //   - compression_risk: charRatio < 0.55  (PRIMARY gate; faithful ~0.83, summary ~0.21)
 //   - under_refined:     source filler-heavy AND emptyReduction < 0.25
-//   - ending_missing:    source's last sentence not found in the refined output
 //   - residual_noise / long_paragraphs: from the output-only checks
 //   speakerTurnRatio is reported as a CONFIRMING signal only (consolidated
 //   alternations, so rule-4a same-speaker merging doesn't lower it) — it never
 //   fails a high-charRatio output on its own.
-//   mode 'summary' | 'timeline' | 'logic' skip the charRatio / under_refined /
-//   ending gates (a summary is meant to be short).
+//   mode 'summary' | 'timeline' | 'logic' skip the charRatio / under_refined gates
+//   (a summary is meant to be short). Literal ending coverage is informational only.
 //
 // Importable: auditText / auditFile / auditFiles / auditPair / auditPairs. Also a CLI.
 import fs from 'node:fs'
@@ -837,6 +836,22 @@ function consolidatedTurns(text) {
   for (const s of speakerSeq(text)) { if (s !== prev) { turns += 1; prev = s } }
   return turns
 }
+// Retired as a publication gate: this literal tail-window heuristic is too brittle to block a delivery.
+// Keep its old signal for observability only; auditPair exposes it as metrics.endingCovered plus the soft
+// ending_check_info finding below.
+function endingCovered(sourceText, refinedText) {
+  const srcLines = sourceText.split(/\r?\n/).map((s) => s.trim())
+    .filter((s) => s && !/^\*{0,2}\s*发言人/.test(s) && !/^[#*>|]/.test(s))
+  const lastSrc = srcLines[srcLines.length - 1] || ''
+  const tail = (lastSrc.match(/[一-龥]/g) || []).slice(-14).join('')
+  if (tail.length < 4) return true
+  const refHan = (refinedText.match(/[一-龥]/g) || []).join('')
+  for (let i = 0; i + 4 <= tail.length; i += 1) {
+    if (refHan.includes(tail.slice(i, i + 4))) return true
+  }
+  return false
+}
+
 // ===== Content-gap detection (coverage scan) =====
 // Detects source sections that never made it into the refined output — the silent-omission failure
 // (observed live: a model content-policy pass dropped a contiguous ~1500-字 segment mid-file; the global
@@ -2338,6 +2353,7 @@ export function auditPair({
   const sEmptyDensity = sChars ? emptyCount(sourceText) / sChars : 0
   const rEmptyDensity = rChars ? emptyCount(refinedText) / rChars : 0
   const emptyReduction = sEmptyDensity ? Number((1 - rEmptyDensity / sEmptyDensity).toFixed(3)) : 0
+  const ending = endingCovered(sourceText, refinedText)
   const coverage = scanCoverage(sourceText, refinedText, { knownSpeakerLabels })
   // M4 mutation tier: number-atom + hedge fidelity. refine mode only (a summary/timeline legitimately drops
   // qualifiers). All-soft; SOFT findings never enter failed[] this pass (see below).
@@ -2365,6 +2381,7 @@ export function auditPair({
     sourceChars: sChars, refinedChars: rChars, charRatio,
     sourceTurns: sTurns, refinedTurns: rTurns, speakerTurnRatio, // turnRatio is confirming-only, never an independent gate
     sourceEmptyDensity: Number(sEmptyDensity.toFixed(4)), refinedEmptyDensity: Number(rEmptyDensity.toFixed(4)), emptyReduction,
+    endingCovered: ending,
     coverage: { assessed: coverage.assessed, turnsSubstantive: coverage.turnsSubstantive, turnsLost: coverage.turnsLost, lostChars: coverage.lostChars, lostRatio: coverage.lostRatio },
     ...(atoms ? { atoms: { sourceNumbers: atoms.sourceNumbers, refinedNumbers: atoms.refinedNumbers, drifted: atoms.drifted, driftNotes: atoms.driftNotes, hedgeTurnsLost: atoms.hedgeTurnsLost, assessed: atoms.assessed } } : {}),
     ...(attribution ? { attribution: { status: attribution.status, assessed: attribution.assessed, mapped: attribution.mappedSpeakers, mismatches: attribution.mismatches, review: attribution.review, partyCount: attribution.partyCount } } : {}),
@@ -2406,6 +2423,8 @@ export function auditPair({
   }
   const failed = Object.keys(gates).filter((k) => gates[k])
   const findings = out.findings.concat([
+    { name: 'ending_check_info', severity: 'soft', count: ending ? 0 : 1,
+      samples: ending ? [] : [{ text: '源稿末句的字面窗口未在成稿中命中，仅供人工复核，不影响门禁', line: 1 }] },
     { name: 'content_gap_soft', severity: 'soft', count: coverage.gaps.filter((g) => g.severity === 'soft').length, samples: coverage.gaps.filter((g) => g.severity === 'soft').slice(0, 12).map((g) => ({ text: `第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字${g.trace ? '（有折叠痕迹）' : ''}`, line: g.startLine })) },
     { name: 'model_marker', severity: 'soft', count: coverage.modelMarkers.length, samples: coverage.modelMarkers.slice(0, 12).map((m) => ({ text: m.text, line: m.line })) },
     ...(coverage.assessed && coverage.lostRatio >= COVERAGE.LOST_RATIO_SOFT
@@ -3127,7 +3146,7 @@ function usage() {
   node scripts/audit_refined.mjs --refined <精校稿> --fix-quotes  # 确定性修正正文可见区域的 ASCII/直角引号；代码、URL、链接不动
 
 输出-only hard（算失败）：嗯/呃、对对对/是是是、我我/就就、因为因为/涂鸦涂鸦、重复年份、20182018/SaaSAPP 等纯噪音或 ASR 粘连；超约 900 字的对话长段；中文旁 ASCII/直角引号。
-对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、结尾缺失、
+对比源文 hard（mode=refine）：charRatio < 0.55（疑似压缩成摘要）、欠精校、
   content_gap（成段源内容未出现在成稿且无折叠痕迹——疑似被模型无声略过/审查，附源文件行号）、
   attribution_mismatch（高置信度的发言内容落到另一位发言人名下）。
 soft（不算失败、需看上下文）：句末语气词 啊/哦/欸，那个/这个/就是说 等；小缺口/折叠缺口/散点流失；

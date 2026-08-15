@@ -5,7 +5,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { JobConfigError, runJob, normalizeModelOverrides } from './jobs.js'
+import { JobConfigError, runJob } from './jobs.js'
 import { parseInternalDirectory } from '../core/spec.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
@@ -45,8 +45,6 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --skill-dir <目录>     references/ 所在目录（默认仓库 claude-code-skill/）
   --prior-glossary <路径> 外部校对表作为往次记忆种子（默认自动读 <输出>/校对表.md；累积仍写回 <输出>/校对表.md）
   --concurrency <N>      并发上限（默认 min(16, 核数-2)）
-  --models <映射>        阶段模型覆盖，如 refine=deepseek-v4-pro,repair=deepseek-v4-pro；也接受 JSON 对象。
-                         未指定的阶段沿用默认 flash/pro 路由；只允许 DeepSeek v4 flash/pro 与三档别名
   --fresh                忽略既有 校对表.md，从零重建
   --no-annotate          检出内容缺口时不往成稿里插「内容缺口」标记（默认会插，便于读者看到缺失）
   --no-anchors           不往成稿各小节插源锚点注释（默认会插：<!-- 源 L25-L38 · 08:00-12:05 -->，
@@ -60,8 +58,9 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
 
 密钥（环境变量，或仓库根目录 .env）:
   DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
-  SERPER_API_KEY         建议——标准/深度核实与时间线的联网搜索用；未设时联网核实降级为不联网（refine 不受影响）
-  JINA_API_KEY           可选——Jina Reader key；未设仍可调用公开 Reader，失败后走本地安全抓取
+  TAVILY_API_KEY         建议——标准/深度核实与时间线的默认联网搜索用
+  SERPER_API_KEY         可选实验——未设 Tavily 时使用的搜索后端
+  JINA_API_KEY           可选实验——Jina Reader key；未设仍可调用公开 Reader，失败后走本地安全抓取
   ⚠ 信源提示            DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。
                          涉敏感话题或需保护信源的访谈请慎用。
 `
@@ -84,6 +83,7 @@ export function parseArgs(argv) {
   let i = 0
   while (i < argv.length) {
     const tok = argv[i]
+    if (tok === '--models') throw new JobConfigError('DeepSeek 版使用固定模型，CLI 不支持 --models')
     if (booleans[tok]) { out[booleans[tok]] = true; i++; continue }
     if (variadic[tok]) {
       const key = variadic[tok]; i++
@@ -112,24 +112,6 @@ export function parseChunkSize(v) {
     throw new JobConfigError(`--chunk-size 需为 ≥ ${CHUNK_SIZE_MIN} 的整数（每块目标正文字数），收到「${v}」`)
   }
   return n
-}
-
-export function parseModels(v) {
-  if (v == null || v === '') return undefined
-  if (typeof v === 'object') return normalizeModelOverrides(v)
-  const raw = String(v).trim()
-  let obj
-  if (raw.startsWith('{')) {
-    try { obj = JSON.parse(raw) } catch (e) { throw new JobConfigError(`--models JSON 无法解析：${e.message}`) }
-  } else {
-    obj = {}
-    for (const item of raw.split(',').map((x) => x.trim()).filter(Boolean)) {
-      const at = item.indexOf('=')
-      if (at <= 0 || at === item.length - 1) throw new JobConfigError(`--models 条目须为 stage=model，收到「${item}」`)
-      obj[item.slice(0, at).trim()] = item.slice(at + 1).trim()
-    }
-  }
-  return normalizeModelOverrides(obj)
 }
 
 export function buildRunParams(a, { env = process.env } = {}) {
@@ -174,6 +156,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
 
   return {
     apiKey: env.DEEPSEEK_API_KEY,
+    tavilyKey: env.TAVILY_API_KEY,
     serperKey: env.SERPER_API_KEY,
     jinaKey: env.JINA_API_KEY,
     topic,
@@ -197,7 +180,6 @@ export function buildRunParams(a, { env = process.env } = {}) {
     devTrace: a.devTrace || env.REFINER_DEV_TRACE === '1' || undefined,   // 开发排查用，默认关闭
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
-    models: parseModels(a.models),
   }
 }
 

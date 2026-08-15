@@ -22,7 +22,23 @@ test('query normalization is NFKC/trim/collapse/lower; fragments are removed fro
   assert.equal(canonicalWebUrl('https://user:pass@example.com/'), null)
 })
 
-test('Serper request contract, successful-empty caching, in-flight/cache dedupe, and telemetry', async () => {
+test('Tavily is primary when both search keys are configured', async () => {
+  const calls = []
+  const rt = makeWebRuntime({
+    tavilyApiKey: 'tavily-secret',
+    searchApiKey: 'serper-secret',
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init })
+      return response({ json: { results: [{ title: '结果', url: 'https://example.com/a', content: '摘要' }] } })
+    },
+  })
+  assert.match(await rt.search('示例查询'), /结果/)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, 'https://api.tavily.com/search')
+  assert.deepEqual(JSON.parse(calls[0].init.body), { api_key: 'tavily-secret', query: '示例查询', max_results: 5 })
+})
+
+test('Serper alternate request contract, successful-empty caching, in-flight/cache dedupe, and telemetry', async () => {
   const calls = []
   let release
   const gate = new Promise((resolve) => { release = resolve })

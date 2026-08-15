@@ -461,7 +461,7 @@ test('searchFn override: online web_search routes to the injected adapter with (
   assert.match(toolMsg.content, /example\.com\/team/, 'the adapter url is rendered')
 })
 
-test('default (no searchFn): web_search uses the fixed Serper path and fails cleanly without a key', async () => {
+test('default (no searchFn): web_search fails cleanly when neither Tavily nor Serper has a key', async () => {
   const client = mockClient([
     completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
@@ -469,7 +469,7 @@ test('default (no searchFn): web_search uses the fixed Serper path and fails cle
   const engine = makeDeepSeekEngine({ client, concurrency: 1 })
   await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
   const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
-  assert.match(toolMsg.content, /SERPER_API_KEY/, 'fixed Serper runtime reports its missing key without network')
+  assert.match(toolMsg.content, /TAVILY_API_KEY.*SERPER_API_KEY/, 'dual-backend runtime reports both accepted search keys without network')
 })
 
 test('formatSearchResults renders the normalized search contract (empty → 无结果)', () => {

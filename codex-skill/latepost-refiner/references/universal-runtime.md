@@ -20,7 +20,7 @@ npm run web
 ```
 
 Open the printed `http://127.0.0.1:<port>` URL. The UI has:
-- Three key fields: required `DEEPSEEK_API_KEY` and `SERPER_API_KEY`, plus optional `JINA_API_KEY`.
+- Two key fields: required `DEEPSEEK_API_KEY` and recommended `TAVILY_API_KEY`.
 - File upload for `.txt`, `.md`, `.docx`, `.pptx`, `.xlsx`, `.pdf`.
 - Scope checkboxes: `refine` (always on), plus `logic` / `summary` / `timeline`.
 - Verify depth: `key` (default) / `deep` / `none`.
@@ -30,7 +30,7 @@ API keys are used in memory for the local run; do not write them to output files
 
 ## CLI
 
-The default profile is fixed: mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, repair, logic, summary, timeline) run `deepseek-v4-pro`. For controlled tests, `--models stage=model` may override individual stages with either supported DeepSeek v4 model (or the `haiku` / `sonnet` / `opus` aliases). `run.json` records the complete effective stage routing plus the sparse override, so the manifest reflects what actually ran.
+The profile is fixed: mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, repair, logic, summary, timeline) run `deepseek-v4-pro`. `run.json` records the complete effective stage routing.
 
 ```bash
 node universal/cli.js \
@@ -46,13 +46,12 @@ node universal/cli.js \
 Useful flags:
 - `--background-file <路径>` to read a long background from a file instead of inline text
 - `--heading-policy none|keep|regenerate` (default `none`)
-- `--verify key|deep|none` (default `key`) — use `none` to skip web verification, e.g. when `SERPER_API_KEY` isn't set
+- `--verify key|deep|none` (default `key`) — use `none` to skip web verification when neither `TAVILY_API_KEY` nor `SERPER_API_KEY` is set
 - `--chunk speed|cost|off` (default `cost`) — long files auto-chunk at speaker-turn boundaries regardless, to stop the DeepSeek models from silently compressing them; `speed` additionally parallelizes big files for faster multi-file batches; `off` disables all chunking, including the automatic kind
 - `--chunk-size <N>` — explicit chunk target in 正文字数 (≥2000), overrides the automatic budget
 - `--fresh` to ignore an existing `校对表.md` and rebuild from zero
 - `--prior-glossary <path>` to seed from an external `校对表.md`
 - `--concurrency <N>` to cap parallel model calls
-- `--models refine=deepseek-v4-pro,repair=deepseek-v4-pro` for an explicit per-stage test override; omitted stages keep defaults
 - `--allow-audit-fail` to exit 0 when the only failure is a still-hard audit gate and main transcripts were written (derivatives remain withheld)
 
 Run `node universal/cli.js --help` for the complete, current flag list — treat it as the source of truth over this doc.
@@ -62,7 +61,10 @@ Run `node universal/cli.js --help` for the complete, current flag list — treat
 ## Environment
 
 - `DEEPSEEK_API_KEY` — required. DeepSeek's API key; used for every stage.
-- `SERPER_API_KEY` — required for standard/deep web verification and the timeline stage. Without it, online stages degrade with visible unresolved warnings; refine itself never goes online. Pass `--verify none` when intentionally running offline.
+- `TAVILY_API_KEY` — recommended default search backend for standard/deep web verification and the timeline stage.
+- `SERPER_API_KEY` — optional experimental alternate when Tavily is not configured.
+- `JINA_API_KEY` — optional experimental Reader authentication; public Reader and the safe local fallback remain available without it.
+  Without either search key, online stages degrade with visible unresolved warnings; refine itself never goes online. Pass `--verify none` when intentionally running offline.
 - `JINA_API_KEY` — optional bearer token for Jina Reader. `web_fetch` tries Jina Reader first and then the SSRF-guarded local extractor; the token is never persisted.
 
 Each job permits at most 100 unique search queries. `run.json` records search/fetch calls, cache hits, HTTP attempts, billed Serper responses, Jina usage tokens, fallbacks, and failures without recording credentials. The per-run JSONL log keeps model cost in `estCost`, Serper cost in `searchEstCost`, Jina Reader cost in `fetchEstCost`, and combines all three in `totalEstCost`.

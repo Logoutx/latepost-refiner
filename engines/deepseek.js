@@ -4,12 +4,12 @@
 // the ONLY API provider the Universal edition supports — Claude runs via the Claude Code skill,
 // not this engine. Everything here is hard-wired to DeepSeek; there is no provider selection.
 //
-// Fixed defaults (runJob/CLI may explicitly override a stage between these two DeepSeek model ids):
+// Fixed CLI defaults (internal programmatic callers may explicitly override a stage between these model ids):
 //   • Endpoint  https://api.deepseek.com ; key from DEEPSEEK_API_KEY.
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
 //               V4 defaults to thinking mode; tool-call turns therefore replay reasoning_content.
-//   • Web       Job-scoped runtime: Serper search → Jina Reader → SSRF-safe local fallback. Optional
+//   • Web       Job-scoped runtime: Tavily-first search (Serper alternate) → Jina Reader → SSRF-safe local fallback. Optional
 //               programmatic searchFn/fetch injections remain for tests and benchmarks.
 //   • Structured output via a function tool. The final fallback asks again with only that tool exposed;
 //               it does not send tool_choice because V4 thinking mode rejects that parameter.
@@ -213,7 +213,7 @@ export function makeDeepSeekEngine(opts = {}) {
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     filePolicy,
     onPhase, onLog, onToolEvent, onAgentEvent,
-    searchApiKey, readerApiKey,
+    tavilyApiKey, searchApiKey, readerApiKey,
     searchFn, fetchImpl, localFetchFn, dnsLookup,
     searchK = 5, maxSearchRequestsPerJob = 100,
     webRuntime,
@@ -223,7 +223,7 @@ export function makeDeepSeekEngine(opts = {}) {
   const client = opts.client || new OpenAI({ apiKey, baseURL: DEEPSEEK_BASE_URL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
-  const web = webRuntime || makeWebRuntime({ searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
+  const web = webRuntime || makeWebRuntime({ tavilyApiKey, searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
   const failures = []
 

@@ -146,7 +146,11 @@ test('a cleaned closing pleasantry is not a standalone lexical-tail failure', ()
   ].join('\n')
   const r = auditPair({ sourceText, refinedText, mode: 'refine' })
   assert.ok(!r.failed.includes('ending_missing'), '正常去口癖不能被连续字窗口误判成断尾')
-  assert.equal(Object.hasOwn(r.metrics, 'endingCovered'), false, '删除误导性的字面结尾指标')
+  assert.equal(typeof r.metrics.endingCovered, 'boolean', '字面结尾指标仅作为信息保留')
+  const info = r.findings.find((finding) => finding.name === 'ending_check_info')
+  assert.equal(info.severity, 'soft')
+  assert.equal(info.count, r.metrics.endingCovered ? 0 : 1)
+  assert.ok(!r.failed.includes('ending_check_info'), '信息项永不进入门禁')
 })
 
 test('summary mode does NOT apply the compression gate (a summary is meant to be short)', () => {

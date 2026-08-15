@@ -1,5 +1,6 @@
 // ===== Job-scoped web tools ==================================================
-// Fixed production stack: Serper search → Jina Reader → SSRF-safe local fallback.
+// Production stack: Tavily search by default, Serper as an optional alternate →
+// Jina Reader → SSRF-safe local fallback.
 // The runtime owns all mutable state (budget, caches, allow-set, telemetry) for ONE job.
 
 import dns from 'node:dns'
@@ -8,6 +9,7 @@ import https from 'node:https'
 import net from 'node:net'
 
 export const SERPER_ENDPOINT = 'https://google.serper.dev/search'
+export const TAVILY_ENDPOINT = 'https://api.tavily.com/search'
 export const JINA_READER_PREFIX = 'https://r.jina.ai/'
 export const DOH_ENDPOINT = 'https://dns.google/resolve'
 export const WEB_TELEMETRY_FIELDS = Object.freeze([
@@ -203,7 +205,7 @@ async function localHttpFetch(raw, { resolveAddresses = (host) => publicAddresse
 
 export function makeWebRuntime(opts = {}) {
   const {
-    searchApiKey, readerApiKey, searchFn,
+    tavilyApiKey, searchApiKey, readerApiKey, searchFn,
     fetchImpl = globalThis.fetch, localFetchFn,
     dnsLookup = dns.promises.lookup,
     dohLookup, dohFetchImpl = globalThis.fetch,
@@ -265,6 +267,39 @@ export function makeWebRuntime(opts = {}) {
     throw last || new Error('Serper 搜索失败')
   }
 
+  async function doTavily(query) {
+    if (!tavilyApiKey) throw new Error('未配置 TAVILY_API_KEY')
+    let last
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let res
+      try {
+        stats.searchAttempts += 1
+        res = await fetchWithTimeout(fetchImpl, TAVILY_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key: tavilyApiKey, query, max_results: searchK }),
+        }, SEARCH_TIMEOUT_MS)
+      } catch (e) {
+        last = e
+        if (attempt === 0) continue
+        throw e
+      }
+      if (res.ok) {
+        stats.searchBilled += 1
+        let json
+        try { json = await res.json() } catch (e) { throw new Error(`Tavily 2xx JSON 无法解析：${e.message}`) }
+        if (!json || !Array.isArray(json.results)) throw new Error('Tavily 2xx 响应缺少 results 数组')
+        return json.results.slice(0, searchK).map((x) => ({
+          title: x.title || '', url: x.url || '', snippet: x.content || x.snippet || '',
+        })).filter((x) => x.url)
+      }
+      last = new Error(`Tavily HTTP ${res.status}`)
+      if (!retryableStatus(res.status) || attempt > 0) throw last
+      await wait(retryDelayMs(res))
+    }
+    throw last || new Error('Tavily 搜索失败')
+  }
+
   async function search(queryRaw) {
     stats.searchCalls += 1
     const key = normalizeSearchQuery(queryRaw)
@@ -278,8 +313,12 @@ export function makeWebRuntime(opts = {}) {
     reserved += 1 // reserve before starting so concurrent unique queries cannot oversubscribe
     const work = (async () => {
       try {
-        const rows = searchFn ? await searchFn(queryRaw, { k: searchK }) : await doSerper(queryRaw)
-        if (!Array.isArray(rows)) throw new Error('searchFn/Serper 未返回结果数组')
+        const rows = searchFn
+          ? await searchFn(queryRaw, { k: searchK })
+          : (tavilyApiKey
+              ? await doTavily(queryRaw)
+              : (searchApiKey ? await doSerper(queryRaw) : await Promise.reject(new Error('未配置 TAVILY_API_KEY 或 SERPER_API_KEY'))))
+        if (!Array.isArray(rows)) throw new Error('searchFn/Tavily/Serper 未返回结果数组')
         const normalized = rows.slice(0, searchK).map((x) => ({ title: x?.title || '', url: x?.url || '', snippet: x?.snippet || '' })).filter((x) => x.url)
         searchCache.set(key, normalized) // successful empty result is cacheable
         addAllowed(normalized)

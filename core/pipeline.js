@@ -111,7 +111,7 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // agent forwards opts.effort.
   const refineEffort = effortFor(A, 'refine')
   // Provider-aware auto-chunk: if the engine that will run refine declares a faithful-length budget for the model
-  // actually assigned to refine (respects --models AND the category-router's smart engine), split any file over
+  // actually assigned to refine (respects the internal stage-model map and the category-router's smart engine), split any file over
   // it — a weaker-but-cheaper model silently compresses long transcripts. Anthropic / the CC sandbox expose no
   // refineBudget → rb null → budget undefined → splitForRefine behaves byte-identically to before. See
   // engines/providers.js for the per-model budgets and the retention evidence behind them.
@@ -538,8 +538,38 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText, options = 
   let hard = hardOf(cur)
   let repaired = false
   const repairAttempts = []
-  // A runtime without fs cannot stage, audit and atomically promote a candidate. Do not let a fallback model
-  // overwrite the current transcript in place; keep the hard finding for explicit/manual repair instead.
+
+  // Claude Code Workflow sandbox: there is no host fs transaction capability, but its Read/Edit agent can
+  // still repair the two historically safe, precisely located classes once. Preserve that subscription-runtime
+  // ability without changing Universal/DeepSeek's candidate-and-promote loop below.
+  const sandboxRepairFindings = hard.filter((name) => name === 'content_gap' || name === 'quote_style')
+  const sandboxRepairModel = (A.models && A.models.refine) || DEFAULT_STAGE_MODELS.refine
+  if (options.allowRepair !== false && sandboxRepairFindings.length
+      && typeof cap.repair !== 'function' && typeof cap.runAudit !== 'function') {
+    engine.log(`审计 hard：${f.label} → ${sandboxRepairFindings.join('、')}——尝试 CC 定点修复一次`)
+    const gaps = (cur.gaps || []).filter((g) => g.severity === 'hard')
+    const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
+    const parts = []
+    if (sandboxRepairFindings.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
+    if (sandboxRepairFindings.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
+    await engine.agent(
+      `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
+      { label: `repair:${f.label}`, phase: 'Audit', model: sandboxRepairModel })
+    const again = await audit({ phase: 'post_sandbox_repair', round: 1 })
+    if (again) {
+      cur = again
+      repaired = true
+      hard = hardOf(cur)
+      repairAttempts.push({
+        file: out, round: 1, action: 'sandbox_spot_repair', model: sandboxRepairModel,
+        failedBefore: sandboxRepairFindings, failedAfter: hard.slice(),
+        outcome: hard.length ? 'audit_failed' : 'passed',
+      })
+      engine.log(`审计复检：${f.label} → ${hard.length ? `hard 仍在：${hard.join('、')}` : '已通过'}`)
+    }
+  }
+
+  // Runtimes with fs keep the team candidate-and-promote transaction exactly as the primary repair path.
   const repairAvailable = options.allowRepair !== false && typeof cap.repair === 'function'
 
   if (hard.length && repairAvailable) engine.log(`审计 hard：${f.label} → ${hard.join('、')}——最多候选修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮，每轮后复检`)
@@ -693,11 +723,15 @@ let speakerIdentityFinalizations = [] // post-refine track registry decisions + 
 let transcriptMetadata = null // single-file catalog metadata produced by the same final identity pass
 let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
-// Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
-// Keep the former branch in place temporarily for an easy diff/review, but make it unreachable.
-const useShortFileFastPath = false
-// Former condition:
-// A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot && !A.files[0].needsSpeakerResolution
+// Claude Code / Codex subscription runtimes keep the original cheap one-pass path for a lone short file.
+// Universal supplies host capabilities (including the Turn IR contract), so it always takes the full
+// Scout/Resolve/Refine path. Generic-label inputs also stay on that full path so deterministic speaker
+// resolution and canonical-label enforcement remain active.
+const useShortFileFastPath = !capabilities
+  && A.files.length === 1
+  && refineSize(A.files[0]) < ONE_PASS_CHARS
+  && !A.captureSingleShot
+  && A.files[0].needsSpeakerResolution === false
 if (useShortFileFastPath) {
   // Legacy single-short-file path: one-pass refine, skipping Scout/Verify.
   // (M11b: a batch-submit capture pass forces the else-branch so even a tiny lone file is captured as a
@@ -1061,7 +1095,7 @@ if (scope.includes('refine') && pairsToAudit.length) {
       else auditFailed.push({ path: f.outPath, findings: ['seam_duplicate'] })
     }
   })
-  if (auditFailed.length) engine.log(`审计未过（候选修复后仍 hard，或当前运行时无安全自动修复能力）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
+  if (auditFailed.length) engine.log(`审计未过（候选 / CC 定点修复后仍 hard，或当前运行时无适用自动修复能力）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
 }
 

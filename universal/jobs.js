@@ -198,13 +198,14 @@ export function repairCandidatePath(outputDir, file = {}, round = 1) {
 // Build the DeepSeek engine — the only API provider the Universal edition supports. apiKey (if given)
 // overrides the env lookup: the web UI passes the key the user typed; the CLI passes nothing and falls
 // back to DEEPSEEK_API_KEY. Endpoint and the flash/pro model split are fixed inside makeDeepSeekEngine.
-export function selectEngine({ concurrency, apiKey, serperKey, jinaKey, filePolicy, env = process.env, onPhase, onLog, onToolEvent, onAgentEvent, searchFn, fetchImpl, localFetchFn, dnsLookup } = {}) {
+export function selectEngine({ concurrency, apiKey, tavilyKey, serperKey, jinaKey, filePolicy, env = process.env, onPhase, onLog, onToolEvent, onAgentEvent, searchFn, fetchImpl, localFetchFn, dnsLookup } = {}) {
   const key = apiKey || env.DEEPSEEK_API_KEY
   if (!key) throw new Error('未设 DEEPSEEK_API_KEY（DeepSeek 的 API key）')
   return {
     provider: 'deepseek',
     engine: makeDeepSeekEngine({
       apiKey: key,
+      tavilyApiKey: tavilyKey || env.TAVILY_API_KEY,
       searchApiKey: serperKey || env.SERPER_API_KEY,
       readerApiKey: jinaKey || env.JINA_API_KEY,
       concurrency, filePolicy, onPhase, onLog, onToolEvent, onAgentEvent, searchFn, fetchImpl, localFetchFn, dnsLookup,
@@ -492,7 +493,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   const startedAt = new Date(startedMs).toISOString()
   const notice = (msg) => { if (onNotice) onNotice(msg) }
   const {
-    apiKey, serperKey, jinaKey, models,
+    apiKey, tavilyKey, serperKey, jinaKey, models,
     files = [], topic = 'untitled', date = '', background = '',
     scope = ['refine'], verifyDepth = 'key', headingPolicy = 'none',
     outputDir, fresh = false, concurrency,
@@ -549,7 +550,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     notice(`沿用既有校对表：${priorSource}`)
   }
 
-  // 3. engine: an injected engine (tests) or DeepSeek + a job-scoped Serper/Jina runtime. Keys are passed
+  // 3. engine: an injected engine (tests) or DeepSeek + a job-scoped Tavily-first/Serper/Jina runtime. Keys are passed
   //    explicitly; never mutate process.env, so concurrent jobs cannot leak credentials into one another.
   const filePolicy = buildFilePolicy({ outputDir: outDir, skillDir: resolvedSkillDir, files: fileEntries, topic, scope })
   const repairToolEvents = []
@@ -558,7 +559,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   else {
     try {
       sel = selectEngine({
-        concurrency, apiKey, serperKey, jinaKey, filePolicy,
+        concurrency, apiKey, tavilyKey, serperKey, jinaKey, filePolicy,
         onPhase: (title) => { trace.stage(title); if (onPhase) onPhase(title) },
         onLog,
         onToolEvent: (event) => {
@@ -582,8 +583,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
   if (sel.provider === 'deepseek') {
     notice(`provider=${sel.provider}（${sel.info.label}）· baseURL=${sel.info.baseURL} · key=${sel.info.keyVar}`)
     notice(`⚠ ${SOURCE_PROTECTION_NOTE}`)
-    if (!(serperKey || process.env.SERPER_API_KEY) && (scope.includes('timeline') || verifyDepth !== 'none')) {
-      notice('提示：未设 SERPER_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
+    if (!(tavilyKey || process.env.TAVILY_API_KEY || serperKey || process.env.SERPER_API_KEY) && (scope.includes('timeline') || verifyDepth !== 'none')) {
+      notice('提示：未设 TAVILY_API_KEY 或 SERPER_API_KEY——联网核实/时间线将降级为不联网（refine 不受影响）。')
     }
   }
   notice(`
@@ -1049,7 +1050,8 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     modelOverrides,
     effectiveModels,
     capabilities,
-    searchProvider: 'serper', fetchProvider: 'jina-reader+local-fallback',
+    searchProvider: (tavilyKey || process.env.TAVILY_API_KEY) ? 'tavily' : ((serperKey || process.env.SERPER_API_KEY) ? 'serper' : 'tavily'),
+    fetchProvider: 'jina-reader+local-fallback',
     fresh, annotate: params.annotate, files: fileEntries,
     plannedChunks: [],
     onChunkPlan: (plan) => trace.plan(plan),

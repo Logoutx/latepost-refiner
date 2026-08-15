@@ -914,7 +914,7 @@ test('runJob: a faithful refine leaves auditFailed empty and marks each entry au
   assert.ok((result.anchors || []).length >= 1, 'anchors still ran on the clean 成稿')
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'))
   assert.deepEqual(manifest.webTelemetry, result.webTelemetry, 'runJob persists job-scoped web telemetry in run.json')
-  assert.equal(manifest.config.searchProvider, 'serper')
+  assert.equal(manifest.config.searchProvider, 'tavily')
   assert.equal(manifest.config.fetchProvider, 'jina-reader+local-fallback')
 })
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildRunParams, parseArgs, parseModels, computeExitCode } from '../universal/cli.js'
+import { buildRunParams, parseArgs, computeExitCode, HELP_TEXT } from '../universal/cli.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-cli-'))
@@ -34,9 +34,8 @@ test('parseArgs output maps CLI flags to runJob params', () => {
     '--background', '会被背景文件覆盖',
     '--scope', 'refine,summary,timeline',
     '--prior-glossary', path.join(dir, '往次校对表.md'),
-    '--models', 'refine=deepseek-v4-pro,repair=opus',
   ])
-  const params = buildRunParams(args, { env: { HOME: dir, DEEPSEEK_API_KEY: 'd', SERPER_API_KEY: 's', JINA_API_KEY: 'j' } })
+  const params = buildRunParams(args, { env: { HOME: dir, DEEPSEEK_API_KEY: 'd', TAVILY_API_KEY: 't', SERPER_API_KEY: 's', JINA_API_KEY: 'j' } })
 
   assert.deepEqual(params.files, [{ path: a }, { path: b }])
   assert.equal(params.topic, '虚构项目')
@@ -52,17 +51,18 @@ test('parseArgs output maps CLI flags to runJob params', () => {
   assert.equal(params.fresh, true)
   assert.equal(params.annotate, false)
   assert.equal(params.priorGlossaryPath, path.join(dir, '往次校对表.md'), '--prior-glossary resolves to an absolute path')
-  assert.deepEqual(params.models, { refine: 'deepseek-v4-pro', repair: 'opus' })
   assert.equal(params.apiKey, 'd')
+  assert.equal(params.tavilyKey, 't')
   assert.equal(params.serperKey, 's')
   assert.equal(params.jinaKey, 'j')
 })
 
-test('--models accepts JSON or stage=model and rejects non-DeepSeek/provider values', () => {
-  assert.deepEqual(parseModels('{"refine":"opus","repair":"deepseek-v4-pro"}'), { refine: 'opus', repair: 'deepseek-v4-pro' })
-  assert.deepEqual(parseModels('scout=haiku,refine=deepseek-v4-pro'), { scout: 'haiku', refine: 'deepseek-v4-pro' })
-  assert.throws(() => parseModels('refine=claude-opus-4'), /DeepSeek/)
-  assert.throws(() => parseModels('unknown=opus'), /未知模型阶段/)
+test('CLI does not expose per-stage --models selection', () => {
+  assert.throws(
+    () => parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--models', 'refine=deepseek-v4-flash']),
+    /固定模型.*不支持 --models/,
+  )
+  assert.doesNotMatch(HELP_TEXT, /--models/)
 })
 
 test('parseArgs: --prior-glossary is undefined when the flag is absent', () => {
