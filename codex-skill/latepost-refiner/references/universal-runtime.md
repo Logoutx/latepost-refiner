@@ -20,7 +20,7 @@ npm run web
 ```
 
 Open the printed `http://127.0.0.1:<port>` URL. The UI has:
-- Two key fields: `DEEPSEEK_API_KEY` and (optional) `TAVILY_API_KEY`.
+- Three key fields: required `DEEPSEEK_API_KEY` and `SERPER_API_KEY`, plus optional `JINA_API_KEY`.
 - File upload for `.txt`, `.md`, `.docx`, `.pptx`, `.xlsx`, `.pdf`.
 - Scope checkboxes: `refine` (always on), plus `logic` / `summary` / `timeline`.
 - Verify depth: `key` (default) / `deep` / `none`.
@@ -30,7 +30,7 @@ API keys are used in memory for the local run; do not write them to output files
 
 ## CLI
 
-Models are fixed — there is no selection. Mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, logic, summary, timeline) run `deepseek-v4-pro`.
+The default profile is fixed: mechanical stages (scout, verify, dedup) run `deepseek-v4-flash`; judgment stages (refine, repair, logic, summary, timeline) run `deepseek-v4-pro`. For controlled tests, `--models stage=model` may override individual stages with either supported DeepSeek v4 model (or the `haiku` / `sonnet` / `opus` aliases). `run.json` records the complete effective stage routing plus the sparse override, so the manifest reflects what actually ran.
 
 ```bash
 node universal/cli.js \
@@ -46,13 +46,14 @@ node universal/cli.js \
 Useful flags:
 - `--background-file <路径>` to read a long background from a file instead of inline text
 - `--heading-policy none|keep|regenerate` (default `none`)
-- `--verify key|deep|none` (default `key`) — use `none` to skip web verification, e.g. when `TAVILY_API_KEY` isn't set
+- `--verify key|deep|none` (default `key`) — use `none` to skip web verification, e.g. when `SERPER_API_KEY` isn't set
 - `--chunk speed|cost|off` (default `cost`) — long files auto-chunk at speaker-turn boundaries regardless, to stop the DeepSeek models from silently compressing them; `speed` additionally parallelizes big files for faster multi-file batches; `off` disables all chunking, including the automatic kind
 - `--chunk-size <N>` — explicit chunk target in 正文字数 (≥2000), overrides the automatic budget
 - `--fresh` to ignore an existing `校对表.md` and rebuild from zero
 - `--prior-glossary <path>` to seed from an external `校对表.md`
 - `--concurrency <N>` to cap parallel model calls
-- `--allow-audit-fail` to exit 0 when the only failure is a still-hard audit gate and products were already written
+- `--models refine=deepseek-v4-pro,repair=deepseek-v4-pro` for an explicit per-stage test override; omitted stages keep defaults
+- `--allow-audit-fail` to exit 0 when the only failure is a still-hard audit gate and main transcripts were written (derivatives remain withheld)
 
 Run `node universal/cli.js --help` for the complete, current flag list — treat it as the source of truth over this doc.
 
@@ -61,7 +62,10 @@ Run `node universal/cli.js --help` for the complete, current flag list — treat
 ## Environment
 
 - `DEEPSEEK_API_KEY` — required. DeepSeek's API key; used for every stage.
-- `TAVILY_API_KEY` — advised, not required. Used for standard/deep web verification and the timeline stage. Without it, verify/timeline degrade automatically to no-verify (refine itself never goes online, so it is unaffected); pass `--verify none` to skip web verification explicitly instead of relying on the degrade.
+- `SERPER_API_KEY` — required for standard/deep web verification and the timeline stage. Without it, online stages degrade with visible unresolved warnings; refine itself never goes online. Pass `--verify none` when intentionally running offline.
+- `JINA_API_KEY` — optional bearer token for Jina Reader. `web_fetch` tries Jina Reader first and then the SSRF-guarded local extractor; the token is never persisted.
+
+Each job permits at most 100 unique search queries. `run.json` records search/fetch calls, cache hits, HTTP attempts, billed Serper responses, Jina usage tokens, fallbacks, and failures without recording credentials. The per-run JSONL log keeps model cost in `estCost`, Serper cost in `searchEstCost`, Jina Reader cost in `fetchEstCost`, and combines all three in `totalEstCost`.
 
 ⚠ DeepSeek is operated by a China-based company: full transcript text is transmitted to its servers and subject to local regulation, including content review. Avoid this edition for sensitive-topic interviews or ones needing source protection.
 
@@ -76,23 +80,28 @@ The runtime writes:
 - `<out>/<topic>访谈总结.md` when `summary` is in scope
 - `<out>/<topic>时间线.md` when `timeline` is in scope
 
-Read `review.md` before reporting completion. It consolidates failed files, incomplete endings, audit-gate failures, a thin-校对表 warning, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
+Read `review.md` before reporting completion. It consolidates failed files, source-aware audit failures, a thin-校对表 warning, unverified network items, suspected duplicate names, source-heading conflicts, and open questions.
 
-Read `run.json` when auditing a run or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded.
+Read `run.json` when auditing a run or explaining exactly what files, models, provider, scope, hashes, artifacts, and usage were recorded. Use `artifactQuality` for the independent `ready / review_needed / blocked` state of each transcript, logic draft, summary, and timeline; the run-level `quality` is intentionally the worst state across the run.
 
 ## Exit Code And `auditFailed`
 
-The in-pipeline audit gate runs per file after refine. When a file is still **hard** (`content_gap` / `quote_style`) after one auto-repair, it is recorded in the run's top-level **`auditFailed`** (`[{ path, findings }]`, mirrored in `review.md` and `run.json`). By default the CLI then **exits 1** — but the 成稿 and every other product are **already written to disk**; the non-zero code flags "one or more files need a manual look", not "the run failed". A calling script must therefore check the **`auditFailed` field in `run.json` / `review.md`** to decide per-file follow-up, rather than treating a non-zero exit as a whole-run failure and discarding the output.
+The in-pipeline audit gate runs per file after refine. One shared publication contract drives repair, derivative withholding, CLI exit, scorecards, and installed editions:
 
-Pass **`--allow-audit-fail`** to make the CLI exit **0** when products were generated and the only problem is `auditFailed` (a pipeline error still exits 1). Use it in CI/batch drivers that want to consume the produced transcripts and act on `auditFailed` out-of-band instead of gating on the exit code.
+- body fidelity: `content_gap`, `compression_risk`, high-confidence `attribution_mismatch`, `seam_duplicate`;
+- output quality: `residual_noise`, `under_refined`, `long_paragraphs`, `quote_style`.
 
-The runtime now runs a source-aware quality audit for refined transcripts. It records compression risk, under-refinement, ending coverage, hard residual noise, phrase repeats, ASR glue, broken fragment starts, and long paragraphs. When a refined file fails, the runtime can retry up to 2 repair rounds:
-- compression or missing ending -> rerun that file from the source;
-- under-refined output -> full cleanup against source plus current output;
-- local residual noise -> targeted repair of flagged spans.
-Full-file repair uses the same fixed `refine` model as the original refine (`deepseek-v4-pro`) — there is no separate repair model to configure.
+Audit-generated failures receive at most two candidate repair rounds, each followed by a re-audit. A real ending omission is handled by the same `content_gap` / `compression_risk` evidence as an omission in the middle; the audit does not fail merely because the source's last few characters are absent. Chunk seams receive deterministic cleanup, an extended long-replay repair, then a residual scan. A still-failing body is recorded in top-level **`auditFailed`**. The main transcript and review artifacts are still written, but requested logic/summary/timeline products are withheld and listed in **`derivativesSkipped`** so no derivative can fossilize a known body defect. By default the CLI exits 1; callers should inspect both fields in `run.json` / `review.md` and retain the main transcript for targeted follow-up.
 
-If failures remain after the repair loop, treat `review.md` as the handoff source of truth and do not present the run as clean.
+After generation, logic drafts are audited independently for same-order copying and missing refined-section provenance (`logicFailed`). Summary/timeline facts are checked clause by clause: Chinese/English money scales and supported range compaction compare as equivalent, while a real amount reassigned to another glossary entity remains a hard derivative-attribution failure. These findings affect only the artifact that failed; inspect `artifactQuality` rather than inferring every attachment's state from the run-level label.
+
+Pass **`--allow-audit-fail`** to make the CLI exit **0** when transcripts were generated and the only problem is a completed audit recorded in `auditFailed` (a pipeline error, unavailable audit, or `logicFailed` still exits 1). This changes process control only; it never changes an artifact's status or unblocks derivatives.
+
+The runtime runs a source-aware quality audit for each refined transcript, then gives publication-gate failures at most two candidate repair rounds with a re-audit after each. A quote-style-only failure is normalized deterministically without calling the repair model. Other repair prompts receive the audit's exact source ranges, speaker mismatch, compression signal, named findings, and the exact canonical speaker-label registry. Each repair agent gets an agent-scoped file policy: it may write only one `.repair-candidates/…` file and cannot touch the accepted transcript. Deterministic code normalizes that candidate, verifies the speaker contract, rejects any new hard finding or non-improving result, and atomically promotes it only after improvement. A rejected candidate is deleted and the prior transcript remains unchanged. The `repair` stage defaults to `deepseek-v4-pro` and can be overridden explicitly like other stages.
+
+`run.json.qualityRepair` records only whitelisted metadata: round, before/after hard counts, model/action, successful tool counts, failed tool code counts, byte change, candidate promotion/validation state, rejection reason, outcome, and stop reason. Attempts stay append-only even if the corresponding draft is later removed from the deliverable list. It never stores prompts, response bodies, transcript snippets, or Edit arguments. Tool failures are append-only evidence and do not automatically block a body that passes the post-repair audit.
+
+If failures remain after that pass, treat `review.md` as the handoff source of truth, retain the main body for manual correction, and do not generate or present derivatives as clean.
 
 ## Return And Handoff
 

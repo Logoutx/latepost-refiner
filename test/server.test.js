@@ -39,13 +39,19 @@ test('sanitizeRunParams drops web-only dangerous fields', () => {
   const params = sanitizeRunParams({
     skillDir: '/',
     __engine: { anything: true },
+    searchFn: 'not allowed over HTTP',
+    fetchImpl: 'not allowed over HTTP',
     apiKey: 'deepseek-key',
-    tavilyKey: 't',
+    serperKey: 's',
+    jinaKey: 'j',
   })
   assert.equal(params.skillDir, undefined, 'skillDir cannot be set over the wire')
   assert.equal(params.__engine, undefined, 'the test-only engine injection cannot be set over the wire')
+  assert.equal(params.searchFn, undefined)
+  assert.equal(params.fetchImpl, undefined)
   assert.equal(params.apiKey, 'deepseek-key', 'the DeepSeek key passes through')
-  assert.equal(params.tavilyKey, 't', 'the Tavily key passes through')
+  assert.equal(params.serperKey, 's', 'the Serper key passes through')
+  assert.equal(params.jinaKey, 'j', 'the optional Jina key passes through')
 })
 
 test('served HTML embeds the per-session API token', async () => {

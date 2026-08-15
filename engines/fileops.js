@@ -15,11 +15,13 @@ const DEFAULT_POLICY = Object.freeze({
   writeRoots: [process.cwd()],
   readPaths: [],
   writePaths: [],
+  writePartBases: [],
 })
 
 const asArray = (v) => Array.isArray(v) ? v : (v ? [v] : [])
 const uniq = (xs) => Array.from(new Set(xs.filter(Boolean)))
 const resolveList = (xs) => uniq(asArray(xs).map((x) => path.resolve(String(x))))
+const fail = (code, text, meta = {}) => ({ ok: false, code, text, ...meta })
 
 export function makeFilePolicy(policy = {}) {
   return {
@@ -27,6 +29,9 @@ export function makeFilePolicy(policy = {}) {
     writeRoots: resolveList(policy.writeRoots || DEFAULT_POLICY.writeRoots),
     readPaths: resolveList(policy.readPaths || DEFAULT_POLICY.readPaths),
     writePaths: resolveList(policy.writePaths || DEFAULT_POLICY.writePaths),
+    // Exact derived family: a base `/out/A.md` permits only `/out/A.md.part<positive integer>`.
+    // This keeps scratch/test files denied without pretending provider-budget chunk counts are capped.
+    writePartBases: resolveList(policy.writePartBases || DEFAULT_POLICY.writePartBases),
   }
 }
 
@@ -65,6 +70,13 @@ function lexicalAllowed(target, roots, exactPaths) {
   return exactPaths.includes(target) || insideAnyRoot(target, roots)
 }
 
+function isDeclaredPartPath(target, bases) {
+  return bases.some((base) => {
+    if (!target.startsWith(`${base}.part`)) return false
+    return /^[1-9]\d*$/.test(target.slice(`${base}.part`.length))
+  })
+}
+
 function realTargetAllowed(target, roots) {
   const real = realpathMaybe(target)
   if (!real) return false
@@ -83,30 +95,36 @@ function writeParentAllowed(target, roots) {
 }
 
 function checkAccess(kind, filePath, policy) {
-  if (!filePath) return { ok: false, text: `${kind}: 缺少 file_path` }
+  if (!filePath) return fail('TOOL_ARGUMENT_INVALID', `${kind}: 缺少 file_path`)
   const p = makeFilePolicy(policy)
   const abs = path.resolve(String(filePath))
   const roots = kind === 'Read' ? p.readRoots : p.writeRoots
   const exact = kind === 'Read' ? uniq([...p.readPaths, ...p.writePaths]) : p.writePaths
-  if (!lexicalAllowed(abs, roots, exact)) {
-    const hint = roots.concat(exact).join('；') || '（无）'
-    return { ok: false, text: `${kind}: 路径不在允许范围内: ${abs}；允许范围: ${hint}` }
+  const declaredPart = isDeclaredPartPath(abs, p.writePartBases)
+  // When writePaths is non-empty it is an allowlist, not merely an escape hatch beside writeRoots.
+  // Universal jobs use this to prevent a model from leaving scratch/test files in the production output tree.
+  const allowed = kind === 'Read'
+    ? (lexicalAllowed(abs, roots, exact) || declaredPart)
+    : ((exact.length || p.writePartBases.length) ? (exact.includes(abs) || declaredPart) : insideAnyRoot(abs, roots))
+  if (!allowed) {
+    const hint = roots.concat(exact, p.writePartBases.map((base) => `${base}.partN`)).join('；') || '（无）'
+    return fail('TOOL_PATH_DENIED', `${kind}: 路径不在允许范围内: ${abs}；允许范围: ${hint}`, { path: abs })
   }
 
   if (kind === 'Read') {
     const explicitSource = p.readPaths.includes(abs)
     const exists = fs.existsSync(abs)
     if (exists && !explicitSource && !realTargetAllowed(abs, roots)) {
-      return { ok: false, text: `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}` }
+      return fail('TOOL_PATH_DENIED', `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}`, { path: abs })
     }
   } else {
-    if (isSymlink(abs)) return { ok: false, text: `${kind}: 拒绝写入符号链接: ${abs}` }
+    if (isSymlink(abs)) return fail('TOOL_PATH_DENIED', `${kind}: 拒绝写入符号链接: ${abs}`, { path: abs })
     if (fs.existsSync(abs)) {
       if (!realTargetAllowed(abs, roots)) {
-        return { ok: false, text: `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}` }
+        return fail('TOOL_PATH_DENIED', `${kind}: 路径解析后不在允许范围内（可能是符号链接）: ${abs}`, { path: abs })
       }
     } else if (!writeParentAllowed(abs, roots)) {
-      return { ok: false, text: `${kind}: 父目录解析后不在允许范围内: ${abs}` }
+      return fail('TOOL_PATH_DENIED', `${kind}: 父目录解析后不在允许范围内: ${abs}`, { path: abs })
     }
   }
   return { ok: true, path: abs }
@@ -116,7 +134,7 @@ export function readFile(input = {}, policy) {
   const access = checkAccess('Read', input.file_path, policy)
   if (!access.ok) return access
   const fp = access.path
-  if (!fs.existsSync(fp)) return { ok: false, text: `Read: 文件不存在: ${fp}` }
+  if (!fs.existsSync(fp)) return fail('TOOL_FILE_MISSING', `Read: 文件不存在: ${fp}`, { path: fp })
   const all = fs.readFileSync(fp, 'utf8').split('\n')
   const start = Math.max(0, Number(input.offset) || 0)
   const lim = Number(input.limit) > 0 ? Number(input.limit) : 2000
@@ -125,7 +143,7 @@ export function readFile(input = {}, policy) {
   const body = slice
     .map((ln, i) => `${String(start + i + 1).padStart(6)}\t${ln.length > MAX_LINE ? ln.slice(0, MAX_LINE) + '…[truncated]' : ln}`)
     .join('\n')
-  return { ok: true, text: body }
+  return { ok: true, text: body, path: fp }
 }
 
 export function writeFile(input = {}, policy) {
@@ -135,7 +153,8 @@ export function writeFile(input = {}, policy) {
   const content = input.content == null ? '' : String(input.content)
   fs.mkdirSync(path.dirname(fp), { recursive: true })
   fs.writeFileSync(fp, content, 'utf8')
-  return { ok: true, text: `已写入 ${Buffer.byteLength(content, 'utf8')} 字节 → ${fp}` }
+  const bytes = Buffer.byteLength(content, 'utf8')
+  return { ok: true, text: `已写入 ${bytes} 字节 → ${fp}`, path: fp, bytes }
 }
 
 export function editFile(input = {}, policy) {
@@ -144,16 +163,16 @@ export function editFile(input = {}, policy) {
   const fp = access.path
   const oldStr = input.old_string
   const newStr = input.new_string == null ? '' : String(input.new_string)
-  if (oldStr == null) return { ok: false, text: 'Edit: 缺少 old_string' }
-  if (oldStr === '') return { ok: false, text: 'Edit: old_string 不能为空' }
-  if (!fs.existsSync(fp)) return { ok: false, text: `Edit: 文件不存在: ${fp}` }
+  if (oldStr == null) return fail('TOOL_ARGUMENT_INVALID', 'Edit: 缺少 old_string', { path: fp })
+  if (oldStr === '') return fail('TOOL_ARGUMENT_INVALID', 'Edit: old_string 不能为空', { path: fp })
+  if (!fs.existsSync(fp)) return fail('TOOL_FILE_MISSING', `Edit: 文件不存在: ${fp}`, { path: fp })
   let text = fs.readFileSync(fp, 'utf8')
   const count = text.split(oldStr).length - 1
-  if (count === 0) return { ok: false, text: 'Edit: 文件中找不到 old_string（须精确匹配，含空白与换行）' }
-  if (count > 1 && !input.replace_all) return { ok: false, text: `Edit: old_string 出现 ${count} 次——请加 replace_all:true 或提供更具体的片段` }
+  if (count === 0) return fail('TOOL_EDIT_TARGET_MISMATCH', 'Edit: 文件中找不到 old_string（须精确匹配，含空白与换行）', { path: fp })
+  if (count > 1 && !input.replace_all) return fail('TOOL_EDIT_TARGET_AMBIGUOUS', `Edit: old_string 出现 ${count} 次——请加 replace_all:true 或提供更具体的片段`, { path: fp })
   text = input.replace_all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr)
   fs.writeFileSync(fp, text, 'utf8')
-  return { ok: true, text: `已编辑 ${fp}（替换 ${input.replace_all ? count : 1} 处）` }
+  return { ok: true, text: `已编辑 ${fp}（替换 ${input.replace_all ? count : 1} 处）`, path: fp, replacements: input.replace_all ? count : 1, bytes: Buffer.byteLength(text, 'utf8') }
 }
 
 // Concatenate part files into one target, in order, with the shared stitchParts logic (one blank line
@@ -161,20 +180,21 @@ export function editFile(input = {}, policy) {
 // single tool call instead of retyping a long transcript (which would hit the per-response output cap).
 export function concatFiles(input = {}, policy) {
   const sources = Array.isArray(input.sources) ? input.sources : []
-  if (!sources.length) return { ok: false, text: 'Concat: 缺少 sources（要按顺序合并的分块文件路径数组）' }
+  if (!sources.length) return fail('TOOL_ARGUMENT_INVALID', 'Concat: 缺少 sources（要按顺序合并的分块文件路径数组）')
   const wr = checkAccess('Write', input.file_path, policy)
   if (!wr.ok) return wr
   const texts = []
   for (const s of sources) {
     const rd = checkAccess('Read', s, policy)
     if (!rd.ok) return rd
-    if (!fs.existsSync(rd.path)) return { ok: false, text: `Concat: 分块文件不存在: ${rd.path}` }
+    if (!fs.existsSync(rd.path)) return fail('STITCH_PART_MISSING', `Concat: 分块文件不存在: ${rd.path}`, { path: rd.path })
     texts.push(fs.readFileSync(rd.path, 'utf8'))
   }
   const merged = stitchParts(texts)
   fs.mkdirSync(path.dirname(wr.path), { recursive: true })
   fs.writeFileSync(wr.path, merged, 'utf8')
-  return { ok: true, text: `已按顺序合并 ${sources.length} 个分块 → ${wr.path}（${Buffer.byteLength(merged, 'utf8')} 字节）` }
+  const bytes = Buffer.byteLength(merged, 'utf8')
+  return { ok: true, text: `已按顺序合并 ${sources.length} 个分块 → ${wr.path}（${bytes} 字节）`, path: wr.path, bytes, sources: sources.length }
 }
 
 // Dispatch by tool name; never throws (errors → { ok:false }).
@@ -184,9 +204,9 @@ export function runFileTool(name, input, policy) {
     if (name === 'Write') return writeFile(input, policy)
     if (name === 'Edit') return editFile(input, policy)
     if (name === 'Concat') return concatFiles(input, policy)
-    return { ok: false, text: `未知工具: ${name}` }
+    return fail('TOOL_UNKNOWN', `未知工具: ${name}`)
   } catch (e) {
-    return { ok: false, text: `${name} 执行出错: ${e.message}` }
+    return fail('TOOL_EXECUTION_ERROR', `${name} 执行出错: ${e.message}`)
   }
 }
 

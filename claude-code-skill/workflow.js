@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Scout', detail: '每份转录一个侦察代理（超大文件自动拆段并行、防单代理卡死），返回结构化清单（默认 haiku）' },
     { title: 'Verify', detail: '关键实体联网核实（默认 sonnet）' },
     { title: 'Refine', detail: '逐份精校（大文件拆块并行 + 拼接；侦察失败也照常精校，默认 opus；Workflow 拼接 fallback 为 haiku）' },
-    { title: 'Audit', detail: '源比对审计（ending_missing / content_gap / 引号 hard；Universal 直接跑确定性脚本）' },
+    { title: 'Audit', detail: '正文忠实性审计（实质缺口 / 压缩 / 说话人 / 引号 hard；Universal 最多候选修复两轮并逐轮复检，无事务能力时留待人工修复，仍未过则暂停派生产物）' },
     { title: 'Logic', detail: '逐份逻辑顺序重排稿（按主线把问答重排成叙事顺序，默认 opus）' },
     { title: 'Deliver', detail: '访谈总结 / 时间线（默认 opus）' },
   ],
@@ -16,15 +16,887 @@ export const meta = {
 // { topic, date, background, outputDir, skillDir,
 //   scope: ['refine','logic','summary','timeline'] trimmed as needed ('logic' = logical-order rewrite, depends on refine output),
 //   verifyDepth: 'key'|'deep'|'none', headingPolicy: 'none'|'regenerate'|'keep',
-//   models?: {scout,verify,refine,stitch,summary,timeline},  (stitch = chunk-merge agent for large files, default haiku)
+//   models?: {scout,verify,dedup,refine,repair,stitch,logic,summary,timeline},  (repair defaults to opus)
 //   priorGlossaryText?: full text of an existing <outputDir>/校对表.md (per-company persistent glossary, P1) —
 //     Step 0 reads it if present; the workflow parses it to seed scout and accumulates this batch into it.
 //   fresh?: true to ignore any prior glossary and rebuild from scratch.
 //   files: [{ path, label, lines, bytes?, chars?, title, subtitle, outPath, speakerHints?, notes? }] }
-//   (chars = 正文字数 (汉字 + 每个英文词/数字各算 1); THE document-length metric — routing (one-pass / chunk) keys on it, not lines.
+//   (chars = 正文字数 (汉字 + 每个英文词/数字各算 1); THE document-length metric — chunk routing keys on it, not lines.
 //    lines/bytes are for Read pagination only (readPlan). If chars is absent it's estimated from bytes, then lines.)
 
 // ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====
+
+// Deterministic bridge between full-text Scout and Refine.
+//
+// Scout decides who each source speaker track represents. This module never re-diarizes prose and never lets
+// Refine invent a second mapping: it rewrites only recognized speaker-label lines in a disposable model-input
+// copy. The untouched source remains the ground truth for the downstream source-aware audit.
+
+// A timecode is metadata around a speaker turn, never proof that the line is (or is not) a speaker label.
+// Keep the grammar bounded enough to reject prose, but accept the common precision/wrapper variants emitted by
+// transcript tools. Speaker detection may still recover an unfamiliar decorator through exact Scout evidence;
+// successful timestamp normalization is deliberately NOT a prerequisite for establishing a speaker track.
+const COLON_TIMECODE = '\\d{1,3}:\\d{2}(?::\\d{2})?(?:[.,]\\d{1,3})?'
+const PRIME_TIMECODE = "\\d{1,3}\\s*[′']\\s*\\d{1,2}(?:\\s*[″\"])?"
+const TIMESTAMP = `(?:${COLON_TIMECODE}|${PRIME_TIMECODE})`
+const GENERIC_PREFIX = '(?:发言人|说话人|讲者|讲话人|Speaker)'
+const GENERIC_NUMBER = '[0-9０-９一二三四五六七八九十]+'
+const GENERIC_LINE_RE = new RegExp(
+  `^(\\s*)\\*{0,2}\\s*(${GENERIC_PREFIX})\\s*(${GENERIC_NUMBER})(?:\\s+(${TIMESTAMP}))?\\s*\\*{0,2}\\s*$`,
+  'iu',
+)
+const GENERIC_INLINE_RE = new RegExp(
+  `^(\\s*)\\*{0,2}\\s*(${GENERIC_PREFIX})\\s*(${GENERIC_NUMBER})\\s*\\*{0,2}\\s*[：:]\\s*(.*)$`,
+  'iu',
+)
+const CITE_RE = new RegExp(`^(\\s*)<cite\\b([^>]*)>\\s*</cite>\\s+(${TIMESTAMP})\\s*$`, 'iu')
+const CITE_ONLY_RE = /^(\s*)<cite\b([^>]*)>\s*<\/cite>\s*$/iu
+const NAMED_TIMESTAMP_RE = new RegExp(`^(\\s*)\\*{0,2}\\s*(.{1,40}?)\\s+(${TIMESTAMP})\\s*\\*{0,2}\\s*$`, 'u')
+const INLINE_RE = /^(\s*)([^：:\r\n]{1,40})[：:]\s*(.*)$/u
+const LEADING_TIMESTAMP_RE = new RegExp(
+  `^(\\s*)(?:\\[(${TIMESTAMP})\\]|\\((${TIMESTAMP})\\)|【(${TIMESTAMP})】|((?:T\\+)?${TIMESTAMP}))\\s+`,
+  'iu',
+)
+const ROLE_TOKEN = '(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)'
+const ROLE_RE = new RegExp(`^${ROLE_TOKEN}(?:[／/][一-龥A-Za-z]{1,16})*(?:\\s*\\d+)?$`, 'iu')
+const TITLE_WORD_RE = /(?:创始人|联合创始人|负责人|总裁|董事|经理|老师|先生|女士|博士|教授|CEO|CTO|COO|CFO|公司|团队|产品)/iu
+const AI_SUMMARY_DISCLOSURE_RE = /(?:智能纪要|本(?:份)?纪要|本(?:份)?摘要)\s*(?:由|为)\s*AI\s*(?:生成|整理)|(?:由|使用)\s*AI\s*(?:生成|整理)(?:的)?(?:智能纪要|会议纪要|摘要)/iu
+
+// Pandoc-style docx exports end lines with a Markdown hard break: a trailing backslash, as in
+// `说话人 1 00:01\`. Label-only, end-anchored forms must tolerate it or the generic inline fallback
+// splits the line at the colon inside the timestamp and mints a fake per-minute speaker.
+const stripLineEndHardBreak = (value) => String(value || '').replace(/\s*\\\s*$/u, '')
+
+function splitLeadingTimestamp(value) {
+  const source = String(value || '')
+  const match = source.match(LEADING_TIMESTAMP_RE)
+  if (!match) return { matched: false, timestamp: '', rest: source }
+  const timestamp = [match[2], match[3], match[4], match[5]].find(Boolean) || ''
+  return {
+    matched: true,
+    timestamp: timestamp.replace(/^T\+/iu, ''),
+    rest: `${match[1] || ''}${source.slice(match[0].length)}`,
+  }
+}
+
+const normalizeLabel = (value) => String(value || '')
+  .normalize('NFKC')
+  .replace(/^\*{1,2}|\*{1,2}$/g, '')
+  .replace(/[：:]\s*$/u, '')
+  .replace(/\s+/g, ' ')
+  .trim()
+
+function parseAttrs(raw) {
+  const attrs = {}
+  for (const match of String(raw || '').matchAll(/([A-Za-z][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) {
+    attrs[match[1].toLowerCase()] = match[2] ?? match[3] ?? ''
+  }
+  return attrs
+}
+
+// Transcript headers carry date/time lines (`2026年7月2日 下午 3:37`) that would otherwise satisfy the
+// name-plus-timestamp form. A date is never a speaker name — but real labels can contain date-adjacent
+// characters (姓周的人名、选手2号), so only a date SHAPE at the label start, or a label that is nothing
+// but a weekday/time-of-day word, is rejected.
+const DATE_LIKE_RE = /^\d{2,4}\s*年|^\d{1,2}\s*月\s*\d{1,2}\s*[日号]|^(?:上午|下午|中午|凌晨|晚上|周[一二三四五六日天]|星期[一二三四五六日天])$/u
+
+function plausibleLabel(value) {
+  const label = normalizeLabel(value)
+  if (!label || label.length > 32) return false
+  // normalizeLabel runs NFKC first, so a source full-width comma becomes ASCII "," before this guard.
+  if (/^[#*>|<]/u.test(label) || /[：:,，。；;！？!?]/u.test(label)) return false
+  if (DATE_LIKE_RE.test(label)) return false
+  return /[一-龥A-Za-z]/u.test(label)
+}
+
+function speakerKey(value) {
+  const label = normalizeLabel(value).replace(/\s*[（(]\s*(?:uid-ref|uid)\s*=[^（）()]*[）)]\s*$/iu, '').trim()
+  const generic = label.match(new RegExp(`^(${GENERIC_PREFIX})\\s*(${GENERIC_NUMBER})$`, 'iu'))
+  if (generic) return `generic:${generic[2].normalize('NFKC')}`
+  return label ? `label:${label}` : ''
+}
+
+function isGenericSpeakerLabel(value) {
+  return speakerKey(value).startsWith('generic:')
+}
+
+function isRoleSpeakerLabel(value) {
+  return ROLE_RE.test(normalizeLabel(value))
+}
+
+function strongLabel(rawLine) {
+  const raw = String(rawLine || '')
+  const leading = splitLeadingTimestamp(raw)
+  const classificationRaw = leading.matched ? leading.rest : raw
+  let match = classificationRaw.match(GENERIC_INLINE_RE)
+  if (match) {
+    const label = normalizeLabel(`${match[2]} ${match[3]}`)
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'generic-inline',
+      body: match[4] || '',
+      timestamp: leading.timestamp || '',
+      generic: true,
+    }
+  }
+  // Only the label-only forms below match against the hard-break-stripped view. The body-capturing
+  // forms above (and the inline fallback) keep the raw line, so a body's own trailing hard break
+  // stays part of the body and survives rewriting untouched.
+  const line = stripLineEndHardBreak(classificationRaw)
+  match = line.match(GENERIC_LINE_RE)
+  if (match) {
+    const label = normalizeLabel(`${match[2]} ${match[3]}`)
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'generic',
+      body: '',
+      timestamp: leading.timestamp || match[4] || '',
+      generic: true,
+    }
+  }
+  match = leading.matched ? line.match(CITE_ONLY_RE) : line.match(CITE_RE)
+  if (match) {
+    const attrs = parseAttrs(match[2])
+    const label = normalizeLabel(attrs['user-name'])
+    if (!plausibleLabel(label)) return null
+    const uid = normalizeLabel(attrs['uid-ref'] || attrs.uid)
+    return {
+      indent: match[1],
+      key: uid ? `feishu:${uid}` : speakerKey(label),
+      matchKey: speakerKey(label),
+      label,
+      kind: 'cite',
+      body: '',
+      timestamp: leading.timestamp || match[3] || '',
+      generic: false,
+    }
+  }
+  // A bare name after a leading timecode (`00:03 张三`) is deliberately NOT promoted here. It is
+  // indistinguishable from an agenda marker (`00:03 开场`) on one line, so it needs exact Scout evidence below.
+  match = line.match(NAMED_TIMESTAMP_RE)
+  if (match) {
+    const label = normalizeLabel(match[2])
+    if (!plausibleLabel(label)) return null
+    return {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: 'timestamp',
+      body: '',
+      timestamp: leading.timestamp || match[3] || '',
+      generic: false,
+      hardBreak: line !== classificationRaw,
+    }
+  }
+  return null
+}
+
+function inlineView(rawLine) {
+  const raw = String(rawLine || '')
+  const leading = splitLeadingTimestamp(raw)
+  const view = leading.matched ? leading.rest : raw
+  return { leading, match: view.match(INLINE_RE) }
+}
+
+function decoratedSpeakerCandidate(rawLine) {
+  const raw = String(rawLine || '')
+  const leading = splitLeadingTimestamp(raw)
+  if (leading.matched) {
+    const tail = stripLineEndHardBreak(leading.rest)
+    const inline = tail.match(INLINE_RE)
+    const label = normalizeLabel(inline ? inline[2] : tail)
+    return plausibleLabel(label) || isGenericSpeakerLabel(label) ? { label } : null
+  }
+
+  // Do not try to understand every vendor's wrapper. Find a split where the left side is numeric decoration
+  // and the right side is a plausible label-only token. Two or more such lines are ambiguity evidence, not
+  // confirmed tracks: `⟦00:03⟧ 张三` and an agenda marker can look identical without Scout/full-text context.
+  const normalized = stripLineEndHardBreak(raw).normalize('NFKC')
+  const boundaries = [...normalized.matchAll(/\s+/gu)]
+  for (const boundary of boundaries) {
+    const at = boundary.index
+    const prefix = normalized.slice(0, at)
+    const tail = normalized.slice(at + boundary[0].length)
+    const inline = tail.match(INLINE_RE)
+    const label = normalizeLabel(inline ? inline[2] : tail)
+    if (!decorativePrefix(prefix)) continue
+    if (plausibleLabel(label) || isGenericSpeakerLabel(label)) return { label }
+  }
+  return null
+}
+
+function evidenceLine(value) {
+  return stripLineEndHardBreak(String(value || ''))
+    .normalize('NFKC')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
+function decorativePrefix(value) {
+  const clean = String(value || '').replace(/\*{1,2}/gu, '').trim()
+  if (!clean || clean.length > 48 || !/\d/u.test(clean)) return false
+  // Unknown vendor timecodes may use punctuation or a literal T+, but semantic prose before a mentioned name
+  // must never qualify as a decorator.
+  if (/[一-龥]/u.test(clean) || /[A-SU-Z]/iu.test(clean)) return false
+  return /[:：.,，′″'"\[\]()【】+\-–—>]/u.test(clean)
+}
+
+function knownLabelFact(rawLine, requestedLabel) {
+  const raw = String(rawLine || '')
+  const label = normalizeLabel(requestedLabel)
+  if (!plausibleLabel(label) && !isGenericSpeakerLabel(label)) return null
+
+  const leading = splitLeadingTimestamp(raw)
+  const view = leading.matched ? leading.rest : raw
+  const inline = view.match(INLINE_RE)
+  if (inline && speakerKey(inline[2]) === speakerKey(label)) {
+    return {
+      indent: inline[1],
+      key: speakerKey(label),
+      label,
+      kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'scout-evidence',
+      body: inline[3] || '',
+      timestamp: leading.timestamp || '',
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+
+  // For an unfamiliar leading decorator, locate the Scout-provided label without understanding the timestamp.
+  // The prefix must be decoration-only and the suffix must be a label boundary, so prose such as
+  // `他在 00:03 问张三：...` cannot become a speaker turn.
+  const normalizedRaw = stripLineEndHardBreak(raw).normalize('NFKC')
+  const normalizedRequested = label.normalize('NFKC')
+  const at = normalizedRaw.indexOf(normalizedRequested)
+  if (at < 0) return null
+  const prefix = normalizedRaw.slice(0, at)
+  if (prefix.trim() && !decorativePrefix(prefix)) return null
+  const suffix = normalizedRaw.slice(at + normalizedRequested.length)
+  const inlineSuffix = suffix.match(/^\s*[：:]\s*(.*)$/u)
+  if (inlineSuffix) {
+    return {
+      indent: (raw.match(/^\s*/u) || [''])[0],
+      key: speakerKey(label),
+      label,
+      kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'scout-evidence',
+      body: inlineSuffix[1] || '',
+      timestamp: leading.timestamp || prefix.trim(),
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+  if (/^\s*(?:\\\s*)?$/u.test(suffix)) {
+    return {
+      indent: (raw.match(/^\s*/u) || [''])[0],
+      key: speakerKey(label),
+      label,
+      kind: 'scout-evidence',
+      body: '',
+      timestamp: leading.timestamp || prefix.trim(),
+      generic: isGenericSpeakerLabel(label),
+      recoveredByScout: true,
+    }
+  }
+  return null
+}
+
+function scoutStructureRecord(record) {
+  if (!record || !normalizeLabel(record.label) || !String(record.sample || '').trim()) return false
+  const output = cleanOutputLabel(record.output_label)
+  return Boolean(
+    isGenericSpeakerLabel(record.label)
+    || normalizeRole(record.role)
+    || normalizeRole(output)
+    || effectiveScoutPersonName(record),
+  )
+}
+
+function scoutRecordKeys(record) {
+  const keys = new Set()
+  const label = normalizeLabel(record && record.label)
+  const direct = speakerKey(label)
+  if (direct) keys.add(direct)
+
+  // Feishu Scout records are instructed to keep the source label verbatim, so `label` may be the
+  // bare cite element while the deterministic parser represents that same track by user-name.
+  // Treat these as two views of one already-parsed track; this is identity matching, not structure recovery.
+  const cite = stripLineEndHardBreak(String(record && record.label || '')).match(CITE_ONLY_RE)
+  if (cite) {
+    const attrs = parseAttrs(cite[2])
+    const nameKey = speakerKey(attrs['user-name'])
+    if (nameKey) keys.add(nameKey)
+  }
+  return keys
+}
+
+function recoverScoutFacts(lines, facts, scoutSpeakers = []) {
+  const recovered = []
+  const evidenceMisses = []
+  for (const record of scoutSpeakers || []) {
+    if (!scoutStructureRecord(record)) continue
+    const recordKeys = scoutRecordKeys(record)
+    const knownKeys = new Set(facts.filter(Boolean).flatMap((fact) => [fact.key, fact.matchKey]).filter(Boolean))
+    const alreadyParsed = [...recordKeys].some((key) => knownKeys.has(key))
+    const samples = String(record.sample || '').split(/\r?\n/u).map(evidenceLine).filter(Boolean)
+    const evidenceIndexes = []
+    for (let i = 0; i < lines.length; i += 1) {
+      if (samples.includes(evidenceLine(lines[i]))) evidenceIndexes.push(i)
+    }
+    const exactEvidence = evidenceIndexes.some((i) => knownLabelFact(lines[i], record.label))
+    if (!exactEvidence && !alreadyParsed) {
+      evidenceMisses.push(normalizeLabel(record.label))
+      continue
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      if (facts[i]) continue
+      const fact = knownLabelFact(lines[i], record.label)
+      if (!fact) continue
+      facts[i] = fact
+      recovered.push({ line: i + 1, label: fact.label })
+    }
+  }
+  return { recovered, evidenceMisses }
+}
+
+function recoverKnownFacts(lines, facts, knownSpeakerLabels = []) {
+  const recovered = []
+  for (const requestedLabel of [...new Set((knownSpeakerLabels || []).map(normalizeLabel).filter(Boolean))]) {
+    for (let i = 0; i < lines.length; i += 1) {
+      if (facts[i]) continue
+      const fact = knownLabelFact(lines[i], requestedLabel)
+      if (!fact) continue
+      facts[i] = fact
+      recovered.push({ line: i + 1, label: fact.label })
+    }
+  }
+  return recovered
+}
+
+function substantiveLine(value) {
+  const line = String(value || '').trim()
+  return Boolean(
+    line
+    && !/^<!--/u.test(line)
+    && !/^(?:[#*>|`~_]|[-+]\s|\d+[.)、]\s)/u.test(line),
+  )
+}
+
+function parseSpeakerLabels(sourceText, options = {}) {
+  const text = String(sourceText || '')
+  const lines = text.split(/\r?\n/)
+  const facts = lines.map(strongLabel)
+  // On a clean line, name+timestamp is distinctive evidence even once. In a Pandoc hard-break document
+  // a wrapped body fragment ending in a time (`会议改到下午 3:30\`) reads identically. Markdown itself
+  // separates the two: a hard break means the NEXT line continues the same paragraph, so a line whose
+  // previous line ends with a hard break AND still carries substantive text can never start a speaker
+  // turn — while a real label always opens its own paragraph. A line that is ONLY a backslash is a
+  // paragraph separator in real Pandoc transcript output (production Job-58 shape), not a continuation.
+  // Occurrence counting is wrong here: it silently absorbs a speaker who talks only once into the
+  // previous turn. Demoted fragments are also barred from the inline fallback below — otherwise the
+  // colon inside their timestamp re-mints exactly the truncated fake labels this fix removes.
+  const demotedTimeFragments = new Set()
+  for (let i = 0; i < facts.length; i += 1) {
+    const fact = facts[i]
+    if (!fact || fact.kind !== 'timestamp' || !fact.hardBreak) continue
+    const prev = i > 0 ? stripLineEndHardBreak(lines[i - 1]) : ''
+    const prevHadHardBreak = i > 0 && prev !== String(lines[i - 1] || '')
+    if (prevHadHardBreak && prev.trim()) {
+      facts[i] = null
+      demotedTimeFragments.add(i)
+    }
+  }
+  const strongNames = new Set(facts.filter(Boolean).flatMap((fact) => [fact.label, fact.matchKey]).filter(Boolean))
+  const inlineCounts = new Map()
+  let substantive = 0
+  let inlineCandidates = 0
+  let plainInlineCandidates = 0
+  const leadingInlineCandidates = []
+  const unresolvedDecoratedCandidates = []
+
+  for (let i = 0; i < lines.length; i += 1) {
+    if (facts[i] || !substantiveLine(lines[i])) continue
+    substantive += 1
+    if (demotedTimeFragments.has(i)) continue
+    const { leading, match } = inlineView(lines[i])
+    if (!match || !plausibleLabel(match[2])) {
+      const decorated = decoratedSpeakerCandidate(lines[i])
+      if (decorated) unresolvedDecoratedCandidates.push({ line: i + 1, label: decorated.label })
+      continue
+    }
+    const label = normalizeLabel(match[2])
+    inlineCandidates += 1
+    if (leading.matched) leadingInlineCandidates.push({ line: i + 1, label })
+    else plainInlineCandidates += 1
+    inlineCounts.set(label, (inlineCounts.get(label) || 0) + 1)
+  }
+
+  // The all-lines-are-inline shortcut is safe only when the label starts the source line. Once a time/decorator
+  // precedes a weak name, the same surface shape also describes agenda/prose lines and needs recurrence, a role,
+  // an existing strong track, or exact Scout evidence.
+  const pureInline = !facts.some(Boolean)
+    && plainInlineCandidates >= 2
+    && plainInlineCandidates === substantive
+    && inlineCandidates === plainInlineCandidates
+  for (let i = 0; i < lines.length; i += 1) {
+    // The counting pass above defines the structural boundary: Markdown headings, blockquotes, tables and
+    // emphasis/list rows are document structure, not dialogue turns. Re-apply it here before any recurrence,
+    // role-name or pure-inline shortcut can promote an individual row.
+    if (facts[i] || demotedTimeFragments.has(i) || !substantiveLine(lines[i])) continue
+    const { leading, match } = inlineView(lines[i])
+    if (!match) continue
+    const label = normalizeLabel(match[2])
+    if (!plausibleLabel(label)) continue
+    const accepted = strongNames.has(label)
+      || isRoleSpeakerLabel(label)
+      || (!leading.matched && ((inlineCounts.get(label) || 0) >= 2 || pureInline))
+    if (!accepted) continue
+    facts[i] = {
+      indent: match[1],
+      key: speakerKey(label),
+      label,
+      kind: isGenericSpeakerLabel(label) ? 'generic-inline' : 'inline',
+      body: match[3] || '',
+      timestamp: leading.timestamp || '',
+      generic: isGenericSpeakerLabel(label),
+    }
+  }
+
+  // Once one occurrence has established a label, the label itself is structural evidence for the same
+  // track under another timestamp wrapper. This avoids enumerating every vendor decorator while keeping
+  // unknown labels fail-closed: knownLabelFact still accepts decoration-only prefixes and exact label
+  // boundaries, never arbitrary prose.
+  const parsedLabels = facts.filter(Boolean).map((fact) => fact.label)
+  const knownRecovery = recoverKnownFacts(lines, facts, [
+    ...parsedLabels,
+    ...(options.knownSpeakerLabels || []),
+  ])
+  const scoutRecovery = recoverScoutFacts(lines, facts, options.scoutSpeakers || [])
+  const tracks = new Map()
+  const labels = []
+  for (let i = 0; i < facts.length; i += 1) {
+    const fact = facts[i]
+    if (!fact) continue
+    labels.push({ line: i + 1, ...fact })
+    const key = fact.matchKey || fact.key
+    let track = tracks.get(key)
+    if (!track) {
+      track = { key, sourceLabel: fact.label, generic: fact.generic, roleLike: isRoleSpeakerLabel(fact.label), firstLine: i + 1, labelLines: 0 }
+      tracks.set(key, track)
+    }
+    track.labelLines += 1
+  }
+
+  const structureWarnings = []
+  const unresolvedLeadingInline = leadingInlineCandidates.filter((candidate) => !facts[candidate.line - 1])
+  const unresolvedDecorated = [
+    ...unresolvedLeadingInline,
+    ...unresolvedDecoratedCandidates.filter((candidate) => !facts[candidate.line - 1]),
+  ]
+  if (unresolvedDecorated.length >= 2) {
+    structureWarnings.push({
+      kind: 'unrecognized_speaker_structure',
+      count: unresolvedDecorated.length,
+      lines: unresolvedDecorated.slice(0, 8).map((item) => item.line),
+      labels: [...new Set(unresolvedDecorated.map((item) => item.label))].slice(0, 8),
+    })
+  }
+  const scoutSignals = [...new Set((options.scoutSpeakers || [])
+    .filter(scoutStructureRecord)
+    .map((record) => speakerKey(record.label))
+    .filter(Boolean))]
+  if (!tracks.size && scoutSignals.length >= 2) {
+    structureWarnings.push({
+      kind: 'scout_parser_disagreement',
+      count: scoutSignals.length,
+      lines: [],
+      labels: (options.scoutSpeakers || []).filter(scoutStructureRecord).map((record) => normalizeLabel(record.label)).slice(0, 8),
+    })
+  } else if (tracks.size && scoutRecovery.evidenceMisses.length) {
+    structureWarnings.push({
+      kind: 'scout_evidence_unmatched',
+      count: scoutRecovery.evidenceMisses.length,
+      lines: [],
+      labels: [...new Set(scoutRecovery.evidenceMisses)].slice(0, 8),
+    })
+  }
+
+  return {
+    lines,
+    labels,
+    tracks: [...tracks.values()],
+    labelLines: labels.length,
+    needsResolution: [...tracks.values()].some((track) => track.generic || track.roleLike),
+    recoveredByScout: scoutRecovery.recovered,
+    recoveredByKnownLabel: knownRecovery,
+    structureWarnings,
+  }
+}
+
+function unitBodyLine(raw) {
+  const line = String(raw || '').trim()
+  if (!line || /^<!--/u.test(line) || /^#{1,6}\s/u.test(line) || /^<title\b/iu.test(line)) return ''
+  return line
+}
+
+function trackedUnits(parsed) {
+  return parsed.labels.map((fact, index) => {
+    const next = parsed.labels[index + 1]
+    const endIndex = next ? next.line - 2 : parsed.lines.length - 1
+    const body = []
+    let endLine = fact.line
+    if (String(fact.body || '').trim()) body.push(String(fact.body).trim())
+    for (let i = fact.line; i <= endIndex; i += 1) {
+      const line = unitBodyLine(parsed.lines[i])
+      if (!line) continue
+      body.push(line)
+      endLine = i + 1
+    }
+    return {
+      speaker: fact.label,
+      speakerKey: fact.matchKey || fact.key,
+      startLine: fact.line,
+      endLine,
+      text: body.join('\n'),
+      ts: fact.timestamp || null,
+    }
+  })
+}
+
+function untrackedUnits(lines) {
+  const units = []
+  let cur = null
+  const flush = () => {
+    if (cur && cur.text.length) units.push({ speaker: null, speakerKey: '', ...cur, text: cur.text.join('\n') })
+    cur = null
+  }
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = String(lines[i] || '')
+    const line = raw.trim()
+    if (!line) { flush(); continue }
+    if (/^<!--/u.test(line) || /^#{1,6}\s/u.test(line) || /^<title\b/iu.test(line)) { flush(); continue }
+    if (/^>\s*(?:录音主题|录音时间|智能纪要由\s*AI\s*生成)/iu.test(line)) { flush(); continue }
+    const listItem = /^\s*(?:[-*+]|\d+[.)、])\s+/u.test(raw)
+    if (listItem && cur) flush()
+    if (!cur) cur = { startLine: i + 1, endLine: i + 1, text: [] }
+    cur.text.push(line)
+    cur.endLine = i + 1
+  }
+  flush()
+  return units
+}
+
+// One canonical structural parse for every downstream consumer. `tracked` means complete verified tracks,
+// `ambiguous` means speaker-shaped structure is still unresolved, and `untracked` means no label evidence exists
+// (it may still be a valid monologue).
+function parseSpeakerDocument(sourceText, options = {}) {
+  const parsed = parseSpeakerLabels(sourceText, options)
+  const speakerMode = parsed.structureWarnings.length ? 'ambiguous' : parsed.tracks.length ? 'tracked' : 'untracked'
+  return {
+    ...parsed,
+    speakerMode,
+    units: speakerMode === 'tracked' ? trackedUnits(parsed) : untrackedUnits(parsed.lines),
+  }
+}
+
+// Conservative provenance gate: only an explicit declaration near the document head qualifies. A filename,
+// an “智能纪要” title by itself, a summary-like writing style, or zero speaker tracks is never enough.
+function detectDeclaredAiSummary(sourceText) {
+  const head = String(sourceText || '').split(/\r?\n/u).slice(0, 80)
+  const index = head.findIndex((line) => AI_SUMMARY_DISCLOSURE_RE.test(line))
+  return index >= 0
+    ? { declared: true, kind: 'declared_ai_summary', line: index + 1, evidence: head[index].trim().slice(0, 200) }
+    : { declared: false, kind: 'transcript', line: null, evidence: '' }
+}
+
+function normalizeRole(value) {
+  const role = normalizeLabel(value).replace(/[（(].*$/u, '').trim()
+  if (/记者|采访者|访谈者|提问者/iu.test(role)) return '记者'
+  if (/受访者|嘉宾|回答者/iu.test(role)) return '受访者'
+  if (/主持/iu.test(role)) return '主持人'
+  if (/\bPR\b|公关/iu.test(role)) return 'PR'
+  if (/同事/iu.test(role)) return '同事'
+  if (/协调/iu.test(role)) return '协调'
+  return ROLE_RE.test(role) ? role.replace(/\s*\d+$/u, '') : ''
+}
+
+function extractPersonName(value) {
+  let head = normalizeLabel(value).replace(/^(?:姓名|名字)\s*[：:]\s*/u, '')
+  head = head.split(/[，,；;（(\n]/u, 1)[0].trim()
+  if (!head || TITLE_WORD_RE.test(head) || isRoleSpeakerLabel(head) || isGenericSpeakerLabel(head)) return ''
+  if (/^[\p{Script=Han}·]{2,8}$/u.test(head)) return head
+  if (/^[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,3}$/u.test(head)) return head
+  return ''
+}
+
+function cleanOutputLabel(value) {
+  const label = normalizeLabel(value)
+  if (!label || label.length > 32 || isGenericSpeakerLabel(label)) return ''
+  const name = extractPersonName(label)
+  if (name) return name
+  return normalizeRole(label)
+}
+
+function recordScore(record) {
+  if (!record) return -1
+  const output = cleanOutputLabel(record.output_label)
+  const identity = extractPersonName(record.identity)
+  const confident = record.output_label_confidence === 'high' && String(record.output_label_evidence || '').trim()
+  return (confident && output && !isRoleSpeakerLabel(output) ? 20 : 0)
+    + (confident && identity ? 10 : 0)
+    + (output ? 4 : 0)
+    + (normalizeRole(record.role) ? 2 : 0)
+}
+
+function scoutRecordsByKey(speakers) {
+  const records = new Map()
+  const conflictKeys = new Set()
+  for (const record of speakers || []) {
+    if (!record) continue
+    const keys = [speakerKey(record.label)]
+    const sampleHead = String(record.sample || '').split(/\r?\n/u, 1)[0]
+    if (sampleHead) keys.push(speakerKey(stripLineEndHardBreak(sampleHead).replace(/\s+\d{1,2}:\d{2}(?::\d{2})?\s*$/u, '')))
+    for (const key of keys.filter(Boolean)) {
+      if (record.name_conflict) conflictKeys.add(key)
+      if (!records.has(key) || recordScore(record) > recordScore(records.get(key))) records.set(key, record)
+    }
+  }
+  return { records, conflictKeys }
+}
+
+// The one interpretation of "which person does this Scout record name". chooseOutputLabel can turn a
+// record into a person name through exactly two branches — a confident non-role output_label, else a
+// confident identity — and conflict detection in mergeScoutChunks must use the same two branches, or an
+// identity-only disagreement slips past the comparison and the resolver still names the track.
+function effectiveScoutPersonName(record) {
+  if (!record) return ''
+  const confident = record.output_label_confidence === 'high' && String(record.output_label_evidence || '').trim()
+  if (!confident) return ''
+  const requested = cleanOutputLabel(record.output_label)
+  if (requested && !isRoleSpeakerLabel(requested)) return requested
+  return extractPersonName(record.identity)
+}
+
+function chooseOutputLabel(track, record) {
+  const requested = cleanOutputLabel(record && record.output_label)
+  const confidentIdentity = record && record.output_label_confidence === 'high' && String(record.output_label_evidence || '').trim()
+  if (confidentIdentity && requested && !isRoleSpeakerLabel(requested)) return { outputLabel: requested, basis: 'scout_output_label' }
+  if (!track.generic && !track.roleLike) return { outputLabel: track.sourceLabel, basis: 'source_name' }
+  const identity = extractPersonName(record && record.identity)
+  if (confidentIdentity && identity) return { outputLabel: identity, basis: 'scout_identity' }
+  if (requested && isRoleSpeakerLabel(requested)) return { outputLabel: requested, basis: 'scout_output_label' }
+  const role = normalizeRole(record && record.role)
+  if (role) return { outputLabel: role, basis: 'scout_role' }
+  return { outputLabel: track.sourceLabel, basis: 'unresolved' }
+}
+
+function resolveSpeakerMapping(sourceText, scoutSpeakers = []) {
+  const parsed = parseSpeakerLabels(sourceText, { scoutSpeakers })
+  const { records, conflictKeys } = scoutRecordsByKey(scoutSpeakers)
+  const mappings = parsed.tracks.map((track) => {
+    let record = records.get(track.key)
+    // A track whose Scout chunks disagreed on the person keeps its conflict verdict: no record that
+    // reaches this key — however it got here — may hand the track a person name again.
+    if (record && conflictKeys.has(track.key)) {
+      record = { ...record, output_label: '', output_label_confidence: 'low', output_label_evidence: '', identity: '' }
+    }
+    return { ...track, role: normalizeRole(record && record.role), ...chooseOutputLabel(track, record) }
+  })
+
+  // Two unidentified people with the same role must never collapse into one visible speaker. Keep the semantic
+  // role, but number the distinct source tracks deterministically by first appearance.
+  const roleGroups = new Map()
+  for (const mapping of mappings) {
+    if (!isRoleSpeakerLabel(mapping.outputLabel)) continue
+    if (!roleGroups.has(mapping.outputLabel)) roleGroups.set(mapping.outputLabel, [])
+    roleGroups.get(mapping.outputLabel).push(mapping)
+  }
+  for (const [role, group] of roleGroups) {
+    if (group.length < 2) continue
+    group.sort((a, b) => a.firstLine - b.firstLine)
+    group.forEach((mapping, index) => {
+      mapping.outputLabel = `${role} ${index + 1}`
+      mapping.basis += '_disambiguated'
+    })
+  }
+
+  return {
+    parsed,
+    mappings,
+    unresolved: mappings.filter((mapping) => mapping.basis === 'unresolved').map((mapping) => mapping.sourceLabel),
+    speakerMode: parsed.structureWarnings.length ? 'ambiguous' : parsed.tracks.length ? 'tracked' : 'untracked',
+    structureWarnings: parsed.structureWarnings,
+    recoveredByScout: parsed.recoveredByScout,
+  }
+}
+
+function rewriteSpeakerLabels(sourceText, scoutSpeakers = [], options = {}) {
+  const source = String(sourceText || '')
+  const newline = source.includes('\r\n') ? '\r\n' : '\n'
+  const { parsed, mappings, unresolved, speakerMode, structureWarnings, recoveredByScout } = resolveSpeakerMapping(source, scoutSpeakers)
+  const byKey = new Map(mappings.map((mapping) => [mapping.key, mapping]))
+  const out = [...parsed.lines]
+  let changedLines = 0
+
+  for (const fact of parsed.labels) {
+    const mapping = byKey.get(fact.matchKey || fact.key)
+    const outputLabel = mapping ? mapping.outputLabel : fact.label
+    const timestamp = options.keepTimestamps && fact.timestamp ? ` ${fact.timestamp}` : ''
+    const rewritten = `${fact.indent || ''}${outputLabel}${timestamp}：${fact.body || ''}`
+    if (out[fact.line - 1] !== rewritten) changedLines += 1
+    out[fact.line - 1] = rewritten
+  }
+
+  return {
+    text: out.join(newline),
+    mappings: mappings.map(({ key, sourceLabel, outputLabel, role, basis, firstLine, labelLines }) =>
+      ({ key, sourceLabel, outputLabel, role, basis, firstLine, labelLines })),
+    unresolved,
+    changedLines,
+    labelLines: parsed.labelLines,
+    needsResolution: parsed.needsResolution,
+    speakerMode,
+    structureWarnings,
+    recoveredByScout,
+  }
+}
+
+// A generic prefix followed by a second number that runs straight into a colon or the line end
+// (`说话人 1 00：…` / `说话人 1 00`) is the signature of a truncated timestamp, never legitimate prose.
+// Requiring the colon/EOL keeps narrative lines like `发言人 2 15 分钟后回来` out of the trap. Enforcement
+// fails closed on the signature even when it occurs too rarely for the inline accept-gate to parse it.
+const TRUNCATED_GENERIC_RE = new RegExp(
+  `^\\s*\\*{0,2}\\s*(?:${GENERIC_PREFIX})\\s*(?:${GENERIC_NUMBER})\\s+\\d{1,4}\\s*(?:[：:]|$)`,
+  'iu',
+)
+
+function aliasKey(value) {
+  const label = normalizeLabel(value)
+  const role = normalizeRole(label)
+  return role ? `role:${role}` : speakerKey(label)
+}
+
+function inlineableTurnBody(value) {
+  const line = String(value || '')
+  const trimmed = line.trim()
+  if (!trimmed || line !== line.trimStart()) return false
+  return !/^(?:#{1,6}\s|<!--|<title\b|```|~~~|>|[-*+]\s|\d+[.)、]\s|\|)/iu.test(trimmed)
+}
+
+function inlineCanonicalSpeakerBodies(lines, labels, canonicalLabelLines) {
+  const out = [...lines]
+  const removals = new Set()
+  for (let i = 0; i < labels.length; i += 1) {
+    const fact = labels[i]
+    if (!canonicalLabelLines.has(fact.line) || String(fact.body || '').trim()) continue
+    const nextLabelLine = labels[i + 1] ? labels[i + 1].line : out.length + 1
+    let bodyIndex = fact.line
+    while (bodyIndex < nextLabelLine - 1 && !String(out[bodyIndex] || '').trim()) bodyIndex += 1
+    if (bodyIndex >= nextLabelLine - 1 || !inlineableTurnBody(out[bodyIndex])) continue
+    out[fact.line - 1] = `${out[fact.line - 1]}${out[bodyIndex]}`
+    for (let lineIndex = fact.line; lineIndex <= bodyIndex; lineIndex += 1) removals.add(lineIndex)
+  }
+  return out.filter((_line, index) => !removals.has(index))
+}
+
+function enforceCanonicalSpeakerLabels(refinedText, mappings = [], options = {}) {
+  const source = String(refinedText || '')
+  const newline = source.includes('\r\n') ? '\r\n' : '\n'
+  const parsed = parseSpeakerLabels(source)
+  const speakerMode = ['tracked', 'ambiguous', 'untracked'].includes(options.speakerMode)
+    ? options.speakerMode
+    : 'tracked'
+  const aliases = new Map()
+  const register = (alias, canonical) => {
+    const key = aliasKey(alias)
+    if (!key || !canonical) return
+    if (!aliases.has(key)) aliases.set(key, canonical)
+    else if (aliases.get(key) !== canonical) aliases.set(key, null)
+  }
+  for (const mapping of mappings || []) {
+    if (!mapping || !mapping.outputLabel) continue
+    register(mapping.sourceLabel, mapping.outputLabel)
+    register(mapping.outputLabel, mapping.outputLabel)
+    register(mapping.role, mapping.outputLabel)
+  }
+
+  const canonicalSet = new Set((mappings || []).map((mapping) => mapping && mapping.outputLabel).filter(Boolean))
+  const out = [...parsed.lines]
+  const replacements = []
+  const unknownLabels = []
+  const canonicalLabelLines = new Set()
+  for (const fact of parsed.labels) {
+    const canonical = aliases.get(aliasKey(fact.label))
+    if (!canonical) {
+      if (!canonicalSet.has(fact.label)) unknownLabels.push({ line: fact.line, label: fact.label })
+      else canonicalLabelLines.add(fact.line)
+      continue
+    }
+    canonicalLabelLines.add(fact.line)
+    const rewritten = `${fact.indent || ''}${canonical}：${fact.body || ''}`
+    if (out[fact.line - 1] === rewritten) continue
+    replacements.push({ line: fact.line, from: fact.label, to: canonical })
+    out[fact.line - 1] = rewritten
+  }
+  const factLines = new Set(parsed.labels.map((fact) => fact.line))
+  for (let i = 0; i < parsed.lines.length; i += 1) {
+    if (factLines.has(i + 1) || !TRUNCATED_GENERIC_RE.test(parsed.lines[i])) continue
+    unknownLabels.push({ line: i + 1, label: normalizeLabel(parsed.lines[i].split(/[：:]/u, 1)[0]).slice(0, 40) })
+  }
+  return {
+    text: inlineCanonicalSpeakerBodies(out, parsed.labels, canonicalLabelLines).join(newline),
+    speakerMode,
+    replacements,
+    changedLines: replacements.length,
+    unknownLabels,
+    labelLines: parsed.labelLines,
+    valid: unknownLabels.length === 0,
+    violations: unknownLabels.map((item) => ({
+      ...item,
+      kind: speakerMode === 'untracked'
+        ? 'invented_speaker_label'
+        : speakerMode === 'ambiguous'
+        ? 'unverified_speaker_label'
+        : 'unknown_speaker_label',
+    })),
+  }
+}
+
+
+
+// Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
+const BODY_FIDELITY_GATES = Object.freeze([
+  'content_gap', 'compression_risk', 'attribution_mismatch', 'seam_duplicate',
+])
+
+// Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file
+// carrying one of them is still not a final body. Keep them separate from BODY_FIDELITY_GATES so diagnostics can
+// say whether the risk is factual or editorial; both groups receive at most two repair + re-audit rounds before blocking.
+const OUTPUT_QUALITY_GATES = Object.freeze([
+  'residual_noise', 'under_refined', 'long_paragraphs', 'quote_style',
+])
+
+// The ONE shared answer to “does this body block derivatives/direct publication?”. Pipeline repair, Codex-native
+// gating, and run-level scorecards must consume this list instead of re-interpreting audit `status` independently.
+const PUBLICATION_BLOCK_GATES = Object.freeze([
+  ...BODY_FIDELITY_GATES,
+  ...OUTPUT_QUALITY_GATES,
+])
+
+// Compare semantic section titles, not their typesetting. Model-authored logic provenance often changes Chinese
+// curly quotes to ASCII quotes, folds spaces around Latin words, or swaps full-/half-width punctuation. None of
+// those changes means a source section is missing. NFKC folds width variants; lower-case removes Latin case drift;
+// every Unicode punctuation/space code point (including zero-width spaces) is ignored. Keep letters, numbers and
+// non-punctuation symbols because they may carry meaning (for example C++); callers retain the original title for reporting.
+function canonicalHeadingKey(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{Z}\s\u200B-\u200D\uFEFF]+/gu, '')
+}
 
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
@@ -48,7 +920,10 @@ const SCOUT_SCHEMA = {
       label: { type: 'string', description: '转录中的发言人标签原样' },
       role: { type: 'string', description: '受访者 / 记者 / PR陪同 / 同事 / 协调 等' },
       identity: { type: 'string', description: '对应到谁 + title（若文中可判断）' },
-      sample: { type: 'string', description: '一处原文标签样例' },
+      output_label: { type: 'string', description: '精校稿最终应显示的纯标签：能判断真名则只写真名，否则写可区分角色；拿不准留空' },
+      output_label_confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '真名归属置信度；只有全文内有直接证据才可 high' },
+      output_label_evidence: { type: 'string', description: '支持 output_label 的一处原文证据；写真名时必须说明为何这是本人而非被提到/被喊话的人' },
+      sample: { type: 'string', description: '一整行原文标签样例，必须逐字照抄该行（含行首时间码/括号、标签、冒号与同行正文），供确定性代码回查；不得省略或改写' },
     } } },
     people: { type: 'array', items: entitySchema({ public_figure: { type: 'boolean', description: '公众人物，可公开核实' } }) },
     brands: { type: 'array', items: entitySchema({ category: { type: 'string', description: '自家/竞品/供应商/平台/产品/机构' } }) },
@@ -67,6 +942,33 @@ const SCOUT_SCHEMA = {
   },
 }
 
+const SPEAKER_CANDIDATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    decisions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          line: { type: 'number', description: '候选在精校稿中的 1-based 行号；必须原样返回输入候选行号' },
+          label: { type: 'string', description: '候选标签；必须原样返回输入候选标签' },
+          verdict: {
+            type: 'string',
+            enum: ['invented_speaker', 'not_speaker', 'source_supported_alias', 'uncertain'],
+            description: 'invented_speaker=确为对话发言轮且源稿/映射均不支持；not_speaker=标题、说明、元信息等非发言轮；source_supported_alias=源稿支持但映射遗漏；uncertain=证据不足',
+          },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          reason: {
+            type: 'string',
+            enum: ['dialogue_turn_without_source', 'document_metadata', 'heading_or_caption', 'list_quote_or_table', 'source_label_or_alias', 'insufficient_context'],
+            description: '只返回最贴近直接文本证据的一类原因，不写自由文本',
+          },
+        },
+      },
+    },
+  },
+}
+
 const VERIFY_SCHEMA = {
   type: 'object',
   properties: {
@@ -75,6 +977,11 @@ const VERIFY_SCHEMA = {
       canonical: { type: 'string', description: '核实后的正确写法' },
       identity: { type: 'string', description: '身份/title' },
       source: { type: 'string', description: '依据来源一句话' },
+      // Chinese-name spelling is a separate key from identity. An English/Pinyin author page may prove that
+      // Lin Chuan is the person being discussed, but it cannot prove whether the Chinese name is 林川 or 林传.
+      // The verifier must both set this flag and repeat the exact canonical Han spelling in `source`; the render
+      // side checks both before it lets a person-name conclusion enter the glossary/body.
+      name_script_exact: { type: 'boolean', description: '人名 canonical 为中文汉字时，仅当所列来源页面直接出现该完整汉字写法才置 true；仅有英文名/拼音/罗马字必须为 false' },
       // OPTIONAL (all existing consumers survive its absence): the agent attests BOTH keys held for a decisive
       // conclusion on a phonetically-suspect / contested entity — a 高级别来源（官方域名/大媒体/百科）AND 语境吻合.
       // Only two_key===true may retire a 〔同指两解〕 row (see confidenceMark); a coattail/SEO/分销站 never sets it.
@@ -154,8 +1061,11 @@ const LOGIC_PLAN_SCHEMA = {
 
 
 // ---------- proofreading rules (kept in sync with SKILL.md Step 2) ----------
-const RULES = `精校规范（务必全部遵守）：
-1. 保持对话体、不要改写成叙述文章；发言人标签一律「名字：」纯文本形态，不加粗、不加时间戳、不加其它样式——写成 李明： 而不是 **李明：** 或 李明 12:03：，全篇同一形态（源转录标签里夹的时间戳一律不进成稿标签，溯源靠锚点注释，不靠标签）。
+// Content editing and serialization are deliberately separate facts. Legacy Markdown agents still own their
+// wrapper/label syntax; turn-ir-v2 agents edit only block bodies and relations, while the host owns H1, subtitle,
+// and canonical speaker labels. Do not derive one mode from the other with regex/string filtering.
+const EDITORIAL_RULES = `精校内容规范（务必全部遵守）：
+1. 保持对话体、不要改写成叙述文章；保留每轮发言的归属和顺序，不把不同说话人的内容混在一起，也不把转述改造成新的直接引语。
 2. 删口癖、口语赘词与口语重复，合并语义重复句；以“读着顺、信息不丢”为准——不改语气风格与原意，不替发言人加观点，拿不准就保留，宁可漏删一处也别删出歧义。注意：“宁可漏删”只适用于可能改义的词，不适用于纯噪音；纯噪音（语气音、确认复读、卡顿）必须删干净。开场寒暄**只有在纯问候、无任何实质内容时**才折叠成一句括号说明；**夹在寒暄里的产品评论、事实陈述、观点原话必须逐句保留**（例：调试录音设备时对某支麦克风的吐槽、闲聊里带出的一个数字或判断，都属于必须保留的实质内容，不得随寒暄一起折叠）。
    · **径删（纯垫词，无任何语义）**：语气与卡顿音（嗯、呃、啊、哦、欸）；确认复读（对对对、是是是、嗯嗯）；纯卡顿的“那个…这个…就是说…”；句首口头禅式的“然后/其实/就是”；空洞的反问尾巴（对吧、是吧、对不对、你知道——确在向对方求证的留）。
    · **看义删（有义则留，纯垫才删）**：“一个/一种/一些”作量词废垫删、表“一/同一/特指某个”留——“为了让它有一个统一口感”→“为了有统一口感”（删），“跟咖啡豆拼配是一个道理”照留（＝同一个道理，有义），“摆在一个角落、同一个时间、给他一个机会”留；“其实”句首口头禅删、表转折（本以为…其实…、但其实）留；“然后”空接续删、表真实先后或因果留；“就是”卡顿垫词删、表“正是/只是/即”留；“的话”纯提顿删（“做手工的话”→“做手工”）、真条件（“需要的话”）留。
@@ -163,19 +1073,33 @@ const RULES = `精校规范（务必全部遵守）：
    纯粹确认写法的来回**折叠成结果**：口头拼字（“吴，哪个杰？”“捷报的捷——提手旁那个”“哦，口天的吴”）在书面稿里没有残值，在名字首次出现处直接写澄清后的写法（“吴捷”），整段问字对话删去——但必须用**澄清后**的字（捷，非先听到的杰）；夹有信息量内容（名字来历/玩笑）的只删机械确认、内容照留；没澄清出结果的保留（音）。
 3. 理顺破碎口语、修语序与冗余助词；有信息量/有个性的金句照留，不要抹平。
 4. 按主题加 ## 小标题：准确概括、不篡改原意、不加原文没有的结论；一律不编号；一份通常 6–20 个。
-4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字），必要时每段重复发言人标签；单个对话段超过约 900 字视为需要重切。
+4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字）；单个对话段超过约 900 字视为需要重切。
 5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。**凡校对表中标 ⚠ 或注明「保留（音）／未能核实／疑为转录误写」的名字：正文每处都写作「名字（音，存疑）」或「名字（音）」，不得裸写**（这些是尚未核实的写法，裸写会被误当成已确认）。
 6. 保留全部事实细节（数字/金额/时间/产品/工艺/渠道/观点）——精校不是摘要。
 7. 发言人规范：采访方追问归对应记者名；被访方旁白/补充按校对表标注；拒答/「以招股书为准」等语境务必原样保留，勿替受访者补数字。
-8. 文件抬头：首行 H1 标题，第二行斜体说明行。
-9. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。**书面化的引语、专名与术语首次出现、带反讽或口头禅性质的短语，主动用全角弯引号 “” 标出**（如 他说这是 “行业惯例”、所谓 “现厂制”）。代码/英文专名/路径里的 ASCII 引号不动。
-10. 数字用阿拉伯数字：把汉字数字改成阿拉伯数字（十六个部门→16 个部门，六七十 B 大模型→60-70B 大模型，三四百人→300-400 人，约数范围用连字符）。例外——很短的口语化小数目保留汉字：两个人、三五个、一两次、七八年、一两句话 等约定俗成口语不转；成语/固定词不动（三心二意、五花八门、一五一十）。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。
-11. 中文与英文/数字之间加一个半角空格（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插一个空格（用 GPT-4 做、16 个部门、覆盖 80% 用户、A 轮融资、2021 年底）。不加空格：①数字与紧跟的单位/符号之间（60-70B、80%、$50、5G、A4）；②与全角标点相邻处；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
-12. 长文件分多次接力写（先 Write 抬头+开头，再用 Edit 以已写入的最后一句为锚点追加），务必覆盖到源文件结尾。**每次 Write/Edit 都在单次输出上限内写尽量大的整块（通常一次写完一整段主题、上千字），用尽量少的写入次数完成——别一行一行或一小段一小段地追加。**
-13. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。
-14. **绝不无声跳过任何实质内容段**。若确有无法恢复的缺口（原文转录缺失、彻底无法辨认），就在原位置用**一句人话的括号说明**交代，例：（此处约 200 字因转录缺失未能恢复，见源 L120-L150）——**禁止输出工具告警式、系统报错式的文案**。此为最后手段——正常情况下整份成稿应没有任何缺口说明；口水寒暄按规范 2 折叠成一句括号说明不算缺口、不要标；段落太长也不是理由（按规范 12 分多次写完）。宁可如实标注缺口，不可无声省略。`
+8. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。**书面化的引语、专名与术语首次出现、带反讽或口头禅性质的短语，主动用全角弯引号 “” 标出**（如 他说这是 “行业惯例”、所谓 “现厂制”）。代码/英文专名/路径里的 ASCII 引号不动。
+9. 数字用阿拉伯数字：把汉字数字改成阿拉伯数字（十六个部门→16 个部门，六七十 B 大模型→60-70B 大模型，三四百人→300-400 人，约数范围用连字符）。例外——很短的口语化小数目保留汉字：两个人、三五个、一两次、七八年、一两句话 等约定俗成口语不转；成语/固定词不动（三心二意、五花八门、一五一十）。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。
+10. 中文与英文/数字之间加一个半角空格（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插一个空格（用 GPT-4 做、16 个部门、覆盖 80% 用户、A 轮融资、2021 年底）。不加空格：①数字与紧跟的单位/符号之间（60-70B、80%、$50、5G、A4）；②与全角标点相邻处；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
+11. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。
+12. **绝不无声跳过任何实质内容段**。若确有无法恢复的缺口（原文转录缺失、彻底无法辨认），就在原位置用**一句人话的括号说明**交代，例：（此处约 200 字因转录缺失未能恢复，见源 L120-L150）——**禁止输出工具告警式、系统报错式的文案**。此为最后手段——正常情况下整份成稿应没有任何缺口说明；口水寒暄按规范 2 折叠成一句括号说明不算缺口、不要标。宁可如实标注缺口，不可无声省略。`
 
-// Chinese typesetting rules (same source as RULES items 9/10/11): injected into every sub-agent that generates Chinese.
+const LEGACY_MARKDOWN_RULES = `传统 Markdown 输出规范（仅适用于模型直接拥有最终 Markdown 格式的路径）：
+1. 发言人标签一律「名字：」纯文本形态，不加粗、不加时间戳、不加其它样式——写成 李明： 而不是 **李明：** 或 李明 12:03：，全篇同一形态；长独白分段时按需重复发言人标签。
+2. 文件抬头由模型写入：首行 H1 标题，第二行斜体说明行。
+3. 长文件分多次接力写：先 Write 抬头和开头，再用 Edit 以已写入的最后一句为锚点追加，务必覆盖到源文件结尾；每次写尽量大的完整主题块，不要逐行追加。`
+
+const TURN_IR_V2_RULES = `Turn IR v2 序列化规范（宿主是最终格式的唯一所有者）：
+- 第一条非空行必须逐字为 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
+- 只使用成对的 \`LRB_OUTPUT_BLOCK sources=... disposition=keep|merge|split|fold_noise\` 标记承载正文；\`LRB_SOURCE_REFS\` 是宿主只读元数据，可原样保留。
+- 全部来源 ID 必须按原顺序完整记账（这里的 ID 即 source turn ID）：keep 一对一；merge 只合并相邻同轨来源；split 把同一来源连续映射到至少两个 block；fold_noise 只折叠相邻纯口癖或纯寒暄来源。不得把事实或观点搬到不相干来源，不同说话人的实质发言不得合并。
+- output block 外只能出现 \`## \` 小标题，且小标题归属于它后面的 block；block 正文内不得出现 Markdown 标题。
+- 不要输出 H1、说明行、前言、结语或分隔线；不要输出或猜测 speaker_track_id，也不要输出说话人标签。标题、说明行和 canonical 说话人标签只由宿主根据结构化事实确定性渲染。`
+
+// Backward-compatible name for direct-Markdown paths. Contracted paths must explicitly select
+// EDITORIAL_RULES + TURN_IR_V2_RULES and never interpolate RULES.
+const RULES = `${EDITORIAL_RULES}\n\n${LEGACY_MARKDOWN_RULES}`
+
+// Chinese typesetting rules (same source as EDITORIAL_RULES items 8/9/10): injected into every sub-agent that generates Chinese.
 // Proofreading agents already get them via RULES; summaries/timelines inject this compact version separately
 // (timelines are the densest for numbers/years/amounts, so rules ② and ③ matter most there).
 const TYPESET = `中文排版三规范（务必遵守）：
@@ -433,6 +1357,72 @@ function mergeHints(a, b) {
   return [...kept, ...warns, ...(truncated ? [HINT_TRUNC_MARK] : [])].join(HINT_SEP)
 }
 
+// ---------- internal-directory suspicion (飞书 ASR 同事名偏置) ----------
+// 飞书/Lark ASR 会把听不清的人名优先写成上传方租户内的同事名（热词表来自企业通讯录）。因此转录里一个与内部
+// 通讯录完全同名的人名反而【更可疑】：真实说话对象可能是外部同音他人，被 ASR「吸附」成了同事。通讯录在这里
+// 只作【存疑名单】，绝不是白名单或改名依据——命中者置 suspect_asr=true（强制联网核实，哪怕 verify=key），
+// 改不改仍由既有的两把钥匙规则裁决。匹配全部在代码里完成：通讯录内容不进任何 prompt、输出或日志，
+// 只有转录里本来就出现的名字会被标记。名单文件由宿主本地读取（--internal-directory），不入库。
+// hint 措辞刻意只描述 ASR 的失误模式，不断言「此人在我方通讯录里」——hint 会进核实/精校 prompt 与校对表，
+// 措辞越少确认名单成员身份越好（残余信号见 README 该节说明）。
+const INTERNAL_DIRECTORY_HINT = '⚠ 疑为飞书 ASR 同事名偏置产物（ASR 常把听不清的名字写成文件上传方的同事名），此写法可能是同音他人——须凭上下文与联网证据核实正身，勿仅因像真名而采信'
+// 匹配归一化：NFKC 折叠全角/半角，去掉全部空白，拉丁字母不分大小写——「张　三」「ZHANG san」都能对上。
+const normalizeDirName = (n) => String(n || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase()
+const CJK_RE = /[㐀-鿿]/
+function parseInternalDirectory(text) {
+  const names = new Set()
+  for (const raw of String(text || '').replace(/^﻿/, '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    // 分号/顿号是【姓名列表】分隔（一行多个名字：「蔡梅梅; 杜静; 龚格」）；tab/逗号/竖线是【列】分隔
+    // （姓名后跟部门等列，只取首列）。空格不算任何分隔，否则英文全名（Mary Jane）会被腰斩。
+    for (const item of line.split(/[;；、]+/)) {
+      let name = item.split(/[\t,，|]+/)[0].trim()
+      // 中文条目内若用空格隔开部门或英文别名（「沈其安 市场部」「申远 neil」），姓名取首个空格前的字段；英文条目保留整段。
+      if (CJK_RE.test(name)) name = name.split(/\s+/)[0]
+      if (name && normalizeDirName(name).length >= 2) names.add(name)
+    }
+  }
+  return Array.from(names)
+}
+// merged: mergeFindings 输出（people/brands/terms）。就地标记 people 中命中通讯录的条目并返回命中条目数组
+// （{canonical, writings}：writings 供 forceReopen 撬开核实缓存，canonical 供日志）。locked（用户钦定）条目跳过
+// ——decree 是明确的人工指令，终局（README 记载此例外）。hint 追加走 mergeHints（幂等，⚠ 子句永不被截断），
+// 累积批次里 parse→render 往返也不会重复膨胀。只查 people：品牌/术语不受同事名偏置影响。
+function applyInternalDirectorySuspicion(merged, dirNames) {
+  const dir = new Set((dirNames || []).map((n) => normalizeDirName(stripDesc(String(n)))).filter(Boolean))
+  if (!dir.size) return []
+  const matched = []
+  for (const e of (merged && merged.people) || []) {
+    if (!e || e.locked) continue
+    const forms = [e.canonical, ...(e.variants || [])].map((n) => stripDesc(String(n || ''))).filter(Boolean)
+    if (!forms.some((n) => dir.has(normalizeDirName(n)))) continue
+    e.suspect_asr = true
+    e.hint = mergeHints(e.hint, INTERNAL_DIRECTORY_HINT)
+    matched.push({ canonical: e.canonical, writings: forms })
+  }
+  return matched
+}
+// 侦察漏网补扫：通讯录名字若在源文本里出现、却没进侦察的 people 清单（侦察分块失败/漏抽/只当成说话人标签），
+// 逐字扫描把它找回来。中文名用子串匹配（≥2 字全名撞进别的词的概率低，误报的代价只是多一次核实）；
+// 拉丁名要求词边界、不分大小写。excludeForms 传已在 people 里的全部写法，避免重复注入。纯函数，宿主读文件。
+function scanTextForDirectoryNames(text, dirNames, excludeForms) {
+  const t = String(text || '')
+  if (!t) return []
+  const tNorm = t.normalize('NFKC').toLowerCase()
+  const seen = new Set((excludeForms || []).map((n) => normalizeDirName(stripDesc(String(n)))))
+  const out = []
+  for (const name of dirNames || []) {
+    const key = normalizeDirName(name)
+    if (!key || seen.has(key)) continue
+    let hit
+    if (CJK_RE.test(name)) hit = t.includes(name) || tNorm.includes(key)
+    else hit = new RegExp(`(?<![A-Za-z])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z])`, 'i').test(t)
+    if (hit) { seen.add(key); out.push(name) }
+  }
+  return out
+}
+
 function clusterEntities(entries) {
   const clusters = []
   for (const e of entries) {
@@ -587,7 +1577,7 @@ function dedupListText(merged) {
 // (including auto) — the escape hatch. Unset budget + non-speed mode ⇒ one agent, exactly as before.
 // Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
 // NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
-// ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
+// ran 13.9 字/line). Chunking decisions key on this metric.
 // See [[feedback-size-metric]]. Read-tool pagination stays line-addressed (readPlan) because Read is
 // line-based — that's a mechanic, not a size judgment.
 function contentLength(text) {
@@ -601,7 +1591,7 @@ function refineSize(f) {
   if (f && f.bytes) return Math.round(f.bytes / 2.6)
   return Math.round(((f && f.lines) || 0) * 14)
 }
-const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+const ONE_PASS_CHARS = 4000          // legacy short-file threshold; bypass is disabled so every file enters Scout
 
 // ---------- single-shot refine (M11a) ----------
 // Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
@@ -632,7 +1622,7 @@ function singleShotMaxTokens(sourceChars) {
 
 const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
-const MAX_REFINE_CHUNKS = 2          // conservative cap for SPEED mode only — a coarse batch lever, not a fine split (budget mode is uncapped)
+const MAX_SPEED_REFINE_CHUNKS = 2    // conservative cap for SPEED mode only — a coarse batch lever, not a limit on provider-budget chunks
 const singleChunk = (f) => {
   const lines = (f && f.lines) || 0
   return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
@@ -662,7 +1652,6 @@ function evenLineChunks(f, K) {
 // preflight (universal jobs.prepareFile) to attach f.turns so the orchestrator can snap chunk boundaries to real
 // turns AND avoid ending a chunk on a question (see turnAwareChunks). Editions with no fs (the CC Workflow sandbox)
 // simply don't populate f.turns → splitForRefine falls back to evenLineChunks, byte-identical to before.
-const TURN_LABEL_RE = /^\s*[一-龥A-Za-z0-9·]{1,12}[：:]/
 // A turn "ends with a question" if — after stripping trailing whitespace, closing quotes/brackets, and any trailing
 // HTML-comment provenance marker (<!-- 源 L… -->) — the last visible glyph is ？ or ?. This is what lets us keep a
 // question glued to the answer that follows it. Pure + exported so the rule is unit-testable in isolation.
@@ -677,17 +1666,10 @@ function endsWithQuestion(text) {
   return /[？?]$/.test(t)
 }
 function parseTurns(content) {
-  const lines = String(content == null ? '' : content).split('\n')
-  const idx = []   // 0-based line indices where a turn opens
-  for (let i = 0; i < lines.length; i += 1) if (TURN_LABEL_RE.test(lines[i])) idx.push(i)
-  if (!idx.length) return []
-  const turns = []
-  for (let k = 0; k < idx.length; k += 1) {
-    const start = idx[k]
-    const end = (k + 1 < idx.length) ? idx[k + 1] - 1 : lines.length - 1   // turn spans up to the next label line
-    turns.push({ startLine: start + 1, q: endsWithQuestion(lines.slice(start, end + 1).join('\n')) })
-  }
-  return turns
+  return parseSpeakerDocument(content).units.map((unit) => ({
+    startLine: unit.startLine,
+    q: endsWithQuestion(unit.text),
+  }))
 }
 // Split a file into K chunks whose boundaries land on real turn edges, then move any boundary that would END a chunk
 // on a question to a nearby non-question turn boundary. Only reached when f.turns is present and has ≥ K turns;
@@ -753,9 +1735,9 @@ function splitForRefine(f, mode, budget, chunkSize) {
     // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
     K = Math.max(1, Math.ceil(size / chunkSize))
   } else {
-    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    // Speed: opt-in coarse lever — only large files, capped at MAX_SPEED_REFINE_CHUNKS.
     const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      ? Math.min(MAX_SPEED_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
       : 1
     // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
     const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
@@ -791,10 +1773,60 @@ function splitForScout(f) {
 function mergeScoutChunks(parts, f) {
   const got = (parts || []).filter(Boolean)
   if (!got.length) return null
-  const speakers = []; const seenSp = new Set()
+  const speakers = []; const speakerIndex = new Map()
+  const speakerKey = (value) => {
+    const label = String(value || '').normalize('NFKC').trim()
+    const generic = label.match(/^(?:发言人|说话人|讲者|讲话人|Speaker)\s*([0-9一二三四五六七八九十]+)$/iu)
+    return generic ? `generic:${generic[1]}` : label
+  }
+  const ROLE_OUTPUT_RE = /^(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)$/iu
+  const speakerScore = (speaker) => {
+    const output = String((speaker && speaker.output_label) || '').trim()
+    const identity = String((speaker && speaker.identity) || '').trim()
+    const role = String((speaker && speaker.role) || '').trim()
+    const confident = speaker && speaker.output_label_confidence === 'high' && String(speaker.output_label_evidence || '').trim()
+    return (confident && output && !ROLE_OUTPUT_RE.test(output) ? 20 : 0) + (confident && identity ? 10 : 0) + (output ? 4 : 0) + (role ? 2 : 0)
+  }
+  // A high-confidence person name for a track: only these can conflict. Role outputs (记者/受访者…)
+  // never name a person, so they keep competing on score alone. effectiveScoutPersonName is the same
+  // interpretation the resolver uses to pick the final name (output_label first, identity second), so a
+  // disagreement on EITHER naming path is caught. Comparison strips inner whitespace so “张三” and
+  // “张 三” read as the same person, not a contradiction.
+  const confidentName = (speaker) => String(effectiveScoutPersonName(speaker) || '').replace(/\s+/gu, '')
+  const conflicted = new Set()
+  const conflictNotes = []
   for (const p of got) for (const s of p.speakers || []) {
-    const k = ((s && s.label) || '').trim()
-    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+    const k = speakerKey(s && s.label)
+    if (!k) continue
+    if (!speakerIndex.has(k)) {
+      speakerIndex.set(k, speakers.length)
+      speakers.push(s)
+      continue
+    }
+    const i = speakerIndex.get(k)
+    if (conflicted.has(k)) {
+      // The name stays dropped, but a later chunk may still contribute the role the demoted record
+      // lacks — roles are the safe fallback display, so backfilling one cannot re-name the track.
+      const role = String((s && s.role) || '').trim()
+      if (role && !String(speakers[i].role || '').trim()) speakers[i] = { ...speakers[i], role }
+      continue
+    }
+    const kept = speakers[i]
+    const keptName = confidentName(kept)
+    const newName = confidentName(s)
+    // Two chunks naming the same source track as different people is a disagreement, not a ranking
+    // problem: silently keeping either name risks publishing the wrong person. Drop the automatic
+    // name, keep the numbered source label, and surface the conflict for a human.
+    if (keptName && newName && keptName !== newName) {
+      const base = speakerScore(s) > speakerScore(kept) ? { ...s, label: kept.label } : kept
+      // name_conflict travels with the record so the resolver can refuse person names for this track
+      // even when a stray alias record (person-name label + sample pointing here) outscores it.
+      speakers[i] = { ...base, output_label: '', output_label_confidence: 'low', output_label_evidence: '', identity: '', name_conflict: true }
+      conflicted.add(k)
+      conflictNotes.push(`分段侦察对“${kept.label}”给出相互矛盾的高置信姓名（“${keptName}”与“${newName}”），已放弃自动命名，保留原始标签待人工确认。`)
+      continue
+    }
+    if (speakerScore(s) > speakerScore(kept)) speakers[i] = { ...s, label: kept.label }
   }
   const cat = (key) => got.flatMap((p) => p[key] || [])
   const errByKind = {}
@@ -818,7 +1850,7 @@ function mergeScoutChunks(parts, f) {
     themes: uniq('themes'),
     has_existing_headings: got.some((p) => p.has_existing_headings),
     ending_anchor: ending || {},
-    special_notes: uniq('special_notes'),
+    special_notes: [...uniq('special_notes'), ...conflictNotes],
   }
 }
 const partPath = (outPath, idx) => `${outPath}.part${idx}`
@@ -826,12 +1858,158 @@ const partPath = (outPath, idx) => `${outPath}.part${idx}`
 // Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
 // join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
 // testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
-// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
-// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
-function stitchParts(texts) {
+// line. Besides an exact-duplicate `##` heading, remove only a HIGH-CONFIDENCE duplicated prose block at
+// the seam: same speaker (when labelled), >=60 normalized chars, and either containment at near-equal length
+// or >=0.92 bigram Dice similarity. Short/common replies are deliberately never deduplicated.
+function seamNorm(text) {
+  return String(text || '')
+    .replace(/^\s*#{1,6}\s+.*$/gm, '')
+    .replace(/^\s*[一-龥A-Za-z0-9·]{1,16}[：:]\s*/, '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function seamSpeaker(text) {
+  const parsed = parseSpeakerDocument(text)
+  return parsed.speakerMode === 'tracked' && parsed.labels.length ? parsed.labels[0].label : null
+}
+
+function bigramDice(a, b) {
+  const grams = (s) => {
+    const m = new Map()
+    for (let i = 0; i + 1 < s.length; i += 1) {
+      const g = s.slice(i, i + 2)
+      m.set(g, (m.get(g) || 0) + 1)
+    }
+    return m
+  }
+  const ga = grams(a), gb = grams(b)
+  let overlap = 0
+  for (const [g, n] of ga) overlap += Math.min(n, gb.get(g) || 0)
+  const total = Array.from(ga.values()).reduce((s, n) => s + n, 0) + Array.from(gb.values()).reduce((s, n) => s + n, 0)
+  return total ? (2 * overlap) / total : 0
+}
+
+function h2Key(line) {
+  const m = String(line || '').match(/^\s*##\s+(.+?)\s*$/)
+  if (!m) return null
+  return m[1].normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function proseRanges(lines, start, end) {
+  const out = []
+  let i = start
+  while (i < end) {
+    while (i < end && (!lines[i].trim() || /^\s*<!--/.test(lines[i]))) i += 1
+    if (i >= end || /^\s*#{1,6}\s+/.test(lines[i])) { i += 1; continue }
+    const from = i
+    while (i < end && lines[i].trim() && !/^\s*#{1,6}\s+/.test(lines[i])) i += 1
+    if (i > from) out.push({ start: from, end: i, text: lines.slice(from, i).join('\n') })
+  }
+  return out
+}
+
+// A chunked model sometimes reopens the same topic with typography-only differences
+// (`2026 年 agent` / `2026年agent`) or repeats the exact heading. When two consecutive H2 sections
+// normalize to the same key, keep one heading and all substantive content. If the boundary also replays the
+// exact same speaker paragraph, remove only that repeated copy. Different-speaker or paraphrased prose stays.
+function collapseAdjacentDuplicateHeadings(text) {
+  const source = String(text || '')
+  const trailingNewline = /\n$/.test(source)
+  const lines = source.split(/\r?\n/)
+  const headings = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const key = h2Key(lines[i])
+    if (key) headings.push({ index: i, key })
+  }
+  const remove = new Set()
+  let removedHeadings = 0
+  let removedBlocks = 0
+  for (let i = 1; i < headings.length; i += 1) {
+    const prev = headings[i - 1]
+    const curr = headings[i]
+    if (!curr.key || curr.key !== prev.key) continue
+    remove.add(curr.index)
+    removedHeadings += 1
+
+    const before = proseRanges(lines, prev.index + 1, curr.index)
+    const nextHeading = headings[i + 1] ? headings[i + 1].index : lines.length
+    const after = proseRanges(lines, curr.index + 1, nextHeading)
+    const left = before.at(-1), right = after[0]
+    if (!left || !right) continue
+    const a = seamNorm(left.text), b = seamNorm(right.text)
+    const sa = seamSpeaker(left.text), sb = seamSpeaker(right.text)
+    if (a.length >= 20 && a === b && (!sa || !sb || sa === sb)) {
+      for (let n = right.start; n < right.end; n += 1) remove.add(n)
+      removedBlocks += 1
+    }
+  }
+  if (!remove.size) return { text: source, removedHeadings: 0, removedBlocks: 0 }
+  const result = lines.filter((_, i) => !remove.has(i)).join('\n').replace(/\n{3,}/g, '\n\n')
+  return { text: result.replace(/\s+$/, '') + (trailingNewline ? '\n' : ''), removedHeadings, removedBlocks }
+}
+
+function isDuplicateSeamBlock(left, right) {
+  const a = seamNorm(left), b = seamNorm(right)
+  if (Math.min(a.length, b.length) < 60) return false
+  const sa = seamSpeaker(left), sb = seamSpeaker(right)
+  if (sa && sb && sa !== sb) return false
+  const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+  if (ratio < 0.82) return false
+  if (a.includes(b) || b.includes(a)) return true
+  return bigramDice(a, b) >= 0.88
+}
+
+function findDuplicateSeamPrefix(left, right, max = 4) {
+  const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+  const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+  const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
+  if (!leftBlocks.length || !rightProse.length) return null
+
+  // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
+  // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
+  // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
+  // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
+  let best = null
+  for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
+    const leftSeq = leftBlocks.slice(-lc).join('\n\n')
+    for (let rc = 1; rc <= Math.min(max, rightProse.length); rc += 1) {
+      const indices = rightProse.slice(0, rc)
+      const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
+      if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
+      const a = seamNorm(leftSeq), b = seamNorm(rightSeq)
+      const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+      // Prefer the tightest semantic fit, not simply the longest match. Otherwise an exact six-block replay
+      // followed by one NEW short question can look like a seven-block containment match and the new question
+      // gets deleted. Length fit + containment/Dice makes the exact replay win while retaining paraphrase support.
+      const quality = ratio + ((a.includes(b) || b.includes(a)) ? 1 : bigramDice(a, b))
+      const score = Math.min(a.length, b.length)
+      if (!best || quality > best.quality || (quality === best.quality && score > best.score)) best = { quality, score, indices }
+    }
+  }
+  return best ? { ...best, rightBlocks } : null
+}
+
+function stripDuplicateSeamPrefix(left, right, max = 4) {
+  const match = findDuplicateSeamPrefix(left, right, max)
+  if (!match) return { text: right, removedBlocks: 0 }
+  const rightBlocks = match.rightBlocks.slice()
+  const removedBlocks = match.indices.length
+  for (const i of match.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return { text: rightBlocks.join('\n\n'), removedBlocks }
+}
+
+// Merge plus a post-merge seam audit. The normal four-block pass preserves the historical conservative cleanup.
+// If an unusually long replay remains, one deterministic eight-block repair is allowed, then a wider final scan
+// records (but does not hide) any still-duplicated seam. The caller can block derivatives on `seamDuplicates`
+// while still delivering the body for review.
+function stitchPartsWithReport(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
-  if (!parts.length) return ''
+  if (!parts.length) return { text: '', seamRepairs: [], seamDuplicates: [] }
   let out = parts[0]
+  const seamRepairs = []
+  const seamDuplicates = []
   for (let i = 1; i < parts.length; i += 1) {
     let next = parts[i]
     const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
@@ -839,9 +2017,35 @@ function stitchParts(texts) {
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
     }
+    // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
+    // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
+    // prose blocks, so later legitimate repetition remains untouched.
+    const normal = stripDuplicateSeamPrefix(out, next, 4)
+    next = normal.text
+    let removedBlocks = normal.removedBlocks
+    const longReplay = findDuplicateSeamPrefix(out, next, 8)
+    if (longReplay) {
+      const repaired = stripDuplicateSeamPrefix(out, next, 8)
+      next = repaired.text
+      removedBlocks += repaired.removedBlocks
+    }
+    if (removedBlocks) seamRepairs.push({ seam: i, removedBlocks })
+    const residual = findDuplicateSeamPrefix(out, next, 12)
+    if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return `${out.replace(/\s+$/, '')}\n`
+  const headingRepair = collapseAdjacentDuplicateHeadings(`${out.replace(/\s+$/, '')}\n`)
+  return {
+    text: headingRepair.text,
+    seamRepairs,
+    seamDuplicates,
+    headingRepairs: headingRepair.removedHeadings,
+    headingReplayBlocksRemoved: headingRepair.removedBlocks,
+  }
+}
+
+function stitchParts(texts) {
+  return stitchPartsWithReport(texts).text
 }
 
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
@@ -870,6 +2074,20 @@ function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
+  // Chinese orthography is its own evidence key. A Romanized author name can establish identity/context but
+  // cannot choose among homophonic Han spellings. Fail closed unless the verifier explicitly attested that the
+  // cited page shows the exact Chinese canonical AND preserved that spelling in the source note, making the
+  // evidence contract machine-checkable instead of trusting a bare `two_key:true`.
+  const hitCanonical = stripDesc(hit.canonical)
+  const needsExactHanScript = isPerson && /^\p{Script=Han}{2,8}$/u.test(hitCanonical)
+  const hasExactHanScript = hit.name_script_exact === true && String(hit.source || '').includes(hitCanonical)
+  if (needsExactHanScript && !hasExactHanScript) {
+    rejected.add(hit)
+    const reason = hit.name_script_exact === true
+      ? `⚠ 联网来源说明未原样包含中文名“${hitCanonical}”，无法证明具体汉字——未采用，待补中文原文来源`
+      : `⚠ 联网仅确认身份/英文名，未直接证明中文名“${hitCanonical}”的汉字写法——未采用，待补中文原文来源`
+    return Object.assign({}, e, { hint: [e.hint, reason].filter(Boolean).join('；') })
+  }
   // Contested entry: a referent substitution (a DIFFERENT written form) is FORBIDDEN unless the fresh verdict
   // carries two_key===true — the verify agent attesting BOTH a high-tier source AND context-fit. Bare
   // concreteness, even a real-looking domain, never licenses it (the coattail failure: verify "confirms" the
@@ -882,8 +2100,21 @@ function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) {
     return e
   }
   const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  // Authority order is explicit:
+  //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
+  // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
+  // exact failure it was meant to fix permanent: Scout flags 林川 as suspect_asr, Verify finds 林传, then the
+  // "strong name" guard keeps 林川. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
+  // Fresh first-run strong spellings are still only Scout hypotheses. A decisive Verify result already attests
+  // both source authority and context fit via two_key, so it may correct them even when Scout forgot to set
+  // suspect_asr (the real replay found the right public names but retained five ASR spellings for exactly this
+  // reason). Carried verified and contested rows remain protected by the branches above / this exclusion.
+  const freshTwoKeyCorrection = e.confidence !== 'verified' && e.confidence !== 'contested'
+    && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
-      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
+      && !freshTwoKeyCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })
@@ -1780,8 +3011,9 @@ const VERIFY_SUSPECT_PROTOCOL = `
 3. 证据分级取信：官方域名／权威媒体／百科 ＞ 目录站与 SEO 博客 ＞ 自我推销/软文贴。结论里注明命中来源属于哪一级。
 4. 搭便车反转规则：一个以该字面写法命名、但自身身份寄生于另一产品的站点（“Powered by X”“转售/代理 X”“X 分销/订阅站”），**不能**作为“该字面写法是独立实体”的证据——它恰恰是修正假设 X 成立的证据。
 5. 上下文吻合校验：把胜出的身份放回转录里对该实体的说法（其提及线索已在清单的“线索”里）核对；与转录内说法矛盾的身份，一律不得判为已核实。
-6. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
-7. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
+6. 中文人名汉字证据：身份相符、英文名或拼音相符，**不能证明中文名具体用哪个同音字**。若 canonical 是中文人名，至少 1 个所列来源页面必须直接显示该完整汉字写法；source 中原样写出页面所见中文名，且仅此时置 name_script_exact:true。只有 Lin Chuan / Chen Tao 一类英文、拼音或论文作者罗马字时，name_script_exact 必须为 false，不能据此“核实”林川/林传、陈涛/陈焘中的任何一个。
+7. 两把钥匙规则：当结论是**与口播形不同的名字**（指代替换）时，必须同时满足【高级别来源】与【上下文吻合】两项，才可写进 resolved；中文人名还必须满足上一条【汉字原文证据】。只满足其一或都不满足，就写进 **contested**——保留口播原形，在 contested 里同时记下字面假设（literal + literal_tier）与修正假设（correction + correction_tier），绝不擅自替换。
+8. two_key 标记：对本清单里疑似口误/两解的实体下**决定性结论**、写进 resolved 时，仅当【高级别来源（官方域名／大媒体／百科）】与【上下文吻合】两项**同时成立**，才置 two_key:true；中文人名若 name_script_exact 不为 true，two_key 也绝不能为 true。搭便车／SEO／分销／软文站永远不能支撑 two_key（哪怕它的域名恰好等于该写法）。缺 two_key 的结论按存疑对待——不足以让该实体退出「两解」状态。`
 
 // ---------- prompt builders ----------
 // Computed read plan: pagination is specified explicitly rather than left to the model
@@ -1866,7 +3098,8 @@ ${knownNote(a)}
 
 ${readBlock}
 读完后按 schema 返回结构化侦察结果：
-- speakers：每个发言人标签 → 角色，附一处原文样例；文中若点出真名/title，写进 identity。
+- speakers：为源转录的**每一条发言轨道**填写 label（源标签原样）、role、identity、output_label、output_label_confidence、output_label_evidence 和一处 sample。sample 必须是该轨道一整行**逐字照抄**的原文标签样例，保留行首时间码/括号、标签、冒号及同行正文，不能省略或改写；代码只会用能在原稿逐字回查的 sample 恢复陌生格式。output_label 是精校稿最终可见的纯标签：能从全文判断具体是谁时，**只写真名**（如「刘益枫」，不要带公司/title）；真名不确定时才写可区分角色（如「记者」「受访者」「PR」）；连角色也拿不准则留空，绝不猜人名。相同源标签在全文只能对应同一个 output_label。
+  · 具体姓名只有在**本人自我介绍、speakerHints 明示、或另一条清楚分轨的发言直接称呼此人**等直接证据成立时，才可标 output_label_confidence=high，并把依据原句写进 output_label_evidence。只是在该轨道正文里提到某个名字、转述某人观点、或混轨段里出现“赵磊，你们组……”一类喊话，不能证明该轨道本人就是赵磊；这种情况 confidence 只能 medium/low，output_label 应退回角色。
 - 特别留意**口头拼字澄清段**（“哪个杰？”“捷报的捷”“口天吴”）——这是人名/术语正确写法的**最强内部证据**：把澄清后的写法记为 canonical，hint 注明「本人口述拼字确认」。
 - people / brands / terms：反复出现的实体；canonical 填你判断的最可信写法，variants 列文中全部其它写法（含疑似同音误写），hint 一句定位线索；公众人物标 public_figure=true。
   · **知名实体用你已知的正确写法做 canonical**：若这是你认得的知名公司/产品/机构/公众人物，canonical 一律填**你所知的规范写法**，哪怕转录通篇是另一种听写——把转录里的写法放进 variants。例：转录一直写「苍碧科技」、而你知道这家公司规范写法是「苍璧科技」（碧→璧 同音误写），则 canonical=苍璧科技、variants 含 苍碧科技。别让一个一直被听错的名字、因为转录里写法统一就当成正确写法。
@@ -1889,20 +3122,73 @@ function verifyPrompt(table, a) {
 采访背景（按「领域 + 名字」检索）：${a.background}
 
 纪律：${depthNote} 网页内容留在你的上下文里，不要贴回；查不到/拿不准的放 unresolved 并说明，绝不臆造。
+中文人名的“身份核实”与“汉字写法核实”是两件事：英文名、拼音、罗马字作者列表只能证明身份，不能证明中文同音字。canonical 为中文人名时，来源页必须直接出现该完整汉字写法，source 原样带上该名字，并置 name_script_exact=true；否则放 unresolved（或两解未决时放 contested），不得凭英文名反推汉字。
 断路器：若检索**连续 2 次报错**（超时/网络错误，区别于“查到了但无结果”），说明网络故障——**立即停止全部检索**，已确认的照常放 resolved，其余全部放 unresolved 并注明「网络故障未核实」；不要反复重试。resolved 里只放**本次检索到依据**的结论，凭你记忆/常识推断的一律放 unresolved。
 ${looksPhoneticallySuspect(table) ? VERIFY_SUSPECT_PROTOCOL + '\n' : ''}
 实体清单（候选写法 ← 文中变体 ｜ 线索）：
 ${table}
 
-按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=依据来源一句话）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
+按 schema 返回 resolved（query=清单中的候选写法；canonical=核实后的正确写法；identity=身份/title；source=具体页面/URL 与依据一句话；name_script_exact=中文人名来源是否直接出现 canonical 的完整汉字；two_key=高级别来源与上下文是否同时成立）、unresolved，以及 contested（两把钥匙未满足的指代替换：query=口播原形；literal/literal_tier=字面假设及其证据级别；correction/correction_tier=修正假设及其证据级别；note=一句原因）。
 注意：identity/source/note 等中文说明会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”（如“据 36 氪 2021 年报道”）。canonical/query 是写法本身，不要改动其内部空格。`
+}
+
+function resolvedSpeakerBlock(f, finding = {}) {
+  const mappings = (f.speakerResolution && f.speakerResolution.mappings) || []
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || (mappings.length ? 'tracked' : null)
+  const scout = (finding.speakers && finding.speakers.length)
+    ? JSON.stringify(finding.speakers)
+    : '侦察未提取到发言人'
+  if (speakerMode === 'untracked') return `【全文结构契约：无说话人轨道】源文没有说话人标签，可能是独白、口述或无标签笔记。保持这种无标签形式：不要改写成问答，不要添加“记者/受访者/姓名：”等任何说话人标签，也不要把转述改造成新的直接引语。本条覆盖通用规范 1、4a、7 中关于对话体和标签的要求。`
+  if (speakerMode === 'ambiguous') return `【全文结构契约：疑似说话人格式未确认】源文出现了疑似发言轨道，但确定性代码与侦察证据未能建立可靠映射。逐字保留源稿中已有的标签、时间码和轮次边界；不要把它改成独白，也不得猜姓名、创造标签、合并轨道或把转述改成直接引语。本稿会进入人工复核，不要自行“修好”结构。`
+  if (!mappings.length) return `【全文发言人统一结果】未取得身份映射。只能保留源稿已有标签；不得据语境猜姓名、创造新标签或合并轨道。`
+  const rows = mappings.map((mapping) => `${mapping.sourceLabel} → ${mapping.outputLabel}`).join('；')
+  return `【全文发言人统一结果】${rows}
+你读取的源文件是依据上述结果生成的输入副本，标签行已经一次性替换完毕；这些**替换后的姓名/角色**是全篇唯一标签。照抄这些标签，不要改回原来的“发言人 N/说话人 N”，也不要在各分块里另起一套名字。
+【Scout 识别依据】${scout}`
+}
+
+// One serialization contract for every turn-ir-v2 editing pass. Initial Refine and quality repair both
+// interpolate this exact block; neither may import the legacy direct-Markdown wrapper rules.
+function turnIrV2PromptBlock() {
+  return `【不可变数据契约】
+${TURN_IR_V2_RULES}
+- 分段不等于改来源：长 turn 可以用多个 split block；同说话人 ASR 碎轮可以用一个 merge block。来源关系服务于回溯，不要求成稿机械一对一。`
 }
 
 function refinePrompt(f, glossary, finding, a, chunk) {
   // Scout results may be missing fields (schema is not strict, to avoid validation-retry loops) — if the anchor is absent, let the refine agent Read the source file's tail itself
   const anchor = finding.ending_anchor || {}
   const notes = (finding.special_notes || []).map((s) => '- ' + s).join('\n')
-  const speakers = (finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'
+  const sourcePath = f.refinePath || f.path
+  const speakers = resolvedSpeakerBlock(f, finding)
+
+  if (f.refineContract) {
+    const contractPath = (chunk && chunk.inputPath) || sourcePath
+    const outPath = chunk && chunk.count > 1 ? partPath(f.outPath, chunk.idx) : f.outPath
+    const turnCount = (chunk && Array.isArray(chunk.turnIds))
+      ? chunk.turnIds.length
+      : ((f.refineContract.records || []).length)
+    const chunkNote = chunk && chunk.count > 1
+      ? `这是第 ${chunk.idx}/${chunk.count} 块；输入文件已经只保留本块拥有的 ${turnCount} 个 source turn，不要再按原稿行号自行切边界。`
+      : `这是整份文件，共 ${turnCount} 个 source turn。`
+    return `你是访谈转录「精校」子代理。宿主程序已经把原稿转换成不可变的 source turn 账本；你把它们映射成可变的 output block，文档结构与说话人标签由宿主程序最终渲染。
+
+【统一校对表】（「联网核实结论」与「写法统一」优先；标 ⚠ 的条目未采纳、勿套用）：
+${glossary}
+
+【结构化输入】${contractPath}
+【输出】Write 到 ${outPath}
+${chunkNote}
+先完整 Read 结构化输入；它已经是宿主生成的默认 \`keep\` output-block 草稿。直接在这份 envelope 上精校，只有确实发生合并、拆分或折叠时才修改来源关系。
+
+${turnIrV2PromptBlock()}
+
+${notes ? `【该份特别提醒】\n${notes}\n` : ''}${headingNote(a.headingPolicy)}
+
+${EDITORIAL_RULES}
+
+完成后按 schema 返回 path（=${outPath}）、headings（你添加的 ## 小标题）、key_fixes、open_questions。`
+  }
 
   // Chunked branch: this agent refines ONLY its line span and writes a part file; a stitch agent merges
   // the parts afterwards. Ownership rule keeps the K parallel agents from overlapping or leaving a gap.
@@ -1912,26 +3198,33 @@ function refinePrompt(f, glossary, finding, a, chunk) {
     const headBlock = chunk.isFirst
       ? `【抬头】你是第 1 块：第一行写 \`# ${f.title}\`，第二行写 \`${f.subtitle}\`，然后从第一个 \`##\` 小标题开始正文。`
       : `【抬头】你是第 ${chunk.idx} 块（非首块）：**不要写 H1 标题、不要写说明行**，直接从一个 \`##\` 小标题开始正文。`
+    const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+    const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+    const boundaryRules = trackless
+      ? `- 本文没有可作为分块依据的已确认说话人轨道；以段落或列表内容块为边界。一个内容块归属于其首行行号落入的分块，整块归一处、绝不拆开。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的第一个完整内容块开始。${chunk.isFirst ? '你是第 1 块，从文件开头正常处理。' : `若第 ${chunk.startLine} 行位于上一内容块中间，跳过该块，从下一个完整块开始。`}
+- 你的终点：凡首行行号 ≤ ${chunk.endLine} 的内容块都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `最后一个内容块即使越过第 ${chunk.endLine} 行也要处理完整，但不要开始首行号 > ${chunk.endLine} 的下一块。`}`
+      : `- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
+- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
+- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}`
     const tailNote = chunk.isLast
       ? `【收尾】你这一块覆盖到源文件结尾（约第 ${f.lines} 行${anchor.text ? `，最后一句「${anchor.text}」` : ''}）——必须精校到最后，正文绝不能中途断掉（结尾客套可折成一句说明）。`
-      : '【收尾】你不是最后一块，正常精校到你负责的最后一轮发言即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。'
+      : `【收尾】你不是最后一块，正常精校到你负责的最后一${trackless ? '内容块' : '轮发言'}即可，**不要补任何结束语 / 总结 / 收束注**——后面还有别的块接着写。`
     return `你是访谈转录「精校」子代理（分块并行：本份共 ${chunk.count} 块，你负责第 ${chunk.idx} 块）。
 
 【写法对照表（精校用）】（表中已是核实后的统一写法，照此统一人名/品牌/术语——**标 ⚠ 的人名条目未采纳、勿套用**；「写法统一」一节的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
 ${glossary}
 
-【源文件】${f.path}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
+【源文件】${sourcePath}（全文约 ${f.lines} 行）。你只负责其中**第 ${chunk.startLine}–${chunk.endLine} 行**这一段。
 读取计划（首尾各多读约 ${CHUNK_MARGIN} 行邻接内容，好看清边界处的整轮发言；只精校属于你的那些发言轮）：
 ${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 
 【分块边界规则——务必严格，确保各块不重不漏】
-- “一轮发言”以发言人标签行开头（如「发言人 N」「记者：」「张三：」）。一轮发言归属于**其开头标签所在行号**落在哪一块的范围，就由哪一块精校，整轮归一块、绝不拆到两块。
-- 你的起点：从行号 ≥ ${chunk.startLine} 的**第一个发言人标签**开始精校。${chunk.isFirst ? '（你是第 1 块，从第 1 行正常开始，不跳过任何内容。）' : `若第 ${chunk.startLine} 行正处在某轮发言中间（该轮标签行在 ${chunk.startLine} 之前），那一轮属于上一块——**跳过、不要精校它**（往前多读几行确认标签位置即可；若那轮特别长、邻接内容里没看到它的标签，就再往前读到看见为止）。`}
-- 你的终点：凡标签行号 ≤ ${chunk.endLine} 的发言轮都归你；${chunk.isLast ? '你是最后一块，精校到文件末尾。' : `若你负责的最后一轮发言正文越过第 ${chunk.endLine} 行，**继续往下读、把这一轮精校完整**；但**不要开始**任何标签行号 > ${chunk.endLine} 的发言轮（那是下一块的）。`}
+${boundaryRules}
 
 【输出】Write 到 ${outPart}
 ${headBlock}
-【该份发言人】${speakers}
+${speakers}
 ${notes ? `【该份特别提醒】\n${notes}` : ''}
 ${headingNote(a.headingPolicy)}
 
@@ -1950,10 +3243,10 @@ ${tailNote}
 【统一校对表】（「联网核实结论」与「写法统一」两节优先级最高，与前文冲突时以它们为准——但其中**标 ⚠ 的条目未被采纳、勿套用**；「写法统一」里的术语/品牌请**初次落笔就写对**，不要先写错再回头逐字改）：
 ${glossary}
 
-【源文件】${f.path}（约 ${f.lines} 行）。${readPlan(f)}
+【源文件】${sourcePath}（约 ${f.lines} 行）。${readPlan(f)}
 【输出】Write 到 ${f.outPath}
 【抬头】第一行 \`# ${f.title}\`；第二行 \`${f.subtitle}\`
-【该份发言人】${(finding.speakers && finding.speakers.length) ? JSON.stringify(finding.speakers) : '侦察未提取到发言人——精校时据原文发言人标签自行归位（若有），见规范 1/7'}
+${speakers}
 ${notes ? `【该份特别提醒】\n${notes}` : ''}
 ${headingNote(a.headingPolicy)}
 
@@ -2006,15 +3299,51 @@ ${listText}
 按 schema 返回 suspects。注意：why（理由）会原样写进存档校对表——遵守排版规范：阿拉伯数字、中文与英文/数字间加半角空格、引号用全角 “”。members/preferred 是写法本身，不要改动其内部空格。`
 }
 
+function speakerCandidatePrompt(f, candidates = []) {
+  const resolution = f.speakerResolution || {}
+  const mappings = (resolution.mappings || [])
+    .filter((item) => item && item.sourceLabel && item.outputLabel)
+    .map((item) => `- ${item.sourceLabel} → ${item.outputLabel}${item.role ? `（${item.role}）` : ''}`)
+  const rows = candidates.map((item) => `- 第 ${item.line} 行：${item.label}`).join('\n')
+  return `你是“说话人候选裁决”代理。程序只依据“短前缀 + 冒号”的表面形状找到了候选；候选不是事实，不能因为标签不在映射中就直接判错。
+
+【只读文件】
+- 原始转录：${f.path}
+- 精校成稿：${f.outPath}
+
+【本轮已由源稿确认的说话人映射】
+${mappings.length ? mappings.join('\n') : '- 无已确认映射'}
+
+【待裁决候选】
+${rows}
+
+逐项 Read 精校稿候选行前后文；只有需要确认来源标签或别名时才 Read 原始转录。禁止 Write / Edit / Concat，禁止改稿、猜姓名或重做说话人映射。
+
+verdict 必须按以下边界：
+- invented_speaker：同时满足“该行确实开启一轮对话发言”与“原始转录及既有映射都没有这个说话人/别名的直接证据”。
+- not_speaker：标题、副标题、斜体说明、主题/日期等文档元信息、列表项、引用、表格、章节名或其它非发言轮结构。
+- source_supported_alias：该行确实是发言轮，且原始转录直接支持同一标签或别名，但既有映射遗漏。
+- uncertain：上下文或来源证据不足，不能满足以上任一结论。
+
+confidence=high 只允许用于直接文本证据充分的结论；仅凭名称像人名、位置像对话或“映射中没有”都不够。按 schema 返回 decisions；每个输入候选恰好返回一项，line 和 label 原样照抄。`
+}
+
 function singlePassPrompt(f, a, overrideNote) {
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const structureInstruction = speakerMode === 'untracked'
+    ? '本文没有说话人标签；按独白/无标签文本精校，保持无标签形式，不得改成问答或新增说话人。'
+    : speakerMode === 'ambiguous'
+    ? '本文疑似有未确认的说话人格式；保留原有标签、时间码与结构，不得猜人名、合并轨道或补造问答。'
+    : '边读边记发言人对应，统一全文标签。'
   return `你是访谈转录「精校」子代理（单文件一遍过）。
 
 采访背景：${a.background}
 
 【源文件】${f.path}（约 ${f.lines} 行）。先把全文**整份读完**。${readPlan(f)}
-边读边记发言人对应、人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
+${structureInstruction}同时记下人名/品牌/术语的各种写法、明显转写错误（同音/英文/时间戳/乱码），在心里建一张迷你校对表（不必落盘）；拿不准的名字保留（音），绝不臆造。然后按规范精校全文：
 【输出】Write 到 ${f.outPath}
 【抬头】第一行 \`# ${f.title}\`；第二行 \`${f.subtitle}\`
+${resolvedSpeakerBlock(f)}
 ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
@@ -2032,16 +3361,19 @@ ${RULES}
 // single-shot run passes '' and the model builds its own mini-glossary as in singlePassPrompt. The response is
 // written to f.outPath verbatim by JS, so it MUST be pure document text: first line the H1, no preamble/epilogue,
 // no code fence, no report — the deterministic source-aware audit then gates it exactly as any other 成稿.
-function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote) {
+function singleShotPrompt(f, a, sourceText, glossaryBlock, overrideNote, finding = {}) {
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
   const glossary = (glossaryBlock && glossaryBlock.trim())
     ? `【统一校对表】（“联网核实结论”与“写法统一”优先级最高；标 ⚠ 的条目未采纳、勿套用；术语/品牌请初次落笔即写对）：\n${glossaryBlock}\n`
-    : '边读边在心里建一张迷你校对表（发言人对应、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。'
+    : `边读边在心里建一张迷你校对表（${trackless ? '文本结构' : '发言人对应'}、人名/品牌/术语各写法、明显转写错误）；拿不准的名字保留（音），绝不臆造。`
   return `你是访谈转录「精校」子代理（单请求一次成稿）。
 
 采访背景：${a.background}
 
 ${glossary}
-下面 <源转录> 标签之间是需要精校的**完整**转录原文（${f.path}）。按规范精校全文。
+下面 <源转录> 标签之间是需要精校的**完整**转录原文（${f.refinePath || f.path}）。按规范精校全文。
+${resolvedSpeakerBlock(f, finding)}
 ${f.speakerHints ? `【发言人线索】${f.speakerHints}` : ''}
 ${f.notes ? `【额外提醒】${f.notes}` : ''}
 ${headingNote(a.headingPolicy)}
@@ -2078,11 +3410,15 @@ function summaryPrompt(a, refined, sectionMapPath) {
     ? `\n先 Read 结构索引 ${sectionMapPath}，用它定位每份成稿的小标题、行号、主题标签和关键实体；需要引用原文时再按索引只读相关成稿小节，避免反复通读全文。`
     : ''
   const summaryTitle = String(a.topic || '').trim().endsWith('访谈') ? `${a.topic}总结` : `${a.topic}访谈总结`
+  const hasTrackless = (a.files || []).some((file) => {
+    const mode = (file.speakerResolution && file.speakerResolution.speakerMode) || file.speakerMode
+    return mode === 'untracked' || mode === 'ambiguous'
+  })
   return `你是「访谈总结」子代理。基于以下精校成稿（先逐一 Read），产出《${summaryTitle}》：
 ${list}${mapNote}
 
 结构模板：先 Read ${a.skillDir}/references/deliverables.md 的「访谈总结」部分。
-三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要带来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**绝不可把公开资料或你推算/换算的数字标成【访谈】**，拿不准就标待核）；金句 Quotes（按发言人归类，忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
+三部分：分类要点（### 按主题小节，每条带具体事实或数字；**每个数字/金额/数量/规格都要紧跟自己的来源标注**：【访谈】=访谈亲口所述、必须确实出自成稿原文；【公开·待记者核实】=取自公开资料、须记者复核——**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注，禁止用行末一个标签统管整条**；绝不可把公开资料或你推算/换算的数字标成【访谈】，拿不准就标待核）；金句 Quotes（${hasTrackless ? '有可靠说话人标签的成稿按发言人归类；无标签或结构待复核的稿件按来源文件/章节归类，绝不补造发言人；' : '按发言人归类，'}忠实引用、只去口癖不改意）；行业与公司/人物洞察（分行业与该公司/人物两块，点出看点与风险，体现判断而非复述）。**所有标题一律不编号**（洞察等列表项也用 - 项目符号，不要 1./一、编号）。
 **源头可溯**：每条金句末尾标〔出处：成稿文件标题 · 所在小标题〕；分类要点凡引用具体数字/事实也尽量带〔出处：标题 · 小标题〕——成稿里每段都在某个 ## 小标题下，照抄那个小标题原文，便于读者一键核对。
 
 ${TYPESET}
@@ -2104,7 +3440,7 @@ function timelinePrompt(a, glossary, refined, sectionMapPath) {
 
 步骤：先 Read ${a.skillDir}/references/deliverables.md 的「时间线」部分作为结构模板；${mapNote ? `${mapNote} ` : ''}再逐一 Read 本次精校成稿（只读下面这些——目录里可能还有往次旧稿，不要读）：
 ${list}
-抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一。**每一条、尤其每一个数字/金额/数量/规格都必须带来源标注**，三选一：【访谈】=访谈亲口所述；【公开·待记者核实】=取自公开资料、须记者复核；【公开+访谈·待记者核实】=两者互证（公开部分仍待核）。**红线：标【访谈】的数字必须确实出自本次成稿原文——绝不可把公开资料、行业常识或你自己推算/换算的数字标成【访谈】**；来源拿不准就标【公开·待记者核实】，宁可标待核也不可冒充访谈。**源头可溯**：凡含【访谈】的事件，在该条末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
+抽出所有带时间/阶段的事实（成立、产品、融资、人事、渠道、出海…）；然后用 WebSearch / WebFetch 按“公司名 + 融资/成立/创始人”等核实年份、轮次、金额、关键人物（网页留在你的上下文里）。访谈与公开资料冲突时两边都列、注明分歧，不强行二选一。**每一个事实子句、尤其每一个数字/金额/数量/规格都必须紧跟自己的来源标注**，三选一：【访谈】=访谈亲口所述；【公开·待记者核实】=取自公开资料、须记者复核；【公开+访谈·待记者核实】=同一事实本身由两者互证（公开部分仍待核）。**一条里若同时有访谈事实和公开补充，必须拆成两个事实子句并各自标注；禁止用行末一个标签统管整条。**红线：标【访谈】的数字必须确实出自本次成稿原文——绝不可把公开资料、行业常识或你自己推算/换算的数字标成【访谈】；来源拿不准就标【公开·待记者核实】，宁可标待核也不可冒充访谈。**源头可溯**：凡含【访谈】的事件，在该事实子句末尾标〔出处：成稿标题 · 小标题〕指明取自哪份成稿哪段，便于核对。${glossaryBlock}
 
 ${TYPESET}
 
@@ -2148,7 +3484,9 @@ function logicWritePrompt(f, a, missing, planPath) {
   const planNote = planPath
     ? `\n【已审重排方案】先 Read ${planPath}。最终稿必须严格按这个 JSON 里的 threads 顺序、source_sections 和 logic 执行；如果方案里 no_reorder_needed=true，就不要写假重排稿，改为返回 open_questions 说明无需另出逻辑稿。`
     : ''
-  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的问答聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：问答块整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
+  const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
+  const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+  return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${trackless ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${trackless ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
@@ -2158,7 +3496,7 @@ function logicWritePrompt(f, a, missing, planPath) {
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。
 2. 每条线索选一个**内部顺序逻辑**：讲历史按时间，讲决策按 问题→洞察→决定→结果，讲产品/事件按 起因→经过→结果。
-3. 把精校稿里属于该线索的问答**整段照原文搬过来**，按上面的逻辑排好——保留 \`发言人：\` 标签**及其在精校稿里的原样式**（精校稿是 \`张三：\` 就写 \`张三：\`，**别改成** \`**张三：**\` 加粗或其它样式）、保留全部事实细节与原话措辞，**只换位置，不改一字**。
+3. 把精校稿里属于该线索的${trackless ? '内容块' : '问答'}**整段照原文搬过来**，按上面的逻辑排好——${trackless ? '保持原有无标签或待复核结构，不得改成问答、补造发言人或猜测标签，' : '保留 `发言人：` 标签及其在精校稿里的原样式（精校稿是 `张三：` 就写 `张三：`，别改成 `**张三：**` 加粗或其它样式）、'}保留全部事实细节与原话措辞，**只换位置，不改一字**。
 4. **指代修复（克制）**：仅当某段被移走后、开头的“他 / 那个 / 上面说的 / 然后”等指代或承接断了，才加一句 \`> [编者] …\` 衔接（如“此段原在访谈后段，承前文同属早期创业”），或把孤立的“他”补成名字。**绝不**改写原话、绝不补受访者没说的、绝不替他下结论。
 5. **不丢不重**：精校稿里每一段实质问答都要在重排稿里出现且**只出现一次**（纯客套/重复可省，与精校稿口径一致）。一段问答若横跨两条线索，放进主线索一次，必要时另一处用一句 \`> [编者]\` 指路。
 6. 开头加一节 \`## 主线脉络（导读）\`：一段话讲清这次访谈的主线与你的重排逻辑。
@@ -2170,8 +3508,43 @@ ${TYPESET}
 
 
 
+const DEFAULT_STAGE_MODELS = Object.freeze({
+  scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', repair: 'opus',
+  stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus',
+})
+
+const QUALITY_REPAIR_MAX_ROUNDS = 2
+
+// One shared publication contract: body-fidelity and output-quality groups stay separate for diagnostics, while
+// their union drives repair, derivative withholding, exit status, and scorecards. Unknown findings stay review-tier.
+
+function recordTurnContractFailure(A, f, error, phase) {
+  if (!Array.isArray(A.turnContractFailures)) A.turnContractFailures = []
+  const failure = {
+    code: (error && error.code) || 'TURN_CONTRACT_INVALID',
+    retryable: false,
+    message: (error && error.message) || 'turn contract 校验失败',
+    phase,
+    label: (f && f.label) || null,
+    path: (f && f.outPath) || null,
+  }
+  A.turnContractFailures.push(failure)
+  return failure
+}
+
+function retryableAgentFailure(engine, label) {
+  if (!engine || typeof engine.failures !== 'function') return false
+  const failures = engine.failures()
+  if (!Array.isArray(failures)) return false
+  const failure = failures.findLast
+    ? failures.findLast((entry) => entry && entry.label === label)
+    : failures.slice().reverse().find((entry) => entry && entry.label === label)
+  return !!(failure && failure.retryable === true)
+}
+
 // Refine one file. Cost mode (default), or a small file → one agent. Speed mode + a large file (> REFINE_CHUNK_CHARS
-// 字) → up to MAX_REFINE_CHUNKS parallel chunk agents writing <outPath>.part{idx}, merged deterministically
+// 字) → parallel chunk agents writing <outPath>.part{idx}, merged deterministically. Speed mode has its own
+// small cap; provider-budget and explicit-size chunking are intentionally uncapped.
 // when the host injects fs capability, or by a cheap stitch agent in the Workflow sandbox. Returns a
 // REFINE_REPORT-shaped object (path = f.outPath) or null if it
 // could not produce an output. A failed chunk is surfaced via open_questions (and caught downstream by the
@@ -2192,7 +3565,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   if (typeof cap.readFile !== 'function') return { degrade: true }
   if (!capturing && (typeof engine.complete !== 'function' || typeof cap.writeFile !== 'function')) return { degrade: true }
   let sourceText
-  try { sourceText = await cap.readFile(f.path) } catch (e) {
+  try { sourceText = await cap.readFile(f.refinePath || f.path) } catch (e) {
     engine.log(`单请求精校：${f.label} 读源失败（${(e && e.message) || e}）——回退代理式`)
     return { degrade: true }
   }
@@ -2208,7 +3581,7 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
   const glossaryBlock = (glossary && glossary !== SINGLE_FILE_GLOSSARY) ? glossary : ''
   const overrideNote = (A.singleShotOverrideNote && A.singleShotOverrideNote[f.label]) || ''
   const maxTokens = singleShotMaxTokens(chars)
-  const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote)
+  const prompt = singleShotPrompt(f, A, sourceText, glossaryBlock, overrideNote, finding)
   const model = M.refine, effort = effortFor(A, 'refine')   // M12-defaults: user override wins, else cap at 'high'
   // M11b batch-submit seam: when A.captureSingleShot is set, hand the built payload to it INSTEAD of sending —
   // the batch script reuses the whole scout→verify→glossary→single-shot-prompt pipeline to assemble batch
@@ -2230,10 +3603,14 @@ async function refineFileSingleShot(engine, f, glossary, finding, A, M) {
 async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   // M11a: single-shot mode builds ONE request per file (source inlined, response = 成稿). Falls back to agentic
   // when the runtime can't support it (no fs / no complete primitive — e.g. the CC sandbox).
-  if (A.refineMode === 'single-shot') {
+  // A structured turn contract needs a host-side parse + deterministic render after the model write, so the
+  // legacy response-as-final-Markdown single-shot path is intentionally bypassed for contracted files.
+  if (A.refineMode === 'single-shot' && !f.refineContract) {
     const r = await refineFileSingleShot(engine, f, glossary, finding, A, M)
     if (!r || !r.degrade) return r
     engine.log(`单请求精校不可用（运行时无 fs / complete 能力）：${f.label} 回退代理式精校`)
+  } else if (A.refineMode === 'single-shot' && f.refineContract) {
+    engine.log(`单请求精校不承载 turn contract：${f.label} 改走结构化代理式精校`)
   }
   // M12: per-category reasoning effort (smart tier). effortFor = user override ?? per-phase default cap. Passed
   // straight to agent opts; the API engine emits output_config.effort only for allowed models, the CC Workflow
@@ -2248,19 +3625,29 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
   const budget = rb ? rb.budget : undefined
   // A.chunkSize (--chunk-size) is the explicit experiment knob; when set it OVERRIDES both the provider budget and
   // speed-mode's count (splitForRefine handles the precedence). `off` still suppresses all chunking upstream.
-  const chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
-  if (chunks.length <= 1) {
-    // Single agent → full glossary (no token multiplication on one agent).
-    return engine.agent(refinePrompt(f, glossary, finding, A),
-      { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })
+  let chunks = splitForRefine(f, A.chunkMode, budget, A.chunkSize)
+  const cap = (A && A.capabilities) || {}
+  const contractValidator = (chunk, outputPath) => (
+    f.refineContract && typeof cap.validateRefineContractOutput === 'function'
+      ? () => cap.validateRefineContractOutput(f, chunk, outputPath)
+      : undefined
+  )
+  if (f.refineContract && typeof cap.prepareRefineChunks === 'function') {
+    try {
+      chunks = await cap.prepareRefineChunks(f, chunks)
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'prepare_chunks')
+      engine.log(`精校 turn contract 分块准备失败：${f.label}（${(e && e.message) || e}）`)
+      return null
+    }
   }
   // autoChunk trace: record when a non-opt-in driver forced the split — the model budget (faithfulness) OR the
   // explicit --chunk-size knob. Speed mode alone is an opt-in batch lever and is NOT traced. `off` suppresses
   // chunking upstream, so it can never reach here. When --chunk-size drove it, the record gains requestedChunkSize
   // (and still carries model/budget when a budgeted provider is in play). Rides on the returned report → run.json +
   // review.md via artifacts.js.
-  const drivenByChunkSize = typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
-  const drivenByBudget = rb && refineSize(f) > rb.budget
+  const drivenByChunkSize = chunks.length > 1 && typeof A.chunkSize === 'number' && A.chunkSize > 0 && refineSize(f) > A.chunkSize
+  const drivenByBudget = chunks.length > 1 && rb && refineSize(f) > rb.budget
   const autoChunk = (drivenByChunkSize || drivenByBudget)
     ? {
       label: f.label,
@@ -2270,38 +3657,114 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
       ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
     }
     : null
+  const plan = {
+    label: f.label,
+    outPath: f.outPath,
+    model: (rb && rb.model) || M.refine,
+    contentLength: refineSize(f),
+    driver: chunks.length <= 1 ? 'single' : (drivenByChunkSize ? 'chunk_size' : (drivenByBudget ? 'provider_budget' : 'speed')),
+    parts: chunks.map((c) => ({ idx: c.idx, startLine: c.startLine, endLine: c.endLine, path: chunks.length > 1 ? partPath(f.outPath, c.idx) : f.outPath })),
+    ...(rb ? { budget: rb.budget } : {}),
+    ...(drivenByChunkSize ? { requestedChunkSize: A.chunkSize } : {}),
+    ...(autoChunk ? { autoChunk } : {}),
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  const previousPlan = A.plannedChunks.findIndex((x) => x && x.label === plan.label)
+  if (previousPlan >= 0) A.plannedChunks[previousPlan] = plan
+  else A.plannedChunks.push(plan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(plan)
+  if (chunks.length <= 1) {
+    // Single agent → full glossary (no token multiplication on one agent).
+    const prompt = refinePrompt(f, glossary, finding, A, chunks[0])
+    const opts = {
+      label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+      schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath,
+      validateOutput: contractValidator(chunks[0], f.outPath),
+    }
+    let rep = await engine.agent(prompt, opts)
+    if (!rep && retryableAgentFailure(engine, opts.label)) {
+      engine.log(`精校单元：${f.label} 遇到可重试 provider 故障——只重跑该单元一次`)
+      rep = await engine.agent(prompt, { ...opts, label: `refine-retry:${f.label}` })
+    }
+    if (!rep || !f.refineContract) return rep
+    if (typeof cap.finalizeRefineContract !== 'function') {
+      recordTurnContractFailure(A, f, { code: 'TURN_CONTRACT_CAPABILITY_MISSING', message: '宿主缺少 turn contract 收口能力' }, 'finalize')
+      engine.log(`精校 turn contract 缺少宿主收口能力：${f.label}`)
+      return null
+    }
+    try {
+      const finalized = await cap.finalizeRefineContract(f, chunks)
+      engine.log(`精校 turn contract：${f.label} 已校验 ${finalized.turnCount} 个 source turn，并从 ${finalized.outputBlockCount} 个 output block 确定性渲染`)
+      return {
+        ...rep,
+        path: f.outPath,
+        headings: finalized.headings || [],
+        turnContract: finalized.contract,
+      }
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'finalize')
+      engine.log(`精校 turn contract 校验失败：${f.label}（${(e && e.code) || 'TURN_CONTRACT_INVALID'}：${(e && e.message) || e}）`)
+      return null
+    }
+  }
   const chunkReason = drivenByChunkSize ? `（显式分块大小 ${A.chunkSize} 字/块）`
     : (drivenByBudget ? `（自动：约 ${refineSize(f)} 字 超过 ${rb.model} 忠实处理长度 ${rb.budget} 字）` : '')
   engine.log(`精校分块：${f.label}（${f.lines} 行）拆 ${chunks.length} 块并行精校，再拼接${chunkReason}`)
   // Chunk agents get the CONDENSED glossary — it's sent to all K of them, so trimming it is the main
   // lever on chunked-refine token cost; 写法 stay identical (verified canonicals applied the same way).
-  const partReps = await engine.parallel(chunks.map((c) => () =>
-    engine.agent(refinePrompt(f, refineGlossary, finding, A, c),
-      { label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort, schema: REFINE_REPORT_SCHEMA })))
+  const partReps = await engine.parallel(chunks.map((c) => async () => {
+    const prompt = refinePrompt(f, refineGlossary, finding, A, c)
+    const opts = {
+      label: `refine:${f.label}#${c.idx}/${chunks.length}`, phase: 'Refine', model: M.refine, effort: refineEffort,
+      schema: REFINE_REPORT_SCHEMA, outputPath: partPath(f.outPath, c.idx),
+      validateOutput: contractValidator(c, partPath(f.outPath, c.idx)),
+    }
+    let rep = await engine.agent(prompt, opts)
+    if (!rep && retryableAgentFailure(engine, opts.label)) {
+      engine.log(`精校单元：${f.label}#${c.idx}/${chunks.length} 遇到可重试 provider 故障——只重跑该单元一次`)
+      rep = await engine.agent(prompt, { ...opts, label: `refine-retry:${f.label}#${c.idx}/${chunks.length}` })
+    }
+    return rep
+  }))
+  const stillMissing = chunks.filter((c, i) => !partReps[i])
+  if (stillMissing.length) {
+    engine.log(`精校分块：${f.label} 处理后仍缺 ${stillMissing.map((c) => `${c.idx}（源第 ${c.startLine}-${c.endLine} 行）`).join('、')}——拒绝拼接残缺正文`)
+    return null
+  }
   const good = partReps.filter(Boolean)
-  if (!good.length) { engine.log(`精校分块：${f.label} 全部 ${chunks.length} 块失败`); return null }
-  const warn = chunks.filter((c, i) => !partReps[i]).map((c) => `分块精校第 ${c.idx}/${chunks.length} 块（源文件约第 ${c.startLine}–${c.endLine} 行）失败，成稿可能缺这一段——建议对该份重跑精校`)
-  if (warn.length) engine.log(`精校分块：${f.label} ${warn.length}/${chunks.length} 块失败——已并入 openQuestions，审计会进一步标记`)
-  const cap = (A && A.capabilities) || {}
-  if (typeof cap.stitch === 'function') {
+  let stitchReport = null
+  if (f.refineContract && typeof cap.finalizeRefineContract === 'function') {
+    try {
+      stitchReport = await cap.finalizeRefineContract(f, chunks)
+      engine.log(`精校 turn contract：${f.label} 已按 ${stitchReport.turnCount} 个 source turn / ${stitchReport.outputBlockCount} 个 output block 校验并合并 ${chunks.length} 块`)
+    } catch (e) {
+      recordTurnContractFailure(A, f, e, 'merge')
+      engine.log(`精校 turn contract 合并失败：${f.label}（${(e && e.code) || 'TURN_CONTRACT_INVALID'}：${(e && e.message) || e}）`)
+      return null
+    }
+  } else if (typeof cap.stitch === 'function') {
     try {
       const stitched = await cap.stitch(f, chunks)
       if (stitched == null) { engine.log(`精校分块：${f.label} 确定性拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
+      stitchReport = stitched
       engine.log(`精校分块：${f.label} 已确定性拼接 ${chunks.length} 块`)
     } catch (e) {
       engine.log(`精校分块：${f.label} 确定性拼接失败：${(e && e.message) || e}`)
       return null
     }
   } else {
-    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch })
+    const stitched = await engine.agent(stitchPrompt(f, chunks), { label: `stitch:${f.label}`, phase: 'Refine', model: M.stitch, outputPath: f.outPath })
     if (stitched == null) { engine.log(`精校分块：${f.label} 拼接失败——各分块已写入 <成稿>.partN，可手动合并`); return null }
   }
   return {
     path: f.outPath,
-    headings: good.flatMap((r) => r.headings || []),
+    headings: (stitchReport && stitchReport.headings) || good.flatMap((r) => r.headings || []),
     key_fixes: good.flatMap((r) => r.key_fixes || []),
-    open_questions: good.flatMap((r) => r.open_questions || []).concat(warn),
+    open_questions: good.flatMap((r) => r.open_questions || []),
     chunked: chunks.length,
+    ...((stitchReport && stitchReport.contract) ? { turnContract: stitchReport.contract } : {}),
+    ...((stitchReport && stitchReport.seamRepairs && stitchReport.seamRepairs.length) ? { seamRepairs: stitchReport.seamRepairs } : {}),
+    ...((stitchReport && stitchReport.seamDuplicates && stitchReport.seamDuplicates.length) ? { seamDuplicates: stitchReport.seamDuplicates } : {}),
     ...(autoChunk ? { autoChunk } : {}),   // present only when the model budget forced the split (traceability)
   }
 }
@@ -2314,12 +3777,30 @@ async function refineFile(engine, f, glossary, refineGlossary, finding, A, M) {
 async function scoutFile(engine, f, A, M, labelPrefix = 'scout') {
   const chunks = splitForScout(f)
   if (chunks.length === 1) {
-    return engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+    const finding = await engine.agent(scoutPrompt(f, A), { label: `${labelPrefix}:${f.label}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })
+    emitSpeakerScout(A, f, 1, [finding], finding)
+    return finding
   }
   engine.log(`侦察分块：大文件 ${f.label}（约 ${refineSize(f)} 字）拆 ${chunks.length} 段并行侦察，防单代理卡死`)
   const parts = await engine.parallel(chunks.map((c) => () =>
     engine.agent(scoutPrompt(f, A, c), { label: `${labelPrefix}:${f.label}#${c.idx}/${c.count}`, phase: 'Scout', model: M.scout, schema: SCOUT_SCHEMA })))
-  return mergeScoutChunks(parts, f)
+  const merged = mergeScoutChunks(parts, f)
+  emitSpeakerScout(A, f, chunks.length, parts, merged)
+  return merged
+}
+
+// Host-side observability hook for the OFF-BY-DEFAULT speaker dev trace (universal/speaker-trace.js). Only
+// speaker labels/roles travel — never transcript text. A missing or throwing callback can never break Scout.
+function emitSpeakerScout(A, f, chunkCount, parts, merged) {
+  if (!A || typeof A.onSpeakerEvent !== 'function') return
+  const pick = (fd) => ((fd && fd.speakers) || []).map((s) => ({ label: s && s.label, output_label: s && s.output_label, output_label_confidence: s && s.output_label_confidence, role: s && s.role }))
+  try {
+    A.onSpeakerEvent({
+      type: 'scout_chunks', fileLabel: (f && f.label) || null, chunkCount,
+      chunks: (parts || []).map((fd, i) => ({ idx: i + 1, ok: !!fd, speakers: pick(fd) })),
+      merged: { speakers: pick(merged), special_notes: (merged && merged.special_notes) || [] },
+    })
+  } catch { /* 开发记录不可影响流水线 */ }
 }
 
 // Resolve the prior-glossary TEXT (P1 persistent 校对表) from the args. Priority: inline priorGlossaryText >
@@ -2367,14 +3848,125 @@ function normalizeAuditResult(raw, f) {
   return raw
 }
 
+const SPEAKER_VERDICTS = new Set(['invented_speaker', 'not_speaker', 'source_supported_alias', 'uncertain'])
+const SPEAKER_CONFIDENCE = new Set(['high', 'medium', 'low'])
+const SPEAKER_REASONS = new Set(['dialogue_turn_without_source', 'document_metadata', 'heading_or_caption', 'list_quote_or_table', 'source_label_or_alias', 'insufficient_context'])
+
+function outputSpeakerCandidates(report) {
+  const out = []
+  const seen = new Set()
+  for (const item of [...((report && report.unknownLabels) || []), ...((report && report.violations) || [])]) {
+    const line = Number(item && item.line)
+    const label = typeof (item && item.label) === 'string' ? item.label.trim().slice(0, 80) : ''
+    if (!Number.isInteger(line) || line <= 0 || !label) continue
+    const key = `${line}\u0000${label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ line, label })
+  }
+  return out
+}
+
+function normalizeSpeakerCandidateDecisions(raw, candidates) {
+  const rows = Array.isArray(raw && raw.decisions) ? raw.decisions : []
+  return candidates.map((candidate) => {
+    const row = rows.find((item) => (
+      Number(item && item.line) === candidate.line
+      && String((item && item.label) || '').trim() === candidate.label
+    ))
+    const verdict = SPEAKER_VERDICTS.has(row && row.verdict) ? row.verdict : 'uncertain'
+    const confidence = SPEAKER_CONFIDENCE.has(row && row.confidence) ? row.confidence : 'low'
+    const reason = SPEAKER_REASONS.has(row && row.reason) ? row.reason : 'insufficient_context'
+    const outcome = verdict === 'invented_speaker' && confidence === 'high'
+      ? 'block'
+      : verdict === 'not_speaker' && confidence === 'high'
+        ? 'dismiss'
+        : 'review'
+    return { ...candidate, verdict, confidence, reason, outcome }
+  })
+}
+
+async function adjudicateOutputSpeakerCandidates(engine, f, report, M = DEFAULT_STAGE_MODELS) {
+  const candidates = outputSpeakerCandidates(report)
+  if (!candidates.length) return null
+  let raw = null
+  try {
+    raw = await engine.agent(speakerCandidatePrompt(f, candidates), {
+      label: `speaker-adjudicate:${f.label}`,
+      phase: 'Audit',
+      // Reuse the existing high-quality repair route instead of adding a new independently configurable stage.
+      // This is a rare publication decision, not a bulk extraction pass.
+      model: M.repair,
+      schema: SPEAKER_CANDIDATE_SCHEMA,
+      // A classifier must never inherit the normal job-wide write allowlist. It may inspect only this source/output
+      // pair and submit structured data; model/tool failure is review-tier, not permission to mutate the draft.
+      filePolicy: {
+        readRoots: [],
+        writeRoots: [],
+        readPaths: [f.path, f.outPath].filter(Boolean),
+        writePaths: [],
+        writePartBases: [],
+      },
+    })
+  } catch {
+    // Fail open only to the explicit review tier. The final contract below still blocks deterministic
+    // unavailability and a high-confidence invented speaker; classifier failure never masquerades as clearance.
+  }
+  const decisions = normalizeSpeakerCandidateDecisions(raw, candidates)
+  const status = decisions.some((item) => item.outcome === 'block')
+    ? 'blocked'
+    : decisions.some((item) => item.outcome === 'review')
+      ? (raw ? 'review_needed' : 'unavailable')
+      : 'cleared'
+  return { label: f.label, path: f.outPath, status, model: M.repair, decisions }
+}
+
+function reuseSpeakerCandidateAdjudication(previous, f, report) {
+  const candidates = outputSpeakerCandidates(report)
+  const prior = Array.isArray(previous && previous.decisions) ? previous.decisions : []
+  if (!candidates.length || !prior.length) return null
+  const decisions = []
+  for (const candidate of candidates) {
+    const match = prior.find((item) => item.label === candidate.label)
+    if (!match) return null
+    decisions.push({ ...match, ...candidate })
+  }
+  const status = decisions.some((item) => item.outcome === 'block')
+    ? 'blocked'
+    : decisions.some((item) => item.outcome === 'review')
+      ? (previous.status === 'unavailable' ? 'unavailable' : 'review_needed')
+      : 'cleared'
+  return { ...previous, label: f.label, path: f.outPath, status, decisions }
+}
+
+function unavailableSpeakerCandidateAdjudication(f, report, M = DEFAULT_STAGE_MODELS) {
+  const candidates = outputSpeakerCandidates(report)
+  if (!candidates.length) return null
+  return {
+    label: f.label,
+    path: f.outPath,
+    status: 'unavailable',
+    model: M.repair,
+    decisions: normalizeSpeakerCandidateDecisions(null, candidates),
+  }
+}
+
+function speakerAuditLabels(adjudication) {
+  const decisions = Array.isArray(adjudication && adjudication.decisions) ? adjudication.decisions : []
+  return {
+    speakerDismissedLabels: [...new Set(decisions.filter((item) => item.outcome === 'dismiss').map((item) => item.label).filter(Boolean))],
+    speakerReviewLabels: [...new Set(decisions.filter((item) => item.outcome === 'review').map((item) => item.label).filter(Boolean))],
+  }
+}
+
 // Per-file quality gate (Wave 2): the source-aware audit is now IN the pipeline, not a report jobs.js runs
 // afterwards. With fs (Universal) the host injects capabilities.runAudit (direct auditPairs call); in the CC
 // sandbox there is no fs, so a stitch/haiku subagent runs `node <skillDir>/audit_refined.mjs` and echoes the
-// JSON. content_gap(hard) or quote_style(hard) → optionally auto-repair once (capabilities.repair, or a refine
-// subagent with Read/Edit in CC), re-audit ONCE, and if still hard mark the file auditFailed + drop a visible
+// JSON. Any PUBLICATION_BLOCK_GATES finding → optionally auto-repair at most twice through a host-provided
+// transactional repair capability, re-audit after each round, and if still hard mark the file auditFailed + drop a visible
 // 缺口 marker (--annotate). Then run source anchors (capability or the same agent with --anchors). Never throws:
 // an unavailable audit degrades to { status:'unavailable', auditUnavailable:true }.
-async function runAuditStep(A, engine, f, capabilities, glossaryText) {
+async function runAuditStep(A, engine, f, capabilities, glossaryText, options = {}) {
   const src = f.path, out = f.outPath
   const skillDir = A.skillDir || '.'
   const cap = capabilities || {}
@@ -2387,13 +3979,14 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
   const glossaryPath = A.outputDir ? `${A.outputDir}/校对表.md` : null
 
   // 1) obtain an audit file-result ({ status, failed[], gaps[], findings[], modelMarkers[] })
-  async function audit() {
+  async function audit(auditContext = {}) {
+    const speakerContext = speakerAuditLabels(f.speakerCandidateAdjudication)
     if (typeof cap.runAudit === 'function') {
       // Pass the in-memory glossary so the capability doesn't have to read a not-yet-persisted file (risk a).
       // Fail-loud (P7): a thrown direct audit is retried ONCE (parity with the CC agent path's one retry); still
       // throwing → null, which the caller turns into a LOUD run failure instead of a quiet "audit unavailable".
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary }), f) }
+        try { return normalizeAuditResult(await cap.runAudit(f, { glossaryText: memGlossary, ...speakerContext, ...auditContext }), f) }
         catch { if (attempt >= 1) return null }
       }
       return null
@@ -2407,7 +4000,13 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       glossaryArg = ` --glossary ${JSON.stringify(scratch)}`
       stagePreamble = `先用 Write 把下面这段“校对表全文”一字不改写到临时文件 ${JSON.stringify(scratch)}，再运行审计命令。\n<校对表全文>\n${memGlossary}\n</校对表全文>\n\n`
     }
-    const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}`
+    const dismissedArg = speakerContext.speakerDismissedLabels.length
+      ? ` --speaker-dismissed-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerDismissedLabels))}`
+      : ''
+    const reviewArg = speakerContext.speakerReviewLabels.length
+      ? ` --speaker-review-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerReviewLabels))}`
+      : ''
+    const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}${dismissedArg}${reviewArg}`
     const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON **原样**返回（不要任何解释、不要加代码围栏、不要改动）：\n${cmd}`
     let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku' })
     let parsed = parseAuditJson(raw)
@@ -2418,44 +4017,95 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
     return normalizeAuditResult(parsed, f)
   }
 
-  const first = await audit()
+  const first = await audit({ phase: options.phase || 'pre_audit' })
   // Fail-loud (P7): the audit could not run after one retry. Previously this "degraded to record-only, non-blocking"
   // and the run reported success with an "audit unavailable" note — a quality gate that can be skipped silently.
   // Now the per-file result still carries auditUnavailable (the 成稿 is kept, not destroyed), but the orchestration
   // collects it into a top-level auditUnavailable list that marks the whole run FAILED (unaudited ≠ passed).
-  if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit } }
+  if (!first) { engine.log(`⚠ 审计无法运行（重试后仍失败）：${f.label}——该成稿未经审计，本次运行判定为失败（deliverables unaudited/invalid，请人工跑 audit_refined.mjs 核验）`); return { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, repairAttempts: [], anchorsAdded: 0, directAudit } }
 
-  const hardOf = (r) => (r.failed || []).filter((k) => k === 'content_gap' || k === 'quote_style')
-  const softOf = (r) => (r.failed || []).filter((k) => k !== 'content_gap' && k !== 'quote_style')
+  const hardOf = (r) => (r.failed || []).filter((k) => PUBLICATION_BLOCK_GATES.includes(k))
+  const softOf = (r) => (r.failed || []).filter((k) => !PUBLICATION_BLOCK_GATES.includes(k))
+  const issueCounts = (r, hard) => {
+    const counts = {}
+    for (const finding of (r.findings || [])) {
+      if (!finding || finding.severity !== 'hard') continue
+      const count = Number(finding.count)
+      if (finding.name && Number.isFinite(count) && count > 0) counts[finding.name] = count
+    }
+    const hardGaps = (r.gaps || []).filter((g) => g && g.severity === 'hard').length
+    if (hardGaps) counts.content_gap = Math.max(counts.content_gap || 0, hardGaps)
+    const longParagraphs = Array.isArray(r.long_paragraphs) ? r.long_paragraphs.length : 0
+    if (longParagraphs) counts.long_paragraphs = Math.max(counts.long_paragraphs || 0, longParagraphs)
+    for (const name of hard) if (!counts[name]) counts[name] = 1
+    return counts
+  }
   let cur = first
   let hard = hardOf(cur)
   let repaired = false
+  const repairAttempts = []
+  // A runtime without fs cannot stage, audit and atomically promote a candidate. Do not let a fallback model
+  // overwrite the current transcript in place; keep the hard finding for explicit/manual repair instead.
+  const repairAvailable = options.allowRepair !== false && typeof cap.repair === 'function'
 
-  if (hard.length) {
-    engine.log(`审计 hard：${f.label} → ${hard.join('、')}——尝试自动修复一次`)
+  if (hard.length && repairAvailable) engine.log(`审计 hard：${f.label} → ${hard.join('、')}——最多候选修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮，每轮后复检`)
+  for (let round = 1; hard.length && repairAvailable && round <= QUALITY_REPAIR_MAX_ROUNDS; round += 1) {
+    const failedBefore = hard.slice()
+    const hardIssueCountsBefore = issueCounts(cur, failedBefore)
     const gaps = (cur.gaps || []).filter((g) => g.severity === 'hard')
-    const gapLines = gaps.map((g) => `源第 ${g.startLine}-${g.endLine} 行（约 ${g.chars} 字）`).join('；') || '（见审计 gaps）'
-    let didRepair = false
-    if (typeof cap.repair === 'function') {
-      try { await cap.repair(f, { gaps, hard }); didRepair = true } catch { didRepair = false }
-    } else if (typeof cap.runAudit !== 'function') {
-      // CC path: a refine-tier subagent with Read/Edit patches ONLY the flagged spots in the on-disk 成稿.
-      const parts = []
-      if (hard.includes('content_gap')) parts.push(`· 内容缺口：把源文件这些行区间的实质内容按精校规范补进成稿的对应位置：${gapLines}。`)
-      if (hard.includes('quote_style')) parts.push('· 直引号：把正文里紧贴中文的 ASCII 直引号（以及任何「」『』）改成全角弯引号 “”（内层 ‘’）。')
-      await engine.agent(
-        `用 Read 打开成稿 ${out}（必要时也 Read 源文件 ${src} 对照），只修下面点名的位置、用 Edit 直接改 ${out}，**不得改动其它任何内容、不得重写全文**：\n${parts.join('\n')}\n改完用一句话回复即可。`,
-        { label: `repair:${f.label}`, phase: 'Audit', model: 'refine' })
-      didRepair = true
+    let repairMeta = {}
+    let repairError = null
+    try { repairMeta = (await cap.repair(f, { gaps, hard: failedBefore, audit: cur, round, maxRounds: QUALITY_REPAIR_MAX_ROUNDS, glossaryText: memGlossary })) || {} }
+    catch (error) { repairError = (error && error.code) || 'REPAIR_AGENT_FAILED' }
+
+    const again = await audit({ phase: `post_repair_round_${round}`, round })
+    if (!again) {
+      repairAttempts.push({
+        file: out, round, action: repairMeta.action || null, model: repairMeta.model || null,
+        failedBefore, hardIssueCountsBefore, toolSummary: repairMeta.toolSummary || { succeeded: {}, failed: [] },
+        bytesBefore: repairMeta.bytesBefore ?? null, bytesAfter: repairMeta.bytesAfter ?? null,
+        changed: repairMeta.changed === true, agentCompleted: repairMeta.agentCompleted ?? null,
+        candidatePromoted: repairMeta.candidatePromoted ?? null,
+        candidateSpeakerValid: repairMeta.candidateSpeakerValid ?? null,
+        candidateRejectedReason: repairMeta.candidateRejectedReason || null,
+        candidateHardFindings: repairMeta.candidateHardFindings || [],
+        failedAfter: failedBefore, hardIssueCountsAfter: hardIssueCountsBefore,
+        outcome: 'audit_unavailable', errorCode: repairError,
+      })
+      engine.log(`审计复检：${f.label} 第 ${round}/${QUALITY_REPAIR_MAX_ROUNDS} 轮后无法运行——停止自动修复，保留原 hard 结论`)
+      break
     }
-    if (didRepair) {
-      const again = await audit()
-      if (again) { cur = again; repaired = true; hard = hardOf(cur); engine.log(`审计复检：${f.label} → ${hard.length ? 'hard 仍在：' + hard.join('、') : '已通过'}`) }
-    }
+
+    cur = again
+    hard = hardOf(cur)
+    const hardIssueCountsAfter = issueCounts(cur, hard)
+    const toolFailures = ((repairMeta.toolSummary || {}).failed || []).reduce((sum, x) => sum + (Number(x.count) || 0), 0)
+    const changed = repairMeta.changed === true
+    const improved = hard.length < failedBefore.length || hard.some((name) => !failedBefore.includes(name)) || failedBefore.some((name) => !hard.includes(name))
+    if (changed || improved || (!hard.length && repairMeta.changed == null)) repaired = true
+    let outcome
+    if (repairError || repairMeta.agentCompleted === false) outcome = 'agent_failed'
+    else if (repairMeta.candidatePromoted === false && repairMeta.candidateRejectedReason) outcome = 'candidate_rejected'
+    else if (!changed && repairMeta.changed != null) outcome = 'no_change'
+    else if (!hard.length) outcome = toolFailures ? 'passed_with_tool_errors' : 'passed'
+    else outcome = toolFailures ? 'audit_failed_with_tool_errors' : 'audit_failed'
+    repairAttempts.push({
+      file: out, round, action: repairMeta.action || null, model: repairMeta.model || null,
+      failedBefore, hardIssueCountsBefore, toolSummary: repairMeta.toolSummary || { succeeded: {}, failed: [] },
+      bytesBefore: repairMeta.bytesBefore ?? null, bytesAfter: repairMeta.bytesAfter ?? null,
+      changed, agentCompleted: repairMeta.agentCompleted ?? null,
+      candidatePromoted: repairMeta.candidatePromoted ?? null,
+      candidateSpeakerValid: repairMeta.candidateSpeakerValid ?? null,
+      candidateRejectedReason: repairMeta.candidateRejectedReason || null,
+      candidateHardFindings: repairMeta.candidateHardFindings || [],
+      failedAfter: hard.slice(), hardIssueCountsAfter, outcome,
+      errorCode: repairError || repairMeta.errorCode || null,
+    })
+    engine.log(`审计复检：${f.label} 第 ${round}/${QUALITY_REPAIR_MAX_ROUNDS} 轮 → ${hard.length ? `hard 仍在：${hard.join('、')}` : '已通过'}${toolFailures ? `；本轮工具失败 ${toolFailures} 次（已保留记录）` : ''}`)
   }
 
   const auditFailed = hard.length ? hard.slice() : []
-  // Still hard after (at most one) repair → drop a visible 内容缺口/引号 marker so the document shows the defect.
+// Still hard after at most two repairs → annotate any concrete source gaps so the document shows the defect.
   // Risk (b): fall back to the agent whenever the annotate CAPABILITY specifically is missing — not only in the
   // all-agent CC path. A host that injects runAudit but not annotate still gets the marker via the agent.
   if (auditFailed.length && (cur.gaps || []).some((g) => g.severity === 'hard')) {
@@ -2479,7 +4129,7 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText) {
       { label: `anchors:${f.label}`, phase: 'Audit', model: 'haiku' })
   }
 
-  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, anchorsAdded, directAudit }
+  return { status: auditFailed.length ? 'fail' : 'ok', auditFailed, failedFindings: (cur.failed || []).filter(Boolean), hardFindings: hard, softFindings: softOf(cur), repaired, repairAttempts, anchorsAdded, directAudit }
 }
 
 const DEDUP_SKIP_UNKNOWN_RATIO = 0.10
@@ -2495,12 +4145,12 @@ function dedupCoverage(prior, merged) {
 
 async function runPipeline(A, engine) {
 const M = Object.assign(
-  { scout: 'haiku', verify: 'sonnet', dedup: 'sonnet', refine: 'opus', stitch: 'haiku', logic: 'opus', summary: 'opus', timeline: 'opus' },
+  {}, DEFAULT_STAGE_MODELS,
   A.models || {}
 )
 const scope = A.scope || ['refine']
 const capabilities = A.capabilities || null
-const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, auditFailed: [], auditUnavailable: [] })
+const EMPTY_RETURN = (error) => ({ error, glossary: '', refined: [], failed: [], incomplete: [], unchecked: [], headingConflicts: [], scoutSuspect: [], scoutFailed: [], suspectedDuplicates: [], networkUnverified: [], logic: [], openQuestions: [], summary: null, timeline: null, transcriptMetadata: null, speakerIdentityFinalizations: [], auditFailed: [], auditUnavailable: [], qualityRepairAttempts: [] })
 if (!Array.isArray(A.files) || A.files.length === 0) {
   return EMPTY_RETURN('args.files 为空——需在 Step 0 预检后组装 files 再派发')
 }
@@ -2533,15 +4183,29 @@ let headingConflicts = []
 let scoutSuspect = []
 let scoutFailed = []   // files whose scout returned nothing (stalled) — refined anyway (glossary degraded), surfaced for re-scout
 let dedup = null
-let auditFailed = []    // §2: per-file hard audit findings (content_gap/quote_style) still failing after one repair
-let incomplete = []     // Derived from direct deterministic audit ending_missing failures.
+let auditFailed = []    // per-file publication-gate findings still failing after at most two targeted repair rounds
+let incomplete = []     // Legacy return-contract field; source-aware hard failures live in auditFailed.
 let unchecked = []      // Refined files lacking a direct audit capability, or whose audit errored.
 let auditUnavailable = []  // P7 fail-loud: files whose audit could NOT run after one retry — the run is marked failed (unaudited, not passed).
+let derivativesSkipped = [] // requested derivatives withheld because their source body was not final/audited
 let overrideQuestions = []   // SF-2 + risk(c): decree conflicts (one cluster claimed by ≥2 decrees) and cross-category mis-declared-category warnings → openQuestions
 let refinedPairs = []   // [{ f, rep }]: successfully refined files and their reports (including headings); used by the logic-reorder phase to read f.title/outPath and verify section-heading coverage
+let speakerResolutions = []  // one deterministic Scout mapping per file; Refine reads its materialized input copy
+let speakerOutputNormalizations = [] // same mapping re-applied to model output aliases; no identity inference
+let speakerStructuralFailures = [] // output violated the source's tracked/untracked speaker contract; never deliver that draft
+let speakerStructureWarnings = [] // parser/Scout disagreement or unresolved label shape; visible review, never silent untracked
+let speakerCandidateAdjudications = [] // LLM verdicts for residual output candidates; only high-confidence invention blocks
+let speakerIdentityFinalizations = [] // post-refine track registry decisions + deterministic render ledger
+let transcriptMetadata = null // single-file catalog metadata produced by the same final identity pass
+let qualityRepairAttempts = [] // append-only across all files, including drafts later removed by the final contract
 
-if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot) {
-  // Single short file: one-pass refine (mirrors the fast path in SKILL.md), skip Scout/Verify.
+// Disabled: every transcript must pass through the full-text Scout before Refine, including a single short file.
+// Keep the former branch in place temporarily for an easy diff/review, but make it unreachable.
+const useShortFileFastPath = false
+// Former condition:
+// A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captureSingleShot && !A.files[0].needsSpeakerResolution
+if (useShortFileFastPath) {
+  // Legacy single-short-file path: one-pass refine, skipping Scout/Verify.
   // (M11b: a batch-submit capture pass forces the else-branch so even a tiny lone file is captured as a
   // single-shot batch request via refineFileSingleShot, not sent through the one-pass Write-tool agent.)
   // Length judged by 正文字数, not lines. NOTE (M11a): refineMode:'single-shot' does NOT change this branch —
@@ -2576,7 +4240,14 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     onePassGlossaryText = ['## 人名 / 品牌（用户钦定）', ...lockedAll.map((e) =>
       `- **${e.canonical}** ← ${(e.variants || []).join(' / ') || '—'} ｜ 用户钦定`)].join('\n')
   }
-  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA })
+  const onePassPlan = {
+    label: f.label, outPath: f.outPath, model: M.refine, contentLength: refineSize(f), driver: 'single',
+    parts: [{ idx: 1, startLine: 1, endLine: f.lines, path: f.outPath }],
+  }
+  if (!Array.isArray(A.plannedChunks)) A.plannedChunks = []
+  A.plannedChunks.push(onePassPlan)
+  if (typeof A.onChunkPlan === 'function') A.onChunkPlan(onePassPlan)
+  const rep = await engine.agent(singlePassPrompt(f, A, overrideNote), { label: `refine:${f.label}`, phase: 'Refine', model: M.refine, effort: effortFor(A, 'refine'), schema: REFINE_REPORT_SCHEMA, outputPath: f.outPath })
   if (rep) {
     refined = [Object.assign({}, rep, { outPath: f.outPath, complete: null, checkNote: '审计待跑' })]
     refinedPairs = [{ f, rep, anchor: null, onePassGlossaryText }]
@@ -2609,6 +4280,35 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
   const mergedThisBatch = applyOverridesToMerged(mergeFindings(cleanFindings, A.files), A.canonicalOverrides)
   const lockedCount = [...(mergedThisBatch.people || []), ...(mergedThisBatch.brands || []), ...(mergedThisBatch.terms || [])].filter((e) => e && e.locked).length
   if (lockedCount) engine.log(`用户钦定正名：${lockedCount} 条已锁定（强制 canonical、跳联网核实、渲染带〔用户钦定〕）`)
+  // 飞书 ASR 同事名偏置：与内部通讯录同名的人名标 suspect_asr（强制联网核实）。放在 overrides 之后——
+  // locked（用户钦定）条目不受名单影响（decree 是明确人工指令）。名单只在代码里比对，内容不进任何 prompt
+  // （hint 只描述失误模式，不断言名单成员身份，见 spec.js 该节注释）。
+  let dirReopenWritings = []
+  if (Array.isArray(A.internalDirectory) && A.internalDirectory.length) {
+    if (A.verifyDepth === 'none') engine.log('⚠ 已传内部通讯录但 verify=none：命中名单的人名只能标记存疑、写进 openQuestions，无法联网核实——建议至少用 --verify key')
+    // 侦察漏网补扫：名单名字出现在源文本、却没进侦察 people 清单时，代码级逐字扫描把它找回来注入
+    // （侦察分块失败/漏抽/只当成说话人标签都会漏）。宿主没有 readFile 能力（CC sandbox）时跳过——侦察结果仍然覆盖。
+    const cap = A.capabilities || {}
+    if (typeof cap.readFile === 'function') {
+      const existingForms = mergedThisBatch.people.flatMap((e) => [e.canonical, ...(e.variants || [])])
+      for (const f of A.files) {
+        let text = null
+        try { text = await cap.readFile(f.refinePath || f.path) } catch { /* 单文件读失败不致命——该文件只失去补扫 */ }
+        if (!text) continue
+        for (const name of scanTextForDirectoryNames(text, A.internalDirectory, existingForms)) {
+          existingForms.push(name)
+          mergedThisBatch.people.push({ canonical: name, variants: [], hint: '', files: [f.label], public_figure: false, suspect_asr: false, category: '', crossFile: false })
+        }
+      }
+    }
+    const dirMatched = applyInternalDirectorySuspicion(mergedThisBatch, A.internalDirectory)
+    if (dirMatched.length) {
+      engine.log(`内部通讯录同名预警：${dirMatched.map((m) => m.canonical).join('、')}——已标⚠强制联网核实（飞书 ASR 常把听不清的名字写成上传方同事名）`)
+      // 撬开核实缓存：往批已〔核实〕的条目会被 excludeVerified 跳过，但名单命中者必须每批重核——
+      // 上一批核实时可能还没传名单，且这类名字被 ASR 吸附的先验概率高，宁可多核。
+      dirReopenWritings = dirMatched.flatMap((m) => m.writings)
+    }
+  }
   // SF-2: a single cluster claimed by ≥2 competing decrees was merged into one locked cluster (canonical = first
   // decree) — surface the disagreement. Risk(c): a decree that hit nothing in its declared category but whose
   // writing appears in another category's cluster — likely a mis-declared category. Both go into openQuestions.
@@ -2634,7 +4334,7 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
     const reopen = contradictionReopen(prior, mergedThisBatch)   // M9a: scout-evidence contradiction (no model call)
     const rot = rotateReverify(prior, ROTATE_REVERIFY)           // M9b: oldest-N age rotation
     reopenNotes = reopen.notes
-    forceReopen = Array.from(new Set([...reopen.writings, ...rot.writings]))
+    forceReopen = Array.from(new Set([...reopen.writings, ...rot.writings, ...dirReopenWritings]))
     if (reopen.notes.length) engine.log(`往批核实复核（M9a）：${reopen.notes.length} 项旧核实结论遇新写法证据，已重新入队核实`)
     if (rot.count) engine.log(`轮换复核：${rot.count} 项旧核实结论重新入队（最早 ${rot.oldest || '无日期（视为最旧）'}）`)
   }
@@ -2699,33 +4399,138 @@ if (A.files.length === 1 && refineSize(A.files[0]) < ONE_PASS_CHARS && !A.captur
 
   let positional = []
   if (scope.includes('refine')) {
+    // Speaker identity is a whole-file decision owned by Scout, not by independent Refine chunks. Universal
+    // materializes that mapping into a disposable, line-for-line input copy here. The original path stays on f
+    // for source-aware audit; only Refine switches to refinePath. Runtimes without fs capability keep the prior
+    // prompt-only behaviour.
+    if (capabilities && typeof capabilities.prepareSpeakerInput === 'function') {
+      const prepared = await engine.parallel(A.files.map((f, i) => async () => {
+        const finding = cleanFindings[i] || {}
+        try { return await capabilities.prepareSpeakerInput(f, finding) } catch (e) {
+          if (capabilities.requireTurnContract) return { turnContractFailure: e }
+          engine.log(`发言人统一输入生成失败：${f.label}（${(e && e.message) || e}）——保留原稿进入 Refine`)
+          return null
+        }
+      }))
+      prepared.forEach((resolution, i) => {
+        if (!resolution) return
+        const f = A.files[i]
+        if (resolution.turnContractFailure) {
+          f.refinePreparationFailed = true
+          const failure = recordTurnContractFailure(A, f, resolution.turnContractFailure, 'prepare')
+          engine.log(`精校 turn contract 输入生成失败：${f.label}（${failure.code}：${failure.message}）`)
+          return
+        }
+        f.refinePath = resolution.refinePath || resolution.path || f.path
+        f.refineSourcePath = resolution.path || f.path
+        f.refineContract = resolution.refineContract || null
+        if (Array.isArray(resolution.turns) && resolution.turns.length) f.turns = resolution.turns
+        f.speakerResolution = {
+          speakerMode: resolution.speakerMode || f.speakerMode || (resolution.labelLines ? 'tracked' : 'untracked'),
+          mappings: resolution.mappings || [],
+          unresolved: resolution.unresolved || [],
+          changedLines: resolution.changedLines || 0,
+          labelLines: resolution.labelLines || 0,
+          structureWarnings: resolution.structureWarnings || [],
+          recoveredByScout: resolution.recoveredByScout || [],
+        }
+        f.speakerMode = f.speakerResolution.speakerMode
+        if (f.speakerResolution.structureWarnings.length) {
+          speakerStructureWarnings.push({
+            label: f.label,
+            path: f.outPath,
+            speakerMode: f.speakerResolution.speakerMode,
+            warnings: f.speakerResolution.structureWarnings,
+          })
+          engine.log(`发言人结构待复核：${f.label} 有 ${f.speakerResolution.structureWarnings.length} 类解析/侦察不一致——本次质量状态将标记待复核`)
+        }
+        const renamed = f.speakerResolution.mappings.filter((m) => m.sourceLabel !== m.outputLabel)
+        if (renamed.length) engine.log(`发言人统一：${f.label} 已在 Refine 输入中一次性应用 ${renamed.map((m) => `${m.sourceLabel}→${m.outputLabel}`).join('、')}`)
+        if (f.speakerResolution.unresolved.length) engine.log(`发言人仍未识别：${f.label} 的 ${f.speakerResolution.unresolved.join('、')}（未猜名，保留源标签）`)
+      })
+    }
     engine.phase('Refine')
     engine.log(`▶ 3/${scope.includes('logic') ? 5 : 4} 精校 Refine：${A.files.length} 份逐份精校${A.chunkMode === 'speed' ? '（大文件分块并行）' : ''}`)
     // Refine runs even when scout failed for a file (findings[i] null): refine reads the source directly and
     // the glossary is only an aid, so a stalled cheap scout degrades the glossary but
     // never blocks the expensive pass. No barrier between files (pipeline).
     positional = await engine.pipeline(A.files,
-      (f, _f, i) => refineFile(engine, f, glossary, refineGlossary, findings[i] || {}, A, M))
+      (f, _f, i) => f.refinePreparationFailed
+        ? Promise.resolve(null)
+        : refineFile(engine, f, glossary, refineGlossary, cleanFindings[i] || {}, A, M))
   }
   scoutFailed = A.files.filter((f, i) => scope.includes('refine') && positional[i] && !findings[i]).map((f) => f.label)
   if (scoutFailed.length) engine.log(`侦察未返回、已照常精校（校对表缺这几份实体，网络稳定后可重扫）：${scoutFailed.join('、')}`)
   failed = A.files.filter((f, i) => scope.includes('refine') && !positional[i]).map((f) => f.label)
-  refined = positional.map((rep, i) => rep && Object.assign({}, rep, { outPath: A.files[i].outPath, complete: null, checkNote: '审计待跑' })).filter(Boolean)
-  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: findings[i] && findings[i].ending_anchor })).filter((p) => p.rep)
+  refined = positional.map((rep, i) => rep && Object.assign({}, rep, {
+    outPath: A.files[i].outPath,
+    complete: null,
+    checkNote: '审计待跑',
+    ...(A.files[i].speakerResolution ? { speakerResolution: A.files[i].speakerResolution } : {}),
+  })).filter(Boolean)
+  refinedPairs = A.files.map((f, i) => ({ f, rep: positional[i], anchor: cleanFindings[i] && cleanFindings[i].ending_anchor })).filter((p) => p.rep)
   if (failed.length) engine.log(`未完成：${failed.join('、')}（主代理需按 SKILL.md Step 1–2 手动补做）`)
 }
 
+// One output contract for BOTH the one-pass and standard branches. Tracked sources may use only the canonical
+// mapping; untracked sources must remain untracked. Known aliases are rewritten deterministically. Unknown labels
+// are left visible for the final fail-closed check below — never guessed or stripped.
+if (scope.includes('refine') && refinedPairs.length && capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
+  const normalized = await engine.parallel(refinedPairs.map(({ f, rep }) => async () => {
+    if (!rep || rep.captured) return null
+    try { return await capabilities.enforceSpeakerOutput(f, 'post_refine') } catch (e) {
+      engine.log(`发言人输出收口失败：${f.label}（${(e && e.message) || e}）——最终结构契约将拒绝该草稿`)
+      return { contractUnavailable: true, unknownLabels: [], violations: [] }
+    }
+  }))
+  normalized.forEach((report, i) => {
+    if (!report) return
+    const { f, rep } = refinedPairs[i]
+    f.speakerOutputReport = report
+    const entry = {
+      label: f.label,
+      path: f.outPath,
+      changedLines: report.changedLines || 0,
+      replacements: report.replacements || [],
+      unknownLabels: report.unknownLabels || [],
+      valid: report.valid !== false && !report.contractUnavailable,
+      violations: report.violations || [],
+    }
+    speakerOutputNormalizations.push(entry)
+    if (entry.changedLines) engine.log(`发言人输出收口：${entry.label} 按全文统一映射修正 ${entry.changedLines} 个标签别名`)
+    if (entry.unknownLabels.length) {
+      const labels = [...new Set(entry.unknownLabels.map((x) => x.label))]
+      engine.log(`发言人输出出现映射外候选：${entry.label} 的 ${labels.join('、')}——未自动猜改，将在最终结构契约中按需调用模型裁决`)
+    }
+  })
+}
+speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
+  label: f.label,
+  path: f.refineSourcePath || f.path,
+  ...f.speakerResolution,
+}))
+
 // §2 Audit gate (in-pipeline): each refined file goes through the source-aware audit AFTER refine/stitch and
-// BEFORE logic/summary/timeline. A hard content_gap or quote_style triggers one auto-repair +
-// one re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
+// BEFORE logic/summary/timeline. Any publication gate triggers at most two targeted auto-repair rounds,
+// each followed by a re-audit; still-hard files are recorded in auditFailed (and get a visible 缺口 marker via --annotate).
 // Anchors run on the (possibly repaired) 成稿. With fs the host injects capabilities.runAudit/annotateAnchors/
 // repair; without (CC sandbox) a subagent runs audit_refined.mjs. Skipped for a scope with no refine output.
 // M11b: on a batch-submit capture pass (A.captureSingleShot), no 成稿 is on disk yet (files are written on
 // resume), so every captured rep is excluded from the audit gate here — resume runs the full audit after fetch.
 const pairsToAudit = refinedPairs.filter((p) => !(p.rep && p.rep.captured))
 if (scope.includes('refine') && pairsToAudit.length) {
+  // Adjudicate residual shape candidates before the source-aware audit. Attribution uses the same parser, so
+  // waiting until the final contract would let an uncertain label become a hard attribution mismatch first.
+  const initialAdjudications = await engine.parallel(pairsToAudit.map(({ f }) => () => (
+    adjudicateOutputSpeakerCandidates(engine, f, f.speakerOutputReport, M)
+  )))
+  pairsToAudit.forEach(({ f }, index) => {
+    f.speakerCandidateAdjudication = initialAdjudications[index]
+      || unavailableSpeakerCandidateAdjudication(f, f.speakerOutputReport, M)
+  })
+
   engine.phase('Audit')
-  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（content_gap / 引号 hard → 自动修复一次 → 复检；仍 hard 记入 auditFailed）`)
+  engine.log(`▶ 审计门禁 Audit：${pairsToAudit.length} 份逐份源比对（正文忠实性 + 交付质量；有事务能力时最多候选修复 ${QUALITY_REPAIR_MAX_ROUNDS} 轮并逐轮复检；仍未过记入 auditFailed）`)
   // §1 one-pass branch: onePassGlossaryText (the minimal 用户钦定 rows) stands in for the outer `glossary`
   // (which is just the SINGLE_FILE_GLOSSARY placeholder there, and must NOT be handed to the audit — see
   // risk (a) test). Every multi-file pair lacks this key, so `glossary` (the real rendered 校对表) still flows
@@ -2734,47 +4539,238 @@ if (scope.includes('refine') && pairsToAudit.length) {
   const hasDirectAudit = !!(capabilities && typeof capabilities.runAudit === 'function')
   pairsToAudit.forEach(({ f }, k) => {
     const a = results[k] || { status: 'unavailable', auditUnavailable: true, failedFindings: [], hardFindings: [], softFindings: [], repaired: false, anchorsAdded: 0, directAudit: hasDirectAudit }
-    const endingMissing = (a.failedFindings || []).includes('ending_missing') || (a.softFindings || []).includes('ending_missing')
+    qualityRepairAttempts.push(...(a.repairAttempts || []))
     const r = refined.find((x) => (x.outPath || x.path) === f.outPath)
     if (r) {
-      r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
+      r.audit = { status: a.status, hardFindings: a.hardFindings || [], softFindings: a.softFindings || [], repaired: !!a.repaired, repairAttempts: a.repairAttempts || [], anchorsAdded: a.anchorsAdded || 0, auditUnavailable: !!a.auditUnavailable }
       if (a.directAudit && !a.auditUnavailable) {
-        r.complete = !endingMissing
-        r.checkNote = endingMissing ? 'deterministic audit: ending_missing' : ''
+        r.complete = null
+        r.checkNote = ''
       } else {
         r.complete = null
         r.checkNote = a.auditUnavailable ? 'audit unavailable' : 'no direct audit capability'
       }
     }
-    if (a.directAudit && !a.auditUnavailable && endingMissing) incomplete.push({ path: f.outPath, note: 'deterministic audit: ending_missing' })
     if (!a.directAudit || a.auditUnavailable) unchecked.push(f.outPath)
     // P7: an audit that could NOT run (after one retry) fails the run loudly — distinct from the normal
     // "no direct audit capability" CC case (where the agent audit DID run). Only auditUnavailable qualifies.
     if (a.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
     if ((a.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: a.auditFailed })
+    const seamDuplicates = (r && r.seamDuplicates) || []
+    if (seamDuplicates.length) {
+      if (r && r.audit) {
+        r.audit.status = 'fail'
+        r.audit.hardFindings = [...new Set([...(r.audit.hardFindings || []), 'seam_duplicate'])]
+      }
+      const existing = auditFailed.find((x) => x.path === f.outPath)
+      if (existing) existing.findings = [...new Set([...(existing.findings || []), 'seam_duplicate'])]
+      else auditFailed.push({ path: f.outPath, findings: ['seam_duplicate'] })
+    }
   })
-  if (auditFailed.length) engine.log(`审计未过（自动修复后仍 hard）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
+  if (auditFailed.length) engine.log(`审计未过（候选修复后仍 hard，或当前运行时无安全自动修复能力）：${auditFailed.map((x) => `${x.path}（${x.findings.join('/')}）`).join('；')}`)
   if (auditUnavailable.length) engine.log(`⚠ 审计无法运行 ${auditUnavailable.length} 份——本次运行判定为失败，产物未经审计：${auditUnavailable.map((x) => x.label).join('、')}`)
 }
+
+// Repairs are model writes too. Run the structural contract once more after the final audit/repair round and
+// fail closed. The draft remains on disk for server-side diagnosis, but it is removed from `refined`, so the
+// artifact manifest cannot advertise it as a deliverable main transcript.
+if (scope.includes('refine') && pairsToAudit.length && capabilities && typeof capabilities.enforceSpeakerOutput === 'function') {
+  const finalContracts = await engine.parallel(pairsToAudit.map(({ f }) => async () => {
+    try { return await capabilities.enforceSpeakerOutput(f, 'final_contract') } catch (e) {
+      engine.log(`发言人最终结构契约无法运行：${f.label}（${(e && e.message) || e}）`)
+      return { contractUnavailable: true, valid: false, unknownLabels: [], violations: [] }
+    }
+  }))
+  const adjudications = await engine.parallel(finalContracts.map((report, index) => async () => {
+    if (!report || report.contractUnavailable || !outputSpeakerCandidates(report).length) return Promise.resolve(null)
+    const f = pairsToAudit[index].f
+    return reuseSpeakerCandidateAdjudication(f.speakerCandidateAdjudication, f, report)
+      || adjudicateOutputSpeakerCandidates(engine, f, report, M)
+  }))
+  const rejectedPaths = new Set()
+  finalContracts.forEach((report, index) => {
+    const { f } = pairsToAudit[index]
+    const adjudication = adjudications[index] || unavailableSpeakerCandidateAdjudication(f, report, M)
+    f.speakerCandidateAdjudication = adjudication || null
+    if (adjudication) speakerCandidateAdjudications.push(adjudication)
+    const decisions = (adjudication && adjudication.decisions) || []
+    const blockedCandidates = decisions.filter((item) => item.outcome === 'block')
+    const reviewCandidates = decisions.filter((item) => item.outcome === 'review')
+    const rawCandidates = outputSpeakerCandidates(report)
+    const invalid = !report
+      || report.contractUnavailable
+      || blockedCandidates.length > 0
+      || (report.valid === false && rawCandidates.length === 0)
+    if (reviewCandidates.length) {
+      const labels = [...new Set(reviewCandidates.map((item) => item.label))]
+      const lines = [...new Set(reviewCandidates.map((item) => item.line))]
+      speakerStructureWarnings.push({
+        label: f.label,
+        path: f.outPath,
+        speakerMode: (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || null,
+        warnings: [{
+          kind: adjudication && adjudication.status === 'unavailable'
+            ? 'speaker_candidate_adjudication_unavailable'
+            : 'output_speaker_candidate_unresolved',
+          count: reviewCandidates.length,
+          lines,
+          labels,
+        }],
+      })
+      const question = `成稿有 ${reviewCandidates.length} 处疑似映射外说话人候选，模型未能高置信确认是否为新增说话人：${reviewCandidates.map((item) => `第 ${item.line} 行“${item.label}”`).join('、')}。请人工复核。`
+      const pair = refinedPairs.find((item) => item.f.outPath === f.outPath)
+      if (pair && pair.rep) pair.rep.open_questions = [...(pair.rep.open_questions || []), question]
+      const refinedEntry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+      if (refinedEntry) refinedEntry.open_questions = [...(refinedEntry.open_questions || []), question]
+      engine.log(`发言人候选待复核：${f.label} 的 ${labels.join('、')}——模型裁决不确定或不可用，不阻断成稿`)
+    }
+    if (!invalid) return
+    rejectedPaths.add(f.outPath)
+    const labels = [...new Set(blockedCandidates.map((item) => item.label).filter(Boolean))]
+    const reason = report && report.contractUnavailable
+      ? 'speaker_contract_unavailable'
+      : 'speaker_structure'
+    speakerStructuralFailures.push({
+      path: f.outPath,
+      label: f.label,
+      finding: reason,
+      speakerMode: (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode || null,
+      labels,
+      violations: blockedCandidates,
+    })
+    const existing = auditFailed.find((item) => item.path === f.outPath)
+    if (existing) existing.findings = [...new Set([...(existing.findings || []), reason])]
+    else auditFailed.push({ path: f.outPath, findings: [reason] })
+    const refinedEntry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+    if (refinedEntry && refinedEntry.audit) {
+      refinedEntry.audit.status = 'fail'
+      refinedEntry.audit.hardFindings = [...new Set([...(refinedEntry.audit.hardFindings || []), reason])]
+    }
+    failed.push(f.label)
+    engine.log(`发言人结构契约未通过：${f.label}${labels.length ? `（模型高置信确认新增说话人：${labels.join('、')}）` : ''}——草稿仅留服务端诊断，不声明为可交付主稿`)
+  })
+  if (rejectedPaths.size) {
+    failed = [...new Set(failed)]
+    refined = refined.filter((item) => !rejectedPaths.has(item.outPath || item.path))
+    refinedPairs = refinedPairs.filter(({ f }) => !rejectedPaths.has(f.outPath))
+  }
+}
+
+// Final identity is a registry update, never a Markdown edit. Only bodies that already passed the normal
+// source-aware gate are eligible. The host asks for stable track-ID assignments, updates the one speakerTracks
+// registry, deterministically renders the complete transcript from output blocks, then this pipeline audits that
+// exact rendered body again (without opening a new repair budget) before any derivative may read it.
+if (scope.includes('refine') && refinedPairs.length && capabilities && typeof capabilities.finalizeSpeakerIdentity === 'function') {
+  const identityPairs = refinedPairs.filter(({ f }) => {
+    const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+    return f.refineContractFinalized && f.refineContract
+      && entry && entry.audit && entry.audit.status === 'ok'
+      && !auditFailed.some((item) => item.path === f.outPath)
+      && !auditUnavailable.some((item) => item.path === f.outPath)
+  })
+  if (identityPairs.length) {
+    engine.phase('Audit')
+    engine.log(`▶ 最终身份：${identityPairs.length} 份按 speaker track 注册表定稿，确定性重渲染后重新审计`)
+    const finalizations = await engine.parallel(identityPairs.map(({ f }) => async () => {
+      try { return await capabilities.finalizeSpeakerIdentity(f) } catch (error) {
+        engine.log(`最终身份定稿失败：${f.label}（${(error && error.message) || error}）`)
+        return null
+      }
+    }))
+    finalizations.forEach((finalization, index) => {
+      const { f } = identityPairs[index]
+      if (finalization) {
+        speakerIdentityFinalizations.push(finalization)
+        const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+        if (entry) entry.speakerResolution = f.speakerResolution || null
+      } else {
+        const finding = 'speaker_identity_finalization_unavailable'
+        const existing = auditFailed.find((item) => item.path === f.outPath)
+        if (existing) existing.findings = [...new Set([...(existing.findings || []), finding])]
+        else auditFailed.push({ path: f.outPath, findings: [finding] })
+      }
+    })
+
+    const finalizedPairs = identityPairs.filter((_pair, index) => finalizations[index])
+    const finalAudits = await engine.parallel(finalizedPairs.map(({ f, onePassGlossaryText }) => () => (
+      runAuditStep(
+        A,
+        engine,
+        f,
+        capabilities,
+        onePassGlossaryText || glossary,
+        { allowRepair: false, phase: 'post_identity_finalization' },
+      )
+    )))
+    finalizedPairs.forEach(({ f }, index) => {
+      const result = finalAudits[index] || {
+        status: 'unavailable', auditUnavailable: true, hardFindings: [], softFindings: [],
+        repaired: false, repairAttempts: [], anchorsAdded: 0, directAudit: false,
+      }
+      auditFailed = auditFailed.filter((item) => item.path !== f.outPath)
+      auditUnavailable = auditUnavailable.filter((item) => item.path !== f.outPath)
+      const entry = refined.find((item) => (item.outPath || item.path) === f.outPath)
+      if (entry) {
+        entry.audit = {
+          status: result.status,
+          hardFindings: result.hardFindings || [],
+          softFindings: result.softFindings || [],
+          repaired: !!result.repaired,
+          repairAttempts: result.repairAttempts || [],
+          anchorsAdded: result.anchorsAdded || 0,
+          auditUnavailable: !!result.auditUnavailable,
+        }
+      }
+      if (result.auditUnavailable) auditUnavailable.push({ path: f.outPath, label: f.label })
+      if ((result.auditFailed || []).length) auditFailed.push({ path: f.outPath, findings: result.auditFailed })
+    })
+    if (A.files.length === 1 && refined.length === 1 && speakerIdentityFinalizations.length === 1) {
+      transcriptMetadata = speakerIdentityFinalizations[0].metadata || null
+    }
+  }
+}
+
+// Re-read the public mapping view from the registry after final identity. This view is derived metadata for
+// manifests and downstream naming; renderer and audit never consume it as an authority.
+speakerResolutions = A.files.filter((f) => f.speakerResolution).map((f) => ({
+  label: f.label,
+  path: f.refineSourcePath || f.path,
+  ...f.speakerResolution,
+}))
+
+// Derivatives may only read FINAL bodies. The main transcript is still delivered when blocked (with review /
+// visible markers), but logic/summary/timeline are withheld rather than fossilising a known gap or speaker swap.
+const derivativesRequested = ['logic', 'summary', 'timeline'].filter((x) => scope.includes(x))
+const finalBodiesReady = refined.length > 0
+  && failed.length === 0
+  && auditFailed.length === 0
+  && auditUnavailable.length === 0
+  && pairsToAudit.length === refinedPairs.length
+  && refined.every((r) => r.audit && r.audit.status === 'ok')
+if (derivativesRequested.length && !finalBodiesReady) {
+  derivativesSkipped = derivativesRequested.map((kind) => ({ kind, reason: '正文未完成或忠实性审计未通过' }))
+  engine.log(`派生产物暂停：${derivativesRequested.join('、')}——正文未完成或忠实性审计未通过；主成稿与 review 仍照常交付`)
+}
+const derivativePairs = finalBodiesReady ? refinedPairs : []
 
 // Logic-order resequencing (optional): reads each refined transcript and reorders it into narrative order, run concurrently. Completeness is verified by a zero-cost JS check —
 // diff the headings in the refine report against threads[].source_sections in the logic report; any headings not covered go into missingSections.
 let logic = []
-if (scope.includes('logic') && refinedPairs.length) {
+if (scope.includes('logic') && derivativePairs.length) {
   engine.phase('Logic')
-  engine.log(`▶ 4/5 逻辑顺序 Logic：${refinedPairs.length} 份按主线重排为叙事顺序`)
+  engine.log(`▶ 4/5 逻辑顺序 Logic：${derivativePairs.length} 份按主线重排为叙事顺序`)
   // Build one logic entry from a (report, refine-report) pair. safeName(f.title) so a title with a slash / colon
   // can't fabricate a nested directory under 逻辑顺序/ (§3). missingSections = refine小标题 not covered by threads.
   const toEntry = (lrep, f, rep) => {
     if (!lrep) return { label: f.label, path: null, mainline: '', threads: [], missingSections: [], open_questions: [] }
-    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map((s) => (s || '').trim()).filter(Boolean)))
+    const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map(canonicalHeadingKey).filter(Boolean)))
     const srcHeadings = ((rep && rep.headings) || []).map((h) => (h || '').trim()).filter(Boolean)
-    const missing = srcHeadings.filter((h) => !covered.has(h))
+    const missing = srcHeadings.filter((h) => !covered.has(canonicalHeadingKey(h)))
     return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
-  const lreps = await engine.parallel(refinedPairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })))
-  logic = lreps.map((lrep, k) => toEntry(lrep, refinedPairs[k].f, refinedPairs[k].rep))
+  const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })))
+  logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
   // two) entry — the residual missing stays in the return for a Step-5 spot-check (current behaviour preserved).
@@ -2782,33 +4778,33 @@ if (scope.includes('logic') && refinedPairs.length) {
   if (rerunIdx.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
-      const { f } = refinedPairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA })
+      const { f } = derivativePairs[k]
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
       if (!re) return // rerun failed → keep the first-pass entry
-      const entry = toEntry(re, refinedPairs[k].f, refinedPairs[k].rep)
+      const entry = toEntry(re, derivativePairs[k].f, derivativePairs[k].rep)
       // Adopt the rerun only if it covers at least as many headings (fewer missing); otherwise keep the first pass.
       if (entry.path && entry.missingSections.length <= logic[k].missingSections.length) logic[k] = entry
     })
   }
   const failedLogic = logic.filter((l) => !l.path).map((l) => l.label)
   const missLogic = logic.filter((l) => l.missingSections && l.missingSections.length)
-  engine.log(`逻辑顺序稿完成 ${logic.filter((l) => l.path).length}/${refinedPairs.length} 份${failedLogic.length ? `（${failedLogic.join('、')} 失败）` : ''}`)
+  engine.log(`逻辑顺序稿完成 ${logic.filter((l) => l.path).length}/${derivativePairs.length} 份${failedLogic.length ? `（${failedLogic.join('、')} 失败）` : ''}`)
   if (missLogic.length) engine.log(`逻辑顺序稿疑漏小标题（重跑后仍疑漏，按精校稿小标题覆盖核对，需抽查）：${missLogic.map((l) => `${l.label}:${l.missingSections.join('/')}`).join('；')}`)
 }
 
 engine.phase('Deliver')
-if (refined.length && (scope.includes('summary') || scope.includes('timeline'))) {
+if (finalBodiesReady && (scope.includes('summary') || scope.includes('timeline'))) {
   engine.log(`▶ 交付 Deliver：${[scope.includes('summary') && '访谈总结', scope.includes('timeline') && '时间线'].filter(Boolean).join(' + ')}`)
 }
 const [summary, timeline] = await engine.parallel([
-  () => (scope.includes('summary') && refined.length
-    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary') })
+  () => (scope.includes('summary') && finalBodiesReady
+    ? engine.agent(summaryPrompt(A, refined), { label: 'summary', phase: 'Deliver', model: M.summary, effort: effortFor(A, 'summary'), outputPath: `${A.outputDir}/${summaryDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
-  () => (scope.includes('timeline') && refined.length
-    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline') })
+  () => (scope.includes('timeline') && finalBodiesReady
+    ? engine.agent(timelinePrompt(A, glossary, refined), { label: 'timeline', phase: 'Deliver', model: M.timeline, effort: effortFor(A, 'timeline'), outputPath: `${A.outputDir}/${timelineDeliverableName(A.topic)}` })
     : Promise.resolve(null)),
 ])
 
@@ -2825,11 +4821,22 @@ return {
   scoutFailed,
   suspectedDuplicates: (dedup && dedup.suspects) || [],
   networkUnverified: netUnverified,
-  auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after one auto-repair
+  auditFailed,   // §2: [{ path, findings:['content_gap',…] }] — hard audit findings still failing after at most two repair rounds
   auditUnavailable,   // P7: [{ path, label }] — files whose audit could NOT run after one retry → run marked failed (unaudited)
-  autoChunk: refined.map((r) => r.autoChunk).filter(Boolean),   // provider-budget auto-split records → run.json + review.md
+  plannedChunks: A.plannedChunks || [],   // recorded before any refine agent starts, so failed files remain diagnosable
+  speakerResolutions,
+  speakerOutputNormalizations,
+  speakerStructuralFailures,
+  speakerStructureWarnings,
+  speakerCandidateAdjudications,
+  speakerIdentityFinalizations,
+  transcriptMetadata,
+  qualityRepairAttempts,
+  turnContractFailures: A.turnContractFailures || [],
+  autoChunk: (A.plannedChunks || []).map((p) => p.autoChunk).filter(Boolean),   // includes failed provider-budget splits
   logic,
-  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes),
+  derivativesSkipped,
+  openQuestions: refined.flatMap((r) => r.open_questions || []).concat(dedupQuestions(dedup)).concat(logic.flatMap((l) => l.open_questions || [])).concat(conflicts).concat(weakDups).concat(asrSuspects).concat(contestedAsks).concat(overrideQuestions).concat(reopenNotes).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),
   summary,
   timeline,
 }

@@ -1,7 +1,7 @@
 # Codex Native Runtime
 
 Use this path first in Codex. It runs on the signed-in ChatGPT/Codex subscription and does not require
-`OPENAI_API_KEY` or `TAVILY_API_KEY`.
+`OPENAI_API_KEY`, `SERPER_API_KEY`, or `JINA_API_KEY`.
 
 The native runtime mirrors the Claude Workflow edition:
 
@@ -10,7 +10,7 @@ The native runtime mirrors the Claude Workflow edition:
 | Step 0 preflight | Local shell + deterministic helper | File stats, output paths, prior glossary loading. |
 | Scout | Codex native subagents, one per file | Full-file reading stays out of the main context. |
 | Merge/glossary | Local Node helper using `core/spec.js` | Reuses exact clustering, weak-name guards, glossary render. |
-| Verify | Codex native web/browsing subagents | Public-source checks without Tavily/API keys. |
+| Verify | Codex native web/browsing subagents | Public-source checks without external search/reader API keys. |
 | Dedup | Codex native subagent | Semantic same-referent review. |
 | Refine | Codex native subagents, one per file or chunk | Heavy transcript text stays inside file-level workers. |
 | Audit/anchors | Local Node helper | Deterministic source-aware completeness, content-gap, compression, and source-anchor checks. |
@@ -22,14 +22,15 @@ The native runtime mirrors the Claude Workflow edition:
 Before a run, verify the key is absent:
 
 ```bash
-printf 'OPENAI_API_KEY=[%s]\nTAVILY_API_KEY=[%s]\n' "$OPENAI_API_KEY" "$TAVILY_API_KEY"
+printf 'OPENAI_API_KEY=[%s]\nSERPER_API_KEY=[%s]\nJINA_API_KEY=[%s]\n' "$OPENAI_API_KEY" "$SERPER_API_KEY" "$JINA_API_KEY"
 ```
 
 Expected:
 
 ```text
 OPENAI_API_KEY=[]
-TAVILY_API_KEY=[]
+SERPER_API_KEY=[]
+JINA_API_KEY=[]
 ```
 
 Do not ask the user for API keys on the primary path. If a stage cannot use native Codex tools, degrade that stage and
@@ -59,7 +60,7 @@ The June 2026 spike passed all required gates:
 |---|---|---|
 | A — parallel subagents, no key | pass | Native `multi_agent_v1` subagents launched concurrently and cleaned both snippets with no API key. |
 | B — `node` runs `core/` JS, no key | pass | `env -u OPENAI_API_KEY npm test` passed 30/30; direct `clusterEntities()` import printed expected output. |
-| C — web search, no key | pass | Built-in Codex browsing returned sourced public facts without Tavily/API keys. |
+| C — web search, no key | pass | Built-in Codex browsing returned sourced public facts without external search/reader API keys. |
 
 Chosen design: use the full no-key Codex-native pipeline.
 
@@ -175,7 +176,7 @@ This writes `state-after-scout.json`, verify prompts, and a dedup prompt when ne
 
 ## Verify And Dedup
 
-Spawn native Codex subagents for each verify prompt, using each prompt entry's `model` and `reasoning_effort` when available. Use built-in browsing/web search only; do not use Tavily.
+Spawn native Codex subagents for each verify prompt, using each prompt entry's `model` and `reasoning_effort` when available. Use built-in browsing/web search only; do not call the Universal Serper/Jina adapters.
 
 Save verify results either as an array of prompt results:
 
@@ -258,6 +259,15 @@ node "<this skill dir>/scripts/codex-native.mjs" deliver-prompts \
   --state <out>/_codex-native/state-after-refine.json
 ```
 
+`deliver-prompts` first runs the same deterministic body-fidelity gate used by the shared pipeline. It generates
+logic/summary/timeline prompts only when every requested refined body is present and has no shared publication gate:
+`content_gap`, `compression_risk`, high-confidence `attribution_mismatch`, `seam_duplicate`,
+`residual_noise`, `under_refined`, `long_paragraphs`, or `quote_style`
+finding. Otherwise `deliver-prompt-manifest.json` contains an empty prompt list plus `bodyGate` and
+`derivativesSkipped`; repair the named body against its source, re-audit, and rerun this command. `after-deliver`
+repeats the guard and ignores externally supplied derivative reports while the body is still hard, so bypassing
+the prompt step cannot make a stale derivative look valid.
+
 The `logic` lane is two-step:
 
 1. Run `logic-plan` prompts first. They write audited JSON plans to
@@ -297,10 +307,10 @@ When `logic` was not requested, use `state-after-refine.json` for `--state` and 
 Assemble the final result object. Start from `state-after-verify.json`'s `resultSeed`, then fill in `refined`, `logic`,
 `summary`, `timeline`, `failed`, `incomplete`, and `unchecked`.
 
-Run the deterministic quality audit before writing `review.md` / `run.json`, so hard findings are captured in the
-same handoff artifacts. The helper pairs each source file with its refined output, passes the current `校对表.md`
-or one-pass glossary to the audit, inserts visible content-gap markers when needed, adds invisible source anchors
-under refined `##` headings, audits logic-order drafts against refined transcripts, and writes
+Run the deterministic final audit before writing `review.md` / `run.json`, so the pre-deliver body-gate result,
+source anchors, and derivative checks are captured in the same handoff artifacts. The helper pairs each source
+file with its refined output, passes the current `校对表.md` or one-pass glossary to the audit, inserts visible
+content-gap markers when needed, adds invisible source anchors under refined `##` headings, audits logic-order drafts against refined transcripts, and writes
 `<out>/_codex-native/result-audited.json`.
 
 ```bash
@@ -335,8 +345,10 @@ node "<this skill dir>/scripts/audit_refined.mjs" --source <源稿.md> --refined
 `status: fail` flags a hard issue:
 - `compression_risk` — refine became a summary (refined/source 汉字 ratio < 0.55). **Rerun that file from source**, don't try to recover detail from the short output.
 - `under_refined` — coverage kept but filler barely removed.
-- `ending_missing` — the source's last turn isn't reflected in the output.
-- residual pure filler (嗯/呃, 对对对/是是是, 我我/就就) or a dialogue paragraph over ~900 characters.
+- A real ending omission is reported as `content_gap` or `compression_risk`; a lexical mismatch against the source's final characters is not an independent failure.
+- `attribution_mismatch` — a high-confidence source turn appears under the wrong speaker in the refined body.
+- `seam_duplicate` — deterministic chunk stitching and its extended repair still leave a high-confidence repeated seam.
+- residual pure filler (嗯/呃), confirmation/stutter runs of 3+ (对对对/是是是/我我我), or a dialogue paragraph over ~900 characters. Exactly two adjacent repeat-candidate characters remain review-only because they can also be normal lexical boundaries.
 
 啊/哦/欸 sentence-final modal particles and 那个/这个/就是说 are soft candidates — inspect context, don't blanket-delete. (Output-only form `node …/audit_refined.mjs <file.md>` still works when no source is at hand, but it cannot detect compression.)
 
@@ -346,7 +358,9 @@ Always read `review.md` before the final user handoff.
 
 - If a scout result is garbled, rerun that file once. If it remains garbled, continue refine but mark the glossary risk.
 - If verify search fails twice in a row, stop that verify chunk and mark unresolved; do not retry indefinitely.
-- If a file's ending check is incomplete or unchecked, surface it in `review.md`.
+- If a file's source-aware audit is unavailable, surface it in `review.md`; do not infer either “complete” or “truncated”.
+- If any publication gate fails, do not spawn or accept logic/summary/timeline output; repair the body first and rerun `deliver-prompts`.
+- Treat `logicFailed` and per-file `artifactQuality` independently: a fake/missing-source logic draft is blocked without relabelling a passed transcript as bad.
 - If native subagents are unavailable, run serially in the main Codex session for small jobs or ask before using the
   Universal API-key fallback.
 - Never paste full raw transcripts or full web pages into the main chat. Keep the main context to paths, prompts,

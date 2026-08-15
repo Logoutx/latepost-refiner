@@ -4,11 +4,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { makeDeepSeekEngine, DEEPSEEK_MODELS, DEEPSEEK_BASE_URL, REFINE_CHAR_BUDGET, SOURCE_PROTECTION_NOTE, formatSearchResults } from '../engines/deepseek.js'
+import { TURN_CONTRACT_HEADER, buildTurnContract, validateOutputBlockEnvelope } from '../universal/output-contract.js'
 
 // The Universal edition supports exactly ONE API provider — DeepSeek — with two FIXED models: v4-flash for the
 // mechanical tiers (scout/check/dedup/stitch → haiku/sonnet) and v4-pro for the writing tiers (refine/logic/
 // summary/timeline → opus). There is no model/provider/base-url selection anywhere. These tests pin that contract
-// and the engine's wire behaviour (forced structured output, Tavily-only web tools on online stages).
+// and the engine's wire behaviour (forced structured output, fixed web tools on online stages).
 
 function completion(message, finishReason = 'stop') {
   return {
@@ -111,7 +112,7 @@ test('file tool calls feed local tool results back to the model', async () => {
   const source = path.join(base, 'source.txt')
   fs.writeFileSync(source, 'hello from transcript\n', 'utf8')
   const client = mockClient([
-    completion({ content: '', tool_calls: [toolCall('read1', 'Read', { file_path: source })] }),
+    completion({ content: '', reasoning_content: 'tool-call reasoning', tool_calls: [toolCall('read1', 'Read', { file_path: source })] }),
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
   ])
   const engine = makeDeepSeekEngine({
@@ -125,9 +126,293 @@ test('file tool calls feed local tool results back to the model', async () => {
   assert.deepEqual(result, { ok: true })
   const toolMessage = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'read1')
   assert.match(toolMessage.content, /hello from transcript/)
+  const assistantMessage = client.calls[1].messages.find((m) => m.role === 'assistant' && m.tool_calls?.[0]?.id === 'read1')
+  assert.equal(assistantMessage.reasoning_content, 'tool-call reasoning', 'V4 thinking tool turns replay reasoning_content')
 })
 
-test('Tavily web tools are only exposed to online (verify/timeline) labels', async () => {
+test('a denied write cannot be masked by structured_output; the agent must create the declared artifact', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-write-contract-'))
+  const outputPath = path.join(base, 'Transcripts', 'A.md.part3')
+  const scratch = path.join(base, 'Transcripts', 'scratch.md')
+  const events = []
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('bad-write', 'Write', { file_path: scratch, content: '临时文件' })] }),
+    completion({ content: '', tool_calls: [toolCall('too-early', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('good-write', 'Write', { file_path: outputPath, content: '采访者：问题\n\n受访者：回答\n' })] }),
+    completion({ content: '', tool_calls: [toolCall('final', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    onToolEvent: (event) => events.push(event),
+    filePolicy: {
+      readRoots: [base], writeRoots: [base], writePaths: [path.join(base, 'Transcripts', 'A.md')],
+      writePartBases: [path.join(base, 'Transcripts', 'A.md')],
+    },
+  })
+
+  const result = await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A#3/3', outputPath })
+
+  assert.deepEqual(result, { ok: true })
+  assert.equal(fs.existsSync(scratch), false)
+  assert.match(fs.readFileSync(outputPath, 'utf8'), /受访者：回答/)
+  assert.equal(client.calls.length, 4, 'premature structured_output was rejected instead of ending the agent')
+  assert.equal(events[0].code, 'TOOL_PATH_DENIED')
+  assert.equal(events.at(-1).ok, true)
+  assert.deepEqual(engine.failures(), [], 'a recovered tool denial is observable but does not fail the agent')
+})
+
+test('an agent-scoped file policy can narrow the job allowlist to one repair candidate', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-repair-scope-'))
+  const finalPath = path.join(base, 'Transcripts', 'A.md')
+  const candidatePath = path.join(base, '.repair-candidates', 'A.round-1.md')
+  fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true })
+  fs.writeFileSync(finalPath, '正式稿：不得改动\n', 'utf8')
+  fs.writeFileSync(candidatePath, '候选稿：待修复\n', 'utf8')
+  const events = []
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('bad-final-write', 'Write', { file_path: finalPath, content: '越权覆盖\n' })] }),
+    completion({ content: '', tool_calls: [toolCall('candidate-write', 'Write', { file_path: candidatePath, content: '候选稿：已修复\n' })] }),
+    completion({ content: 'done' }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    onToolEvent: (event) => events.push(event),
+    filePolicy: {
+      readRoots: [base],
+      writeRoots: [base],
+      writePaths: [finalPath, candidatePath],
+    },
+  })
+
+  const result = await engine.agent('prompt', {
+    model: 'opus',
+    label: 'repair:A:round1',
+    outputPath: candidatePath,
+    filePolicy: {
+      readRoots: [],
+      writeRoots: [base],
+      readPaths: [candidatePath],
+      writePaths: [candidatePath],
+      writePartBases: [],
+    },
+  })
+
+  assert.equal(result, 'done')
+  assert.equal(fs.readFileSync(finalPath, 'utf8'), '正式稿：不得改动\n')
+  assert.equal(fs.readFileSync(candidatePath, 'utf8'), '候选稿：已修复\n')
+  assert.equal(events[0].code, 'TOOL_PATH_DENIED')
+  assert.equal(events[0].path, finalPath)
+  assert.equal(events[1].ok, true)
+})
+
+test('structured_output without the declared artifact becomes a typed non-retryable agent failure', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-missing-output-'))
+  const outputPath = path.join(base, 'Transcripts', 'A.md')
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('early-1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('early-2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+
+  const result = await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath })
+
+  assert.equal(result, null)
+  assert.equal(engine.usage().failed, 1)
+  assert.deepEqual(engine.failures(), [{
+    label: 'refine:A', code: 'OUTPUT_MISSING', retryable: false, message: `声明产物未生成：${outputPath}`,
+    providerSignal: { provider: 'deepseek', finishReason: 'stop', refusalPresent: false, choiceCount: 1, httpStatus: null, requestId: null },
+  }])
+})
+
+test('explicit refusal and content_filter become non-retryable failures with sanitized provider evidence', async () => {
+  const refusalEvents = []
+  const refusal = completion({ content: '', refusal: '原始拒绝正文不应进入失败记录' })
+  refusal._request_id = 'req_refusal-1'
+  const refusalEngine = makeDeepSeekEngine({ client: mockClient([refusal]), concurrency: 1, onAgentEvent: (event) => refusalEvents.push(event) })
+
+  assert.equal(await refusalEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:sensitive' }), null)
+  const refusalFailure = refusalEngine.failures()[0]
+  assert.equal(refusalFailure.code, 'MODEL_REFUSAL')
+  assert.equal(refusalFailure.retryable, false)
+  assert.deepEqual(refusalFailure.providerSignal, {
+    provider: 'deepseek', finishReason: 'stop', refusalPresent: true, choiceCount: 1, httpStatus: null, requestId: 'req_refusal-1',
+  })
+  assert.doesNotMatch(JSON.stringify(refusalFailure), /原始拒绝正文/)
+  assert.deepEqual(refusalEvents.at(-1).providerSignal, refusalFailure.providerSignal)
+
+  const filtered = completion({ content: '' }, 'content_filter')
+  filtered._request_id = 'req_filter-1'
+  const filterEngine = makeDeepSeekEngine({ client: mockClient([filtered]), concurrency: 1 })
+  assert.equal(await filterEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'summary' }), null)
+  assert.deepEqual(filterEngine.failures()[0], {
+    label: 'summary', code: 'CONTENT_FILTER', retryable: false, message: 'summary 被内容过滤',
+    providerSignal: { provider: 'deepseek', finishReason: 'content_filter', refusalPresent: false, choiceCount: 1, httpStatus: null, requestId: 'req_filter-1' },
+  })
+})
+
+test('silent empty responses remain cause-unknown and carry request metadata without being mislabeled as censorship', async () => {
+  const noChoice = { choices: [], usage: { prompt_tokens: 3, completion_tokens: 0 }, _request_id: 'req_empty-choice' }
+  const noChoiceEngine = makeDeepSeekEngine({ client: mockClient([noChoice]), concurrency: 1 })
+  assert.equal(await noChoiceEngine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:empty' }), null)
+  assert.deepEqual(noChoiceEngine.failures()[0].providerSignal, {
+    provider: 'deepseek', finishReason: null, refusalPresent: null, choiceCount: 0, httpStatus: null, requestId: 'req_empty-choice',
+  })
+  assert.equal(noChoiceEngine.failures()[0].code, 'MODEL_EMPTY_RESPONSE')
+
+  const emptyContent = completion({ content: '' })
+  emptyContent._request_id = 'req_empty-content'
+  const emptyContentEngine = makeDeepSeekEngine({ client: mockClient([emptyContent]), concurrency: 1 })
+  assert.equal(await emptyContentEngine.agent('prompt', { model: 'haiku', label: 'audit:file' }), null)
+  assert.equal(emptyContentEngine.failures()[0].code, 'MODEL_EMPTY_CONTENT')
+  assert.equal(emptyContentEngine.failures()[0].providerSignal.refusalPresent, false)
+  assert.doesNotMatch(JSON.stringify(emptyContentEngine.failures()), /CONTENT_FILTER|MODEL_REFUSAL/)
+})
+
+test('API errors retain only status/request id metadata and classify transient transport errors', async () => {
+  const apiError = Object.assign(new Error('provider response body must not be persisted'), { status: 429, requestID: 'req_rate-1' })
+  const engine = makeDeepSeekEngine({ client: mockClient([() => { throw apiError }]), concurrency: 1 })
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:rate' }), null)
+  const failure = engine.failures()[0]
+  assert.equal(failure.code, 'API_TRANSIENT')
+  assert.equal(failure.retryable, true)
+  assert.deepEqual(failure.providerSignal, {
+    provider: 'deepseek', finishReason: null, refusalPresent: null, choiceCount: null, httpStatus: 429, requestId: 'req_rate-1',
+  })
+  assert.doesNotMatch(JSON.stringify(failure), /provider response body/)
+})
+
+test('an unchanged stale artifact cannot satisfy the output postcondition', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-stale-output-'))
+  const outputPath = path.join(base, 'A.md')
+  fs.writeFileSync(outputPath, '旧产物\n', 'utf8')
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('stale-1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('stale-2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath }), null)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_NOT_UPDATED')
+})
+
+test('a declared artifact must pass its structural validator before structured_output is accepted', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-output-validator-'))
+  const outputPath = path.join(base, 'A.md')
+  const invalid = '<!-- contract -->\n# 模型擅自添加的标题\n<!-- block -->\n'
+  const valid = '<!-- contract -->\n<!-- block -->\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-invalid', 'Write', { file_path: outputPath, content: invalid }),
+      toolCall('submit-invalid', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-valid', 'Edit', { file_path: outputPath, old_string: invalid, new_string: valid }),
+      toolCall('submit-valid', 'structured_output', { ok: true }),
+    ] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] },
+  })
+
+  const result = await engine.agent('prompt', {
+    model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath,
+    validateOutput: () => fs.readFileSync(outputPath, 'utf8').includes('# ')
+      ? { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: 'output block 外出现 H1' }
+      : { ok: true },
+  })
+
+  assert.deepEqual(result, { ok: true })
+  assert.equal(fs.readFileSync(outputPath, 'utf8'), valid)
+  assert.match(
+    client.calls[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-invalid').content,
+    /TURN_CONTRACT_OUTSIDE_CONTENT/u,
+  )
+  assert.equal(engine.usage().failed, 0)
+})
+
+test('structural recovery sends every advancing diagnostic back to the same agent context', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-progress-'))
+  const outputPath = path.join(base, 'A.md')
+  const contract = buildTurnContract('记者：问题。\n\n受访者：回答。')
+  const body = '<!-- LRB_OUTPUT_BLOCK sources=T000001 disposition=keep -->\n问题。\n<!-- /LRB_OUTPUT_BLOCK -->\n\n<!-- LRB_OUTPUT_BLOCK sources=T000002 disposition=keep -->\n回答。\n<!-- /LRB_OUTPUT_BLOCK -->\n'
+  const first = `# 模型标题\n\n*模型说明行*\n\n${body}`
+  const second = `${TURN_CONTRACT_HEADER}\n${first}`
+  const valid = `${TURN_CONTRACT_HEADER}\n${body}`
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-first', 'Write', { file_path: outputPath, content: first }),
+      toolCall('submit-first', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-second', 'Edit', { file_path: outputPath, old_string: first, new_string: second }),
+      toolCall('submit-second', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [
+      toolCall('edit-valid', 'Edit', { file_path: outputPath, old_string: second, new_string: valid }),
+      toolCall('submit-valid', 'structured_output', { ok: true }),
+    ] }),
+  ])
+  const engine = makeDeepSeekEngine({
+    client,
+    concurrency: 1,
+    filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] },
+  })
+  const validateOutput = () => validateOutputBlockEnvelope(fs.readFileSync(outputPath, 'utf8'), contract)
+
+  assert.deepEqual(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput }), { ok: true })
+  assert.equal(client.calls.length, 3)
+  const firstFeedback = client.calls[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-first').content
+  const secondFeedback = client.calls[2].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'submit-second').content
+  assert.match(firstFeedback, /TURN_CONTRACT_HEADER_MISSING[\s\S]*TURN_CONTRACT_OUTSIDE_CONTENT/u)
+  assert.match(secondFeedback, /TURN_CONTRACT_OUTSIDE_CONTENT/u)
+  assert.deepEqual(engine.failures(), [])
+})
+
+test('structural recovery stops on an unchanged artifact and error fingerprint', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-stalled-'))
+  const outputPath = path.join(base, 'A.md')
+  const invalid = '# 标题\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [
+      toolCall('write-invalid', 'Write', { file_path: outputPath, content: invalid }),
+      toolCall('submit-first', 'structured_output', { ok: true }),
+    ] }),
+    completion({ content: '', tool_calls: [toolCall('submit-again', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+  const invalidResult = { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: '仍有 H1', errors: [{ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', line: 1 }] }
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput: () => invalidResult }), null)
+  assert.equal(client.calls.length, 2)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_VALIDATION_NO_PROGRESS')
+  assert.match(engine.failures()[0].message, /TURN_CONTRACT_OUTSIDE_CONTENT/u)
+})
+
+test('structural recovery detects an artifact/error-state oscillation', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-deepseek-validator-oscillation-'))
+  const outputPath = path.join(base, 'A.md')
+  const stateA = '# 标题 A\n'
+  const stateB = '# 标题 B\n'
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('write-a1', 'Write', { file_path: outputPath, content: stateA }), toolCall('submit-a1', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('write-b', 'Write', { file_path: outputPath, content: stateB }), toolCall('submit-b', 'structured_output', { ok: true })] }),
+    completion({ content: '', tool_calls: [toolCall('write-a2', 'Write', { file_path: outputPath, content: stateA }), toolCall('submit-a2', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1, filePolicy: { readRoots: [base], writeRoots: [base], writePaths: [outputPath] } })
+  const invalidResult = { ok: false, code: 'TURN_CONTRACT_OUTSIDE_CONTENT', message: '仍有 H1', errors: [{ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', line: 1 }] }
+
+  assert.equal(await engine.agent('prompt', { model: 'opus', schema: SIMPLE_SCHEMA, label: 'refine:A', outputPath, validateOutput: () => invalidResult }), null)
+  assert.equal(client.calls.length, 3)
+  assert.equal(engine.failures()[0].code, 'OUTPUT_VALIDATION_OSCILLATION')
+})
+
+test('web tools are only exposed to online (verify/timeline) labels', async () => {
   const offlineClient = mockClient([
     completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
   ])
@@ -152,9 +437,7 @@ test('Tavily web tools are only exposed to online (verify/timeline) labels', asy
   assert.equal(toolNames(tlClient.calls[0]).includes('web_search'), true)
 })
 
-// ---- searchFn override (bench/tests): swap the web_search backend, Tavily default unchanged --------------
-// The Universal edition ships Tavily-only, but makeDeepSeekEngine takes a programmatic `searchFn` override so
-// the bench can drive verify against an alternative adapter. It is NOT wired to any CLI flag or env var.
+// ---- searchFn override (bench/tests): same job-scoped budget/cache seam as Serper -------------------------
 
 test('searchFn override: online web_search routes to the injected adapter with (query, {k}); results reach the model', async () => {
   const calls = []
@@ -178,35 +461,28 @@ test('searchFn override: online web_search routes to the injected adapter with (
   assert.match(toolMsg.content, /example\.com\/team/, 'the adapter url is rendered')
 })
 
-test('default (no searchFn): web_search uses the built-in Tavily path — proven by its no-key message, no network', async () => {
-  const prev = process.env.TAVILY_API_KEY
-  delete process.env.TAVILY_API_KEY   // force Tavily's graceful no-key branch (returns before any fetch)
-  try {
-    const client = mockClient([
-      completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
-      completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
-    ])
-    const engine = makeDeepSeekEngine({ client, concurrency: 1 })   // no searchFn
-    await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
-    const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
-    assert.match(toolMsg.content, /未配置 TAVILY_API_KEY/, 'default routed to Tavily (its no-key message), so searchFn did not intercept')
-  } finally {
-    if (prev === undefined) delete process.env.TAVILY_API_KEY
-    else process.env.TAVILY_API_KEY = prev
-  }
+test('default (no searchFn): web_search uses the fixed Serper path and fails cleanly without a key', async () => {
+  const client = mockClient([
+    completion({ content: '', tool_calls: [toolCall('ws1', 'web_search', { query: '任意查询' })] }),
+    completion({ content: '', tool_calls: [toolCall('so1', 'structured_output', { ok: true })] }),
+  ])
+  const engine = makeDeepSeekEngine({ client, concurrency: 1 })
+  await engine.agent('p', { model: 'sonnet', schema: SIMPLE_SCHEMA, label: 'verify:1/1' })
+  const toolMsg = client.calls[1].messages.find((m) => m.role === 'tool' && m.tool_call_id === 'ws1')
+  assert.match(toolMsg.content, /SERPER_API_KEY/, 'fixed Serper runtime reports its missing key without network')
 })
 
-test('formatSearchResults renders the normalized adapter shape like the Tavily branch (empty → 无结果)', () => {
+test('formatSearchResults renders the normalized search contract (empty → 无结果)', () => {
   assert.equal(formatSearchResults([]), '无结果')
   assert.equal(formatSearchResults(null), '无结果')
   const txt = formatSearchResults([{ title: 'T1', url: 'https://a', snippet: 'S1' }, { title: 'T2', url: 'https://b', snippet: 'S2' }])
   assert.match(txt, /^1\. T1\n   https:\/\/a\n   S1\n2\. T2\n   https:\/\/b\n   S2$/, 'numbered title/url/snippet block')
-  // snippet is capped at 500 chars, matching the Tavily branch
+  // snippet is capped at 500 chars
   assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(500)), true)
   assert.equal(formatSearchResults([{ title: 't', url: 'u', snippet: 'x'.repeat(600) }]).includes('x'.repeat(501)), false)
 })
 
-test('DeepSeek forces structured_output via tool_choice after two nudges', async () => {
+test('DeepSeek requests structured_output without unsupported thinking-mode tool_choice after two nudges', async () => {
   const client = mockClient([
     completion({ content: 'plain answer' }),
     completion({ content: 'still plain' }),
@@ -219,10 +495,10 @@ test('DeepSeek forces structured_output via tool_choice after two nudges', async
 
   assert.deepEqual(result, { ok: true })
   const forced = client.calls.at(-1)
-  assert.deepEqual(forced.tool_choice, { type: 'function', function: { name: 'structured_output' } })
+  assert.equal(forced.tool_choice, undefined, 'V4 thinking mode rejects explicit tool_choice')
   assert.equal(forced.max_tokens, 64000, 'summary is a big-output label')
   assert.equal('max_completion_tokens' in forced, false)
-  // No Kimi-style json_object fallback: forcing the tool is the only last resort DeepSeek uses.
+  // No json_object fallback: a tools-only structured request is the last resort DeepSeek uses.
   assert.equal(forced.response_format, undefined)
 })
 

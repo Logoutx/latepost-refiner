@@ -130,14 +130,14 @@ test('a verify resolution with source "网络搜索" renders 待复核, still ap
   assert.ok(names.includes('新术语'), 'a brand-new entry is unaffected, still included')
 })
 
-test('a resolution with source "example.com 官网团队页" renders 〔核实〕, exactly as before the guard', () => {
+test('a concrete source with direct Chinese-name text renders 〔核实〕', () => {
   const merged = {
     speakersByFile: [],
     people: [{ canonical: '沈其安', variants: ['沈其岸'], hint: '受访者', files: ['A'], crossFile: false }],
     brands: [], terms: [],
     errors: [], notes: [],
   }
-  const verified = { resolved: [{ query: '沈其岸', canonical: '沈其安', identity: '创始人', source: 'example.com 官网团队页' }], unresolved: [] }
+  const verified = { resolved: [{ query: '沈其岸', canonical: '沈其安', identity: '创始人', source: 'example.com 官网团队页显示“沈其安”', name_script_exact: true }], unresolved: [] }
   const md = renderGlossary(merged, verified, null, GA)
   assert.ok(/沈其安.*〔核实·2025-07〕/.test(md), 'a concrete source still earns the permanent 核实 marker')
 

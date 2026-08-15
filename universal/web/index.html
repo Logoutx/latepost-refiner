@@ -84,12 +84,14 @@
         <input type="password" id="apiKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
       <div>
-        <label><a href="https://app.tavily.com/home" target="_blank" rel="noopener">Tavily API Key</a> <span class="opt">联网核实/时间线用</span></label>
-        <input type="password" id="tavilyKey" placeholder="仅本次使用，不保存" autocomplete="off">
+        <label><a href="https://serper.dev/" target="_blank" rel="noopener">Serper API Key</a> <span class="opt">联网核实/时间线用</span></label>
+        <input type="password" id="serperKey" placeholder="仅本次使用，不保存" autocomplete="off">
+        <label><a href="https://jina.ai/reader/" target="_blank" rel="noopener">Jina Reader API Key</a> <span class="opt">可选；网页正文提取</span></label>
+        <input type="password" id="jinaKey" placeholder="可留空，仅本次使用，不保存" autocomplete="off">
       </div>
     </div>
     <p class="hint">DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。涉敏感话题或需保护信源的访谈请慎用。</p>
-    <p class="hint">Tavily 如不填，无法联网核实：名词校准质量会严重下降，也无法生成时间线。</p>
+    <p class="hint">Serper 如不填，无法联网核实：名词校准质量会严重下降，也无法生成时间线。Jina 可留空。</p>
   </div>
 
   <div class="card">
@@ -154,7 +156,11 @@ let picked = [] // {name, base64}
 function collectModel() {
   const apiKey = $('apiKey').value.trim()
   if (!apiKey) throw new Error('请填写 DeepSeek API Key。')
-  return { apiKey, tavilyKey: $('tavilyKey').value.trim() || undefined }
+  return {
+    apiKey,
+    serperKey: $('serperKey').value.trim() || undefined,
+    jinaKey: $('jinaKey').value.trim() || undefined,
+  }
 }
 
 // file picking → base64
@@ -343,7 +349,7 @@ function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': 
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
 
 // --- persist non-secret settings across reloads (localStorage, lpr_ prefix) ---
-// Never persist: apiKey / tavilyKey or any input[type=password] — those stay in-memory only for the run.
+// Never persist: apiKey / serperKey / jinaKey or any input[type=password] — those stay in-memory only for the run.
 function persistField(id, key) {
   const el = $(id)
   if (!el) return

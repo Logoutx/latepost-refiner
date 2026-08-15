@@ -4,31 +4,37 @@
 // the ONLY API provider the Universal edition supports — Claude runs via the Claude Code skill,
 // not this engine. Everything here is hard-wired to DeepSeek; there is no provider selection.
 //
-// Fixed setup:
+// Fixed defaults (runJob/CLI may explicitly override a stage between these two DeepSeek model ids):
 //   • Endpoint  https://api.deepseek.com ; key from DEEPSEEK_API_KEY.
 //   • Models    deepseek-v4-flash for the mechanical tiers (scout/check/dedup/stitch → haiku/sonnet),
 //               deepseek-v4-pro for the judgment tiers (refine/logic/summary/timeline → opus).
-//               Non-thinking tiers on purpose: DeepSeek's thinking mode disables function calling.
-//   • Web       Tavily by default (TAVILY_API_KEY): a CLIENT-side web_search + web_fetch pair injected on
-//               the online stages (verify/timeline). Absent key → graceful degrade to no-verify. An optional
-//               programmatic `searchFn` override (bench/tests only — NO CLI flag, NO env switch) swaps the
-//               web_search backend for a normalized adapter; web_fetch is unchanged. See makeDeepSeekEngine.
-//   • Structured output via a forced function call (tool_choice), which DeepSeek supports.
+//               V4 defaults to thinking mode; tool-call turns therefore replay reasoning_content.
+//   • Web       Job-scoped runtime: Serper search → Jina Reader → SSRF-safe local fallback. Optional
+//               programmatic searchFn/fetch injections remain for tests and benchmarks.
+//   • Structured output via a function tool. The final fallback asks again with only that tool exposed;
+//               it does not send tool_choice because V4 thinking mode rejects that parameter.
 //
 // Client tools Read/Write/Edit share fileops.js. Offline stages never receive web tools.
 
+import fs from 'node:fs'
 import os from 'node:os'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
 import OpenAI from 'openai'
 import pLimit from 'p-limit'
 import { TOOL_SPECS, runFileTool, makeFilePolicy } from './fileops.js'
+import { makeWebRuntime } from './web.js'
+export { formatSearchResults } from './web.js'
 
 // DeepSeek's OpenAI-compatible endpoint. Fixed — there is no --base-url anymore.
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 
-// Tier word (core passes 'haiku'/'sonnet'/'opus') → DeepSeek model id. FIXED, no selection.
+// Tier word (core passes 'haiku'/'sonnet'/'opus') → default DeepSeek model id. No provider selection;
+// controlled runJob/CLI overrides may assign either supported v4 model to an individual stage.
 // Validated 2026-07-07 on a real 34K-char interview: the old all-deepseek-chat default failed the
 // hard gates (compression + a real dropped section); the flash/pro split passed everything.
-export const DEEPSEEK_MODELS = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
+export const DEEPSEEK_MODELS = Object.freeze({ haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' })
+export const DEEPSEEK_MODEL_IDS = Object.freeze(['deepseek-v4-flash', 'deepseek-v4-pro'])
 
 // Per-model faithful-refine budget, in 正文字数 (content chars). A model that silently compresses a long
 // transcript into a summary must be auto-split BELOW the length where it starts folding content — the refine
@@ -51,13 +57,16 @@ export const REFINE_CHAR_BUDGET = { 'deepseek-v4-pro': 10000, 'deepseek-v4-flash
 export const SOURCE_PROTECTION_NOTE = '信源保护提示：DeepSeek 由中国境内公司运营，转录全文将传输至其服务器处理并受当地法规约束（含内容审查——审查即意味着内容被服务端读取）。涉敏感话题或需保护信源的访谈请慎用。'
 
 const MAX_TURNS = 100
+const MAX_OUTPUT_POSTCONDITION_NUDGES = 2
+const MAX_OUTPUT_VALIDATION_STATES = 8
 const toFn = (s) => ({ type: 'function', function: { name: s.name, description: s.description, parameters: s.parameters } })
 const FILE_TOOLS = TOOL_SPECS.map(toFn)
 const WEB_SEARCH_TOOL = toFn({ name: 'web_search', description: '联网搜索，返回若干结果（标题 / 网址 / 摘要）。', parameters: { type: 'object', properties: { query: { type: 'string', description: '搜索词' } }, required: ['query'] } })
 const WEB_FETCH_TOOL = toFn({ name: 'web_fetch', description: '抓取一个网页 URL，返回正文文本（截断）。', parameters: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } })
 const WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
-// Online stages (verify/timeline) are the only ones that should search; gating web-tool injection to them
-// limits blast radius if Tavily is down (scout/refine still run).
+const FILE_TOOL_NAMES = new Set(['Read', 'Write', 'Edit', 'Concat'])
+const WRITE_TOOL_NAMES = new Set(['Write', 'Edit', 'Concat'])
+// Online stages (verify/timeline) are the only ones that should search.
 const ONLINE_LABEL = /^(verify|timeline)/
 const structuredTool = (schema) => ({
   type: 'function',
@@ -67,6 +76,105 @@ const structuredTool = (schema) => ({
 // big outputs (refine/logic/summary/timeline write whole docs via tool args / content)
 const BIG_LABEL = /^(refine|logic|summary|timeline)/i
 const maxTokensFor = (label = '') => (BIG_LABEL.test(label) ? 64000 : 16000)
+
+function safeProviderToken(value, maxLength = 200) {
+  if (value == null) return null
+  const text = String(value).trim()
+  return text && text.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(text) ? text : null
+}
+
+function providerSignalFromResponse(comp, choice) {
+  const choices = Array.isArray(comp?.choices) ? comp.choices : []
+  return {
+    provider: 'deepseek',
+    finishReason: safeProviderToken(choice?.finish_reason, 80),
+    refusalPresent: choice ? !!choice.message?.refusal : null,
+    choiceCount: choices.length,
+    httpStatus: null,
+    requestId: safeProviderToken(comp?._request_id),
+  }
+}
+
+function providerSignalFromError(error) {
+  const rawStatus = Number(error && (error.status || error.statusCode || error.response?.status))
+  return {
+    provider: 'deepseek',
+    finishReason: null,
+    refusalPresent: null,
+    choiceCount: null,
+    httpStatus: Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : null,
+    requestId: safeProviderToken(error?.requestID || error?.request_id),
+  }
+}
+
+function agentError(code, message, retryable = false, providerSignal = null) {
+  const err = new Error(message)
+  err.code = code
+  err.retryable = retryable
+  if (providerSignal) err.providerSignal = providerSignal
+  return err
+}
+
+function outputSnapshot(filePath) {
+  if (!filePath) return null
+  const resolved = path.resolve(String(filePath))
+  try {
+    const stat = fs.statSync(resolved)
+    const exists = stat.isFile()
+    return {
+      path: resolved,
+      exists,
+      bytes: exists ? stat.size : 0,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      sha256: exists ? createHash('sha256').update(fs.readFileSync(resolved)).digest('hex') : null,
+    }
+  } catch {
+    return { path: resolved, exists: false, bytes: 0, mtimeMs: null, ctimeMs: null, sha256: null }
+  }
+}
+
+function checkOutputPostcondition(filePath, before) {
+  if (!filePath) return { ok: true }
+  const after = outputSnapshot(filePath)
+  if (!after.exists) return { ok: false, code: 'OUTPUT_MISSING', message: `声明产物未生成：${after.path}` }
+  if (after.bytes <= 0) return { ok: false, code: 'OUTPUT_EMPTY', message: `声明产物为空：${after.path}` }
+  if (before && before.exists && before.sha256 === after.sha256) {
+    return { ok: false, code: 'OUTPUT_NOT_UPDATED', message: `声明产物未在本代理调用中更新：${after.path}` }
+  }
+  return { ok: true, path: after.path, bytes: after.bytes, artifactHash: after.sha256 }
+}
+
+function validationFingerprint(failure = {}) {
+  const errors = Array.isArray(failure.errors)
+    ? failure.errors.map((error) => ({ code: error && error.code, line: error && error.line }))
+    : []
+  return JSON.stringify({ code: failure.code || null, errors, message: failure.message || null })
+}
+
+function validationStateKey(failure = {}) {
+  return `${failure.artifactHash || 'no-artifact-hash'}\n${validationFingerprint(failure)}`
+}
+
+function classifyAgentError(error) {
+  if (error && error.code && /^[A-Z][A-Z0-9_]+$/.test(error.code) && typeof error.retryable === 'boolean') {
+    const typed = { code: error.code, retryable: error.retryable, message: error.message || String(error) }
+    if (error.providerSignal) typed.providerSignal = error.providerSignal
+    return typed
+  }
+  const status = Number(error && (error.status || error.statusCode || error.response?.status))
+  const code = error && error.code
+  const transient = status === 408 || status === 409 || status === 429 || status >= 500
+    || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENETUNREACH'].includes(code)
+  const statusText = Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : null
+  const codeText = safeProviderToken(code, 80)
+  return {
+    code: transient ? 'API_TRANSIENT' : 'AGENT_EXECUTION_ERROR',
+    retryable: transient,
+    message: `DeepSeek API 调用失败（${statusText || codeText || '原因未明'}）`,
+    providerSignal: providerSignalFromError(error),
+  }
+}
 
 // ---- Cache observability -----------------------------------------------------
 // DeepSeek caches the prompt prefix server-side automatically, so there are no request-side knobs to set —
@@ -93,62 +201,31 @@ function parseJSON(s) {
   return null
 }
 
-async function webSearch(query) {
-  const key = process.env.TAVILY_API_KEY
-  if (!key) return 'web_search 不可用：未配置 TAVILY_API_KEY（联网核实需设 TAVILY_API_KEY；未设时本次按不联网处理）。'
-  try {
-    const r = await fetch('https://api.tavily.com/search', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: key, query, max_results: 5 }),
-    })
-    if (!r.ok) return `web_search 出错：HTTP ${r.status}`
-    const j = await r.json()
-    const results = (j.results || []).map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}\n   ${(x.content || '').slice(0, 500)}`).join('\n')
-    return (j.answer ? `摘要：${j.answer}\n\n` : '') + (results || '无结果')
-  } catch (e) { return `web_search 出错：${e.message}` }
-}
-
-async function webFetch(url) {
-  try {
-    const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 latepost-refiner' } })
-    if (!r.ok) return `web_fetch 出错：HTTP ${r.status}`
-    const html = await r.text()
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim()
-    return text.slice(0, 8000) || '(页面无可提取文本)'
-  } catch (e) { return `web_fetch 出错：${e.message}` }
-}
-
-// Render normalized adapter results ([{title,url,snippet}]) into the same text block webSearch returns for
-// Tavily, so the online agents see an identical tool-result contract whichever backend produced them. Pure +
-// exported for unit testing. (Adapters carry no synthesized answer, so there is no 摘要 line — snippets only.)
-export function formatSearchResults(results) {
-  const list = Array.isArray(results) ? results : []
-  const text = list
-    .map((x, i) => `${i + 1}. ${(x && x.title) || ''}\n   ${(x && x.url) || ''}\n   ${String((x && x.snippet) || '').slice(0, 500)}`)
-    .join('\n')
-  return text || '无结果'
-}
-
 // Tier word / raw id → DeepSeek model id. Unknown tier → v4-pro (the safe, faithful writing model).
-const resolveModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
+export const resolveDeepSeekModel = (m) => DEEPSEEK_MODELS[m] || m || DEEPSEEK_MODELS.opus
+export const resolveDeepSeekRouting = (stageModels = {}) => Object.fromEntries(
+  Object.entries(stageModels).map(([stage, model]) => [stage, resolveDeepSeekModel(model)]),
+)
 
 export function makeDeepSeekEngine(opts = {}) {
   const {
     apiKey,
     concurrency = Math.max(2, Math.min(16, (os.cpus().length || 4) - 2)),
     filePolicy,
-    onPhase, onLog,
-    searchFn,        // optional programmatic web_search override (bench/tests only) — replaces Tavily on online stages
-    searchK = 5,     // k passed to searchFn; 5 matches Tavily's max_results default
+    onPhase, onLog, onToolEvent, onAgentEvent,
+    searchApiKey, readerApiKey,
+    searchFn, fetchImpl, localFetchFn, dnsLookup,
+    searchK = 5, maxSearchRequestsPerJob = 100,
+    webRuntime,
   } = opts
   if (!opts.client && !apiKey) throw new Error('makeDeepSeekEngine: 缺少 DEEPSEEK_API_KEY')
 
   const client = opts.client || new OpenAI({ apiKey, baseURL: DEEPSEEK_BASE_URL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
-  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const web = webRuntime || makeWebRuntime({ searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
+  const failures = []
 
   const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
   const log = (msg) => (onLog ? onLog(msg) : process.stderr.write(`  ${msg}\n`))
@@ -158,114 +235,253 @@ export function makeDeepSeekEngine(opts = {}) {
     if (comp && comp.usage) {
       // OpenAI-style prompt_tokens INCLUDES cached tokens, so cacheRead is a subset of
       // input reported for observability — we do not subtract it from input.
-      usage.input += comp.usage.prompt_tokens || 0
-      usage.output += comp.usage.completion_tokens || 0
-      usage.cacheRead += parseCachedTokens(comp.usage)
+      const input = comp.usage.prompt_tokens || 0
+      const output = comp.usage.completion_tokens || 0
+      const cacheRead = parseCachedTokens(comp.usage)
+      usage.input += input
+      usage.output += output
+      usage.cacheRead += cacheRead
+      const modelId = params.model || 'unknown'
+      const row = usage.byModel[modelId] || { input: 0, output: 0, cacheRead: 0 }
+      row.input += input
+      row.output += output
+      row.cacheRead += cacheRead
+      usage.byModel[modelId] = row
     }
     return comp
   }
 
-  // web_search backend: the injected searchFn override (bench/tests) or the built-in Tavily path. The override
-  // receives (query, {k}) and returns the normalized adapter shape [{title,url,snippet}]; we format it exactly
-  // like the Tavily branch so the online agents' tool-result contract is unchanged. web_fetch is never overridden
-  // (adapters are search-only). Default (no searchFn) → webSearch, byte-for-byte the prior behaviour.
-  async function runWebSearch(query) {
-    if (!searchFn) return await webSearch(query)
-    try {
-      return formatSearchResults(await searchFn(query, { k: searchK }))
-    } catch (e) {
-      return `web_search 出错：${e.message}`
-    }
+  const emitToolEvent = (event) => {
+    if (!onToolEvent) return
+    try { onToolEvent(event) } catch { /* observability must not fail the run */ }
+  }
+  const emitAgentEvent = (event) => {
+    if (!onAgentEvent) return
+    try { onAgentEvent(event) } catch { /* observability must not fail the run */ }
   }
 
-  async function execTool(call) {
+  async function execTool(call, label, activeFilePolicy = safeFilePolicy) {
     const name = call.function && call.function.name
     const args = parseJSON(call.function && call.function.arguments) || {}
-    if (name === 'web_search') return await runWebSearch(args.query || '')
-    if (name === 'web_fetch') return await webFetch(args.url || '')
-    return runFileTool(name, args, safeFilePolicy).text // Read / Write / Edit
+    if (name === 'web_search') return { ok: true, text: await web.search(args.query || '') }
+    if (name === 'web_fetch') return { ok: true, text: await web.fetch(args.url || '') }
+    const result = runFileTool(name, args, activeFilePolicy)
+    emitToolEvent({ label: label || 'agent', tool: name, ok: !!result.ok, code: result.code || null, path: result.path || (args.file_path ? path.resolve(String(args.file_path)) : null), bytes: result.bytes ?? null })
+    return result
   }
 
-  // Last-resort structured output when the model won't call the tool on its own: force the specific
-  // function via tool_choice (DeepSeek supports this). Returns the parsed args, or null on failure.
+  // Last-resort structured output when the model will not call the tool after two nudges. V4 thinking mode
+  // rejects explicit tool_choice, so expose only structured_output and ask for it again. Returns parsed args,
+  // or null on failure.
   async function forceStructured_(messages, schema, modelId, label) {
     try {
       const comp = await create({
         model: modelId,
         messages: [...messages, { role: 'user', content: '请调用 structured_output 工具提交结果。' }],
         tools: [structuredTool(schema)],
-        tool_choice: { type: 'function', function: { name: 'structured_output' } },
         max_tokens: maxTokensFor(label),
       })
-      const c = (comp.choices?.[0]?.message?.tool_calls || []).find((x) => x.function?.name === 'structured_output')
+      const choice = comp.choices?.[0]
+      const signal = providerSignalFromResponse(comp, choice)
+      if (!choice) return { value: null, failure: classifyAgentError(agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true, signal)) }
+      if (choice.message?.refusal) return { value: null, failure: classifyAgentError(agentError('MODEL_REFUSAL', `${label || 'agent'} 被模型明确拒绝`, false, signal)) }
+      if (choice.finish_reason === 'content_filter') return { value: null, failure: classifyAgentError(agentError('CONTENT_FILTER', `${label || 'agent'} 被内容过滤`, false, signal)) }
+      const c = (choice.message?.tool_calls || []).find((x) => x.function?.name === 'structured_output')
       const v = c && parseJSON(c.function.arguments)
-      return v || null
+      return { value: v || null, signal }
     } catch (e) {
-      log(`⚠ ${label || 'agent'} 结构化兜底失败：${e.message}`)
-      return null
+      const failure = classifyAgentError(e)
+      log(`⚠ ${label || 'agent'} 结构化兜底失败 [${failure.code}]`)
+      return { value: null, failure }
     }
   }
 
-  async function runAgent(prompt, { model, schema, label } = {}) {
-    const modelId = resolveModel(model)
+  async function runAgent(prompt, {
+    model,
+    schema,
+    label,
+    outputPath,
+    validateOutput,
+    filePolicy: agentFilePolicy,
+  } = {}) {
+    const modelId = resolveDeepSeekModel(model)
+    // A stage may narrow the job-wide allowlist for one agent call. Quality repair uses
+    // this as a real write firebreak: the agent can touch its candidate only, never the
+    // already-published transcript that is being evaluated.
+    const activeFilePolicy = agentFilePolicy ? makeFilePolicy(agentFilePolicy) : safeFilePolicy
     const tools = [...FILE_TOOLS]
-    if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS) // client Tavily search + fetch
+    if (ONLINE_LABEL.test(label || '')) tools.push(...WEB_TOOLS)
     if (schema) tools.push(structuredTool(schema))
     const content = schema
       ? `${prompt}\n\n【提交方式】完成全部工作后，必须调用 structured_output 工具提交结构化结果；不要用普通文字给出最终结果。`
       : prompt
     const messages = [{ role: 'user', content }]
     let nudges = 0
+    let outputPostconditionNudges = 0
+    const outputValidationStates = []
+    let unrecoveredWriteFailure = null
+    let lastProviderSignal = null
+    const beforeOutput = outputSnapshot(outputPath)
+
+    const checkDeclaredOutput = async () => {
+      const post = checkOutputPostcondition(outputPath, beforeOutput)
+      if (!post.ok) return { ...post, kind: 'postcondition' }
+      if (typeof validateOutput !== 'function') return post
+      try {
+        const validation = await validateOutput(post)
+        if (validation === true || (validation && validation.ok === true)) return post
+        return {
+          ...(validation && typeof validation === 'object' ? validation : {}),
+          ok: false,
+          code: (validation && validation.code) || 'OUTPUT_VALIDATION_FAILED',
+          message: (validation && validation.message) || '声明产物未通过结构校验',
+          kind: 'validation',
+          artifactHash: post.artifactHash,
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          code: (error && error.code) || 'OUTPUT_VALIDATION_FAILED',
+          message: (error && error.message) || '声明产物结构校验异常',
+          kind: 'validation',
+          artifactHash: post.artifactHash,
+        }
+      }
+    }
+
+    const rejectStructuredOutput = (failure, toolCallId) => {
+      log(`⚠ ${label || 'agent'} 拒绝 structured_output：${failure.code} ${failure.message}`)
+      const instruction = failure.kind === 'validation'
+        ? '请按以上全部结构诊断修改同一产物，再重新提交 structured_output。'
+        : '请先成功写入声明产物，再重新提交 structured_output。'
+      messages.push({ role: 'tool', tool_call_id: toolCallId, content: `${failure.code}: ${failure.message}。${instruction}` })
+
+      if (failure.kind !== 'validation') {
+        outputPostconditionNudges += 1
+        if (outputPostconditionNudges >= MAX_OUTPUT_POSTCONDITION_NUDGES) {
+          throw agentError(failure.code, failure.message, false, lastProviderSignal)
+        }
+        return
+      }
+
+      const stateKey = validationStateKey(failure)
+      const previousIndex = outputValidationStates.lastIndexOf(stateKey)
+      const immediatelyPrevious = previousIndex >= 0 && previousIndex === outputValidationStates.length - 1
+      outputValidationStates.push(stateKey)
+      if (immediatelyPrevious) {
+        throw agentError(
+          'OUTPUT_VALIDATION_NO_PROGRESS',
+          `声明产物结构修正没有推进；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
+      }
+      if (previousIndex >= 0) {
+        throw agentError(
+          'OUTPUT_VALIDATION_OSCILLATION',
+          `声明产物结构修正在已见状态之间振荡；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
+      }
+      if (outputValidationStates.length >= MAX_OUTPUT_VALIDATION_STATES) {
+        throw agentError(
+          'OUTPUT_VALIDATION_LIMIT',
+          `声明产物结构修正达到安全上限（${MAX_OUTPUT_VALIDATION_STATES} 个不同状态）；最后诊断为 ${failure.code}: ${failure.message}`,
+          false,
+          lastProviderSignal,
+        )
+      }
+    }
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const comp = await create({ model: modelId, messages, tools, max_tokens: maxTokensFor(label) })
       const choice = comp.choices?.[0]
-      if (!choice) return null
+      lastProviderSignal = providerSignalFromResponse(comp, choice)
+      if (!choice) throw agentError('MODEL_EMPTY_RESPONSE', `${label || 'agent'} 未返回 choice`, true, lastProviderSignal)
       const m = choice.message || {}
-      if (m.refusal) { log(`⚠ ${label || 'agent'} 被拒：${m.refusal}`); return null }
+      if (m.refusal) throw agentError('MODEL_REFUSAL', `${label || 'agent'} 被模型明确拒绝`, false, lastProviderSignal)
 
       const asst = { role: 'assistant', content: m.content ?? '' }
+      // DeepSeek V4 thinking tool turns are a single protocol unit: the next request must replay the model's
+      // reasoning_content together with content and tool_calls, otherwise the provider rejects it with HTTP 400.
+      if (m.reasoning_content != null) asst.reasoning_content = m.reasoning_content
       const calls = m.tool_calls || []
       if (calls.length) asst.tool_calls = calls
       messages.push(asst)
 
       const so = calls.find((c) => c.function?.name === 'structured_output')
-      if (schema && so) { const v = parseJSON(so.function.arguments); if (v) return v }
+      const structuredValue = schema && so ? parseJSON(so.function.arguments) : null
 
       if (calls.length) {
         for (const c of calls) {
           const fname = c.function && c.function.name
-          const text = fname === 'structured_output'
-            ? 'structured_output 参数解析失败，请重新以合法 JSON 调用。'
-            : await execTool(c)
-          messages.push({ role: 'tool', tool_call_id: c.id, content: String(text) })
+          if (fname === 'structured_output') {
+            if (!structuredValue) messages.push({ role: 'tool', tool_call_id: c.id, content: 'structured_output 参数解析失败，请重新以合法 JSON 调用。' })
+            continue
+          }
+          const result = await execTool(c, label, activeFilePolicy)
+          if (FILE_TOOL_NAMES.has(fname) && !result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = result
+          if (FILE_TOOL_NAMES.has(fname) && result.ok && WRITE_TOOL_NAMES.has(fname)) unrecoveredWriteFailure = null
+          messages.push({ role: 'tool', tool_call_id: c.id, content: String(result.text) })
+        }
+        if (structuredValue) {
+          const post = await checkDeclaredOutput()
+          const failure = post.ok && !outputPath && unrecoveredWriteFailure
+            ? { ok: false, code: unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', message: unrecoveredWriteFailure.text }
+            : post
+          if (failure.ok) return structuredValue
+          rejectStructuredOutput(failure, so.id)
         }
         continue
       }
 
       // No tool calls → the model ended its turn.
-      if (choice.finish_reason === 'content_filter') { log(`⚠ ${label || 'agent'} content_filter`); return null }
-      if (!schema) return (m.content || '').trim()
+      if (choice.finish_reason === 'content_filter') throw agentError('CONTENT_FILTER', `${label || 'agent'} 被内容过滤`, false, lastProviderSignal)
+      if (!schema) {
+        const post = await checkDeclaredOutput()
+        if (!post.ok) throw agentError(post.code, post.message, false, lastProviderSignal)
+        if (!outputPath && unrecoveredWriteFailure) throw agentError(unrecoveredWriteFailure.code || 'TOOL_WRITE_FAILED', unrecoveredWriteFailure.text, false, lastProviderSignal)
+        const text = (m.content || '').trim()
+        if (!outputPath && !text) throw agentError('MODEL_EMPTY_CONTENT', `${label || 'agent'} 返回空内容`, true, lastProviderSignal)
+        return text
+      }
       if (nudges < 2) {
         nudges++
         messages.push({ role: 'user', content: '请现在调用 structured_output 工具提交最终结构化结果（不要用普通文字回复）。' })
         continue
       }
-      return await forceStructured_(messages, schema, modelId, label)
+      const forced = await forceStructured_(messages, schema, modelId, label)
+      if (!forced.value) {
+        if (forced.failure) throw agentError(forced.failure.code, forced.failure.message, forced.failure.retryable, forced.failure.providerSignal || lastProviderSignal)
+        throw agentError('STRUCTURED_OUTPUT_MISSING', `${label || 'agent'} 未返回结构化结果`, true, forced.signal || lastProviderSignal)
+      }
+      const post = await checkDeclaredOutput()
+      if (!post.ok) throw agentError(post.code, post.message, false, forced.signal || lastProviderSignal)
+      return forced.value
     }
-    log(`⚠ ${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`)
-    return schema ? await forceStructured_(messages, schema, modelId, label) : null
+    throw agentError('AGENT_TURN_LIMIT', `${label || 'agent'} 达到工具循环上限（${MAX_TURNS}）`, false, lastProviderSignal)
   }
 
   // Limiter wraps each agent (leaf unit); nested parallel shares one global cap, no deadlock.
   function agent(prompt, agentOpts = {}) {
     return limit(async () => {
       usage.agents++
+      const baseEvent = {
+        label: agentOpts.label || 'agent', phase: agentOpts.phase || null,
+        model: resolveDeepSeekModel(agentOpts.model),
+      }
+      emitAgentEvent({ ...baseEvent, status: 'started' })
       try {
-        return await runAgent(prompt, agentOpts)
+        const value = await runAgent(prompt, agentOpts)
+        emitAgentEvent({ ...baseEvent, status: 'completed' })
+        return value
       } catch (e) {
         usage.failed++
-        log(`⚠ ${agentOpts.label || 'agent'} 失败：${e.message}`)
+        const failure = { label: agentOpts.label || 'agent', ...classifyAgentError(e) }
+        failures.push(failure)
+        emitAgentEvent({ ...baseEvent, status: 'failed', code: failure.code, retryable: failure.retryable, providerSignal: failure.providerSignal || null })
+        log(`⚠ ${failure.label} 失败 [${failure.code}]：${failure.message}`)
         return null
       }
     })
@@ -292,10 +508,16 @@ export function makeDeepSeekEngine(opts = {}) {
   // declares a budget, else undefined — the pipeline reads it to decide auto-chunking, and undefined means
   // "no cap". Pure lookup, no network.
   function refineBudget(tier) {
-    const model = resolveModel(tier)
+    const model = resolveDeepSeekModel(tier)
     const budget = REFINE_CHAR_BUDGET[model]
     return (typeof budget === 'number' && budget > 0) ? { model, budget } : undefined
   }
 
-  return { agent, parallel, pipeline, phase, log, usage: () => ({ ...usage }), refineBudget }
+  return {
+    agent, parallel, pipeline, phase, log,
+    usage: () => ({ ...usage, byModel: Object.fromEntries(Object.entries(usage.byModel).map(([k, v]) => [k, { ...v }])) }),
+    failures: () => failures.map((f) => ({ ...f })),
+    refineBudget,
+    webTelemetry: web.telemetry,
+  }
 }
