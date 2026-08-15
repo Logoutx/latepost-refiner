@@ -48,7 +48,7 @@ function refinedDoc(title = '示例访谈') {
   ].join('\n')
 }
 
-test('Codex native prepare normalizes SRT sources into local markdown before prompts', () => {
+test('Codex native short SRT with generic Speaker 1/2 labels is normalized and stays on the staged flow', () => {
   const out = tmpdir()
   const src = path.join(out, '2026-07-01_示例字幕.srt')
   fs.writeFileSync(src, [
@@ -73,6 +73,9 @@ test('Codex native prepare normalizes SRT sources into local markdown before pro
   const args = JSON.parse(fs.readFileSync(prepared.argsPath, 'utf8'))
   assert.equal(args.files[0].sourceKind, 'srt')
   assert.equal(args.files[0].originalPath, src)
+  assert.equal(args.files[0].needsSpeakerResolution, true)
+  assert.equal(prepared.prompts[0].stage, 'scout')
+  assert.ok(!prepared.prompts.some((prompt) => prompt.stage === 'single-pass'))
   assert.match(args.files[0].path, /_codex-native\/sources\/.+\.md$/)
   const normalized = fs.readFileSync(args.files[0].path, 'utf8')
   assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(normalized), 'raw timecode arrows are not sent to native prompts')

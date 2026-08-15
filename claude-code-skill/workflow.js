@@ -1591,7 +1591,9 @@ function refineSize(f) {
   if (f && f.bytes) return Math.round(f.bytes / 2.6)
   return Math.round(((f && f.lines) || 0) * 14)
 }
-const ONE_PASS_CHARS = 4000          // legacy short-file threshold; bypass is disabled so every file enters Scout
+// Subscription runtimes retain a speaker-gated short-file fast path; Universal supplies host capabilities and
+// always takes the full staged path. Callers must never bypass Scout while speaker resolution is still needed.
+const ONE_PASS_CHARS = 4000
 
 // ---------- single-shot refine (M11a) ----------
 // Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
@@ -4007,12 +4009,37 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText, options = 
       ? ` --speaker-review-labels ${JSON.stringify(JSON.stringify(speakerContext.speakerReviewLabels))}`
       : ''
     const cmd = `node ${JSON.stringify(skillDir + '/audit_refined.mjs')} --source ${JSON.stringify(src)} --refined ${JSON.stringify(out)}${glossaryArg}${dismissedArg}${reviewArg}`
-    const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON 解析后原样交回（结构化返回；字段一律照抄，不要改写任何字符串——尤其不要把弯引号改成直引号）：\n${cmd}`
+    const prompt = `${stagePreamble}用 Bash 运行下面这条命令，把它打印到 stdout 的 JSON 原样交回——不要改写任何字符，尤其不要把弯引号改成直引号（使用结构化返回；字段一律照抄）：\n${cmd}`
     // Free-text echo is NOT trusted here: a relay model can silently normalize curly quotes inside JSON string
     // values into ASCII quotes, breaking the escaping (hit live 2026-08-16 on a heading containing “…”). The
     // schema forces a validated tool-call return, so malformed JSON is rejected at the harness layer and retried
     // there — parseAuditJson stays only as the belt for exotic hosts that ignore schemas.
-    const AUDIT_ECHO_SCHEMA = { type: 'object', additionalProperties: true, properties: { status: { type: 'string' }, files: { type: 'array' } } }
+    const openObject = { type: 'object', additionalProperties: true }
+    const AUDIT_ECHO_SCHEMA = {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        status: { type: 'string' },
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: true,
+            properties: {
+              file: { type: 'string' },
+              status: { type: 'string' },
+              failed: { type: 'array', items: { type: 'string' } },
+              gaps: { type: 'array', items: openObject },
+              findings: { type: 'array', items: openObject },
+              metrics: openObject,
+              sections: { type: 'array', items: openObject },
+              modelMarkers: { type: 'array', items: openObject },
+              numericConflicts: { type: 'array', items: openObject },
+            },
+          },
+        },
+      },
+    }
     let raw = await engine.agent(prompt, { label: `audit:${f.label}`, phase: 'Audit', model: 'haiku', schema: AUDIT_ECHO_SCHEMA })
     let parsed = parseAuditJson(raw)
     if (!parsed) { // one retry
@@ -4069,14 +4096,19 @@ async function runAuditStep(A, engine, f, capabilities, glossaryText, options = 
     const again = await audit({ phase: 'post_sandbox_repair', round: 1 })
     if (again) {
       cur = again
-      repaired = true
       hard = hardOf(cur)
+      repaired = hard.length === 0
       repairAttempts.push({
-        file: out, round: 1, action: 'sandbox_spot_repair', model: sandboxRepairModel,
+        file: out, round: 1, mode: 'in_place_sandbox', action: 'sandbox_spot_repair', model: sandboxRepairModel,
         failedBefore: sandboxRepairFindings, failedAfter: hard.slice(),
         outcome: hard.length ? 'audit_failed' : 'passed',
       })
       engine.log(`审计复检：${f.label} → ${hard.length ? `hard 仍在：${hard.join('、')}` : '已通过'}`)
+    } else {
+      repairAttempts.push({
+        file: out, round: 1, mode: 'in_place_sandbox', action: 'sandbox_spot_repair', model: sandboxRepairModel,
+        failedBefore: sandboxRepairFindings, failedAfter: hard.slice(), outcome: 'audit_unavailable',
+      })
     }
   }
 

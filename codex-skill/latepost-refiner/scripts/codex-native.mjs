@@ -55,6 +55,7 @@ import {
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
 import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource, normalizeQuoteStyleText } from './audit_refined.mjs'
+import { parseSpeakerDocument } from './speaker-resolver.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -277,6 +278,7 @@ export function normalizeArgs(input) {
     f.lines = Number.isFinite(Number(f.lines)) && Number(f.lines) > 0 ? Number(f.lines) : lineCount(f.path)
     f.bytes = Number.isFinite(Number(f.bytes)) && Number(f.bytes) > 0 ? Number(f.bytes) : byteCount(f.path)
     f.chars = Number.isFinite(Number(f.chars)) && Number(f.chars) > 0 ? Number(f.chars) : contentChars(f.path)
+    f.needsSpeakerResolution = parseSpeakerDocument(fs.readFileSync(f.path, 'utf8')).needsResolution
     f.title = f.title || originalTitle || titleFromPath(f.path) || f.label
     f.subtitle = f.subtitle || defaultSubtitle(A)
     f.outPath = f.outPath ? path.resolve(f.outPath) : path.join(A.outputDir, 'Transcripts', `${f.title}.md`)
@@ -301,7 +303,9 @@ export function prepareNativeRun(args) {
   markStage(A, 'prepare', 'start')
   const normalizedArgsPath = writeJson(path.join(dir, 'args.json'), A)
   const prompts = []
-  const shortSinglePass = A.files.length === 1 && (A.files[0].chars || 0) < ONE_PASS_CHARS
+  const shortSinglePass = A.files.length === 1
+    && (A.files[0].chars || 0) < ONE_PASS_CHARS
+    && A.files[0].needsSpeakerResolution === false
   if (shortSinglePass) {
     const f = A.files[0]
     const lockedClusters = (A.canonicalOverrides && A.canonicalOverrides.length)

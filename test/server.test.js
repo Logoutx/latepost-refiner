@@ -63,6 +63,10 @@ test('served HTML embeds the per-session API token', async () => {
   const res = await request(server, 'GET', '/')
   assert.equal(res.status, 200)
   assert.match(res.body, /window\.__TRANSCRIBER_TOKEN__="test-token"/)
+  assert.match(res.body, /id="tavilyKey"/)
+  assert.match(res.body, /id="serperKey"/)
+  assert.match(res.body, /id="jinaKey"/)
+  assert.match(res.body, /serperKey: \$\('serperKey'\).*jinaKey: \$\('jinaKey'\)/s)
 })
 
 test('serves a PWA manifest and an SVG icon so the GUI installs as a local app', async () => {

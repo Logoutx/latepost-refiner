@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { runPipeline, normalizeAuditResult } from '../core/pipeline.js'
 import { auditPair } from '../scripts/audit_refined.mjs'
+import { qualityRepairResult } from '../universal/jobs.js'
 
 // All fixtures are fictional (王总/王志远, 苍碧/苍璧科技, 沈其安/沈总, 陈涛/陈焘 — 仓库既有虚构占位).
 // These tests drive runPipeline with a mock engine (zero tokens) + mock capabilities, exercising the Wave 2
@@ -25,7 +26,7 @@ function engine(labels, on = {}, capturePrompts = null) {
   return {
     agent: async (p, o) => {
       labels.push(o.label)
-      if (capturePrompts) capturePrompts.push({ label: o.label, prompt: p })
+      if (capturePrompts) capturePrompts.push({ label: o.label, prompt: p, schema: o.schema })
       for (const [pre, val] of Object.entries(on)) if (new RegExp(pre).test(o.label)) return typeof val === 'function' ? val(p, o) : val
       return def(o.label)
     },
@@ -470,8 +471,16 @@ test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a
   }, prompts)
   const r = await runPipeline(A(), eng) // no capabilities → CC fallback path
   assert.ok(labels.includes('audit:A'), 'a fallback audit agent ran')
-  const auditPrompt = prompts.find((x) => x.label === 'audit:A').prompt
-  assert.ok(/audit_refined\.mjs/.test(auditPrompt) && /--source/.test(auditPrompt), 'the agent is told to run the audit script')
+  const auditCall = prompts.find((x) => x.label === 'audit:A')
+  assert.ok(/audit_refined\.mjs/.test(auditCall.prompt) && /--source/.test(auditCall.prompt), 'the agent is told to run the audit script')
+  assert.match(auditCall.prompt, /stdout 的 JSON 原样交回——不要改写任何字符，尤其不要把弯引号改成直引号/)
+  assert.equal(auditCall.schema.additionalProperties, true)
+  const fileSchema = auditCall.schema.properties.files.items
+  assert.equal(fileSchema.additionalProperties, true)
+  assert.deepEqual(Object.keys(fileSchema.properties).sort(), [
+    'failed', 'file', 'findings', 'gaps', 'metrics', 'modelMarkers', 'numericConflicts', 'sections', 'status',
+  ])
+  assert.equal(fileSchema.properties.metrics.additionalProperties, true)
   assert.deepEqual(r.auditFailed, [])
   assert.equal(r.refined[0].audit.status, 'ok')
 })
@@ -510,6 +519,31 @@ test('CC sandbox spot-repairs content_gap once with Read/Edit and re-audits', as
   assert.deepEqual(r.auditFailed, [])
   assert.equal(r.refined[0].audit.repaired, true)
   assert.equal(r.qualityRepairAttempts[0].action, 'sandbox_spot_repair')
+  assert.equal(r.qualityRepairAttempts[0].mode, 'in_place_sandbox')
+})
+
+test('CC sandbox still-hard spot repair is not marked repaired and reports its single-round stop honestly', async () => {
+  const labels = []
+  let audits = 0
+  const eng = engine(labels, {
+    '^audit:': () => {
+      audits += 1
+      return JSON.stringify({
+        status: 'fail',
+        files: [{ file: '/o/Transcripts/A.md', status: 'fail', failed: ['content_gap'], gaps: [], findings: [] }],
+      })
+    },
+    '^repair:': '已定点修复但问题仍在',
+    '^anchors:': '已加锚点',
+  })
+  const r = await runPipeline(A(), eng)
+  assert.equal(audits, 2)
+  assert.equal(r.refined[0].audit.repaired, false)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap'] }])
+  assert.equal(r.qualityRepairAttempts.length, 1)
+  assert.equal(r.qualityRepairAttempts[0].mode, 'in_place_sandbox')
+  assert.equal(r.qualityRepairAttempts[0].round, 1)
+  assert.equal(qualityRepairResult(r).stopReason, 'sandbox_single_round')
 })
 
 test('audit gate (no capability): unparseable agent output → one retry → FAILS LOUDLY via top-level auditUnavailable, never throws', async () => {

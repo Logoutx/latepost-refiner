@@ -220,15 +220,14 @@ export function makeDeepSeekEngine(opts = {}) {
   } = opts
   if (!opts.client && !apiKey) throw new Error('makeDeepSeekEngine: 缺少 DEEPSEEK_API_KEY')
 
+  const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
+  const log = (msg) => (onLog ? onLog(msg) : process.stderr.write(`  ${msg}\n`))
   const client = opts.client || new OpenAI({ apiKey, baseURL: DEEPSEEK_BASE_URL, timeout: 600000, maxRetries: 4 })
   const limit = pLimit(concurrency)
   const safeFilePolicy = makeFilePolicy(filePolicy)
-  const web = webRuntime || makeWebRuntime({ tavilyApiKey, searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob })
+  const web = webRuntime || makeWebRuntime({ tavilyApiKey, searchApiKey, readerApiKey, searchFn, fetchImpl, localFetchFn, dnsLookup, searchK, maxSearchRequestsPerJob, onLog: log })
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0, byModel: {} }
   const failures = []
-
-  const phase = (title) => (onPhase ? onPhase(title) : process.stderr.write(`\n▸ ${title}\n`))
-  const log = (msg) => (onLog ? onLog(msg) : process.stderr.write(`  ${msg}\n`))
 
   async function create(params) {
     const comp = await client.chat.completions.create(params)

@@ -90,7 +90,7 @@ export function estimateCost(provider, models, usage) {
 // `provider`/`models` describe what actually served the run: `models` is the tier→model-id map used for
 // cost estimation (e.g. DEEPSEEK_MODELS) — null when it doesn't apply (e.g. an injected test engine with
 // no real provider/model map).
-export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null, webTelemetry = null } = {}) {
+export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null, webTelemetry = null, searchProvider = null } = {}) {
   const durationMs = result.durationMs || 0
   const usageSrc = result.usage || {}
   const usage = {
@@ -106,7 +106,14 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
 
   const estCost = estimateCost(provider, models, usage)
   const searchBilled = (webTelemetry && webTelemetry.searchBilled) || 0
-  const searchEstCost = { value: round6(searchBilled / 1000), currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' }
+  const effectiveSearchProvider = searchProvider === 'tavily' || searchProvider === 'serper' ? searchProvider : null
+  const searchRate = effectiveSearchProvider === 'tavily' ? 0.008 : effectiveSearchProvider === 'serper' ? 0.001 : 0
+  const searchNote = effectiveSearchProvider === 'tavily'
+    ? 'Tavily Basic list price: $0.008 / search'
+    : effectiveSearchProvider === 'serper'
+      ? 'Serper list price: $1 / 1,000 searches'
+      : 'No search provider configured'
+  const searchEstCost = { value: round6(searchBilled * searchRate), currency: 'USD', note: searchNote }
   const readerTokens = (webTelemetry && webTelemetry.fetchJinaTokens) || 0
   const readerMissing = (webTelemetry && webTelemetry.fetchJinaUsageMissing) || 0
   const readerEstCost = {
@@ -116,7 +123,7 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
   }
   const totalEstCost = estCost
     ? { value: round8(estCost.value + searchEstCost.value + readerEstCost.value), currency: 'USD', note: estCost.note }
-    : ((searchBilled || readerTokens) ? {
+    : (((searchBilled && effectiveSearchProvider) || readerTokens) ? {
         value: round8(searchEstCost.value + readerEstCost.value), currency: 'USD', note: null,
       } : null)
 
@@ -132,6 +139,7 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     durationMin: round1(durationMs / 60000),
     usage,
     estCost,
+    searchProvider: effectiveSearchProvider,
     searchEstCost,
     readerEstCost,
     totalEstCost,

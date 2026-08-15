@@ -44,23 +44,28 @@ test('buildRunLogEntry: shape from a fake result (all fields, worked-example cos
   // fresh = 1000-200 = 800; cheaper (flash) for input, writing-tier (pro) for output:
   // (800*0.14 + 200*0.0028 + 500*0.87) / 1e6 = (112 + 0.56 + 435) / 1e6 = 0.000548
   assert.deepEqual(entry.estCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
-  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
+  assert.equal(entry.searchProvider, null)
+  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'No search provider configured' })
   assert.deepEqual(entry.readerEstCost, { value: 0, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
   assert.deepEqual(entry.totalEstCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.equal(entry.auditStatus, 'ok')
   assert.equal(entry.outputDir, '/out/虚构示例项目')
 })
 
-test('buildRunLogEntry separates DeepSeek, Serper, and Jina estimated costs', () => {
+test('buildRunLogEntry separates DeepSeek, Tavily, and Jina estimated costs', () => {
   const models = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
   const result = { usage: { input: 1000, output: 500 }, durationMs: 1 }
   const webTelemetry = { searchBilled: 7, fetchJinaTokens: 608025, fetchJinaUsageMissing: 0 }
-  const entry = buildRunLogEntry({ params: {}, result, provider: 'deepseek', models, webTelemetry })
+  const entry = buildRunLogEntry({ params: {}, result, provider: 'deepseek', models, webTelemetry, searchProvider: 'tavily' })
   assert.equal(entry.estCost.value, 0.000575)
-  assert.deepEqual(entry.searchEstCost, { value: 0.007, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
+  assert.equal(entry.searchProvider, 'tavily')
+  assert.deepEqual(entry.searchEstCost, { value: 0.056, currency: 'USD', note: 'Tavily Basic list price: $0.008 / search' })
   assert.deepEqual(entry.readerEstCost, { value: 0.03040125, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
-  assert.equal(entry.totalEstCost.value, 0.03797625)
+  assert.equal(entry.totalEstCost.value, 0.08697625)
   assert.deepEqual(entry.webTelemetry, webTelemetry)
+
+  const serper = buildRunLogEntry({ result: {}, webTelemetry: { searchBilled: 7 }, searchProvider: 'serper' })
+  assert.deepEqual(serper.searchEstCost, { value: 0.007, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
 })
 
 test('buildRunLogEntry: auditStatus is "unavailable" when result.audit is absent, "fail" when audit failed', () => {
@@ -227,8 +232,9 @@ test('runJob integration: a completed run appends exactly one log line with the 
   assert.equal(entry.engine, 'universal')
   assert.equal(entry.provider, 'injected')
   assert.equal(entry.webTelemetry.searchBilled, 1)
-  assert.equal(entry.searchEstCost.value, 0.001)
-  assert.equal(entry.totalEstCost.value, 0.001)
+  assert.equal(entry.searchProvider, null)
+  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'No search provider configured' })
+  assert.equal(entry.totalEstCost, null)
   assert.ok(['ok', 'fail', 'unavailable'].includes(entry.auditStatus))
 })
 

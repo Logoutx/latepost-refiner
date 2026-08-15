@@ -345,7 +345,10 @@ export function qualityRepairResult(pipelineResult = {}) {
   const roundsUsed = attempts.reduce((max, attempt) => Math.max(max, Number(attempt.round) || 0), 0)
   let stopReason = 'not_needed'
   if ((pipelineResult.auditUnavailable || []).length || attempts.some((attempt) => attempt.outcome === 'audit_unavailable')) stopReason = 'audit_unavailable'
-  else if ((pipelineResult.auditFailed || []).length) stopReason = attempts.length ? 'max_rounds' : 'repair_unavailable'
+  else if ((pipelineResult.auditFailed || []).length) {
+    if (attempts.some((attempt) => attempt.mode === 'in_place_sandbox')) stopReason = 'sandbox_single_round'
+    else stopReason = attempts.length ? 'max_rounds' : 'repair_unavailable'
+  }
   else if (attempts.length) stopReason = 'passed'
   return { schemaVersion: 1, maxRounds: QUALITY_REPAIR_MAX_ROUNDS, roundsUsed, stopReason, attempts }
 }
@@ -1050,7 +1053,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     modelOverrides,
     effectiveModels,
     capabilities,
-    searchProvider: (tavilyKey || process.env.TAVILY_API_KEY) ? 'tavily' : ((serperKey || process.env.SERPER_API_KEY) ? 'serper' : 'tavily'),
+    searchProvider: (tavilyKey || process.env.TAVILY_API_KEY) ? 'tavily' : ((serperKey || process.env.SERPER_API_KEY) ? 'serper' : null),
     fetchProvider: 'jina-reader+local-fallback',
     fresh, annotate: params.annotate, files: fileEntries,
     plannedChunks: [],
@@ -1161,7 +1164,7 @@ export async function runJob(params, { onPhase, onLog, onNotice } = {}) {
     let runLog = null
     if (params.runLog !== false) {
       const runLogModels = sel.provider === 'deepseek' ? effectiveModels : null
-      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels, webTelemetry })
+      const entry = buildRunLogEntry({ params, result, provider: sel.provider, models: runLogModels, webTelemetry, searchProvider: A.searchProvider })
       const logRes = appendRunLog(entry, { logPath: params.runLogPath })
       if (logRes.ok) runLog = { path: logRes.path, lineCount: logRes.lineCount }
       else notice(`警告：运行日志写入失败：${logRes.error}`)

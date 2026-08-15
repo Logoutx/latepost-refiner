@@ -206,6 +206,7 @@ async function localHttpFetch(raw, { resolveAddresses = (host) => publicAddresse
 export function makeWebRuntime(opts = {}) {
   const {
     tavilyApiKey, searchApiKey, readerApiKey, searchFn,
+    onLog,
     fetchImpl = globalThis.fetch, localFetchFn,
     dnsLookup = dns.promises.lookup,
     dohLookup, dohFetchImpl = globalThis.fetch,
@@ -217,6 +218,7 @@ export function makeWebRuntime(opts = {}) {
   const addressCache = new Map()
   const allowed = new Set()
   let reserved = 0
+  const log = typeof onLog === 'function' ? onLog : () => {}
   const effectiveDohLookup = dohLookup || ((host) => trustedDohLookup(host, dohFetchImpl))
 
   const resolveAddresses = async (host) => {
@@ -300,6 +302,20 @@ export function makeWebRuntime(opts = {}) {
     throw last || new Error('Tavily 搜索失败')
   }
 
+  async function doConfiguredSearch(query) {
+    if (!tavilyApiKey) {
+      if (searchApiKey) return await doSerper(query)
+      throw new Error('未配置 TAVILY_API_KEY 或 SERPER_API_KEY')
+    }
+    try {
+      return await doTavily(query)
+    } catch (error) {
+      if (!searchApiKey) throw error
+      log('搜索后备：Tavily 失败，改用 Serper')
+      return await doSerper(query)
+    }
+  }
+
   async function search(queryRaw) {
     stats.searchCalls += 1
     const key = normalizeSearchQuery(queryRaw)
@@ -315,9 +331,7 @@ export function makeWebRuntime(opts = {}) {
       try {
         const rows = searchFn
           ? await searchFn(queryRaw, { k: searchK })
-          : (tavilyApiKey
-              ? await doTavily(queryRaw)
-              : (searchApiKey ? await doSerper(queryRaw) : await Promise.reject(new Error('未配置 TAVILY_API_KEY 或 SERPER_API_KEY'))))
+          : await doConfiguredSearch(queryRaw)
         if (!Array.isArray(rows)) throw new Error('searchFn/Tavily/Serper 未返回结果数组')
         const normalized = rows.slice(0, searchK).map((x) => ({ title: x?.title || '', url: x?.url || '', snippet: x?.snippet || '' })).filter((x) => x.url)
         searchCache.set(key, normalized) // successful empty result is cacheable

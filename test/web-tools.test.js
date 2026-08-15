@@ -38,6 +38,29 @@ test('Tavily is primary when both search keys are configured', async () => {
   assert.deepEqual(JSON.parse(calls[0].init.body), { api_key: 'tavily-secret', query: '示例查询', max_results: 5 })
 })
 
+test('Tavily failure falls back to Serper once and caches the successful query result', async () => {
+  const calls = [], logs = []
+  const rt = makeWebRuntime({
+    tavilyApiKey: 'tavily-secret',
+    searchApiKey: 'serper-secret',
+    onLog: (line) => logs.push(line),
+    fetchImpl: async (url) => {
+      calls.push(url)
+      if (url === 'https://api.tavily.com/search') return response({ status: 401 })
+      return response({ json: { organic: [{ title: '后备结果', link: 'https://example.com/fallback', snippet: '摘要' }] } })
+    },
+  })
+  assert.match(await rt.search('后备查询'), /后备结果/)
+  assert.match(await rt.search(' 后备查询 '), /后备结果/)
+  assert.deepEqual(calls, ['https://api.tavily.com/search', 'https://google.serper.dev/search'])
+  assert.deepEqual(logs, ['搜索后备：Tavily 失败，改用 Serper'])
+  assert.deepEqual(rt.telemetry(), {
+    searchCalls: 2, searchAttempts: 2, searchBilled: 1, searchCacheHits: 1, searchBudgetRejected: 0, searchFailures: 0,
+    fetchCalls: 0, fetchCacheHits: 0, fetchJinaAttempts: 0, fetchJinaSuccess: 0, fetchJinaTokens: 0,
+    fetchJinaUsageMissing: 0, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0,
+  })
+})
+
 test('Serper alternate request contract, successful-empty caching, in-flight/cache dedupe, and telemetry', async () => {
   const calls = []
   let release

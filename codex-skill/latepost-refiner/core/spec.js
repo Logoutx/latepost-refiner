@@ -725,7 +725,9 @@ export function refineSize(f) {
   if (f && f.bytes) return Math.round(f.bytes / 2.6)
   return Math.round(((f && f.lines) || 0) * 14)
 }
-export const ONE_PASS_CHARS = 4000          // legacy short-file threshold; bypass is disabled so every file enters Scout
+// Subscription runtimes retain a speaker-gated short-file fast path; Universal supplies host capabilities and
+// always takes the full staged path. Callers must never bypass Scout while speaker resolution is still needed.
+export const ONE_PASS_CHARS = 4000
 
 // ---------- single-shot refine (M11a) ----------
 // Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
