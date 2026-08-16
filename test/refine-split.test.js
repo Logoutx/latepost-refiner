@@ -4,12 +4,13 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, contentLength,
-  REFINE_CHUNK_CHARS, MAX_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
+  splitForRefine, splitForScout, mergeScoutChunks, partPath, stitchParts, stitchPartsWithReport, contentLength,
+  REFINE_CHUNK_CHARS, MAX_SPEED_REFINE_CHUNKS, SCOUT_CHUNK_CHARS, MAX_SCOUT_CHUNKS,
   renderGlossary, renderRefineGlossary,
   clusterEntities, entityWorth, verifyChunks, suspectUnverified,
   endsWithQuestion, parseTurns,
 } from '../core/spec.js'
+import { resolveSpeakerMapping } from '../scripts/speaker-resolver.js'
 import { checkMissingYin, parseGlossaryLite } from '../scripts/audit_refined.mjs'
 import { readPlanRange, refinePrompt, stitchPrompt, scoutPrompt, summaryPrompt } from '../core/prompts.js'
 import { concatFiles, makeFilePolicy } from '../engines/fileops.js'
@@ -58,14 +59,14 @@ test('speed mode fallback: files ≤ char threshold stay single; just over → 2
 test('speed mode: large files split into up to 2 contiguous chunks by 字数 (conservative cap)', () => {
   for (const [lines, chars] of [[2130, 29599], [1467, 21000], [1350, 20764]]) {
     const chunks = splitForRefine({ lines, chars, label: 'A' }, 'speed')
-    assert.equal(chunks.length, 2, `${chars} 字 → 2 chunks (MAX ${MAX_REFINE_CHUNKS})`)
+    assert.equal(chunks.length, 2, `${chars} 字 → 2 chunks (MAX ${MAX_SPEED_REFINE_CHUNKS})`)
     assertContiguous(chunks, lines)
   }
 })
 
-test('speed mode: very large files capped at MAX_REFINE_CHUNKS', () => {
+test('speed mode: very large files capped at MAX_SPEED_REFINE_CHUNKS', () => {
   const chunks = splitForRefine({ lines: 9000, chars: 120000, label: 'A' }, 'speed')
-  assert.equal(chunks.length, MAX_REFINE_CHUNKS, 'capped at MAX_REFINE_CHUNKS')
+  assert.equal(chunks.length, MAX_SPEED_REFINE_CHUNKS, 'capped at MAX_SPEED_REFINE_CHUNKS')
   assertContiguous(chunks, 9000)
 })
 
@@ -212,7 +213,7 @@ test('parseTurns maps each 名字：label line to its opening line and question 
     { startLine: 3, q: false },  // 「为什么不涨价」 has no trailing ？
     { startLine: 4, q: false },
   ])
-  assert.deepEqual(parseTurns('没有任何发言人标签的纯文本'), [], 'label-less text → no turns (line-divider fallback)')
+  assert.deepEqual(parseTurns('没有任何发言人标签的纯文本'), [{ startLine: 1, q: false }], 'label-less text → one paragraph block boundary')
 })
 
 // ---------- splitForScout / mergeScoutChunks (oversized-file scout resilience) ----------
@@ -241,10 +242,11 @@ test('splitForScout: not gated by chunkMode (resilience, always on) and unsplitt
 test('mergeScoutChunks unions per-chunk findings into one and keeps the file-end anchor', () => {
   const parts = [
     { speakers: [{ label: '记者', role: '记者' }, { label: '发言人1', role: '受访者' }], people: [{ canonical: '张三' }], brands: [], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['A'] }], themes: ['开场'], has_existing_headings: false, ending_anchor: { line: 700, text: '中段。' }, special_notes: ['注一'] },
-    { speakers: [{ label: '发言人1', role: '受访者' }], people: [{ canonical: '李四' }], brands: [{ canonical: '某品牌' }], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['B'] }], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 2000, text: '就到这里。' }, special_notes: ['注二'] },
+    { speakers: [{ label: '发言人 1', role: '受访者', identity: '李四，创始人', output_label: '李四' }], people: [{ canonical: '李四' }], brands: [{ canonical: '某品牌' }], terms: [{ canonical: '甲术语' }], errors: [{ kind: '同音字错', examples: ['B'] }], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 2000, text: '就到这里。' }, special_notes: ['注二'] },
   ]
   const m = mergeScoutChunks(parts, { lines: 2000 })
   assert.deepEqual(m.speakers.map((s) => s.label), ['记者', '发言人1'], 'speakers unioned, deduped by label')
+  assert.equal(m.speakers[1].output_label, '李四', 'a later chunk with a specific identity upgrades the shared speaker record')
   assert.equal(m.people.length, 2, 'people concatenated (downstream clusterEntities dedups across chunks, as it does across files)')
   assert.deepEqual(m.themes, ['开场', '收尾'], 'themes unioned')
   assert.equal(m.has_existing_headings, true, 'has_existing_headings is OR across chunks')
@@ -265,6 +267,73 @@ test('mergeScoutChunks returns null only if every chunk failed; a partial set st
   assert.ok(m && m.people.length === 1, 'one surviving chunk still produces a usable glossary')
 })
 
+// ---------- mergeScoutChunks: 分段侦察对同一说话人给出矛盾高置信姓名时的降级处理 ----------
+
+test('分段侦察对同一轨道给出矛盾高置信姓名时降级并显式记录', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '矛盾姓名一律放弃自动命名')
+  assert.equal(m.speakers[0].output_label_confidence, 'low')
+  assert.equal(m.speakers[0].label, '说话人 1', '仍保留原始数字标签，等人工确认')
+  assert.ok(m.special_notes.some((n) => n.includes('林洄') && n.includes('陈遥')), '矛盾双方姓名都要显式出现在提示里')
+})
+
+test('矛盾姓名即使分数不同也降级', () => {
+  // 第二条记录多带一个 identity，打分会更高；但“分数更高”不能替代“姓名互相矛盾”的判断——
+  // 即使换成分数占优的一方，两个不同的人名本身就是需要人工确认的分歧，不能自动定论。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者', identity: '陈遥' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '分数占优的一方也不能绕过冲突降级')
+  assert.equal(m.speakers[0].output_label_confidence, 'low')
+  assert.ok(m.special_notes.some((n) => n.includes('林洄') && n.includes('陈遥')))
+})
+
+test('同名不冲突，高分替换保留首次拼写', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍', role: '受访者' }] },
+    // 第二段的标签写法不带空格（说话人1），但按 generic key 仍归到同一轨道；且姓名相同不构成矛盾。
+    { speakers: [{ label: '说话人1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '对方称呼', role: '受访者', identity: '林洄，创始人' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '林洄')
+  assert.equal(m.speakers[0].output_label_confidence, 'high', '同名不触发降级，高分记录正常替换')
+  assert.equal(m.speakers[0].label, '说话人 1', '标签拼写保留第一次出现的写法')
+  assert.ok(!m.special_notes.some((n) => n.includes('矛盾') || n.includes('冲突')), '同名不应产生冲突提示')
+})
+
+test('角色输出不触发姓名冲突', () => {
+  // 记者/受访者这类角色词从不代表某个具体的人，不适用“矛盾姓名”判断——它们只按老逻辑比分数。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '记者', output_label_confidence: 'high', output_label_evidence: '开场自称记者' }] },
+    { speakers: [{ label: '说话人 1', output_label: '受访者', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.ok(!m.special_notes.some((n) => n.includes('矛盾') || n.includes('冲突')), '角色词之间的差异不算姓名冲突')
+  assert.equal(m.speakers[0].output_label, '记者', '两条角色记录分数打平，保留先到的一条（既有比分逻辑不变）')
+})
+
+test('mergeScoutChunks 在无姓名冲突时人物/品牌/术语合并与结尾锚点逻辑保持不变', () => {
+  const parts = [
+    { speakers: [{ label: '记者', role: '记者' }], people: [{ canonical: '苍璧科技' }], brands: [{ canonical: '苍璧牌' }], terms: [{ canonical: '乙术语' }], errors: [], themes: ['开场'], has_existing_headings: false, ending_anchor: { line: 500, text: '中段。' }, special_notes: [] },
+    { speakers: [{ label: '发言人 1', role: '受访者', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }], people: [{ canonical: '陈遥' }], brands: [{ canonical: '苍璧牌' }], terms: [{ canonical: '乙术语' }], errors: [], themes: ['收尾'], has_existing_headings: true, ending_anchor: { line: 1000, text: '就到这里。' }, special_notes: [] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 1000 })
+  assert.equal(m.speakers.length, 2, '两个不同轨道各自保留，互不冲突')
+  assert.deepEqual(m.people.map((p) => p.canonical), ['苍璧科技', '陈遥'], 'people 按 chunk 顺序拼接，跨 chunk 去重交给下游 clusterEntities')
+  assert.deepEqual(m.brands.map((b) => b.canonical), ['苍璧牌', '苍璧牌'], 'brands 同样直接拼接，不在此处去重')
+  assert.deepEqual(m.ending_anchor, { line: 1000, text: '就到这里。' }, '结尾锚点取覆盖到文件末尾的那个 chunk')
+})
+
 test('partPath derives sibling intermediate paths', () => {
   assert.equal(partPath('/out/Transcripts/X.md', 1), '/out/Transcripts/X.md.part1')
   assert.equal(partPath('/out/Transcripts/X.md', 3), '/out/Transcripts/X.md.part3')
@@ -282,6 +351,54 @@ test('stitchParts collapses an exact-duplicate heading straddling a seam', () =>
   // the duplicated "## 乙" at the seam appears once
   assert.equal(merged.match(/## 乙/g).length, 1)
   assert.ok(merged.includes('李明：上。') && merged.includes('王某：下。'))
+})
+
+test('stitchParts collapses typography-only duplicate H2 sections and an exact replayed turn', () => {
+  const question = '小君：你对 2026 年的 agent 发展还会有什么预期吗？年初 OpenClaw 已经这么火了。'
+  const merged = stitchParts([
+    `## 2026 年 agent 的关键瓶颈：continual learning\n\n苏煜：关键在持续学习。\n\n${question}`,
+    `## 2026年agent的关键瓶颈：continual learning\n\n${question}\n\n苏煜：接下来会出现很多不同路线。`,
+  ])
+  assert.equal((merged.match(/关键瓶颈：continual learning/g) || []).length, 1, 'spacing-only duplicate heading is unified')
+  assert.equal((merged.match(/OpenClaw 已经这么火了/g) || []).length, 1, 'the exact seam replay is removed once')
+  assert.match(merged, /接下来会出现很多不同路线/, 'new substantive content remains')
+})
+
+test('stitchParts removes a high-confidence semantic duplicate at a chunk seam', () => {
+  const repeated = '周砚：我们在东南亚先后设立了本地团队，并在中东建设区域中转仓，欧洲则通过跨境电商做小规模验证；这套路径的共同点是先验证需求，再逐步增加固定投入。'
+  const paraphrase = '周砚：我们在东南亚先后设立本地团队，也在中东建设区域中转仓；欧洲主要通过跨境电商做小规模验证。这套路径共同点是先验证需求，再逐步增加固定投入。'
+  const merged = stitchParts([`## 海外\n\n${repeated}`, `## 下一块\n\n${paraphrase}\n\n记者：后来进展如何？`])
+  assert.equal((merged.match(/先验证需求/g) || []).length, 1, 'near-identical repeated turn appears once')
+  assert.match(merged, /记者：后来进展如何/)
+})
+
+test('stitchParts removes a multi-turn duplicated suffix/prefix sequence at a chunk seam', () => {
+  const a = '沈其安：我们做了一个桌面智能体，让模型像人一样先看屏幕，再判断下一步操作，并直接点击对应位置；这个方向后来成为多种电脑使用产品的基础。'
+  const b = '这个系统与过去依赖 HTML 的方案不同，它使用视觉感知和像素级动作，因此面对普通应用界面也能完成连续操作。'
+  const c = '随后多家公司推出类似产品，到了第二年，代码智能体也因为基础模型能力提升而快速普及，团队的工作方式在几个月里明显改变。'
+  const ap = '沈其安：我们做了一个桌面智能体，让模型像人一样先看屏幕、判断下一步操作，再直接点击对应位置；这个方向后来成为多种电脑使用产品的基础。'
+  const bp = '这个系统和过去依赖 HTML 的方案不同，使用视觉感知与像素级动作，因此面对普通应用界面也可以完成连续操作。'
+  const cp = '随后多家公司推出了类似产品。到了第二年，代码智能体也因基础模型能力提升而迅速普及，团队工作方式在几个月里明显改变。'
+  const merged = stitchParts([`## 前块\n\n${a}\n\n${b}\n\n${c}`, `## 后块\n\n${ap}\n\n${bp}\n\n${cp}\n\n记者：接下来你们准备做什么？`])
+  assert.equal((merged.match(/桌面智能体/g) || []).length, 1, 'the repeated three-turn sequence appears once')
+  assert.match(merged, /接下来你们准备做什么/)
+})
+
+test('stitchPartsWithReport repairs a long replay beyond the normal four-block seam window', () => {
+  const blocks = Array.from({ length: 6 }, (_, i) => `受访者：第${i + 1}段说明包含一组足够具体的事实和完整限定条件，用来验证超长接缝回放不会在最终正文中重复出现。`)
+  const report = stitchPartsWithReport([
+    `## 前块\n\n${blocks.join('\n\n')}`,
+    `## 后块\n\n${blocks.join('\n\n')}\n\n记者：接下来发生了什么？`,
+  ])
+  assert.ok(report.seamRepairs.some((x) => x.removedBlocks >= 6), 'the extended deterministic pass records its repair')
+  assert.deepEqual(report.seamDuplicates, [], 'the repaired seam has no residual hard duplicate')
+  assert.equal((report.text.match(/接下来发生了什么/g) || []).length, 1)
+  for (const block of blocks) assert.equal((report.text.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length, 1)
+})
+
+test('stitchParts keeps short or differently attributed repetition', () => {
+  const merged = stitchParts(['## 甲\n\n记者：这个结论很重要。', '## 乙\n\n受访者：这个结论很重要。'])
+  assert.equal((merged.match(/这个结论很重要/g) || []).length, 2, 'short common wording is never deleted')
 })
 
 test('stitchParts ignores empty parts and returns "" for none', () => {
@@ -335,6 +452,42 @@ test('refinePrompt without a chunk arg is the unchanged single-agent prompt (wri
   assert.ok(p.includes(`Write 到 ${F.outPath}`))
   assert.ok(!p.includes('.part'), 'no part file in single mode')
   assert.ok(!p.includes('分块'), 'no chunk framing in single mode')
+})
+
+test('contracted Refine maps stable source turns to output blocks while the host owns labels and rendering', () => {
+  const contracted = {
+    ...F,
+    refinePath: '/out/.converted/A.turns.md',
+    refineContract: { records: [{ id: 'T000001' }, { id: 'T000002' }] },
+  }
+  const chunk = {
+    idx: 1, count: 2, inputPath: '/out/.converted/A.turns.part1.md',
+    turnIds: ['T000001'],
+  }
+  const p = refinePrompt(contracted, '校对表', FINDING, A, chunk)
+  assert.match(p, /不可变的 source turn 账本/u)
+  assert.match(p, /output block/u)
+  assert.match(p, /来源 ID 必须按原顺序完整记账/u)
+  assert.match(p, /keep.*merge.*split.*fold_noise/u)
+  assert.match(p, /不要输出或猜测 speaker_track_id/u)
+  assert.match(p, /不要输出 H1、说明行/u)
+  assert.match(p, /不要再按原稿行号自行切边界/u)
+  assert.ok(p.includes(`Write 到 ${F.outPath}.part1`))
+  assert.ok(p.includes(chunk.inputPath))
+})
+
+test('ambiguous speaker structure uses content-block boundaries and forbids guessing labels', () => {
+  const ambiguous = {
+    ...F,
+    speakerMode: 'ambiguous',
+    speakerResolution: { speakerMode: 'ambiguous', mappings: [], structureWarnings: [{ kind: 'scout_parser_disagreement' }] },
+  }
+  const chunks = splitForRefine(ambiguous, 'speed')
+  const p = refinePrompt(ambiguous, '校对表', FINDING, A, chunks[0])
+  assert.match(p, /疑似说话人格式未确认/)
+  assert.match(p, /以段落或列表内容块为边界/)
+  assert.match(p, /不得猜姓名、创造标签、合并轨道/)
+  assert.doesNotMatch(p, /源文没有说话人标签/)
 })
 
 test('first chunk writes the H1 title, its part file, and the non-last end-boundary rule', () => {
@@ -490,6 +643,7 @@ test('scoutPrompt instructs knowledge-canonical and the suspect_asr flag', () =>
   const p = scoutPrompt({ path: '/s/A.txt', label: 'A', lines: 100 }, { background: 'bg' })
   assert.ok(p.includes('知名实体用你已知的正确写法') && p.includes('苍璧科技'), 'knowledge-canonical instruction present')
   assert.ok(p.includes('suspect_asr=true'), 'suspect-flag instruction present')
+  assert.ok(p.includes('一整行') && p.includes('逐字照抄') && p.includes('行首时间码'), 'Scout sample is an exact source-line evidence contract')
 })
 
 test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {
@@ -504,6 +658,7 @@ test('summaryPrompt avoids duplicate 访谈 suffix in output filename', () => {
 // ---------- pipeline routing (mock engine, zero tokens) ----------
 
 function mockEngine(labels, opts = {}) {
+  const failures = []
   const reply = (label) => {
     if (/^scout/.test(label)) return { speakers: [{ label: '记者', role: '记者' }], people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 1467, text: '就到这里。' }, special_notes: [] }
     if (/^refine/.test(label)) return { path: 'x', headings: ['某节'], key_fixes: [], open_questions: [] }
@@ -513,7 +668,15 @@ function mockEngine(labels, opts = {}) {
     return null
   }
   const e = {
-    agent: async (_p, o) => { labels.push(o.label); return (opts.fail && opts.fail(o.label)) ? null : reply(o.label) },
+    agent: async (_p, o) => {
+      labels.push(o.label)
+      if (opts.fail && opts.fail(o.label)) {
+        const failure = opts.failureFor && opts.failureFor(o.label)
+        if (failure) failures.push({ label: o.label, ...failure })
+        return null
+      }
+      return reply(o.label)
+    },
     parallel: (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null))),
     pipeline: async (items, ...stages) => Promise.all((items || []).map(async (item, i) => {
       let v = item
@@ -522,6 +685,7 @@ function mockEngine(labels, opts = {}) {
     })),
     phase: () => {}, log: () => {},
   }
+  if (opts.failureFor) e.failures = () => failures.map((failure) => ({ ...failure }))
   // Only a budgeted engine (DeepSeek etc.) exposes refineBudget; omitting it mirrors Anthropic / the CC sandbox.
   if (opts.refineBudget) e.refineBudget = opts.refineBudget
   return e
@@ -575,6 +739,37 @@ test('cost mode (default): pipeline keeps a single refine agent even for a large
   assert.ok(!labels.some((l) => /^stitch/.test(l)), 'no stitch agent in cost mode')
 })
 
+test('single refine units rerun once only for a typed transient provider failure', async () => {
+  const labels = []
+  const files = [
+    { path: '/src/A.txt', label: 'A', lines: 100, chars: 1000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' },
+    { path: '/src/B.txt', label: 'B', lines: 100, chars: 1000, title: 'B', subtitle: '*s*', outPath: '/out/Transcripts/B.md' },
+  ]
+  const eng = mockEngine(labels, {
+    fail: (label) => label === 'refine:A',
+    failureFor: () => ({ code: 'API_TRANSIENT', retryable: true, message: 'HTTP 429' }),
+  })
+  const result = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files }, eng)
+
+  assert.ok(labels.includes('refine-retry:A'))
+  assert.equal(labels.filter((label) => label === 'refine-retry:A').length, 1)
+  assert.equal(result.refined.length, 2)
+})
+
+test('chunked refine does not fresh-retry a non-retryable contract failure', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const eng = mockEngine(labels, {
+    refineBudget: stubBudget('stub-pro', 10000),
+    fail: (label) => label === 'refine:A#2/3',
+    failureFor: () => ({ code: 'TURN_CONTRACT_OUTSIDE_CONTENT', retryable: false, message: 'contract invalid' }),
+  })
+  const result = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, eng)
+
+  assert.equal(labels.some((label) => label === 'refine-retry:A#2/3'), false)
+  assert.deepEqual(result.failed, ['A'])
+})
+
 // ---------- provider-aware auto-chunk (pipeline wiring, mock engine) ----------
 
 // A stub budget resolver stands in for a real provider engine's refineBudget(tier). 25,000 字 / 10,000 budget → 3
@@ -592,6 +787,21 @@ test('auto-chunk: an over-budget file on a budgeted engine splits into ceil(字�
   assert.equal(r.autoChunk.length, 1, 'one autoChunk record for the file')
   assert.deepEqual(r.autoChunk[0], { label: 'A', model: 'stub-pro', budget: 10000, contentLength: 25000, parts: 3 }, 'the record carries model/budget/字数/parts')
   assert.equal(r.refined.length, 1, 'the file is still refined (stitched)')
+})
+
+test('a failed provider-budget chunk still leaves its complete pre-dispatch plan in the result', async () => {
+  const labels = []
+  const file = { path: '/src/A.txt', label: 'A', lines: 1500, chars: 25000, title: 'A', subtitle: '*s*', outPath: '/out/Transcripts/A.md' }
+  const r = await runPipeline(
+    { topic: 'X', date: '2025-02', background: 'bg', outputDir: '/out', scope: ['refine'], verifyDepth: 'none', headingPolicy: 'none', files: [file] },
+    mockEngine(labels, { refineBudget: stubBudget('stub-pro', 10000), fail: (label) => /(?:refine|refine-retry):A#3\/3/.test(label) }),
+  )
+
+  assert.deepEqual(r.failed, ['A'])
+  assert.equal(r.refined.length, 0)
+  assert.equal(r.plannedChunks.length, 1)
+  assert.deepEqual(r.plannedChunks[0].parts.map((part) => part.path), ['/out/Transcripts/A.md.part1', '/out/Transcripts/A.md.part2', '/out/Transcripts/A.md.part3'])
+  assert.deepEqual(r.autoChunk[0], { label: 'A', model: 'stub-pro', budget: 10000, contentLength: 25000, parts: 3 })
 })
 
 test('no auto-chunk when the engine declares no budget (Anthropic / CC path unchanged)', async () => {
@@ -651,8 +861,10 @@ test('an unavailable audit (no fs capability, fallback agent fails to parse) is 
   // No capabilities are injected (CC-sandbox shape), so the audit gate falls back to an agent; the mock returns
   // null for every audit/audit-retry label → the audit is "unavailable".
   const r = await runPipeline({ topic: 'X', date: '2025-02', background: 'bg', outputDir: '/o', scope: ['refine', 'summary'], verifyDepth: 'none', headingPolicy: 'none', files: [file] }, mockEngine(labels, { fail: (l) => l.startsWith('audit') }))
-  // Deliverables are PRESERVED (work not destroyed) …
-  assert.ok(r.summary, 'the summary deliverable is still produced (work is preserved, just marked unaudited)')
+  // The main body is preserved, but a derivative must never treat an unaudited body as final.
+  assert.equal(r.refined.length, 1, 'the main transcript is preserved')
+  assert.equal(r.summary, null, 'summary is withheld until the body has a valid audit')
+  assert.deepEqual(r.derivativesSkipped, [{ kind: 'summary', reason: '正文未完成或忠实性审计未通过' }])
   assert.ok(!labels.some((l) => /^check/.test(l)), 'no separate completeness check phase exists anymore')
   assert.deepEqual(r.unchecked, ['/o/Transcripts/A.md'], 'an unavailable audit still surfaces the file as unchecked')
   assert.deepEqual(r.incomplete, [], 'unavailable ≠ incomplete: an audit that could not run must not be reported as a truncated ending')
@@ -691,4 +903,75 @@ test('oversized file: if every sub-scout stalls, it degrades to scoutFailed — 
   assert.ok(labels.includes('refine:A'), 'refine still runs even when the whole chunked scout fails')
   assert.deepEqual(r.scoutFailed, ['A'], 'all chunks failed → scoutFailed (same graceful path as a single failed scout)')
   assert.equal(r.refined.length, 1)
+})
+
+test('mergeScoutChunks：仅空格差异的同名不算冲突（张三 vs 张 三）', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '张 三', output_label_confidence: 'high', output_label_evidence: '对方称呼', identity: '张 三' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.notEqual(m.speakers[0].output_label, '', '同名不同空格不应触发降级')
+  assert.equal(m.special_notes.some((n) => n.includes('矛盾')), false)
+})
+
+test('mergeScoutChunks：已冲突轨道仍可回填缺失的角色，但不能翻案命名', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+    { speakers: [{ label: '说话人 1', output_label: '苏澈', output_label_confidence: 'high', output_label_evidence: '再次称呼', role: '受访者' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].output_label, '', '冲突后第三个分段不能翻案命名')
+  assert.equal(m.speakers[0].role, '受访者', '角色应从后续分段回填')
+})
+
+test('mergeScoutChunks + resolver：冲突降级不被 sample 别名记录翻案', () => {
+  // 第三个分段把人名当 label、sample 首行指回“说话人 1”——旧逻辑里这条记录会以高分抢回
+  // generic:1 的映射，让刚被降级的轨道重新拿到人名。
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '自我介绍' }] },
+    { speakers: [{ label: '说话人 1', output_label: '陈遥', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+    { speakers: [{ label: '林洄', output_label: '林洄', output_label_confidence: 'high', output_label_evidence: '再次称呼', sample: '说话人 1 00:03\n我先说' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  const doc = ['说话人 1 00:01\\', '你好。', '', '说话人 2 00:05\\', '你好。'].join('\n')
+  const { mappings } = resolveSpeakerMapping(doc, m.speakers)
+  const track1 = mappings.find((x) => x.sourceLabel === '说话人 1')
+  assert.notEqual(track1.outputLabel, '林洄', '冲突轨道不能经 sample 别名重新拿到人名')
+  assert.notEqual(track1.outputLabel, '陈遥')
+})
+
+test('mergeScoutChunks：identity 路径的跨段姓名冲突同样降级（评审复现样本）', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', identity: '张三', output_label: '', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '李四', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers.length, 1)
+  assert.equal(m.speakers[0].name_conflict, true, 'identity 冲突必须打上冲突标记')
+  assert.equal(m.speakers[0].identity, '', '冲突后 identity 必须清空')
+  assert.ok(m.special_notes.some((n) => n.includes('张三') && n.includes('李四')), '冲突备注要点名两个候选')
+  const doc = ['说话人 1 00:01\\', '你好。', '', '说话人 2 00:05\\', '你好。'].join('\n')
+  const { mappings } = resolveSpeakerMapping(doc, m.speakers)
+  const track1 = mappings.find((x) => x.sourceLabel === '说话人 1')
+  assert.notEqual(track1.outputLabel, '张三', '冲突轨道不能经 identity 拿到人名')
+  assert.notEqual(track1.outputLabel, '李四')
+})
+
+test('mergeScoutChunks：output_label 与 identity 交叉给名也按同一套解释比较', () => {
+  const parts = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '李四', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m = mergeScoutChunks(parts, { lines: 100 })
+  assert.equal(m.speakers[0].name_conflict, true)
+  const same = [
+    { speakers: [{ label: '说话人 1', output_label: '张三', output_label_confidence: 'high', output_label_evidence: '开场自我介绍' }] },
+    { speakers: [{ label: '说话人 1', identity: '张三', output_label: '', output_label_confidence: 'high', output_label_evidence: '对方称呼' }] },
+  ]
+  const m2 = mergeScoutChunks(same, { lines: 100 })
+  assert.notEqual(m2.speakers[0].name_conflict, true, '两条路径给出同一个人不算冲突')
 })

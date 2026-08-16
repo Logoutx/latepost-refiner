@@ -34,12 +34,17 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 // Explicit, committed manifest: source relpath → [copy relpaths]. No globbing at sync time.
 const MANIFEST = {
+  'scripts/speaker-resolver.js': [
+    'claude-code-skill/speaker-resolver.js',
+    'codex-skill/latepost-refiner/scripts/speaker-resolver.js',
+  ],
   'scripts/audit_refined.mjs': [
     'claude-code-skill/audit_refined.mjs',
     'codex-skill/latepost-refiner/scripts/audit_refined.mjs',
   ],
   'core/spec.js': ['codex-skill/latepost-refiner/core/spec.js'],
   'core/prompts.js': ['codex-skill/latepost-refiner/core/prompts.js'],
+  'core/transcript-metadata.js': ['codex-skill/latepost-refiner/core/transcript-metadata.js'],
   'universal/artifacts.js': ['codex-skill/latepost-refiner/universal/artifacts.js'],
   'claude-code-skill/references/editorial-spec.md': [
     'codex-skill/latepost-refiner/references/editorial-spec.md',

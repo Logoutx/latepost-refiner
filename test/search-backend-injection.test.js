@@ -10,7 +10,7 @@ import { makeDeepSeekEngine } from '../engines/deepseek.js'
 // The search-api bench's Level-2 verify replay (bench/search-api/run-verify-replay.mjs) drives the REAL
 // pipeline with scope=['verify'] and an alternative search adapter injected via makeDeepSeekEngine({ searchFn }).
 // This test pins that seam end-to-end without a network or a real model: a fake OpenAI-style client walks
-// scout→verify, and we assert the injected searchFn (not Tavily) is what the verify stage calls, that its
+// scout→verify, and we assert the injected searchFn (not the fixed Serper adapter) is what verify calls, that its
 // result reaches the rendered glossary, and that refine is skipped because scope excludes it.
 // All fixture names are fictional (repo placeholders 云洲仪器/沈其安).
 
@@ -20,7 +20,7 @@ const SUPERSET = {
   people: [{ canonical: '沈其安', variants: ['沈奇安'], hint: '云洲仪器 创始人' }],
   brands: [{ canonical: '云洲仪器', variants: ['云州仪器'], hint: '受访公司' }],
   terms: [],
-  resolved: [{ query: '沈其安', canonical: '沈其安', identity: '云洲仪器 创始人', source: 'example.com 官网团队页' }],
+  resolved: [{ query: '沈其安', canonical: '沈其安', identity: '云洲仪器 创始人', source: 'example.com 官网团队页显示“沈其安”', name_script_exact: true }],
   unresolved: [],
   suspects: [],
 }
@@ -46,9 +46,9 @@ function makeFakeClient() {
   }
 }
 
-test('verify replay seam: scope=[verify] drives scout→verify against the injected searchFn, not Tavily', async () => {
+test('verify replay seam: scope=[verify] drives scout→verify against the injected searchFn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-inject-'))
-  // A real-sized transcript (≥ ONE_PASS_CHARS) so the pipeline takes the scout+verify branch, not one-pass.
+  // A real-sized transcript exercises Scout/Verify plus injected search backends.
   const turns = []
   for (let i = 0; i < 70; i += 1) {
     turns.push(`记者：第 ${i} 个问题，关于云洲仪器早期做水质监测设备的判断，你们当时怎么取舍？请具体讲讲。`)

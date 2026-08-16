@@ -13,11 +13,13 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (p) => readFileSync(join(root, p), 'utf8')
 const strip = (s) => s
   .replace(/^import[^\n]*\n/gm, '')   // drop import lines
+  .replace(/^export\s*\{[^\n]*\}\s*from[^\n]*\n/gm, '') // drop ESM re-export lines; bundled symbols already share scope
   .replace(/^export /gm, '')          // drop the export keyword (line start only)
 
 const out = [
   read('core/meta.js').trim(),        // export const meta = {...} (not stripped; must stay first)
   '// ===== Generated from core/* by build/build-cc.mjs — do not edit by hand; edit core/ and re-run build =====',
+  strip(read('scripts/speaker-resolver.js')),
   strip(read('core/spec.js')),
   strip(read('core/prompts.js')),
   strip(read('core/pipeline.js')),
@@ -26,7 +28,7 @@ const out = [
 
 // Sandbox-safety guard: the Workflow script sandbox has no Node globals — a bare Buffer/process/require
 // reference in the bundle only explodes at run time, so fail the build instead.
-for (const bad of [/\bBuffer\./, /\bprocess\.env\b/, /\brequire\(/]) {
+for (const bad of [/\bBuffer\./, /\bprocess\.env\b/, /\brequire\(/, /^\s*\{[^\n]+\}\s+from\s+['"]/m, /^\s*export\s+\{/m]) {
   if (bad.test(out)) throw new Error(`sandbox-unsafe reference in generated bundle: ${bad}`)
 }
 

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { runPipeline, normalizeAuditResult } from '../core/pipeline.js'
+import { auditPair } from '../scripts/audit_refined.mjs'
+import { qualityRepairResult } from '../universal/jobs.js'
 
 // All fixtures are fictional (王总/王志远, 苍碧/苍璧科技, 沈其安/沈总, 陈涛/陈焘 — 仓库既有虚构占位).
 // These tests drive runPipeline with a mock engine (zero tokens) + mock capabilities, exercising the Wave 2
@@ -24,7 +26,7 @@ function engine(labels, on = {}, capturePrompts = null) {
   return {
     agent: async (p, o) => {
       labels.push(o.label)
-      if (capturePrompts) capturePrompts.push({ label: o.label, prompt: p })
+      if (capturePrompts) capturePrompts.push({ label: o.label, prompt: p, schema: o.schema })
       for (const [pre, val] of Object.entries(on)) if (new RegExp(pre).test(o.label)) return typeof val === 'function' ? val(p, o) : val
       return def(o.label)
     },
@@ -88,33 +90,40 @@ test('override: excludeVerified via prior confidence coexists with a fresh decre
   assert.ok(/新人/.test(verifyPrompts), 'a genuinely new entity still gets verified')
 })
 
-// ---------- one-pass branch: canonicalOverrides must not be silently dropped ----------
-// The one-pass branch (single short file, refineSize < ONE_PASS_CHARS) skips scout/merge entirely — before this
-// fix, A.canonicalOverrides had no cluster list to attach to and was dropped: singlePassPrompt never mentioned
-// the decree, and the audit gate got no glossaryText (so ghost_name/missing_yin couldn't watch for a variant
-// leaking into the 成稿). Both effects are now covered.
+// ---------- CC short-file fast path; host-capability runtimes keep the full path ----------
 
-test('one-pass: canonicalOverrides is injected into singlePassPrompt as a 用户钦定 note', async () => {
+test('CC short single file uses one-pass Refine and carries canonicalOverrides into its prompt', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
   await runPipeline(A({
-    files: [F({ chars: 1000 })],
+    files: [F({ chars: 1000, needsSpeakerResolution: false })],
     canonicalOverrides: [{ canonical: '陈涛', variants: ['陈焘', '陈涛（同音）'] }],
   }), eng)
+  assert.ok(!labels.includes('scout:A'), 'the CC short-file path skips Scout')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
-  assert.ok(/用户钦定正名/.test(refinePrompt), 'the prompt carries a 用户钦定 section on the one-pass path')
+  assert.match(refinePrompt, /单文件一遍过/)
+  assert.ok(/用户钦定/.test(refinePrompt), 'the one-pass Refine prompt carries the locked glossary entry')
   assert.ok(refinePrompt.includes('陈涛') && refinePrompt.includes('陈焘'), 'both canonical and variant are named')
 })
 
-test('one-pass: canonicalOverrides absent leaves singlePassPrompt unchanged (no stray section)', async () => {
+test('CC short single file without canonicalOverrides still uses one-pass Refine', async () => {
   const labels = [], prompts = []
   const eng = engine(labels, {}, prompts)
-  await runPipeline(A({ files: [F({ chars: 1000 })] }), eng)
+  await runPipeline(A({ files: [F({ chars: 1000, needsSpeakerResolution: false })] }), eng)
+  assert.ok(!labels.includes('scout:A'), 'the short-file Scout bypass is active in CC')
   const refinePrompt = prompts.find((x) => x.label === 'refine:A').prompt
   assert.ok(!/用户钦定正名/.test(refinePrompt), 'no decree section appears when there is no override')
 })
 
-test('one-pass: canonicalOverrides is handed to the audit gate as glossaryText (canonical + variants present)', async () => {
+test('CC freeform Refine does not receive the Turn IR v2 envelope contract', async () => {
+  const labels = [], prompts = []
+  await runPipeline(A({ files: [F({ chars: 5000 })] }), engine(labels, {}, prompts))
+  const prompt = prompts.find((item) => item.label === 'refine:A').prompt
+  assert.doesNotMatch(prompt, /Turn IR v2|不可变数据契约|output block/)
+  assert.match(prompt, /小标题/)
+})
+
+test('short single file hands the normal in-memory glossary to audit', async () => {
   const labels = []
   let seenGlossary = 'unset'
   const capabilities = {
@@ -131,7 +140,7 @@ test('one-pass: canonicalOverrides is handed to the audit gate as glossaryText (
   assert.ok(seenGlossary.includes('陈焘'), 'the decreed variant is present (so ghost_name can catch it surviving in prose)')
 })
 
-test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary (unchanged prior behaviour)', async () => {
+test('short single file without overrides still hands the Scout-built glossary to audit', async () => {
   const labels = []
   let seenGlossary = 'unset'
   const capabilities = {
@@ -139,16 +148,167 @@ test('one-pass: with no canonicalOverrides the audit gate still gets NO glossary
     annotateAnchors: () => ({ updated: [] }),
   }
   await runPipeline(A({ files: [F({ chars: 1000 })], capabilities }), engine(labels))
-  assert.equal(seenGlossary, null, 'no fake glossary is handed to the audit when there is no override (SINGLE_FILE_GLOSSARY placeholder is never leaked)')
+  assert.ok(typeof seenGlossary === 'string' && seenGlossary.includes('统一校对表'), 'the normal Scout-built glossary reaches audit')
+})
+
+test('generic speakers bypass the short-file fast path and every Refine read uses the Scout-resolved input', async () => {
+  const labels = [], prompts = []
+  let auditSource = '', outputEnforced = false
+  const capabilities = {
+    prepareSpeakerInput: (f, finding) => {
+      assert.equal(f.path, '/s/A.txt', 'the resolver reads the untouched original')
+      assert.equal(finding.speakers[0].output_label, '刘益枫')
+      return {
+        path: '/o/.converted/A.speaker-resolved.md',
+        mappings: [{ sourceLabel: '发言人 1', outputLabel: '刘益枫', basis: 'scout_output_label' }],
+        unresolved: [],
+        changedLines: 12,
+        labelLines: 12,
+      }
+    },
+    enforceSpeakerOutput: (f) => {
+      outputEnforced = true
+      assert.equal(f.refinePath, '/o/.converted/A.speaker-resolved.md', 'output enforcement reuses the prepared mapping')
+      return { changedLines: 1, replacements: [{ line: 10, from: '发言人 1', to: '刘益枫' }], unknownLabels: [] }
+    },
+    runAudit: (f) => {
+      auditSource = f.path
+      return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }
+    },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const eng = engine(labels, {
+    '^scout': {
+      speakers: [{ label: '发言人 1', role: '受访者', identity: '刘益枫，某公司创始人', output_label: '刘益枫' }],
+      people: [], brands: [], terms: [], errors: [], themes: [], ending_anchor: { line: 100, text: '完' }, special_notes: [],
+    },
+  }, prompts)
+  const result = await runPipeline(A({
+    files: [F({ chars: 1000, needsSpeakerResolution: true })],
+    capabilities,
+  }), eng)
+
+  assert.ok(labels.includes('scout:A'), 'a generic-label short file no longer skips the whole-file Scout')
+  const refine = prompts.find((item) => item.label === 'refine:A')
+  assert.ok(refine.prompt.includes('/o/.converted/A.speaker-resolved.md'), 'Refine reads the materialized canonical-label copy')
+  assert.ok(refine.prompt.includes('发言人 1 → 刘益枫'), 'the one mapping is explicit in the prompt')
+  assert.equal(outputEnforced, true, 'the same mapping is enforced once after Refine and before audit')
+  assert.equal(auditSource, '/s/A.txt', 'the source-aware audit still compares against the original transcript')
+  assert.equal(result.speakerResolutions[0].mappings[0].outputLabel, '刘益枫')
+  assert.equal(result.speakerOutputNormalizations[0].changedLines, 1)
+})
+
+function unknownSpeakerCapabilities() {
+  return {
+    enforceSpeakerOutput: () => ({
+      changedLines: 0,
+      replacements: [],
+      unknownLabels: [{ line: 3, label: '王小明' }],
+      valid: false,
+      violations: [{ line: 3, label: '王小明', kind: 'unknown_speaker_label' }],
+    }),
+    runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+}
+
+test('a high-confidence LLM verdict is required before an unknown output label blocks delivery', async () => {
+  const labels = []
+  const r = await runPipeline(A({ capabilities: unknownSpeakerCapabilities() }), engine(labels, {
+    '^speaker-adjudicate': {
+      decisions: [{
+        line: 3,
+        label: '王小明',
+        verdict: 'invented_speaker',
+        confidence: 'high',
+        reason: 'dialogue_turn_without_source',
+      }],
+    },
+  }))
+  assert.equal(labels.filter((label) => label === 'speaker-adjudicate:A').length, 1)
+  assert.deepEqual(r.failed, ['A'])
+  assert.equal(r.refined.length, 0)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['speaker_structure'] }])
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'blocked')
+  assert.equal(r.speakerStructuralFailures[0].labels[0], '王小明')
+})
+
+test('an unavailable or uncertain LLM verdict becomes review-needed instead of a hard failure', async () => {
+  const labels = []
+  const r = await runPipeline(A({
+    scope: ['refine', 'summary'],
+    capabilities: unknownSpeakerCapabilities(),
+  }), engine(labels))
+  assert.equal(labels.filter((label) => label === 'speaker-adjudicate:A').length, 1)
+  assert.deepEqual(r.failed, [])
+  assert.equal(r.refined.length, 1)
+  assert.deepEqual(r.auditFailed, [])
+  assert.ok(r.summary, 'review-tier speaker ambiguity does not suppress requested derivatives')
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'unavailable')
+  assert.ok(r.speakerStructureWarnings[0].warnings.some((item) => item.kind === 'speaker_candidate_adjudication_unavailable'))
+  assert.ok(r.openQuestions.some((item) => item.includes('第 3 行“王小明”')))
+})
+
+test('a high-confidence non-speaker verdict clears the candidate without a warning', async () => {
+  const labels = []
+  const r = await runPipeline(A({ capabilities: unknownSpeakerCapabilities() }), engine(labels, {
+    '^speaker-adjudicate': {
+      decisions: [{
+        line: 3,
+        label: '王小明',
+        verdict: 'not_speaker',
+        confidence: 'high',
+        reason: 'heading_or_caption',
+      }],
+    },
+  }))
+  assert.deepEqual(r.failed, [])
+  assert.equal(r.refined.length, 1)
+  assert.deepEqual(r.auditFailed, [])
+  assert.deepEqual(r.speakerStructureWarnings, [])
+  assert.equal(r.speakerCandidateAdjudications[0].status, 'cleared')
 })
 
 // ---------- §2 in-pipeline audit gate (capability injection) ----------
 
+test('an exact double remains reviewable without repair or derivative suppression', async () => {
+  const labels = []
+  let repairs = 0
+  const sourceText = '记者：请告诉我我的安排。\n\n受访者：这个选择可以，但是是另一种方案。'
+  const capabilities = {
+    runAudit: (f) => auditPair({ sourceText, refinedText: sourceText, refinedFile: f.outPath, mode: 'logic' }),
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'summary'], capabilities }), engine(labels))
+  assert.equal(repairs, 0, 'a review-only double does not spend a repair round')
+  assert.deepEqual(r.auditFailed, [])
+  assert.ok(r.summary, 'a review-only double does not suppress requested derivatives')
+  assert.deepEqual(r.refined[0].audit.hardFindings, [])
+})
+
+test('a triple repeat still receives capped repair and suppresses derivatives when it persists', async () => {
+  const labels = []
+  let repairs = 0
+  const sourceText = '受访者：我我我觉得这个方向可以。'
+  const capabilities = {
+    runAudit: (f) => auditPair({ sourceText, refinedText: sourceText, refinedFile: f.outPath, mode: 'logic' }),
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'summary'], capabilities }), engine(labels))
+  assert.equal(repairs, 2)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['residual_noise'] }])
+  assert.equal(r.summary, null)
+  assert.deepEqual(r.derivativesSkipped.map((x) => x.kind), ['summary'])
+})
+
 test('audit gate: content_gap hard → auto-repair → re-audit passes → not auditFailed', async () => {
   const labels = []
   let auditCalls = 0, repaired = false, anchored = false
+  const auditContexts = []
   const capabilities = {
-    runAudit: (f) => { auditCalls += 1; return auditCalls === 1
+    runAudit: (f, opts) => { auditCalls += 1; auditContexts.push(opts); return auditCalls === 1
       ? { file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] }
       : { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
     repair: () => { repaired = true },
@@ -162,22 +322,41 @@ test('audit gate: content_gap hard → auto-repair → re-audit passes → not a
   assert.equal(r.refined[0].audit.status, 'ok')
   assert.equal(r.refined[0].audit.repaired, true)
   assert.equal(r.refined[0].audit.anchorsAdded, 1)
+  assert.equal(auditContexts[0].phase, 'pre_audit')
+  assert.deepEqual({ phase: auditContexts[1].phase, round: auditContexts[1].round }, { phase: 'post_repair_round_1', round: 1 })
 })
 
-test('audit gate: still hard after one repair → auditFailed + visible marker (annotate) + fail status', async () => {
+test('audit gate: still hard after two repair rounds → auditFailed + visible marker (annotate) + fail status', async () => {
   const labels = []
-  let annotateCalled = false, auditCalls = 0
+  let annotateCalled = false, auditCalls = 0, repairCalls = 0
   const capabilities = {
     runAudit: (f) => { auditCalls += 1; return { file: f.outPath, status: 'fail', failed: ['content_gap', 'quote_style'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] } },
-    repair: () => {}, // repair runs but the re-audit still fails
+    repair: () => { repairCalls += 1 }, // both repairs run but both re-audits still fail
     annotate: () => { annotateCalled = true },
     annotateAnchors: () => ({ updated: [] }),
   }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.equal(auditCalls, 2, 'repair-then-reaudit capped at one extra audit (no loop)')
+  assert.equal(auditCalls, 3, 'initial audit plus one re-audit after each of two capped repairs')
+  assert.equal(repairCalls, 2, 'repair is capped at two rounds')
   assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap', 'quote_style'] }])
   assert.ok(annotateCalled, 'a still-hard gap drops a visible 缺口 marker')
   assert.equal(r.refined[0].audit.status, 'fail')
+  assert.equal(r.refined[0].audit.repairAttempts.length, 2)
+})
+
+test('known-bad body is delivered but logic/summary/timeline are withheld', async () => {
+  const labels = []
+  const capabilities = {
+    runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 10, endLine: 30, chars: 400, severity: 'hard' }], findings: [] }),
+    repair: () => {}, annotate: () => {}, annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ scope: ['refine', 'logic', 'summary', 'timeline'], capabilities }), engine(labels))
+  assert.equal(r.refined.length, 1, 'the blocked main transcript is still returned')
+  assert.deepEqual(r.logic, [])
+  assert.equal(r.summary, null)
+  assert.equal(r.timeline, null)
+  assert.deepEqual(r.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+  assert.ok(!labels.some((l) => /^(logic|summary|timeline)/.test(l)), 'no derivative agent reads the known-bad body')
 })
 
 test('audit gate (P7): a throwing runAudit capability is retried once, then FAILS LOUDLY (universal fs path)', async () => {
@@ -193,12 +372,95 @@ test('audit gate (P7): a throwing runAudit capability is retried once, then FAIL
   assert.equal(r.refined[0].audit.auditUnavailable, true)
 })
 
-test('audit gate: soft-only findings never fail the gate', async () => {
+test('audit gate: publication-quality failures receive two repairs and still block when they persist', async () => {
   const labels = []
-  const capabilities = { runAudit: (f) => ({ file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
+  let audits = 0, repairs = 0
+  const capabilities = {
+    runAudit: (f) => { audits += 1; return { file: f.outPath, status: 'fail', failed: ['under_refined'], gaps: [], findings: [] } },
+    repair: () => { repairs += 1 },
+    annotateAnchors: () => ({ updated: [] }),
+  }
   const r = await runPipeline(A({ capabilities }), engine(labels))
-  assert.deepEqual(r.auditFailed, [], 'under_refined (not content_gap/quote_style) is not a hard gate here')
-  assert.deepEqual(r.refined[0].audit.softFindings, ['under_refined'])
+  assert.equal(audits, 3, 'publication-quality failure is re-audited after each repair round')
+  assert.equal(repairs, 2, 'publication-quality failure gets both allowed repair rounds before blocking')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['under_refined'] }])
+  assert.deepEqual(r.refined[0].audit.hardFindings, ['under_refined'])
+})
+
+test('audit gate keeps failed repair tools visible even when a later Edit and the final audit succeed', async () => {
+  let auditCalls = 0
+  const capabilities = {
+    runAudit: (f) => {
+      auditCalls += 1
+      return auditCalls === 1
+        ? {
+            file: f.outPath, status: 'fail', failed: ['residual_noise', 'attribution_mismatch'], gaps: [],
+            findings: [
+              { name: 'confirmation_repeats', severity: 'hard', count: 5, samples: [] },
+              { name: 'attribution_mismatch', severity: 'hard', count: 6, samples: [] },
+            ],
+          }
+        : { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }
+    },
+    repair: () => ({
+      action: 'targeted_repair', model: 'deepseek-v4-pro', changed: true, agentCompleted: true,
+      bytesBefore: 1000, bytesAfter: 1010,
+      toolSummary: {
+        succeeded: { Read: 30, Edit: 30 },
+        failed: [
+          { tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 },
+          { tool: 'Grep', code: 'TOOL_UNKNOWN', count: 5 },
+        ],
+      },
+    }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ capabilities }), engine([]))
+  const attempt = r.refined[0].audit.repairAttempts[0]
+  assert.equal(r.refined[0].audit.status, 'ok', 'the successful final audit remains authoritative')
+  assert.equal(attempt.outcome, 'passed_with_tool_errors')
+  assert.deepEqual(attempt.hardIssueCountsBefore, { confirmation_repeats: 5, attribution_mismatch: 6, residual_noise: 1 })
+  assert.deepEqual(attempt.toolSummary.failed, [
+    { tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 },
+    { tool: 'Grep', code: 'TOOL_UNKNOWN', count: 5 },
+  ])
+  assert.deepEqual(attempt.failedAfter, [])
+})
+
+test('audit gate stops safely and records audit_unavailable when a post-repair re-audit cannot run', async () => {
+  let auditCalls = 0
+  const capabilities = {
+    runAudit: (f) => {
+      auditCalls += 1
+      if (auditCalls === 1) return { file: f.outPath, status: 'fail', failed: ['content_gap'], gaps: [], findings: [] }
+      throw new Error('audit unavailable after repair')
+    },
+    repair: () => ({ action: 'targeted_repair', model: 'deepseek-v4-pro', changed: true, agentCompleted: true }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({ capabilities }), engine([]))
+  assert.equal(auditCalls, 3, 'the post-repair audit receives its normal one retry before stopping')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap'] }])
+  assert.equal(r.refined[0].audit.repairAttempts[0].outcome, 'audit_unavailable')
+  assert.equal(r.refined[0].audit.repairAttempts.length, 1, 'a second repair never runs without a fresh audit')
+})
+
+test('chunk seam: a residual duplicate reported after deterministic stitch blocks derivatives', async () => {
+  const labels = []
+  const capabilities = {
+    stitch: () => ({ path: '/o/Transcripts/A.md', seamRepairs: [], seamDuplicates: [{ seam: 1, repeatedBlocks: 2 }] }),
+    runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }),
+    annotateAnchors: () => ({ updated: [] }),
+  }
+  const r = await runPipeline(A({
+    scope: ['refine', 'summary'],
+    chunkMode: 'speed',
+    files: [F({ chars: 30000, lines: 600 })],
+    capabilities,
+  }), engine(labels))
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['seam_duplicate'] }])
+  assert.equal(r.refined[0].audit.status, 'fail')
+  assert.equal(r.summary, null, 'a derivative cannot read a body with a residual seam duplicate')
 })
 
 test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a parseable pass → ok', async () => {
@@ -209,10 +471,79 @@ test('audit gate (no capability, CC sandbox): an agent runs audit_refined.mjs; a
   }, prompts)
   const r = await runPipeline(A(), eng) // no capabilities → CC fallback path
   assert.ok(labels.includes('audit:A'), 'a fallback audit agent ran')
-  const auditPrompt = prompts.find((x) => x.label === 'audit:A').prompt
-  assert.ok(/audit_refined\.mjs/.test(auditPrompt) && /--source/.test(auditPrompt), 'the agent is told to run the audit script')
+  const auditCall = prompts.find((x) => x.label === 'audit:A')
+  assert.ok(/audit_refined\.mjs/.test(auditCall.prompt) && /--source/.test(auditCall.prompt), 'the agent is told to run the audit script')
+  assert.match(auditCall.prompt, /stdout 的 JSON 原样交回——不要改写任何字符，尤其不要把弯引号改成直引号/)
+  assert.equal(auditCall.schema.additionalProperties, true)
+  const fileSchema = auditCall.schema.properties.files.items
+  assert.equal(fileSchema.additionalProperties, true)
+  assert.deepEqual(Object.keys(fileSchema.properties).sort(), [
+    'failed', 'file', 'findings', 'gaps', 'metrics', 'modelMarkers', 'numericConflicts', 'sections', 'status',
+  ])
+  assert.equal(fileSchema.properties.metrics.additionalProperties, true)
   assert.deepEqual(r.auditFailed, [])
   assert.equal(r.refined[0].audit.status, 'ok')
+})
+
+test('CC sandbox keeps non-spot hard findings for manual repair', async () => {
+  const labels = []
+  const eng = engine(labels, {
+    '^audit:': () => JSON.stringify({ status: 'fail', files: [{ file: '/o/Transcripts/A.md', status: 'fail', failed: ['residual_noise'], gaps: [], findings: [] }] }),
+    '^anchors:': '已加锚点',
+    '^repair:': '不应运行',
+  })
+  const r = await runPipeline(A(), eng)
+  assert.ok(!labels.some((label) => label.startsWith('repair:')), 'no-fs runtime keeps the hard finding for manual repair')
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['residual_noise'] }])
+  assert.deepEqual(r.qualityRepairAttempts, [])
+})
+
+test('CC sandbox spot-repairs content_gap once with Read/Edit and re-audits', async () => {
+  const labels = [], prompts = []
+  let audits = 0
+  const eng = engine(labels, {
+    '^audit:': () => {
+      audits += 1
+      const file = audits === 1
+        ? { file: '/o/Transcripts/A.md', status: 'fail', failed: ['content_gap'], gaps: [{ startLine: 12, endLine: 20, chars: 200, severity: 'hard' }], findings: [] }
+        : { file: '/o/Transcripts/A.md', status: 'ok', failed: [], gaps: [], findings: [] }
+      return JSON.stringify({ status: file.status, files: [file] })
+    },
+    '^repair:': '已定点修复',
+    '^anchors:': '已加锚点',
+  }, prompts)
+  const r = await runPipeline(A(), eng)
+  assert.equal(labels.filter((label) => label === 'repair:A').length, 1)
+  assert.equal(audits, 2)
+  assert.match(prompts.find((item) => item.label === 'repair:A').prompt, /只修下面点名的位置.*不得改动其它任何内容/s)
+  assert.deepEqual(r.auditFailed, [])
+  assert.equal(r.refined[0].audit.repaired, true)
+  assert.equal(r.qualityRepairAttempts[0].action, 'sandbox_spot_repair')
+  assert.equal(r.qualityRepairAttempts[0].mode, 'in_place_sandbox')
+})
+
+test('CC sandbox still-hard spot repair is not marked repaired and reports its single-round stop honestly', async () => {
+  const labels = []
+  let audits = 0
+  const eng = engine(labels, {
+    '^audit:': () => {
+      audits += 1
+      return JSON.stringify({
+        status: 'fail',
+        files: [{ file: '/o/Transcripts/A.md', status: 'fail', failed: ['content_gap'], gaps: [], findings: [] }],
+      })
+    },
+    '^repair:': '已定点修复但问题仍在',
+    '^anchors:': '已加锚点',
+  })
+  const r = await runPipeline(A(), eng)
+  assert.equal(audits, 2)
+  assert.equal(r.refined[0].audit.repaired, false)
+  assert.deepEqual(r.auditFailed, [{ path: '/o/Transcripts/A.md', findings: ['content_gap'] }])
+  assert.equal(r.qualityRepairAttempts.length, 1)
+  assert.equal(r.qualityRepairAttempts[0].mode, 'in_place_sandbox')
+  assert.equal(r.qualityRepairAttempts[0].round, 1)
+  assert.equal(qualityRepairResult(r).stopReason, 'sandbox_single_round')
 })
 
 test('audit gate (no capability): unparseable agent output → one retry → FAILS LOUDLY via top-level auditUnavailable, never throws', async () => {
@@ -229,6 +560,8 @@ test('audit gate (no capability): unparseable agent output → one retry → FAI
 
 // ---------- §5 logic missingSections auto-rerun ----------
 
+const PASS_AUDIT = { runAudit: (f) => ({ file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] }), annotateAnchors: () => ({ updated: [] }) }
+
 test('logic: a first-pass missing section triggers exactly one rerun that clears it', async () => {
   const labels = []
   const eng = engine(labels, {
@@ -236,7 +569,7 @@ test('logic: a first-pass missing section triggers exactly one rerun that clears
     '^logic-rerun': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['某节', '另一节'] }], open_questions: [] },
     '^logic:': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['另一节'] }], open_questions: [] }, // omits 某节
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
   assert.ok(labels.includes('logic:A'), 'first logic pass ran')
   assert.ok(labels.includes('logic-rerun:A'), 'the rerun ran (cap 1)')
   assert.deepEqual(r.logic[0].missingSections, [], 'the rerun covered the omitted heading')
@@ -249,9 +582,20 @@ test('logic: if the rerun still misses, the residual stays in the return (no inf
     '^refine': { path: 'x', headings: ['某节', '另一节'], key_fixes: [], open_questions: [] },
     '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['另一节'] }], open_questions: [] }, // both pass + rerun omit 某节
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
   assert.equal(labels.filter((l) => /^logic-rerun/.test(l)).length, 1, 'still only one rerun')
   assert.deepEqual(r.logic[0].missingSections, ['某节'], 'the still-missing heading is surfaced for a Step-5 spot-check')
+})
+
+test('logic: punctuation and whitespace variants in source_sections do not trigger a false rerun', async () => {
+  const labels = []
+  const eng = engine(labels, {
+    '^refine': { path: 'x', headings: ['“Good Enough”之后，差异化会消失', '2023 年上海车展：一次集体的“Shock”'], key_fixes: [], open_questions: [] },
+    '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['"good enough"之后差异化会消失', '２０２３年上海车展——一次集体的 shock'] }], open_questions: [] },
+  })
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT }), eng)
+  assert.deepEqual(r.logic[0].missingSections, [])
+  assert.equal(labels.filter((l) => /^logic-rerun/.test(l)).length, 0, 'typesetting-only drift is already covered')
 })
 
 test('logic: safeName is applied to the 逻辑顺序 output path (a slash/colon title can\'t fabricate a directory)', async () => {
@@ -259,7 +603,7 @@ test('logic: safeName is applied to the 逻辑顺序 output path (a slash/colon 
   const eng = engine(labels, {
     '^logic': { path: 'y', mainline: '导读', threads: [{ title: '线1', source_sections: ['某节'] }], open_questions: [] },
   })
-  const r = await runPipeline(A({ scope: ['refine', 'logic'], files: [F({ title: 'A/B:2025' })] }), eng)
+  const r = await runPipeline(A({ scope: ['refine', 'logic'], capabilities: PASS_AUDIT, files: [F({ title: 'A/B:2025' })] }), eng)
   assert.equal(r.logic[0].path, '/o/逻辑顺序/A B 2025.md', 'slash and colon scrubbed out of the filename')
 })
 
@@ -431,17 +775,16 @@ test('risk (a): on a first run the audit capability receives the in-memory gloss
   assert.ok(seenGlossary.includes('示例品牌'), 'it is THIS round\'s in-memory glossary (the entity is present) — not an empty disk read')
 })
 
-test('risk (a): the single-file one-pass branch passes NO glossary (SINGLE_FILE_GLOSSARY is not a real 校对表)', async () => {
+test('risk (a): a short single file now passes the Scout-built glossary to audit', async () => {
   const labels = []
   let called = false, seen = 'unset'
   const capabilities = {
     runAudit: (f, opts = {}) => { called = true; seen = opts.glossaryText; return { file: f.outPath, status: 'ok', failed: [], gaps: [], findings: [] } },
     annotateAnchors: () => ({ updated: [] }),
   }
-  // A single short file → one-pass branch → glossary === SINGLE_FILE_GLOSSARY → audit gets null (no ghost/yin).
   await runPipeline(A({ capabilities, files: [F({ chars: 1000 })] }), engine(labels))
-  assert.ok(called, 'the audit still ran for the one-pass file')
-  assert.equal(seen, null, 'no fake glossary is handed to the audit on the one-pass path')
+  assert.ok(called, 'the audit ran for the short file')
+  assert.ok(typeof seen === 'string' && seen.includes('统一校对表'), 'the normal Scout-built glossary reaches audit')
 })
 
 // ---------- risk (b): per-capability agent fallback ----------

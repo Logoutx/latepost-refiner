@@ -27,6 +27,7 @@ export const PRICES = {
 }
 
 const round6 = (n) => Math.round(n * 1e6) / 1e6 // 6dp — sub-cent runs would otherwise show as 0
+const round8 = (n) => Math.round(n * 1e8) / 1e8 // Jina can be below $0.000001 on a short page
 const round1 = (n) => Math.round(n * 10) / 10
 
 const deepseekPrice = (modelId) => (PRICES.deepseek && PRICES.deepseek[modelId]) || null
@@ -43,6 +44,19 @@ export function estimateCost(provider, models, usage) {
   const cacheRead = u.cacheRead || 0
 
   if (provider === 'deepseek') {
+    const byModel = u.byModel && typeof u.byModel === 'object' ? u.byModel : null
+    if (byModel && Object.keys(byModel).length) {
+      let value = 0
+      for (const [modelId, row0] of Object.entries(byModel)) {
+        const price = deepseekPrice(modelId)
+        if (!price) return null
+        const row = row0 || {}
+        const rowInput = row.input || 0
+        const rowCache = row.cacheRead || 0
+        value += (Math.max(0, rowInput - rowCache) * price.inMiss + rowCache * price.inHit + (row.output || 0) * price.out) / 1e6
+      }
+      return { value: round6(value), currency: 'USD', note: null }
+    }
     if (!models || typeof models !== 'object') return null
     const ids = [...new Set(Object.values(models).filter(Boolean))]
     if (!ids.length) return null
@@ -76,7 +90,7 @@ export function estimateCost(provider, models, usage) {
 // `provider`/`models` describe what actually served the run: `models` is the tier→model-id map used for
 // cost estimation (e.g. DEEPSEEK_MODELS) — null when it doesn't apply (e.g. an injected test engine with
 // no real provider/model map).
-export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null } = {}) {
+export function buildRunLogEntry({ params = {}, result = {}, provider = null, models = null, webTelemetry = null, searchProvider = null } = {}) {
   const durationMs = result.durationMs || 0
   const usageSrc = result.usage || {}
   const usage = {
@@ -85,9 +99,33 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     cacheRead: usageSrc.cacheRead || 0,
     cacheWrite: usageSrc.cacheWrite || 0,
     agents: usageSrc.agents || 0,
+    byModel: usageSrc.byModel || {},
   }
   const audit = result.audit
   const auditStatus = !audit ? 'unavailable' : (audit.status === 'fail' ? 'fail' : 'ok')
+
+  const estCost = estimateCost(provider, models, usage)
+  const searchBilled = (webTelemetry && webTelemetry.searchBilled) || 0
+  const effectiveSearchProvider = searchProvider === 'tavily' || searchProvider === 'serper' ? searchProvider : null
+  const searchRate = effectiveSearchProvider === 'tavily' ? 0.008 : effectiveSearchProvider === 'serper' ? 0.001 : 0
+  const searchNote = effectiveSearchProvider === 'tavily'
+    ? 'Tavily Basic list price: $0.008 / search'
+    : effectiveSearchProvider === 'serper'
+      ? 'Serper list price: $1 / 1,000 searches'
+      : 'No search provider configured'
+  const searchEstCost = { value: round6(searchBilled * searchRate), currency: 'USD', note: searchNote }
+  const readerTokens = (webTelemetry && webTelemetry.fetchJinaTokens) || 0
+  const readerMissing = (webTelemetry && webTelemetry.fetchJinaUsageMissing) || 0
+  const readerEstCost = {
+    value: round8(readerTokens * 0.05 / 1e6),
+    currency: 'USD',
+    note: `Jina Reader estimate: $50 / 1B tokens${readerMissing ? `; ${readerMissing} response(s) missing x-usage-tokens` : ''}`,
+  }
+  const totalEstCost = estCost
+    ? { value: round8(estCost.value + searchEstCost.value + readerEstCost.value), currency: 'USD', note: estCost.note }
+    : (((searchBilled && effectiveSearchProvider) || readerTokens) ? {
+        value: round8(searchEstCost.value + readerEstCost.value), currency: 'USD', note: null,
+      } : null)
 
   return {
     finishedAt: result.finishedAt || new Date().toISOString(),
@@ -100,7 +138,12 @@ export function buildRunLogEntry({ params = {}, result = {}, provider = null, mo
     durationMs,
     durationMin: round1(durationMs / 60000),
     usage,
-    estCost: estimateCost(provider, models, usage),
+    estCost,
+    searchProvider: effectiveSearchProvider,
+    searchEstCost,
+    readerEstCost,
+    totalEstCost,
+    webTelemetry: webTelemetry || null,
     auditStatus,
     outputDir: result.outputDir || params.outputDir || null,
   }

@@ -1,6 +1,6 @@
 # LatePost-Refiner Universal — Build Brief
 
-> **历史文档**：这是最初的建造简报，当时的目标是直连 Anthropic API。2026-07-14 起 API 版收敛为 DeepSeek 单一引擎（`engines/deepseek.js`）+ Tavily 搜索，Anthropic/多 provider 相关内容仅作历史记录，现状见仓库根 README。
+> **历史文档**：这是最初的建造简报，当时的目标是直连 Anthropic API。当前 API 版已收敛为 DeepSeek 单一引擎 + Tavily 优先、Serper/Jina 可选后备的 Web runtime；Anthropic/多 provider 相关内容仅作历史记录，现状见仓库根 README。
 
 ## One-line goal
 
@@ -37,25 +37,25 @@ log(msg) -> void
 - **`parallel` / `pipeline`**: Use `Promise` + `p-limit` to cap concurrency (on the order of `min(16, cores-2)`). `pipeline` passes each item independently through all stages with **no barrier**; if any thunk/stage throws, that item becomes `null` (consistent with Workflow semantics — core has `.filter(Boolean)` throughout).
 - **`phase` / `log`**: Write to stderr or a progress bar.
 
-> Web verification: prefer Anthropic's server-side web search tool; alternatively, implement a WebSearch client tool backed by a search API. **Check the `claude-api` skill before starting** to confirm the current web search tool name/version and the correct tool-use syntax.
+> Web verification: prefer Tavily when `TAVILY_API_KEY` is available; otherwise use the optional Serper/Jina backend when its keys are configured.
 
 ### 2. `universal/cli.js` — command-line shell
 
-- Parse argv → assemble `A` (same shape as the Claude Code edition's args — see the contract at the top of `core/meta.js` and `../claude-code-skill/SKILL.md` Step 0): `{ topic, date, background, outputDir, skillDir, scope, verifyDepth, headingPolicy, models, files:[{path,label,lines,bytes,title,subtitle,outPath,...}] }`.
+- Parse argv → assemble `A` (same shape as the Claude Code edition's args — see the contract at the top of `core/meta.js` and `../claude-code-skill/SKILL.md` Step 0): `{ topic, date, background, outputDir, skillDir, scope, verifyDepth, headingPolicy, files:[{path,label,lines,bytes,title,subtitle,outPath,...}] }`.
 - **Pre-flight checks**: convert docx/pdf → md (shell out to `markitdown`, or use `mammoth`); fill in `lines`/`bytes` via `wc -l`/`-c`; grep for sub-headings.
 - `skillDir` points to a location where `references/` is readable (reuse `../claude-code-skill/references/`, or copy it in during packaging).
-- Call `runPipeline(A, engine)` and handle the return value (write glossary to disk; handle `failed/incomplete/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions` — same as "return handling" in SKILL.md).
+- Call `runPipeline(A, engine)` and handle the return value (write glossary to disk; handle `failed/auditFailed/auditUnavailable/unchecked/scoutSuspect/headingConflicts/suspectedDuplicates/networkUnverified/logic/openQuestions`; `incomplete` is legacy compatibility only — same as "return handling" in SKILL.md).
 
 ### 3. Packaging
 
-`package.json` (`type: module`, `bin: latepost-refiner`) + `@anthropic-ai/sdk` + `p-limit` (+ `mammoth` or system `markitdown` dependency) + `.env.example` (`ANTHROPIC_API_KEY`) + README.
+`package.json` (`type: module`, `bin: latepost-refiner`) + `openai` + `p-limit` (+ `mammoth` or system `markitdown` dependency) + `.env.example` (`DEEPSEEK_API_KEY` and `TAVILY_API_KEY`) + README.
 
 ## CLI sketch
 
 ```bash
 latepost-refiner --files "a.docx" "b.docx" --topic "ExampleCo" --date 2025-02 \
   --background "ExampleCo Group cross-team interview series..." --scope refine,logic,summary \
-  --verify key --out ./output --models scout=haiku,refine=opus
+  --verify key --out ./output
 ```
 
 Output is identical to the Claude Code edition: `<out>/校对表.md`, `Transcripts/*.md`, `逻辑顺序/*.md`, `<topic>访谈总结.md`, `<topic>时间线.md`.

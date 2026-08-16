@@ -2,21 +2,58 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { auditText, auditPair, auditLogicPair, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
+import { auditText, auditPair, auditLogicPair, canonicalHeadingKey as auditHeadingKey, parseSourceTurns, annotateGaps, scanCoverage, annotateAnchors, sectionRange, normalizeWithMap, parseGlossaryLite, checkQuoteStyle, normalizeQuoteStyleText, checkSpeakerLabelStyle, checkGhostName, checkMissingYin, auditGlossary, parseGlossaryEntities, normalizeSrtTranscript, checkDerivativeAttribution, auditDerivative } from '../scripts/audit_refined.mjs'
+import { canonicalHeadingKey as pipelineHeadingKey } from '../core/spec.js'
 
 const fixture = (name) => fs.readFileSync(fileURLToPath(new URL(`./fixtures/audit/${name}`, import.meta.url)), 'utf8')
 
 // ---------- output-only audit (cleanliness) ----------
 
 test('hard-fails on leftover filler, confirmation/stutter repeats, and run-on paragraphs', () => {
-  const bad = '李明：对对对，嗯，我我觉得是这样。\n\n王某：' + '这是一段很长的独白内容反复说。'.repeat(200)
+  const bad = '李明：对对对，嗯，我我我觉得是这样。\n\n王某：' + '这是一段很长的独白内容反复说。'.repeat(200)
   const r = auditText(bad, 'bad.md')
   assert.equal(r.status, 'fail')
   const hard = r.findings.filter((f) => f.severity === 'hard' && f.count).map((f) => f.name)
   assert.ok(hard.includes('confirmation_repeats'), '对对对')
   assert.ok(hard.includes('filler_particles'), '嗯')
-  assert.ok(hard.includes('stutter_repeats'), '我我')
+  assert.ok(hard.includes('stutter_repeats'), '我我我')
   assert.equal(r.long_paragraphs.length, 1) // the >900-char monologue
+})
+
+test('exactly two adjacent target characters are review-only, including lexical boundaries and ambiguous stutters', () => {
+  for (const text of [
+    '记者：请告诉我我的安排。',
+    '受访者：这个选择可以，但是是另一种方案。',
+    '记者：但是是不是适合，只有合作之后才知道。',
+    '受访者：我们需要面对对象的差异。',
+    '受访者：这个方案可能能够解决问题。',
+    '受访者：那那个时候还没有想好。',
+    '受访者：我我觉得还要再看看。',
+    '受访者：对对，这个结论没问题。',
+  ]) {
+    const r = auditText(text, 'double-review.md')
+    const review = r.findings.find((f) => f.name === 'contextual_repeat_review')
+    assert.equal(r.status, 'ok', `${text} → an ambiguous double must not block publication`)
+    assert.equal(r.hard_issues, 0, `${text} → an ambiguous double is not a hard issue`)
+    assert.equal(review.count, 1, `${text} → the double remains visible for review`)
+  }
+})
+
+test('three-or-more target characters remain hard while a contained pair is not double-reported as soft', () => {
+  const r = auditText('受访者：我我我觉得可以。记者：对对对。受访者：是是是。记者：嗯嗯。', 'triple-hard.md')
+  assert.equal(r.status, 'fail')
+  assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(r.findings.find((f) => f.name === 'confirmation_repeats').count, 2)
+  assert.equal(r.findings.find((f) => f.name === 'filler_particles').count, 2, '嗯嗯 remains hard through the pure-filler rule')
+  assert.equal(r.findings.find((f) => f.name === 'contextual_repeat_review').count, 0)
+})
+
+test('long paragraphs have their own gate and do not also masquerade as residual_noise', () => {
+  const long = `受访者：${'这是一段完整而连贯的访谈内容。'.repeat(100)}`
+  const r = auditPair({ sourceText: long, refinedText: long, mode: 'logic' })
+  assert.deepEqual(r.failed, ['long_paragraphs'])
+  assert.equal(r.findings.filter((f) => f.severity === 'hard' && f.count).length, 0)
+  assert.equal(r.long_paragraphs.length, 1)
 })
 
 test('sentence-final modal particles 啊/哦/欸 and 这个/那个 are soft — they do NOT fail the audit', () => {
@@ -54,6 +91,17 @@ test('hard-fails phrase repeats, broken starts, and ASR glue left in refined out
   assert.ok(hard.includes('asr_glue'), 'ASR glued tokens')
 })
 
+test('ASCII phrase-repeat detection respects whole-token boundaries', () => {
+  const clean = auditText('李明：Language Agent 是一种常见写法，language agent 也不应被误判为重复。', 'ascii-boundary.md')
+  const cleanRepeat = clean.findings.find((f) => f.name === 'phrase_repeats')
+  assert.equal(cleanRepeat.count, 0, 'overlapping suffix/prefix across adjacent words is not a repeat')
+
+  const repeated = auditText('李明：这个 APP APP 权限需要重新配置。', 'ascii-repeat.md')
+  const repeatedFinding = repeated.findings.find((f) => f.name === 'phrase_repeats')
+  assert.equal(repeatedFinding.count, 1, 'a true repeated ASCII token still fails')
+  assert.equal(repeated.status, 'fail')
+})
+
 // ---------- source-aware audit (compression / under-refinement) ----------
 
 test('refine mode hard-fails a compressed (summarized) output, primarily on charRatio', () => {
@@ -75,6 +123,34 @@ test('refine mode passes a faithful, properly-cleaned refine', () => {
   const r = auditPair({ sourceText: fixture('source-excerpt.md'), refinedText: fixture('clean.md'), mode: 'refine' })
   assert.equal(r.status, 'ok')
   assert.equal(r.failed.length, 0)
+})
+
+test('a cleaned closing pleasantry is not a standalone lexical-tail failure', () => {
+  const sourceText = [
+    '记者：最后还有什么需要补充的吗？',
+    '受访者：核心就是先把产品做好，再考虑扩张。',
+    '记者：好好好，我这边没有别的问题了，非常感谢您的时间。',
+    '受访者：嗯，好好，拜拜。',
+    '记者：嗯嗯，拜拜。',
+  ].join('\n')
+  const refinedText = [
+    '记者：最后还有什么需要补充的吗？',
+    '',
+    '受访者：核心就是先把产品做好，再考虑扩张。',
+    '',
+    '记者：我这边没有其他问题了，非常感谢您的时间。',
+    '',
+    '受访者：拜拜。',
+    '',
+    '记者：拜拜。',
+  ].join('\n')
+  const r = auditPair({ sourceText, refinedText, mode: 'refine' })
+  assert.ok(!r.failed.includes('ending_missing'), '正常去口癖不能被连续字窗口误判成断尾')
+  assert.equal(typeof r.metrics.endingCovered, 'boolean', '字面结尾指标仅作为信息保留')
+  const info = r.findings.find((finding) => finding.name === 'ending_check_info')
+  assert.equal(info.severity, 'soft')
+  assert.equal(info.count, r.metrics.endingCovered ? 0 : 1)
+  assert.ok(!r.failed.includes('ending_check_info'), '信息项永不进入门禁')
 })
 
 test('summary mode does NOT apply the compression gate (a summary is meant to be short)', () => {
@@ -216,6 +292,16 @@ test('a silently omitted section hard-fails content_gap with an accurate source 
   assert.ok(!s.failed.includes('content_gap'), 'summary mode does not gate')
 })
 
+test('one long substantive speaker turn omitted in full is a hard content_gap', () => {
+  const answer = Array.from({ length: 18 }, (_, i) => `第 ${i + 1} 个具体判断涉及客户需求、产品取舍、交付节奏和团队协作，不能被概括删除。`).join('')
+  const source = `记者：请完整解释这次调整。\n受访者：${answer}\n记者：明白了。`
+  const refined = '## 调整\n\n记者：请完整解释这次调整。\n\n记者：明白了。'
+  const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  const gap = r.gaps.find((g) => g.turns === 1)
+  assert.ok(gap && gap.chars >= 300 && gap.severity === 'hard')
+  assert.ok(r.failed.includes('content_gap'), 'a single long answer is a complete turn, not a soft loss')
+})
+
 test('the same omission WITH a stage-direction fold trace is downgraded to soft (cooperative fold, not censorship)', () => {
   const r = auditPair({ sourceText: covSource(), refinedText: fixture('coverage-refined-fold-long.md'), mode: 'refine' })
   assert.ok(!r.failed.includes('content_gap'), 'traced fold does not gate')
@@ -269,9 +355,10 @@ test('annotateGaps falls back to header block / EOF when a gap has no anchors', 
   assert.ok(at > 0 && at < lines.length - 1 && lines.findIndex((l) => l.startsWith('记者：')) > at, 'file-start gap lands after the header block, before the body')
 })
 
-test('an unparseable source degrades to assessed:false and never gates', () => {
+test('an untracked source uses paragraph coverage while speaker attribution is not applicable', () => {
   const r = auditPair({ sourceText: '这是一段没有任何发言人标签的连续文字。\n再来一行还是没有标签。', refinedText: '# 标题\n\n随便的成稿。', mode: 'refine' })
-  assert.equal(r.metrics.coverage.assessed, false)
+  assert.equal(r.metrics.coverage.assessed, true)
+  assert.equal(r.metrics.attribution.status, 'not_applicable')
   assert.ok(!r.failed.includes('content_gap'))
   const s = scanCoverage('无标签文字。', '成稿。')
   assert.equal(s.assessed, false)
@@ -419,6 +506,63 @@ test('quote_style (SF-4): a markdown-link title with CJK-adjacent ASCII quotes d
   // A genuine straight quote in the prose still fires (the masking is scoped to the link segment only).
   const real = '## 出处\n\n周砚：他说"这个太贵"，详见 [报告](https://example.com/a "行业惯例")。'
   assert.ok(checkQuoteStyle(real).find((f) => f.name === 'quote_style').count >= 1, 'a real prose straight quote still fires alongside a masked link title')
+})
+
+test('normalizeQuoteStyleText fixes visible prose/headings but preserves protected Markdown regions', () => {
+  const doc = [
+    '## 「示例标题」',
+    '',
+    '周砚：他说"这个太贵"，也把『内部方案』称为\'第二曲线\'。',
+    '周砚：😀 他说"带 emoji 的中文引语"。',
+    '周砚：命令是 `grep "中文" file`，参见 [报告](https://example.com/a "中文标题") 和 https://example.com/?q="中文"。',
+    '```',
+    'const x = "中文"',
+    '```',
+  ].join('\n')
+  const out = normalizeQuoteStyleText(doc)
+  assert.match(out, /## “示例标题”/)
+  assert.match(out, /他说“这个太贵”/)
+  assert.match(out, /把‘内部方案’称为‘第二曲线’/)
+  assert.match(out, /😀 他说“带 emoji 的中文引语”/, 'astral characters do not shift quote replacements')
+  assert.ok(out.includes('`grep "中文" file`'), 'inline code is unchanged')
+  assert.ok(out.includes('(https://example.com/a "中文标题")'), 'link target/title is unchanged')
+  assert.ok(out.includes('const x = "中文"'), 'fenced code is unchanged')
+  assert.equal(checkQuoteStyle(out).find((f) => f.name === 'quote_style').count, 0)
+  assert.equal(normalizeQuoteStyleText(out), out, 'normalization is idempotent')
+})
+
+test('normalizeQuoteStyleText decodes literal Unicode quote escapes only in visible Markdown', () => {
+  const doc = [
+    '---',
+    'title: "\\u201c元数据保留\\u201d"',
+    '---',
+    '',
+    '## \\u201c转义标题\\u201d',
+    '',
+    '周砚：他说\\u201c正文引语\\u201d，也提到\\u2018内部方案\\u2019。',
+    '周砚：命令是 `printf "\\u201c代码\\u201d"`。',
+    '周砚：详见 [报告](https://example.com/a "\\u201c链接标题\\u201d")。',
+    '周砚：URL 是 https://example.com/\\u201cpath\\u201d。',
+    '<!-- \\u201c注释保留\\u201d -->',
+    '```js',
+    'const x = "\\u201c代码块\\u201d"',
+    '```',
+  ].join('\n')
+
+  const beforeFinding = checkQuoteStyle(doc).find((f) => f.name === 'quote_style')
+  assert.ok(beforeFinding.count >= 1, 'visible prose escapes are publication-invalid quote residue')
+
+  const out = normalizeQuoteStyleText(doc)
+  assert.match(out, /^## “转义标题”$/m)
+  assert.match(out, /他说“正文引语”，也提到‘内部方案’/)
+  assert.ok(out.includes('title: "\\u201c元数据保留\\u201d"'), 'front matter is unchanged')
+  assert.ok(out.includes('`printf "\\u201c代码\\u201d"`'), 'inline code is unchanged')
+  assert.ok(out.includes('(https://example.com/a "\\u201c链接标题\\u201d")'), 'link target/title is unchanged')
+  assert.ok(out.includes('https://example.com/\\u201cpath\\u201d'), 'URLs are unchanged')
+  assert.ok(out.includes('<!-- \\u201c注释保留\\u201d -->'), 'HTML comments are unchanged')
+  assert.ok(out.includes('const x = "\\u201c代码块\\u201d"'), 'fenced code is unchanged')
+  assert.equal(checkQuoteStyle(out).find((f) => f.name === 'quote_style').count, 0)
+  assert.equal(normalizeQuoteStyleText(out), out, 'escape decoding is idempotent')
 })
 
 test('quote_density_low: a long body with zero 弯引号 emits a soft hint (never a gate)', () => {
@@ -598,6 +742,24 @@ test('auditLogicPair accepts provenance titles that contain Chinese separators',
   const r = auditLogicPair(refined, logic)
   assert.equal(r.status, 'ok')
   assert.equal(r.metrics.missingSections, 0)
+})
+
+test('auditLogicPair ignores quotes, whitespace, punctuation, width, and case in provenance titles', () => {
+  const titles = [
+    '“Good Enough”之后，差异化会消失',
+    '2023 年上海车展：一次集体的“Shock”',
+    '“小龙虾”试点：博世中国的 AI 探索',
+  ]
+  const refined = titles.flatMap((title) => [`## ${title}`, `记者：请讲讲${title}。`, `受访者：${title}保留完整事实。`, '']).join('\n')
+  const logic = [
+    '## 新主线',
+    '*〔取自精校稿："good enough"之后差异化会消失、２０２３年上海车展——一次集体的 shock、"小龙虾"试点 博世中国的AI探索〕*',
+    ...titles.flatMap((title) => [`记者：请讲讲${title}。`, `受访者：${title}保留完整事实。`, '']),
+  ].join('\n')
+  const r = auditLogicPair(refined, logic)
+  assert.equal(r.status, 'ok')
+  assert.equal(r.metrics.missingSections, 0)
+  for (const title of titles) assert.equal(auditHeadingKey(title), pipelineHeadingKey(title), 'audit and pipeline canonicalization stay identical')
 })
 
 test('auditLogicPair hard-fails logic drafts that omit refined section provenance', () => {
@@ -833,6 +995,76 @@ test('derivative guard: a legitimate money-scale conversion (8000 万 ⇄ 0.8 �
   const bad = auditDerivative({ corpusText: corpus, derivativeText: '## 时间线\n- **2024 年**【访谈】融资 5 亿元。', kind: 'timeline' })
   assert.equal(bad.status, 'fail', '5 亿 has no equivalent in the interview → fabricated')
   assert.equal(bad.hardFail[0].value, '5')
+})
+
+test('derivative guard: English million/billion amounts match equivalent Chinese 亿 amounts', () => {
+  const corpus = [
+    '沈其安：A 轮是 1.03 billion USD，追加轮是 1.23 billion USD，B 轮超过 860 million dollars。',
+    '沈其安：另外两家公司分别是 $450 million 和 153m USD。',
+  ].join('\n')
+  const deriv = [
+    '## 时间线',
+    '- **2023 年**【访谈】A 轮融资 10.3 亿美元，追加轮融资 12.3 亿美元。',
+    '- **2024 年**【访谈】B 轮融资超过 8.6 亿美元。',
+    '- **2025 年**【访谈】另外两轮融资分别为 4.5 亿美元和 1.53 亿美元。',
+  ].join('\n')
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.deepEqual(r.hardFail, [], 'cross-language money-scale conversions are equivalent, not fabricated figures')
+})
+
+test('derivative guard: a compacted money range is supported by two same-line spoken endpoints', () => {
+  const source = 'Henry：Codex 每个月 20 刀能用饱，Anthropic 可能至少是 100 刀或者 200 刀。'
+  const supported = checkDerivativeAttribution(source, '- 价格差距：Anthropic 同等用量需 100 到 200 美元【访谈】。')
+  assert.equal(supported.hardFail.length, 0, '100/200 on one source line supports the compacted 100-200 range')
+
+  const unrelated = checkDerivativeAttribution('甲：预算是 100。\n乙：另外一项指标是 200。', '- 预算为 100 到 200 美元【访谈】。')
+  assert.equal(unrelated.hardFail.length, 1, 'two unrelated endpoints on separate lines do not fabricate a range')
+})
+
+test('derivative guard: source labels govern factual clauses instead of leaking across a mixed-source line', () => {
+  const corpus = '沈其安：Roda 本轮融资 450 million USD。'
+  const deriv = '## 时间线\n- **2025 年**Roda 融资 4.5 亿美元【访谈】；公开报道的投后估值为 17 亿美元。'
+  const r = auditDerivative({ corpusText: corpus, derivativeText: deriv, kind: 'timeline' })
+  assert.equal(r.status, 'ok')
+  assert.deepEqual(r.hardFail, [], 'the first clause interview label cannot mislabel a later public clause')
+  assert.deepEqual(r.review.map((x) => x.value), ['17'], 'the unlabeled public valuation is still surfaced for correction')
+
+  const wronglyLabeled = auditDerivative({
+    corpusText: corpus,
+    derivativeText: '## 时间线\n- **2025 年**Roda 融资 4.5 亿美元【访谈】；投后估值为 17 亿美元【访谈】。',
+    kind: 'timeline',
+  })
+  assert.equal(wronglyLabeled.status, 'fail')
+  assert.deepEqual(wronglyLabeled.hardFail.map((x) => x.value), ['17'], 'an explicit wrong interview label on the public clause remains blocking')
+})
+
+test('derivative guard: a globally present amount cannot be reassigned to another glossary entity', () => {
+  const glossary = [
+    '## 品牌 / 公司 / 产品（写法 → 统一）',
+    '- **远山物流** ← 远山 ｜ 物流公司',
+    '- **青峰货运** ← 青峰 ｜ 货运公司',
+  ].join('\n')
+  const corpus = '沈其安：青峰货运完成融资 2 亿元。'
+  const wrong = auditDerivative({
+    corpusText: corpus,
+    derivativeText: '## 时间线\n- 远山物流完成融资 2 亿元【访谈】。',
+    kind: 'timeline',
+    glossaryText: glossary,
+  })
+  assert.equal(wrong.status, 'fail')
+  assert.equal(wrong.hardFail[0].reason, 'entity_mismatch')
+  assert.equal(wrong.hardFail[0].entity, '远山物流')
+  assert.deepEqual(wrong.hardFail[0].corpusEntities, ['青峰货运'])
+
+  const alias = auditDerivative({
+    corpusText: '沈其安：远山完成融资 2 亿元。',
+    derivativeText: '## 时间线\n- 远山物流完成融资 2 亿元【访谈】。',
+    kind: 'timeline',
+    glossaryText: glossary,
+  })
+  assert.equal(alias.status, 'ok', 'a source variant and its canonical belong to the same entity cluster')
+  assert.deepEqual(alias.hardFail, [])
 })
 
 // ---------- P1 (Finding 1): derivative_context_review — a passed magnitude with no local corroboration ----------

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import http from 'node:http'
+import { Readable, Writable } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,28 +10,30 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-server-'))
 }
 
-function listen(server) {
+// Exercise the real http.Server request listener in memory. Some CI sandboxes prohibit every listen(2)
+// socket, including loopback and Unix-domain sockets; dispatching the same listener keeps request parsing,
+// origin/token checks, SSE writes and response headers under test without weakening assertions.
+function request(server, method, url, { headers = {}, body = '' } = {}) {
   return new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port))
-  })
-}
-
-function close(server) {
-  return new Promise((resolve) => server.close(resolve))
-}
-
-function request(port, method, url, { headers = {}, body = '' } = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ hostname: '127.0.0.1', port, path: url, method, headers }, (res) => {
-      let text = ''
-      res.setEncoding('utf8')
-      res.on('data', (chunk) => { text += chunk })
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: text }))
+    const normalizedHeaders = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]))
+    if (!normalizedHeaders.host) normalizedHeaders.host = '127.0.0.1:8765'
+    const req = Readable.from(body ? [Buffer.from(body)] : [])
+    Object.assign(req, { method, url, headers: normalizedHeaders })
+    const chunks = []
+    const res = new Writable({
+      write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback() },
     })
-    req.on('error', reject)
-    if (body) req.write(body)
-    req.end()
+    res.statusCode = 200
+    res.headers = {}
+    res.writeHead = (status, values = {}) => {
+      res.statusCode = status
+      res.headers = Object.fromEntries(Object.entries(values).map(([key, value]) => [key.toLowerCase(), value]))
+      return res
+    }
+    res.on('finish', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }))
+    res.on('error', reject)
+    const listener = server.listeners('request')[0]
+    Promise.resolve(listener(req, res)).catch(reject)
   })
 }
 
@@ -39,81 +41,73 @@ test('sanitizeRunParams drops web-only dangerous fields', () => {
   const params = sanitizeRunParams({
     skillDir: '/',
     __engine: { anything: true },
+    searchFn: 'not allowed over HTTP',
+    fetchImpl: 'not allowed over HTTP',
     apiKey: 'deepseek-key',
     tavilyKey: 't',
+    serperKey: 's',
+    jinaKey: 'j',
   })
   assert.equal(params.skillDir, undefined, 'skillDir cannot be set over the wire')
   assert.equal(params.__engine, undefined, 'the test-only engine injection cannot be set over the wire')
+  assert.equal(params.searchFn, undefined)
+  assert.equal(params.fetchImpl, undefined)
   assert.equal(params.apiKey, 'deepseek-key', 'the DeepSeek key passes through')
-  assert.equal(params.tavilyKey, 't', 'the Tavily key passes through')
+  assert.equal(params.tavilyKey, 't', 'the primary Tavily key passes through')
+  assert.equal(params.serperKey, 's', 'the Serper key passes through')
+  assert.equal(params.jinaKey, 'j', 'the optional Jina key passes through')
 })
 
 test('served HTML embeds the per-session API token', async () => {
   const server = createAppServer({ token: 'test-token' })
-  const port = await listen(server)
-  try {
-    const res = await request(port, 'GET', '/')
-    assert.equal(res.status, 200)
-    assert.match(res.body, /window\.__TRANSCRIBER_TOKEN__="test-token"/)
-  } finally {
-    await close(server)
-  }
+  const res = await request(server, 'GET', '/')
+  assert.equal(res.status, 200)
+  assert.match(res.body, /window\.__TRANSCRIBER_TOKEN__="test-token"/)
+  assert.match(res.body, /id="tavilyKey"/)
+  assert.match(res.body, /id="serperKey"/)
+  assert.match(res.body, /id="jinaKey"/)
+  assert.match(res.body, /serperKey: \$\('serperKey'\).*jinaKey: \$\('jinaKey'\)/s)
 })
 
 test('serves a PWA manifest and an SVG icon so the GUI installs as a local app', async () => {
   const server = createAppServer({ token: 't' })
-  const port = await listen(server)
-  try {
-    const m = await request(port, 'GET', '/manifest.webmanifest')
-    assert.equal(m.status, 200)
-    assert.match(m.headers['content-type'], /manifest\+json/)
-    const mf = JSON.parse(m.body)
-    assert.equal(mf.display, 'standalone')
-    assert.ok(mf.name && mf.icons.length, 'manifest has a name and icons')
-    assert.equal(mf.icons[0].src, '/icon.svg')
-    const i = await request(port, 'GET', '/icon.svg')
-    assert.equal(i.status, 200)
-    assert.match(i.headers['content-type'], /image\/svg\+xml/)
-    assert.match(i.body, /^<svg/)
-  } finally {
-    await close(server)
-  }
+  const m = await request(server, 'GET', '/manifest.webmanifest')
+  assert.equal(m.status, 200)
+  assert.match(m.headers['content-type'], /manifest\+json/)
+  const mf = JSON.parse(m.body)
+  assert.equal(mf.display, 'standalone')
+  assert.ok(mf.name && mf.icons.length, 'manifest has a name and icons')
+  assert.equal(mf.icons[0].src, '/icon.svg')
+  const i = await request(server, 'GET', '/icon.svg')
+  assert.equal(i.status, 200)
+  assert.match(i.headers['content-type'], /image\/svg\+xml/)
+  assert.match(i.body, /^<svg/)
 })
 
 test('served HTML links the manifest, icon and theme-color (installable head)', async () => {
   const server = createAppServer({ token: 't' })
-  const port = await listen(server)
-  try {
-    const res = await request(port, 'GET', '/')
-    assert.match(res.body, /rel="manifest" href="\/manifest\.webmanifest"/)
-    assert.match(res.body, /rel="icon" href="\/icon\.svg"/)
-    assert.match(res.body, /name="theme-color"/)
-  } finally {
-    await close(server)
-  }
+  const res = await request(server, 'GET', '/')
+  assert.match(res.body, /rel="manifest" href="\/manifest\.webmanifest"/)
+  assert.match(res.body, /rel="icon" href="\/icon\.svg"/)
+  assert.match(res.body, /name="theme-color"/)
 })
 
 test('API rejects untokened, non-JSON, and cross-origin run requests', async () => {
   let called = false
   const token = 'secret-token'
   const server = createAppServer({ token, runJobImpl: async () => { called = true; return { refined: [], outputDir: tmpdir() } } })
-  const port = await listen(server)
-  try {
-    const noToken = await request(port, 'POST', '/api/run', { headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    assert.equal(noToken.status, 403)
+  const noToken = await request(server, 'POST', '/api/run', { headers: { 'Content-Type': 'application/json' }, body: '{}' })
+  assert.equal(noToken.status, 403)
 
-    const textPlain = await request(port, 'POST', '/api/run', { headers: { [API_TOKEN_HEADER]: token, 'Content-Type': 'text/plain' }, body: '{}' })
-    assert.equal(textPlain.status, 415)
+  const textPlain = await request(server, 'POST', '/api/run', { headers: { [API_TOKEN_HEADER]: token, 'Content-Type': 'text/plain' }, body: '{}' })
+  assert.equal(textPlain.status, 415)
 
-    const wrongOrigin = await request(port, 'POST', '/api/run', {
-      headers: { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: 'http://evil.example' },
-      body: '{}',
-    })
-    assert.equal(wrongOrigin.status, 403)
-    assert.equal(called, false)
-  } finally {
-    await close(server)
-  }
+  const wrongOrigin = await request(server, 'POST', '/api/run', {
+    headers: { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+    body: '{}',
+  })
+  assert.equal(wrongOrigin.status, 403)
+  assert.equal(called, false)
 })
 
 test('API accepts same-origin tokened run requests and only opens returned output paths', async () => {
@@ -143,25 +137,20 @@ test('API accepts same-origin tokened run requests and only opens returned outpu
     },
     openImpl: (p) => { openedPath = p },
   })
-  const port = await listen(server)
-  const headers = { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${port}` }
-  try {
-    const run = await request(port, 'POST', '/api/run', {
-      headers,
-      body: JSON.stringify({ topic: 'T', skillDir: '/', apiKey: 'deepseek-key' }),
-    })
-    assert.equal(run.status, 200)
-    assert.match(run.body, /event: result/)
-    assert.equal(capturedParams.skillDir, undefined)
-    assert.equal(capturedParams.apiKey, 'deepseek-key')
+  const headers = { [API_TOKEN_HEADER]: token, 'Content-Type': 'application/json', Origin: 'http://127.0.0.1:8765' }
+  const run = await request(server, 'POST', '/api/run', {
+    headers,
+    body: JSON.stringify({ topic: 'T', skillDir: '/', apiKey: 'deepseek-key' }),
+  })
+  assert.equal(run.status, 200)
+  assert.match(run.body, /event: result/)
+  assert.equal(capturedParams.skillDir, undefined)
+  assert.equal(capturedParams.apiKey, 'deepseek-key')
 
-    const blockedOpen = await request(port, 'POST', '/api/open', { headers, body: JSON.stringify({ path: otherDir }) })
-    assert.equal(blockedOpen.status, 400)
+  const blockedOpen = await request(server, 'POST', '/api/open', { headers, body: JSON.stringify({ path: otherDir }) })
+  assert.equal(blockedOpen.status, 400)
 
-    const okOpen = await request(port, 'POST', '/api/open', { headers, body: JSON.stringify({ path: outputDir }) })
-    assert.equal(okOpen.status, 200)
-    assert.equal(openedPath, outputDir)
-  } finally {
-    await close(server)
-  }
+  const okOpen = await request(server, 'POST', '/api/open', { headers, body: JSON.stringify({ path: outputDir }) })
+  assert.equal(okOpen.status, 200)
+  assert.equal(openedPath, outputDir)
 })

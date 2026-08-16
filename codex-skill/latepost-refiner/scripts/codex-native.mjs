@@ -18,6 +18,7 @@ import {
 } from '../core/prompts.js'
 import {
   DEDUP_SCHEMA,
+  PUBLICATION_BLOCK_GATES,
   LOGIC_PLAN_SCHEMA,
   LOGIC_REPORT_SCHEMA,
   ONE_PASS_CHARS,
@@ -25,6 +26,7 @@ import {
   SCOUT_SCHEMA,
   VERIFY_SCHEMA,
   applyOverridesToMerged,
+  canonicalHeadingKey,
   cleanSuspects,
   contentLength,
   dedupListText,
@@ -47,12 +49,13 @@ import {
   splitForRefine,
   splitForScout,
   mergeScoutChunks,
-  stitchParts,
+  stitchPartsWithReport,
   verifyChunks,
   weakDupFlags,
 } from '../core/spec.js'
 import { writeRunArtifacts } from '../universal/artifacts.js'
-import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource } from './audit_refined.mjs'
+import { annotateAnchorsFile, annotateFile, auditGlossary, auditLogicFile, auditPairs, auditDerivativeFile, normalizeSrtTranscript, shouldNormalizeSrtSource, normalizeQuoteStyleText } from './audit_refined.mjs'
+import { parseSpeakerDocument } from './speaker-resolver.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const SCRIPT_DIR = path.dirname(__filename)
@@ -98,7 +101,7 @@ function usage() {
   node "<this skill dir>/scripts/codex-native.mjs" mark-stage --args <out>/_codex-native/args.json --stage refine --status start|end
 
 This helper is deterministic glue for the Codex subscription-native workflow. It never calls model APIs and never
-requires OPENAI_API_KEY or TAVILY_API_KEY. Codex subagents consume the generated prompt files and return JSON reports.`
+requires OPENAI_API_KEY, SERPER_API_KEY, or JINA_API_KEY. Codex subagents consume the generated prompt files and return JSON reports.`
 }
 
 function parseCli(argv) {
@@ -275,6 +278,7 @@ export function normalizeArgs(input) {
     f.lines = Number.isFinite(Number(f.lines)) && Number(f.lines) > 0 ? Number(f.lines) : lineCount(f.path)
     f.bytes = Number.isFinite(Number(f.bytes)) && Number(f.bytes) > 0 ? Number(f.bytes) : byteCount(f.path)
     f.chars = Number.isFinite(Number(f.chars)) && Number(f.chars) > 0 ? Number(f.chars) : contentChars(f.path)
+    f.needsSpeakerResolution = parseSpeakerDocument(fs.readFileSync(f.path, 'utf8')).needsResolution
     f.title = f.title || originalTitle || titleFromPath(f.path) || f.label
     f.subtitle = f.subtitle || defaultSubtitle(A)
     f.outPath = f.outPath ? path.resolve(f.outPath) : path.join(A.outputDir, 'Transcripts', `${f.title}.md`)
@@ -299,7 +303,9 @@ export function prepareNativeRun(args) {
   markStage(A, 'prepare', 'start')
   const normalizedArgsPath = writeJson(path.join(dir, 'args.json'), A)
   const prompts = []
-  const shortSinglePass = A.files.length === 1 && (A.files[0].chars || 0) < ONE_PASS_CHARS
+  const shortSinglePass = A.files.length === 1
+    && (A.files[0].chars || 0) < ONE_PASS_CHARS
+    && A.files[0].needsSpeakerResolution === false
   if (shortSinglePass) {
     const f = A.files[0]
     const lockedClusters = (A.canonicalOverrides && A.canonicalOverrides.length)
@@ -531,13 +537,18 @@ function auditLogicPlan(plan, headings) {
     const explicit = Array.isArray(t?.source_order) ? t.source_order.map(Number).filter((n) => Number.isFinite(n)) : []
     if (explicit.length) order.push(...explicit)
     else for (const s of ss) {
-      const found = headings.find((h) => h.title === s)
+      const key = canonicalHeadingKey(s)
+      const found = headings.find((h) => canonicalHeadingKey(h.title) === key)
       if (found) order.push(found.order)
     }
   }
-  const coveredSet = new Set(covered)
-  const missing = source.filter((h) => !coveredSet.has(h))
-  const dupes = Array.from(covered.reduce((m, h) => m.set(h, (m.get(h) || 0) + 1), new Map())).filter(([, n]) => n > 1).map(([h]) => h)
+  const coveredKeys = covered.map(canonicalHeadingKey).filter(Boolean)
+  const coveredSet = new Set(coveredKeys)
+  const sourceByKey = new Map(source.map((h) => [canonicalHeadingKey(h), h]).filter(([key]) => key))
+  const missing = source.filter((h) => !coveredSet.has(canonicalHeadingKey(h)))
+  const dupes = Array.from(coveredKeys.reduce((m, key) => m.set(key, (m.get(key) || 0) + 1), new Map()))
+    .filter(([, n]) => n > 1)
+    .map(([key]) => sourceByKey.get(key) || key)
   if (missing.length) issues.push(`漏掉 ${missing.length}/${source.length} 个精校小标题：${missing.slice(0, 8).join('、')}`)
   if (dupes.length) issues.push(`重复覆盖 ${dupes.length} 个精校小标题：${dupes.slice(0, 8).join('、')}`)
   const canonical = headings.map((h) => h.order).filter((n) => order.includes(n))
@@ -666,7 +677,8 @@ export function afterRefine(args, state, refinedRaw) {
         continue
       }
       const texts = plan.partPaths.map((p) => fs.readFileSync(p, 'utf8'))
-      writeText(f.outPath, stitchParts(texts))
+      const stitched = stitchPartsWithReport(texts)
+      writeText(f.outPath, stitched.text)
       const reps = plan.partPaths.map((p, i) => reportFor(items, [p, `${f.label}#${i + 1}/${plan.partPaths.length}`])).filter(Boolean)
       refined.push({
         label: f.label,
@@ -676,6 +688,8 @@ export function afterRefine(args, state, refinedRaw) {
         key_fixes: reps.flatMap((r) => r.key_fixes || []),
         open_questions: reps.flatMap((r) => r.open_questions || []),
         chunked: plan.partPaths.length,
+        ...(stitched.seamRepairs.length ? { seamRepairs: stitched.seamRepairs } : {}),
+        ...(stitched.seamDuplicates.length ? { seamDuplicates: stitched.seamDuplicates } : {}),
         complete: null,
         checkNote: '结尾核对待跑',
       })
@@ -723,7 +737,9 @@ export function deliverPrompts(args, state) {
   const dir = stateDir(A)
   const refined = (state.refined || state.resultSeed?.refined || []).filter(Boolean)
   const prompts = []
-  if (A.scope.includes('logic')) {
+  const bodyGate = auditNativeBodies(A, refined)
+  const derivativesSkipped = bodyGate.status === 'ok' ? [] : requestedDerivativeSkips(A)
+  if (bodyGate.status === 'ok' && A.scope.includes('logic')) {
     A.files.forEach((f, index) => {
       const refinedFile = asRefinedPromptFile(f)
       prompts.push(promptEntry(A, 'logic-plan', {
@@ -733,22 +749,22 @@ export function deliverPrompts(args, state) {
       }))
     })
   }
-  if (A.scope.includes('summary') && refined.length) {
+  if (bodyGate.status === 'ok' && A.scope.includes('summary') && refined.length) {
     prompts.push(promptEntry(A, 'summary', {
       label: 'summary',
       path: writeText(path.join(dir, 'prompts', 'summary.txt'), summaryPrompt(A, refined, state.sectionMapPath)),
     }))
   }
-  if (A.scope.includes('timeline') && refined.length) {
+  if (bodyGate.status === 'ok' && A.scope.includes('timeline') && refined.length) {
     prompts.push(promptEntry(A, 'timeline', {
       label: 'timeline',
       timeoutMs: A.timelineTimeoutMs || 180000,
       path: writeText(path.join(dir, 'prompts', 'timeline.txt'), timelinePrompt(A, state.glossary || '', refined, state.sectionMapPath)),
     }))
   }
-  const manifestPath = writeJson(path.join(dir, 'deliver-prompt-manifest.json'), { prompts })
-  markStage(A, 'deliver-prompts', 'end', { prompts: prompts.length })
-  return { manifestPath, prompts }
+  const manifestPath = writeJson(path.join(dir, 'deliver-prompt-manifest.json'), { prompts, bodyGate, derivativesSkipped })
+  markStage(A, 'deliver-prompts', 'end', { prompts: prompts.length, bodyGate: bodyGate.status, skipped: derivativesSkipped.length })
+  return { manifestPath, prompts, bodyGate, derivativesSkipped }
 }
 
 export function afterLogicPlan(args, state, plansRaw) {
@@ -813,8 +829,11 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     if (!chk) return r
     return { ...r, complete: chk.complete, checkNote: chk.note || '' }
   })
-  const logicByLabel = new Map((state.resultSeed?.logic || []).filter((l) => l && l.label).map((l) => [l.label, l]))
+  const bodyGate = auditNativeBodies(A, refined)
+  const derivativesSkipped = bodyGate.status === 'ok' ? [] : requestedDerivativeSkips(A)
+  const logicByLabel = new Map((bodyGate.status === 'ok' ? (state.resultSeed?.logic || []) : []).filter((l) => l && l.label).map((l) => [l.label, l]))
   A.files.forEach((f) => {
+    if (bodyGate.status !== 'ok') return
     const rep = reportFor(logicItems, [f.label, path.join(A.outputDir, '逻辑顺序', `${safeName(f.title)}.md`)])
     if (!rep) return
     const outPath = path.resolve(rep.path || path.join(A.outputDir, '逻辑顺序', `${safeName(f.title)}.md`))
@@ -829,8 +848,8 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     })
   })
   const logic = A.files.map((f) => logicByLabel.get(f.label)).filter(Boolean)
-  const summary = summaryRaw ? (typeof summaryRaw === 'string' ? { path: summaryRaw } : summaryRaw) : (state.resultSeed?.summary || null)
-  const timeline = timelineRaw ? (typeof timelineRaw === 'string' ? { path: timelineRaw } : timelineRaw) : (state.resultSeed?.timeline || null)
+  const summary = bodyGate.status === 'ok' ? (summaryRaw ? (typeof summaryRaw === 'string' ? { path: summaryRaw } : summaryRaw) : (state.resultSeed?.summary || null)) : null
+  const timeline = bodyGate.status === 'ok' ? (timelineRaw ? (typeof timelineRaw === 'string' ? { path: timelineRaw } : timelineRaw) : (state.resultSeed?.timeline || null)) : null
   const result = {
     ...(state.resultSeed || {}),
     refined,
@@ -840,7 +859,9 @@ export function afterDeliver(args, state, { logicRaw = null, summaryRaw = null, 
     logic,
     summary,
     timeline,
-    openQuestions: (state.resultSeed?.openQuestions || []).concat(logic.flatMap((l) => l.open_questions || [])),
+    bodyGate,
+    derivativesSkipped,
+    openQuestions: (state.resultSeed?.openQuestions || []).concat(logic.flatMap((l) => l.open_questions || [])).concat(derivativesSkipped.map((x) => `${x.kind} 未生成：${x.reason}`)),
   }
   const resultPath = writeJson(path.join(stateDir(A), 'result.json'), result)
   markStage(A, 'deliver', 'end', { logic: logic.filter((l) => l.path).length, summary: !!summary, timeline: !!timeline })
@@ -862,6 +883,45 @@ function glossaryTextForAudit(A) {
     }
   }
   return null
+}
+
+function requestedDerivativeSkips(A) {
+  return ['logic', 'summary', 'timeline']
+    .filter((kind) => A.scope.includes(kind))
+    .map((kind) => ({ kind, reason: '正文未完成或忠实性审计未通过' }))
+}
+
+function normalizeNativeBodyQuotes(files) {
+  for (const f of files || []) {
+    try {
+      if (!fs.existsSync(f.outPath)) continue
+      const before = fs.readFileSync(f.outPath, 'utf8')
+      const after = normalizeQuoteStyleText(before)
+      if (after !== before) fs.writeFileSync(f.outPath, after, 'utf8')
+    } catch {
+      // The following source-aware audit remains fail-loud; normalization is only a deterministic best effort.
+    }
+  }
+}
+
+function auditNativeBodies(A, refined = []) {
+  normalizeNativeBodyQuotes(A.files)
+  const paths = new Set(refined.map(refinedPathOf).filter(Boolean).map((p) => path.resolve(p)))
+  const missing = A.files.filter((f) => !paths.has(path.resolve(f.outPath)) || !fs.existsSync(f.outPath)).map((f) => ({ label: f.label, path: f.outPath }))
+  const pairs = A.files
+    .filter((f) => paths.has(path.resolve(f.outPath)) && fs.existsSync(f.outPath))
+    .map((f) => ({ sourcePath: f.path, refinedPath: f.outPath, mode: 'refine', glossaryText: glossaryTextForAudit(A) }))
+  const audit = pairs.length ? auditPairs(pairs) : null
+  const files = ((audit && audit.files) || []).map((f) => {
+    const rr = refined.find((r) => path.resolve(refinedPathOf(r) || '') === path.resolve(f.file || f.refinedFile || ''))
+    const failed = [...new Set([
+      ...(f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind)),
+      ...((rr && (rr.seamDuplicates || []).length) ? ['seam_duplicate'] : []),
+    ])]
+    return { file: f.file || f.refinedFile, status: failed.length ? 'fail' : 'ok', failed }
+  })
+  const status = missing.length || pairs.length !== A.files.length || files.some((f) => f.status === 'fail') ? 'fail' : 'ok'
+  return { status, files, missing }
 }
 
 function logicPathOf(A, f, entry) {
@@ -904,7 +964,8 @@ function auditDerivativeOutputs(A, result) {
     const corpus = []
     for (const f of A.files || []) { for (const p of [f.path, f.outPath]) { if (p && fs.existsSync(p) && !corpus.includes(p)) corpus.push(p) } }
     const files = []
-    for (const d of deliverables) { if (fs.existsSync(d.path)) files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind })) }
+    const glossaryText = glossaryTextForAudit(A)
+    for (const d of deliverables) { if (fs.existsSync(d.path)) files.push(auditDerivativeFile(d.path, corpus, { kind: d.kind, glossaryText })) }
     if (!files.length) return null
     return { status: files.some((f) => f.status === 'fail') ? 'fail' : 'ok', files }
   } catch { return null }
@@ -912,6 +973,7 @@ function auditDerivativeOutputs(A, result) {
 
 export function auditNativeResult(args, result) {
   const A = normalizeArgs(args)
+  normalizeNativeBodyQuotes(A.files)
   const refined = Array.isArray(result && result.refined) ? result.refined : []
   const refinedByPath = new Map(refined.map((r) => {
     const p = refinedPathOf(r)
@@ -926,8 +988,14 @@ export function auditNativeResult(args, result) {
     .filter(Boolean)
   const audit = pairs.length ? auditPairs(pairs) : null
   const auditFailed = audit
-    ? audit.files.filter((f) => f.status === 'fail').map((f) => ({ path: f.file || f.refinedFile, findings: f.failed || [] }))
+    ? audit.files
+      .map((f) => ({ file: f, blocking: (f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind)) }))
+      .filter((x) => x.blocking.length)
+      .map(({ file, blocking }) => ({ path: file.file || file.refinedFile, findings: blocking }))
     : []
+  const seamFailed = refined
+    .filter((r) => (r.seamDuplicates || []).length)
+    .map((r) => ({ path: refinedPathOf(r), findings: ['seam_duplicate'] }))
   const annotations = [...(result.annotations || [])]
   const anchors = [...(result.anchors || [])]
   const refinedNext = refined.map((r) => ({ ...r }))
@@ -936,9 +1004,11 @@ export function auditNativeResult(args, result) {
       const outPath = path.resolve(file.refinedFile || file.file || '')
       const rr = refinedNext.find((r) => path.resolve(refinedPathOf(r) || '') === outPath)
       if (rr) {
+        const seamHard = (rr.seamDuplicates || []).length ? ['seam_duplicate'] : []
+        const bodyHard = (file.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
         rr.audit = {
-          status: file.status,
-          hardFindings: file.failed || [],
+          status: bodyHard.length || seamHard.length ? 'fail' : 'ok',
+          hardFindings: [...new Set([...bodyHard, ...seamHard])],
           softFindings: (file.findings || []).filter((f) => f.severity !== 'hard' && f.count).map((f) => f.name),
           repaired: false,
           anchorsAdded: 0,
@@ -973,17 +1043,17 @@ export function auditNativeResult(args, result) {
   const derivativeFailed = derivativeAudit
     ? derivativeAudit.files.filter((f) => (f.hardFail || []).length).map((f) => ({ path: f.file, findings: ['derivative_attribution'] }))
     : []
-  const auditFailedAll = [...auditFailed, ...derivativeFailed]
-  const auditIncomplete = audit
-    ? audit.files
-      .filter((f) => (f.failed || []).includes('ending_missing'))
-      .map((f) => ({ path: f.file || f.refinedFile, note: 'deterministic audit: ending_missing' }))
-    : []
+  const failedByPath = new Map()
+  for (const item of [...auditFailed, ...seamFailed, ...derivativeFailed]) {
+    const p = item.path
+    if (!failedByPath.has(p)) failedByPath.set(p, { path: p, findings: [] })
+    failedByPath.get(p).findings.push(...(item.findings || []))
+  }
+  const auditFailedAll = [...failedByPath.values()].map((x) => ({ ...x, findings: [...new Set(x.findings)] }))
   const auditedPaths = new Set(audit ? (audit.files || []).map((f) => path.resolve(f.file || f.refinedFile || '')).filter(Boolean) : [])
   const unchecked = audit
     ? (result.unchecked || []).filter((p) => !auditedPaths.has(path.resolve(p.path || p)))
     : (result.unchecked || [])
-  const incompleteByPath = new Map([...(result.incomplete || []), ...auditIncomplete].map((x) => [path.resolve(x.path || x), typeof x === 'string' ? { path: x } : x]))
   const audited = {
     ...result,
     refined: refinedNext,
@@ -991,7 +1061,7 @@ export function auditNativeResult(args, result) {
     audit,
     auditFailed: auditFailedAll,
     derivativeAudit,
-    incomplete: Array.from(incompleteByPath.values()),
+    incomplete: result.incomplete || [],
     unchecked,
     glossaryLint,
     logicAudit,

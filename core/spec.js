@@ -1,3 +1,36 @@
+import { parseSpeakerDocument, effectiveScoutPersonName } from '../scripts/speaker-resolver.js'
+
+// Failures that mean substantive interview content is not yet a trustworthy source for derivatives.
+export const BODY_FIDELITY_GATES = Object.freeze([
+  'content_gap', 'compression_risk', 'attribution_mismatch', 'seam_duplicate',
+])
+
+// Publication-invalid cleanup/typesetting failures. They do not imply lost or reassigned content, but a file
+// carrying one of them is still not a final body. Keep them separate from BODY_FIDELITY_GATES so diagnostics can
+// say whether the risk is factual or editorial; both groups receive at most two repair + re-audit rounds before blocking.
+export const OUTPUT_QUALITY_GATES = Object.freeze([
+  'residual_noise', 'under_refined', 'long_paragraphs', 'quote_style',
+])
+
+// The ONE shared answer to “does this body block derivatives/direct publication?”. Pipeline repair, Codex-native
+// gating, and run-level scorecards must consume this list instead of re-interpreting audit `status` independently.
+export const PUBLICATION_BLOCK_GATES = Object.freeze([
+  ...BODY_FIDELITY_GATES,
+  ...OUTPUT_QUALITY_GATES,
+])
+
+// Compare semantic section titles, not their typesetting. Model-authored logic provenance often changes Chinese
+// curly quotes to ASCII quotes, folds spaces around Latin words, or swaps full-/half-width punctuation. None of
+// those changes means a source section is missing. NFKC folds width variants; lower-case removes Latin case drift;
+// every Unicode punctuation/space code point (including zero-width spaces) is ignored. Keep letters, numbers and
+// non-punctuation symbols because they may carry meaning (for example C++); callers retain the original title for reporting.
+export function canonicalHeadingKey(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{Z}\s\u200B-\u200D\uFEFF]+/gu, '')
+}
+
 // ---------- schemas ----------
 // NOTE: no schema sets `required` — a StructuredOutput validation failure triggers an unbounded retry loop.
 // (Observed in the wild: network degradation truncating output caused one `required` field to spin the verify agent
@@ -20,7 +53,10 @@ export const SCOUT_SCHEMA = {
       label: { type: 'string', description: '转录中的发言人标签原样' },
       role: { type: 'string', description: '受访者 / 记者 / PR陪同 / 同事 / 协调 等' },
       identity: { type: 'string', description: '对应到谁 + title（若文中可判断）' },
-      sample: { type: 'string', description: '一处原文标签样例' },
+      output_label: { type: 'string', description: '精校稿最终应显示的纯标签：能判断真名则只写真名，否则写可区分角色；拿不准留空' },
+      output_label_confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '真名归属置信度；只有全文内有直接证据才可 high' },
+      output_label_evidence: { type: 'string', description: '支持 output_label 的一处原文证据；写真名时必须说明为何这是本人而非被提到/被喊话的人' },
+      sample: { type: 'string', description: '一整行原文标签样例，必须逐字照抄该行（含行首时间码/括号、标签、冒号与同行正文），供确定性代码回查；不得省略或改写' },
     } } },
     people: { type: 'array', items: entitySchema({ public_figure: { type: 'boolean', description: '公众人物，可公开核实' } }) },
     brands: { type: 'array', items: entitySchema({ category: { type: 'string', description: '自家/竞品/供应商/平台/产品/机构' } }) },
@@ -39,6 +75,33 @@ export const SCOUT_SCHEMA = {
   },
 }
 
+export const SPEAKER_CANDIDATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    decisions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          line: { type: 'number', description: '候选在精校稿中的 1-based 行号；必须原样返回输入候选行号' },
+          label: { type: 'string', description: '候选标签；必须原样返回输入候选标签' },
+          verdict: {
+            type: 'string',
+            enum: ['invented_speaker', 'not_speaker', 'source_supported_alias', 'uncertain'],
+            description: 'invented_speaker=确为对话发言轮且源稿/映射均不支持；not_speaker=标题、说明、元信息等非发言轮；source_supported_alias=源稿支持但映射遗漏；uncertain=证据不足',
+          },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          reason: {
+            type: 'string',
+            enum: ['dialogue_turn_without_source', 'document_metadata', 'heading_or_caption', 'list_quote_or_table', 'source_label_or_alias', 'insufficient_context'],
+            description: '只返回最贴近直接文本证据的一类原因，不写自由文本',
+          },
+        },
+      },
+    },
+  },
+}
+
 export const VERIFY_SCHEMA = {
   type: 'object',
   properties: {
@@ -47,6 +110,11 @@ export const VERIFY_SCHEMA = {
       canonical: { type: 'string', description: '核实后的正确写法' },
       identity: { type: 'string', description: '身份/title' },
       source: { type: 'string', description: '依据来源一句话' },
+      // Chinese-name spelling is a separate key from identity. An English/Pinyin author page may prove that
+      // Lin Chuan is the person being discussed, but it cannot prove whether the Chinese name is 林川 or 林传.
+      // The verifier must both set this flag and repeat the exact canonical Han spelling in `source`; the render
+      // side checks both before it lets a person-name conclusion enter the glossary/body.
+      name_script_exact: { type: 'boolean', description: '人名 canonical 为中文汉字时，仅当所列来源页面直接出现该完整汉字写法才置 true；仅有英文名/拼音/罗马字必须为 false' },
       // OPTIONAL (all existing consumers survive its absence): the agent attests BOTH keys held for a decisive
       // conclusion on a phonetically-suspect / contested entity — a 高级别来源（官方域名/大媒体/百科）AND 语境吻合.
       // Only two_key===true may retire a 〔同指两解〕 row (see confidenceMark); a coattail/SEO/分销站 never sets it.
@@ -126,8 +194,11 @@ export const LOGIC_PLAN_SCHEMA = {
 
 
 // ---------- proofreading rules (kept in sync with SKILL.md Step 2) ----------
-export const RULES = `精校规范（务必全部遵守）：
-1. 保持对话体、不要改写成叙述文章；发言人标签一律「名字：」纯文本形态，不加粗、不加时间戳、不加其它样式——写成 李明： 而不是 **李明：** 或 李明 12:03：，全篇同一形态（源转录标签里夹的时间戳一律不进成稿标签，溯源靠锚点注释，不靠标签）。
+// Content editing and serialization are deliberately separate facts. Legacy Markdown agents still own their
+// wrapper/label syntax; turn-ir-v2 agents edit only block bodies and relations, while the host owns H1, subtitle,
+// and canonical speaker labels. Do not derive one mode from the other with regex/string filtering.
+export const EDITORIAL_RULES = `精校内容规范（务必全部遵守）：
+1. 保持对话体、不要改写成叙述文章；保留每轮发言的归属和顺序，不把不同说话人的内容混在一起，也不把转述改造成新的直接引语。
 2. 删口癖、口语赘词与口语重复，合并语义重复句；以“读着顺、信息不丢”为准——不改语气风格与原意，不替发言人加观点，拿不准就保留，宁可漏删一处也别删出歧义。注意：“宁可漏删”只适用于可能改义的词，不适用于纯噪音；纯噪音（语气音、确认复读、卡顿）必须删干净。开场寒暄**只有在纯问候、无任何实质内容时**才折叠成一句括号说明；**夹在寒暄里的产品评论、事实陈述、观点原话必须逐句保留**（例：调试录音设备时对某支麦克风的吐槽、闲聊里带出的一个数字或判断，都属于必须保留的实质内容，不得随寒暄一起折叠）。
    · **径删（纯垫词，无任何语义）**：语气与卡顿音（嗯、呃、啊、哦、欸）；确认复读（对对对、是是是、嗯嗯）；纯卡顿的“那个…这个…就是说…”；句首口头禅式的“然后/其实/就是”；空洞的反问尾巴（对吧、是吧、对不对、你知道——确在向对方求证的留）。
    · **看义删（有义则留，纯垫才删）**：“一个/一种/一些”作量词废垫删、表“一/同一/特指某个”留——“为了让它有一个统一口感”→“为了有统一口感”（删），“跟咖啡豆拼配是一个道理”照留（＝同一个道理，有义），“摆在一个角落、同一个时间、给他一个机会”留；“其实”句首口头禅删、表转折（本以为…其实…、但其实）留；“然后”空接续删、表真实先后或因果留；“就是”卡顿垫词删、表“正是/只是/即”留；“的话”纯提顿删（“做手工的话”→“做手工”）、真条件（“需要的话”）留。
@@ -135,19 +206,33 @@ export const RULES = `精校规范（务必全部遵守）：
    纯粹确认写法的来回**折叠成结果**：口头拼字（“吴，哪个杰？”“捷报的捷——提手旁那个”“哦，口天的吴”）在书面稿里没有残值，在名字首次出现处直接写澄清后的写法（“吴捷”），整段问字对话删去——但必须用**澄清后**的字（捷，非先听到的杰）；夹有信息量内容（名字来历/玩笑）的只删机械确认、内容照留；没澄清出结果的保留（音）。
 3. 理顺破碎口语、修语序与冗余助词；有信息量/有个性的金句照留，不要抹平。
 4. 按主题加 ## 小标题：准确概括、不篡改原意、不加原文没有的结论；一律不编号；一份通常 6–20 个。
-4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字），必要时每段重复发言人标签；单个对话段超过约 900 字视为需要重切。
+4a. 段落边界：不要因为连续同一发言人就把多段源转录合成一个巨长段。原则上保留源文件的问答/发言轮次；只有同一发言人的相邻源段明显是同一句话被 ASR 切开、且合并后不超过约 500 字时才合并。长独白拆成多个可读段落（每段通常 200-600 字）；单个对话段超过约 900 字视为需要重切。
 5. 严格按校对表统一人名/品牌/术语；删姓名后/夹行时间戳与英文听写乱码（能判断词义就替换，判断不了就顺掉）；拿不准的名字保留（音），绝不臆造。**凡校对表中标 ⚠ 或注明「保留（音）／未能核实／疑为转录误写」的名字：正文每处都写作「名字（音，存疑）」或「名字（音）」，不得裸写**（这些是尚未核实的写法，裸写会被误当成已确认）。
 6. 保留全部事实细节（数字/金额/时间/产品/工艺/渠道/观点）——精校不是摘要。
 7. 发言人规范：采访方追问归对应记者名；被访方旁白/补充按校对表标注；拒答/「以招股书为准」等语境务必原样保留，勿替受访者补数字。
-8. 文件抬头：首行 H1 标题，第二行斜体说明行。
-9. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。**书面化的引语、专名与术语首次出现、带反讽或口头禅性质的短语，主动用全角弯引号 “” 标出**（如 他说这是 “行业惯例”、所谓 “现厂制”）。代码/英文专名/路径里的 ASCII 引号不动。
-10. 数字用阿拉伯数字：把汉字数字改成阿拉伯数字（十六个部门→16 个部门，六七十 B 大模型→60-70B 大模型，三四百人→300-400 人，约数范围用连字符）。例外——很短的口语化小数目保留汉字：两个人、三五个、一两次、七八年、一两句话 等约定俗成口语不转；成语/固定词不动（三心二意、五花八门、一五一十）。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。
-11. 中文与英文/数字之间加一个半角空格（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插一个空格（用 GPT-4 做、16 个部门、覆盖 80% 用户、A 轮融资、2021 年底）。不加空格：①数字与紧跟的单位/符号之间（60-70B、80%、$50、5G、A4）；②与全角标点相邻处；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
-12. 长文件分多次接力写（先 Write 抬头+开头，再用 Edit 以已写入的最后一句为锚点追加），务必覆盖到源文件结尾。**每次 Write/Edit 都在单次输出上限内写尽量大的整块（通常一次写完一整段主题、上千字），用尽量少的写入次数完成——别一行一行或一小段一小段地追加。**
-13. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。
-14. **绝不无声跳过任何实质内容段**。若确有无法恢复的缺口（原文转录缺失、彻底无法辨认），就在原位置用**一句人话的括号说明**交代，例：（此处约 200 字因转录缺失未能恢复，见源 L120-L150）——**禁止输出工具告警式、系统报错式的文案**。此为最后手段——正常情况下整份成稿应没有任何缺口说明；口水寒暄按规范 2 折叠成一句括号说明不算缺口、不要标；段落太长也不是理由（按规范 12 分多次写完）。宁可如实标注缺口，不可无声省略。`
+8. 中文引号一律用全角 “”（内层 ‘’）——禁用 ASCII 直引号 "/'、禁用「」/『』；其余中文标点（，。；：？！）也用全角。转写常把引号输成直引号，逐一改成全角弯引号。**书面化的引语、专名与术语首次出现、带反讽或口头禅性质的短语，主动用全角弯引号 “” 标出**（如 他说这是 “行业惯例”、所谓 “现厂制”）。代码/英文专名/路径里的 ASCII 引号不动。
+9. 数字用阿拉伯数字：把汉字数字改成阿拉伯数字（十六个部门→16 个部门，六七十 B 大模型→60-70B 大模型，三四百人→300-400 人，约数范围用连字符）。例外——很短的口语化小数目保留汉字：两个人、三五个、一两次、七八年、一两句话 等约定俗成口语不转；成语/固定词不动（三心二意、五花八门、一五一十）。带量词的确切数目（16 个、3 轮、5 家）一律用阿拉伯数字。
+10. 中文与英文/数字之间加一个半角空格（盘古之白）：汉字与拉丁字母、阿拉伯数字相邻处插一个空格（用 GPT-4 做、16 个部门、覆盖 80% 用户、A 轮融资、2021 年底）。不加空格：①数字与紧跟的单位/符号之间（60-70B、80%、$50、5G、A4）；②与全角标点相邻处；③英文/数字内部与 ASCII 标点之间。已正确成对的空格不要再叠加。
+11. **一次写对，别回头微改**：术语/人名/品牌按“写法统一”指令与校对表在初次落笔时就写对；**严禁写完后再回头做大量“改一两个字”的细小 Edit**（每次 Edit 都要把整份转录+校对表重新过一遍，十几个小改 = 成倍拖慢）。确需更正就把多处合并成尽量少的几次 Edit，别逐字逐处单独改。
+12. **绝不无声跳过任何实质内容段**。若确有无法恢复的缺口（原文转录缺失、彻底无法辨认），就在原位置用**一句人话的括号说明**交代，例：（此处约 200 字因转录缺失未能恢复，见源 L120-L150）——**禁止输出工具告警式、系统报错式的文案**。此为最后手段——正常情况下整份成稿应没有任何缺口说明；口水寒暄按规范 2 折叠成一句括号说明不算缺口、不要标。宁可如实标注缺口，不可无声省略。`
 
-// Chinese typesetting rules (same source as RULES items 9/10/11): injected into every sub-agent that generates Chinese.
+export const LEGACY_MARKDOWN_RULES = `传统 Markdown 输出规范（仅适用于模型直接拥有最终 Markdown 格式的路径）：
+1. 发言人标签一律「名字：」纯文本形态，不加粗、不加时间戳、不加其它样式——写成 李明： 而不是 **李明：** 或 李明 12:03：，全篇同一形态；长独白分段时按需重复发言人标签。
+2. 文件抬头由模型写入：首行 H1 标题，第二行斜体说明行。
+3. 长文件分多次接力写：先 Write 抬头和开头，再用 Edit 以已写入的最后一句为锚点追加，务必覆盖到源文件结尾；每次写尽量大的完整主题块，不要逐行追加。`
+
+export const TURN_IR_V2_RULES = `Turn IR v2 序列化规范（宿主是最终格式的唯一所有者）：
+- 第一条非空行必须逐字为 \`<!-- LRB_TURN_CONTRACT v2 -->\`。
+- 只使用成对的 \`LRB_OUTPUT_BLOCK sources=... disposition=keep|merge|split|fold_noise\` 标记承载正文；\`LRB_SOURCE_REFS\` 是宿主只读元数据，可原样保留。
+- 全部来源 ID 必须按原顺序完整记账（这里的 ID 即 source turn ID）：keep 一对一；merge 只合并相邻同轨来源；split 把同一来源连续映射到至少两个 block；fold_noise 只折叠相邻纯口癖或纯寒暄来源。不得把事实或观点搬到不相干来源，不同说话人的实质发言不得合并。
+- output block 外只能出现 \`## \` 小标题，且小标题归属于它后面的 block；block 正文内不得出现 Markdown 标题。
+- 不要输出 H1、说明行、前言、结语或分隔线；不要输出或猜测 speaker_track_id，也不要输出说话人标签。标题、说明行和 canonical 说话人标签只由宿主根据结构化事实确定性渲染。`
+
+// Backward-compatible name for direct-Markdown paths. Contracted paths must explicitly select
+// EDITORIAL_RULES + TURN_IR_V2_RULES and never interpolate RULES.
+export const RULES = `${EDITORIAL_RULES}\n\n${LEGACY_MARKDOWN_RULES}`
+
+// Chinese typesetting rules (same source as EDITORIAL_RULES items 8/9/10): injected into every sub-agent that generates Chinese.
 // Proofreading agents already get them via RULES; summaries/timelines inject this compact version separately
 // (timelines are the densest for numbers/years/amounts, so rules ② and ③ matter most there).
 export const TYPESET = `中文排版三规范（务必遵守）：
@@ -405,6 +490,72 @@ export function mergeHints(a, b) {
   return [...kept, ...warns, ...(truncated ? [HINT_TRUNC_MARK] : [])].join(HINT_SEP)
 }
 
+// ---------- internal-directory suspicion (飞书 ASR 同事名偏置) ----------
+// 飞书/Lark ASR 会把听不清的人名优先写成上传方租户内的同事名（热词表来自企业通讯录）。因此转录里一个与内部
+// 通讯录完全同名的人名反而【更可疑】：真实说话对象可能是外部同音他人，被 ASR「吸附」成了同事。通讯录在这里
+// 只作【存疑名单】，绝不是白名单或改名依据——命中者置 suspect_asr=true（强制联网核实，哪怕 verify=key），
+// 改不改仍由既有的两把钥匙规则裁决。匹配全部在代码里完成：通讯录内容不进任何 prompt、输出或日志，
+// 只有转录里本来就出现的名字会被标记。名单文件由宿主本地读取（--internal-directory），不入库。
+// hint 措辞刻意只描述 ASR 的失误模式，不断言「此人在我方通讯录里」——hint 会进核实/精校 prompt 与校对表，
+// 措辞越少确认名单成员身份越好（残余信号见 README 该节说明）。
+export const INTERNAL_DIRECTORY_HINT = '⚠ 疑为飞书 ASR 同事名偏置产物（ASR 常把听不清的名字写成文件上传方的同事名），此写法可能是同音他人——须凭上下文与联网证据核实正身，勿仅因像真名而采信'
+// 匹配归一化：NFKC 折叠全角/半角，去掉全部空白，拉丁字母不分大小写——「张　三」「ZHANG san」都能对上。
+const normalizeDirName = (n) => String(n || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase()
+const CJK_RE = /[㐀-鿿]/
+export function parseInternalDirectory(text) {
+  const names = new Set()
+  for (const raw of String(text || '').replace(/^﻿/, '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    // 分号/顿号是【姓名列表】分隔（一行多个名字：「蔡梅梅; 杜静; 龚格」）；tab/逗号/竖线是【列】分隔
+    // （姓名后跟部门等列，只取首列）。空格不算任何分隔，否则英文全名（Mary Jane）会被腰斩。
+    for (const item of line.split(/[;；、]+/)) {
+      let name = item.split(/[\t,，|]+/)[0].trim()
+      // 中文条目内若用空格隔开部门或英文别名（「沈其安 市场部」「申远 neil」），姓名取首个空格前的字段；英文条目保留整段。
+      if (CJK_RE.test(name)) name = name.split(/\s+/)[0]
+      if (name && normalizeDirName(name).length >= 2) names.add(name)
+    }
+  }
+  return Array.from(names)
+}
+// merged: mergeFindings 输出（people/brands/terms）。就地标记 people 中命中通讯录的条目并返回命中条目数组
+// （{canonical, writings}：writings 供 forceReopen 撬开核实缓存，canonical 供日志）。locked（用户钦定）条目跳过
+// ——decree 是明确的人工指令，终局（README 记载此例外）。hint 追加走 mergeHints（幂等，⚠ 子句永不被截断），
+// 累积批次里 parse→render 往返也不会重复膨胀。只查 people：品牌/术语不受同事名偏置影响。
+export function applyInternalDirectorySuspicion(merged, dirNames) {
+  const dir = new Set((dirNames || []).map((n) => normalizeDirName(stripDesc(String(n)))).filter(Boolean))
+  if (!dir.size) return []
+  const matched = []
+  for (const e of (merged && merged.people) || []) {
+    if (!e || e.locked) continue
+    const forms = [e.canonical, ...(e.variants || [])].map((n) => stripDesc(String(n || ''))).filter(Boolean)
+    if (!forms.some((n) => dir.has(normalizeDirName(n)))) continue
+    e.suspect_asr = true
+    e.hint = mergeHints(e.hint, INTERNAL_DIRECTORY_HINT)
+    matched.push({ canonical: e.canonical, writings: forms })
+  }
+  return matched
+}
+// 侦察漏网补扫：通讯录名字若在源文本里出现、却没进侦察的 people 清单（侦察分块失败/漏抽/只当成说话人标签），
+// 逐字扫描把它找回来。中文名用子串匹配（≥2 字全名撞进别的词的概率低，误报的代价只是多一次核实）；
+// 拉丁名要求词边界、不分大小写。excludeForms 传已在 people 里的全部写法，避免重复注入。纯函数，宿主读文件。
+export function scanTextForDirectoryNames(text, dirNames, excludeForms) {
+  const t = String(text || '')
+  if (!t) return []
+  const tNorm = t.normalize('NFKC').toLowerCase()
+  const seen = new Set((excludeForms || []).map((n) => normalizeDirName(stripDesc(String(n)))))
+  const out = []
+  for (const name of dirNames || []) {
+    const key = normalizeDirName(name)
+    if (!key || seen.has(key)) continue
+    let hit
+    if (CJK_RE.test(name)) hit = t.includes(name) || tNorm.includes(key)
+    else hit = new RegExp(`(?<![A-Za-z])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z])`, 'i').test(t)
+    if (hit) { seen.add(key); out.push(name) }
+  }
+  return out
+}
+
 export function clusterEntities(entries) {
   const clusters = []
   for (const e of entries) {
@@ -559,7 +710,7 @@ export function dedupListText(merged) {
 // (including auto) — the escape hatch. Unset budget + non-speed mode ⇒ one agent, exactly as before.
 // Document length is measured in 正文字数 (content chars: 汉字 + each English word/number run = 1),
 // NEVER in lines — line count is a poor proxy (timestamp lines, short ASR turns inflate it; one transcript
-// ran 13.9 字/line). Routing decisions (one-pass shortcut, chunk-or-not, chunk count) all key on this.
+// ran 13.9 字/line). Chunking decisions key on this metric.
 // See [[feedback-size-metric]]. Read-tool pagination stays line-addressed (readPlan) because Read is
 // line-based — that's a mechanic, not a size judgment.
 export function contentLength(text) {
@@ -573,7 +724,9 @@ export function refineSize(f) {
   if (f && f.bytes) return Math.round(f.bytes / 2.6)
   return Math.round(((f && f.lines) || 0) * 14)
 }
-export const ONE_PASS_CHARS = 4000          // single file under this many 正文字数 → one-pass branch (skip scout/glossary)
+// Subscription runtimes retain a speaker-gated short-file fast path; Universal supplies host capabilities and
+// always takes the full staged path. Callers must never bypass Scout while speaker resolution is still needed.
+export const ONE_PASS_CHARS = 4000
 
 // ---------- single-shot refine (M11a) ----------
 // Single-shot mode builds ONE request per file: the prompt INLINES the full source text and the response text
@@ -604,7 +757,7 @@ export function singleShotMaxTokens(sourceChars) {
 
 export const REFINE_CHUNK_CHARS = 12000     // speed mode: only files over this many 正文字数 chunk
 export const TARGET_CHUNK_CHARS = 9000      // aim for ~this many 正文字数 per chunk
-export const MAX_REFINE_CHUNKS = 2          // conservative cap for SPEED mode only — a coarse batch lever, not a fine split (budget mode is uncapped)
+export const MAX_SPEED_REFINE_CHUNKS = 2    // conservative cap for SPEED mode only — a coarse batch lever, not a limit on provider-budget chunks
 const singleChunk = (f) => {
   const lines = (f && f.lines) || 0
   return [{ idx: 1, count: 1, startLine: 1, endLine: lines, isFirst: true, isLast: true, label: f && f.label }]
@@ -634,7 +787,6 @@ function evenLineChunks(f, K) {
 // preflight (universal jobs.prepareFile) to attach f.turns so the orchestrator can snap chunk boundaries to real
 // turns AND avoid ending a chunk on a question (see turnAwareChunks). Editions with no fs (the CC Workflow sandbox)
 // simply don't populate f.turns → splitForRefine falls back to evenLineChunks, byte-identical to before.
-const TURN_LABEL_RE = /^\s*[一-龥A-Za-z0-9·]{1,12}[：:]/
 // A turn "ends with a question" if — after stripping trailing whitespace, closing quotes/brackets, and any trailing
 // HTML-comment provenance marker (<!-- 源 L… -->) — the last visible glyph is ？ or ?. This is what lets us keep a
 // question glued to the answer that follows it. Pure + exported so the rule is unit-testable in isolation.
@@ -649,17 +801,10 @@ export function endsWithQuestion(text) {
   return /[？?]$/.test(t)
 }
 export function parseTurns(content) {
-  const lines = String(content == null ? '' : content).split('\n')
-  const idx = []   // 0-based line indices where a turn opens
-  for (let i = 0; i < lines.length; i += 1) if (TURN_LABEL_RE.test(lines[i])) idx.push(i)
-  if (!idx.length) return []
-  const turns = []
-  for (let k = 0; k < idx.length; k += 1) {
-    const start = idx[k]
-    const end = (k + 1 < idx.length) ? idx[k + 1] - 1 : lines.length - 1   // turn spans up to the next label line
-    turns.push({ startLine: start + 1, q: endsWithQuestion(lines.slice(start, end + 1).join('\n')) })
-  }
-  return turns
+  return parseSpeakerDocument(content).units.map((unit) => ({
+    startLine: unit.startLine,
+    q: endsWithQuestion(unit.text),
+  }))
 }
 // Split a file into K chunks whose boundaries land on real turn edges, then move any boundary that would END a chunk
 // on a question to a nearby non-question turn boundary. Only reached when f.turns is present and has ≥ K turns;
@@ -725,9 +870,9 @@ export function splitForRefine(f, mode, budget, chunkSize) {
     // Explicit experiment knob: exactly ceil(字数/N) balanced chunks, ignoring the provider budget and speed cap.
     K = Math.max(1, Math.ceil(size / chunkSize))
   } else {
-    // Speed: opt-in coarse lever — only large files, capped at MAX_REFINE_CHUNKS.
+    // Speed: opt-in coarse lever — only large files, capped at MAX_SPEED_REFINE_CHUNKS.
     const speedK = (mode === 'speed' && size > REFINE_CHUNK_CHARS)
-      ? Math.min(MAX_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
+      ? Math.min(MAX_SPEED_REFINE_CHUNKS, Math.max(2, Math.ceil(size / TARGET_CHUNK_CHARS)))
       : 1
     // Budget: automatic faithfulness cap — target chunk ≈ budget, count UNCAPPED (chunks stay large, never diced).
     const budgetK = (typeof budget === 'number' && budget > 0 && size > budget)
@@ -763,10 +908,60 @@ export function splitForScout(f) {
 export function mergeScoutChunks(parts, f) {
   const got = (parts || []).filter(Boolean)
   if (!got.length) return null
-  const speakers = []; const seenSp = new Set()
+  const speakers = []; const speakerIndex = new Map()
+  const speakerKey = (value) => {
+    const label = String(value || '').normalize('NFKC').trim()
+    const generic = label.match(/^(?:发言人|说话人|讲者|讲话人|Speaker)\s*([0-9一二三四五六七八九十]+)$/iu)
+    return generic ? `generic:${generic[1]}` : label
+  }
+  const ROLE_OUTPUT_RE = /^(?:记者|采访者|访谈者|提问者|主持人|受访者|嘉宾|回答者|主讲人|PR|公关|同事|协调)$/iu
+  const speakerScore = (speaker) => {
+    const output = String((speaker && speaker.output_label) || '').trim()
+    const identity = String((speaker && speaker.identity) || '').trim()
+    const role = String((speaker && speaker.role) || '').trim()
+    const confident = speaker && speaker.output_label_confidence === 'high' && String(speaker.output_label_evidence || '').trim()
+    return (confident && output && !ROLE_OUTPUT_RE.test(output) ? 20 : 0) + (confident && identity ? 10 : 0) + (output ? 4 : 0) + (role ? 2 : 0)
+  }
+  // A high-confidence person name for a track: only these can conflict. Role outputs (记者/受访者…)
+  // never name a person, so they keep competing on score alone. effectiveScoutPersonName is the same
+  // interpretation the resolver uses to pick the final name (output_label first, identity second), so a
+  // disagreement on EITHER naming path is caught. Comparison strips inner whitespace so “张三” and
+  // “张 三” read as the same person, not a contradiction.
+  const confidentName = (speaker) => String(effectiveScoutPersonName(speaker) || '').replace(/\s+/gu, '')
+  const conflicted = new Set()
+  const conflictNotes = []
   for (const p of got) for (const s of p.speakers || []) {
-    const k = ((s && s.label) || '').trim()
-    if (k && !seenSp.has(k)) { seenSp.add(k); speakers.push(s) }
+    const k = speakerKey(s && s.label)
+    if (!k) continue
+    if (!speakerIndex.has(k)) {
+      speakerIndex.set(k, speakers.length)
+      speakers.push(s)
+      continue
+    }
+    const i = speakerIndex.get(k)
+    if (conflicted.has(k)) {
+      // The name stays dropped, but a later chunk may still contribute the role the demoted record
+      // lacks — roles are the safe fallback display, so backfilling one cannot re-name the track.
+      const role = String((s && s.role) || '').trim()
+      if (role && !String(speakers[i].role || '').trim()) speakers[i] = { ...speakers[i], role }
+      continue
+    }
+    const kept = speakers[i]
+    const keptName = confidentName(kept)
+    const newName = confidentName(s)
+    // Two chunks naming the same source track as different people is a disagreement, not a ranking
+    // problem: silently keeping either name risks publishing the wrong person. Drop the automatic
+    // name, keep the numbered source label, and surface the conflict for a human.
+    if (keptName && newName && keptName !== newName) {
+      const base = speakerScore(s) > speakerScore(kept) ? { ...s, label: kept.label } : kept
+      // name_conflict travels with the record so the resolver can refuse person names for this track
+      // even when a stray alias record (person-name label + sample pointing here) outscores it.
+      speakers[i] = { ...base, output_label: '', output_label_confidence: 'low', output_label_evidence: '', identity: '', name_conflict: true }
+      conflicted.add(k)
+      conflictNotes.push(`分段侦察对“${kept.label}”给出相互矛盾的高置信姓名（“${keptName}”与“${newName}”），已放弃自动命名，保留原始标签待人工确认。`)
+      continue
+    }
+    if (speakerScore(s) > speakerScore(kept)) speakers[i] = { ...s, label: kept.label }
   }
   const cat = (key) => got.flatMap((p) => p[key] || [])
   const errByKind = {}
@@ -790,7 +985,7 @@ export function mergeScoutChunks(parts, f) {
     themes: uniq('themes'),
     has_existing_headings: got.some((p) => p.has_existing_headings),
     ending_anchor: ending || {},
-    special_notes: uniq('special_notes'),
+    special_notes: [...uniq('special_notes'), ...conflictNotes],
   }
 }
 export const partPath = (outPath, idx) => `${outPath}.part${idx}`
@@ -798,12 +993,158 @@ export const partPath = (outPath, idx) => `${outPath}.part${idx}`
 // Deterministic part-merge used by the Concat file tool (engines/fileops.js) and by tests:
 // join chunk part-files in order into one transcript. Pure string op (no fs) so it's portable and
 // testable. Each part's trailing whitespace is trimmed and parts are separated by exactly one blank
-// line; an exact-duplicate `##` heading straddling a seam (chunk i ends with the heading chunk i+1
-// opens with) is collapsed to one — cheap insurance, though disjoint ownership makes it rare.
-export function stitchParts(texts) {
+// line. Besides an exact-duplicate `##` heading, remove only a HIGH-CONFIDENCE duplicated prose block at
+// the seam: same speaker (when labelled), >=60 normalized chars, and either containment at near-equal length
+// or >=0.92 bigram Dice similarity. Short/common replies are deliberately never deduplicated.
+function seamNorm(text) {
+  return String(text || '')
+    .replace(/^\s*#{1,6}\s+.*$/gm, '')
+    .replace(/^\s*[一-龥A-Za-z0-9·]{1,16}[：:]\s*/, '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function seamSpeaker(text) {
+  const parsed = parseSpeakerDocument(text)
+  return parsed.speakerMode === 'tracked' && parsed.labels.length ? parsed.labels[0].label : null
+}
+
+function bigramDice(a, b) {
+  const grams = (s) => {
+    const m = new Map()
+    for (let i = 0; i + 1 < s.length; i += 1) {
+      const g = s.slice(i, i + 2)
+      m.set(g, (m.get(g) || 0) + 1)
+    }
+    return m
+  }
+  const ga = grams(a), gb = grams(b)
+  let overlap = 0
+  for (const [g, n] of ga) overlap += Math.min(n, gb.get(g) || 0)
+  const total = Array.from(ga.values()).reduce((s, n) => s + n, 0) + Array.from(gb.values()).reduce((s, n) => s + n, 0)
+  return total ? (2 * overlap) / total : 0
+}
+
+function h2Key(line) {
+  const m = String(line || '').match(/^\s*##\s+(.+?)\s*$/)
+  if (!m) return null
+  return m[1].normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+function proseRanges(lines, start, end) {
+  const out = []
+  let i = start
+  while (i < end) {
+    while (i < end && (!lines[i].trim() || /^\s*<!--/.test(lines[i]))) i += 1
+    if (i >= end || /^\s*#{1,6}\s+/.test(lines[i])) { i += 1; continue }
+    const from = i
+    while (i < end && lines[i].trim() && !/^\s*#{1,6}\s+/.test(lines[i])) i += 1
+    if (i > from) out.push({ start: from, end: i, text: lines.slice(from, i).join('\n') })
+  }
+  return out
+}
+
+// A chunked model sometimes reopens the same topic with typography-only differences
+// (`2026 年 agent` / `2026年agent`) or repeats the exact heading. When two consecutive H2 sections
+// normalize to the same key, keep one heading and all substantive content. If the boundary also replays the
+// exact same speaker paragraph, remove only that repeated copy. Different-speaker or paraphrased prose stays.
+export function collapseAdjacentDuplicateHeadings(text) {
+  const source = String(text || '')
+  const trailingNewline = /\n$/.test(source)
+  const lines = source.split(/\r?\n/)
+  const headings = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const key = h2Key(lines[i])
+    if (key) headings.push({ index: i, key })
+  }
+  const remove = new Set()
+  let removedHeadings = 0
+  let removedBlocks = 0
+  for (let i = 1; i < headings.length; i += 1) {
+    const prev = headings[i - 1]
+    const curr = headings[i]
+    if (!curr.key || curr.key !== prev.key) continue
+    remove.add(curr.index)
+    removedHeadings += 1
+
+    const before = proseRanges(lines, prev.index + 1, curr.index)
+    const nextHeading = headings[i + 1] ? headings[i + 1].index : lines.length
+    const after = proseRanges(lines, curr.index + 1, nextHeading)
+    const left = before.at(-1), right = after[0]
+    if (!left || !right) continue
+    const a = seamNorm(left.text), b = seamNorm(right.text)
+    const sa = seamSpeaker(left.text), sb = seamSpeaker(right.text)
+    if (a.length >= 20 && a === b && (!sa || !sb || sa === sb)) {
+      for (let n = right.start; n < right.end; n += 1) remove.add(n)
+      removedBlocks += 1
+    }
+  }
+  if (!remove.size) return { text: source, removedHeadings: 0, removedBlocks: 0 }
+  const result = lines.filter((_, i) => !remove.has(i)).join('\n').replace(/\n{3,}/g, '\n\n')
+  return { text: result.replace(/\s+$/, '') + (trailingNewline ? '\n' : ''), removedHeadings, removedBlocks }
+}
+
+export function isDuplicateSeamBlock(left, right) {
+  const a = seamNorm(left), b = seamNorm(right)
+  if (Math.min(a.length, b.length) < 60) return false
+  const sa = seamSpeaker(left), sb = seamSpeaker(right)
+  if (sa && sb && sa !== sb) return false
+  const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+  if (ratio < 0.82) return false
+  if (a.includes(b) || b.includes(a)) return true
+  return bigramDice(a, b) >= 0.88
+}
+
+function findDuplicateSeamPrefix(left, right, max = 4) {
+  const leftBlocks = String(left || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).filter((x) => !/^#{1,6}\s/.test(x))
+  const rightBlocks = String(right || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+  const rightProse = rightBlocks.map((x, i) => /^#{1,6}\s/.test(x) ? -1 : i).filter((i) => i >= 0)
+  if (!leftBlocks.length || !rightProse.length) return null
+
+  // A repeated seam can span several turns: part N ends with A→B→C while part N+1 starts by restating
+  // A→B→C. Comparing only C with A misses the whole duplicate (the UGround replay failure). Search a small,
+  // bounded suffix/prefix window and remove the highest-confidence matching prefix as one unit. Heading blocks
+  // are preserved; only prose blocks at the beginning of the new part are eligible for deletion.
+  let best = null
+  for (let lc = 1; lc <= Math.min(max, leftBlocks.length); lc += 1) {
+    const leftSeq = leftBlocks.slice(-lc).join('\n\n')
+    for (let rc = 1; rc <= Math.min(max, rightProse.length); rc += 1) {
+      const indices = rightProse.slice(0, rc)
+      const rightSeq = indices.map((i) => rightBlocks[i]).join('\n\n')
+      if (!isDuplicateSeamBlock(leftSeq, rightSeq)) continue
+      const a = seamNorm(leftSeq), b = seamNorm(rightSeq)
+      const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length)
+      // Prefer the tightest semantic fit, not simply the longest match. Otherwise an exact six-block replay
+      // followed by one NEW short question can look like a seven-block containment match and the new question
+      // gets deleted. Length fit + containment/Dice makes the exact replay win while retaining paraphrase support.
+      const quality = ratio + ((a.includes(b) || b.includes(a)) ? 1 : bigramDice(a, b))
+      const score = Math.min(a.length, b.length)
+      if (!best || quality > best.quality || (quality === best.quality && score > best.score)) best = { quality, score, indices }
+    }
+  }
+  return best ? { ...best, rightBlocks } : null
+}
+
+function stripDuplicateSeamPrefix(left, right, max = 4) {
+  const match = findDuplicateSeamPrefix(left, right, max)
+  if (!match) return { text: right, removedBlocks: 0 }
+  const rightBlocks = match.rightBlocks.slice()
+  const removedBlocks = match.indices.length
+  for (const i of match.indices.slice().sort((a, b) => b - a)) rightBlocks.splice(i, 1)
+  return { text: rightBlocks.join('\n\n'), removedBlocks }
+}
+
+// Merge plus a post-merge seam audit. The normal four-block pass preserves the historical conservative cleanup.
+// If an unusually long replay remains, one deterministic eight-block repair is allowed, then a wider final scan
+// records (but does not hide) any still-duplicated seam. The caller can block derivatives on `seamDuplicates`
+// while still delivering the body for review.
+export function stitchPartsWithReport(texts) {
   const parts = (texts || []).map((t) => String(t == null ? '' : t).replace(/\s+$/, '')).filter((t) => t.length)
-  if (!parts.length) return ''
+  if (!parts.length) return { text: '', seamRepairs: [], seamDuplicates: [] }
   let out = parts[0]
+  const seamRepairs = []
+  const seamDuplicates = []
   for (let i = 1; i < parts.length; i += 1) {
     let next = parts[i]
     const prevLast = out.slice(out.lastIndexOf('\n') + 1).trim()
@@ -811,9 +1152,35 @@ export function stitchParts(texts) {
     if (prevLast.startsWith('## ') && prevLast === nextFirst) {
       next = next.split('\n').slice(1).join('\n').replace(/^\s+/, '')
     }
+    // A model may repeat one turn OR a short sequence of turns from the previous chunk at the new chunk's
+    // opening even though source ownership is disjoint. The helper is bounded to the seam and at most four
+    // prose blocks, so later legitimate repetition remains untouched.
+    const normal = stripDuplicateSeamPrefix(out, next, 4)
+    next = normal.text
+    let removedBlocks = normal.removedBlocks
+    const longReplay = findDuplicateSeamPrefix(out, next, 8)
+    if (longReplay) {
+      const repaired = stripDuplicateSeamPrefix(out, next, 8)
+      next = repaired.text
+      removedBlocks += repaired.removedBlocks
+    }
+    if (removedBlocks) seamRepairs.push({ seam: i, removedBlocks })
+    const residual = findDuplicateSeamPrefix(out, next, 12)
+    if (residual) seamDuplicates.push({ seam: i, repeatedBlocks: residual.indices.length })
     out = `${out}\n\n${next}`
   }
-  return `${out.replace(/\s+$/, '')}\n`
+  const headingRepair = collapseAdjacentDuplicateHeadings(`${out.replace(/\s+$/, '')}\n`)
+  return {
+    text: headingRepair.text,
+    seamRepairs,
+    seamDuplicates,
+    headingRepairs: headingRepair.removedHeadings,
+    headingReplayBlocksRemoved: headingRepair.removedBlocks,
+  }
+}
+
+export function stitchParts(texts) {
+  return stitchPartsWithReport(texts).text
 }
 
 // Fallback for the pre-flight grep: if the scout finds that a source file already has headings but
@@ -842,6 +1209,20 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
   const hit = resolvedMap.get(e.canonical) || (e.variants || []).map((v) => resolvedMap.get(v)).find(Boolean)
   if (!hit) return e
   const names = [e.canonical, ...(e.variants || [])]
+  // Chinese orthography is its own evidence key. A Romanized author name can establish identity/context but
+  // cannot choose among homophonic Han spellings. Fail closed unless the verifier explicitly attested that the
+  // cited page shows the exact Chinese canonical AND preserved that spelling in the source note, making the
+  // evidence contract machine-checkable instead of trusting a bare `two_key:true`.
+  const hitCanonical = stripDesc(hit.canonical)
+  const needsExactHanScript = isPerson && /^\p{Script=Han}{2,8}$/u.test(hitCanonical)
+  const hasExactHanScript = hit.name_script_exact === true && String(hit.source || '').includes(hitCanonical)
+  if (needsExactHanScript && !hasExactHanScript) {
+    rejected.add(hit)
+    const reason = hit.name_script_exact === true
+      ? `⚠ 联网来源说明未原样包含中文名“${hitCanonical}”，无法证明具体汉字——未采用，待补中文原文来源`
+      : `⚠ 联网仅确认身份/英文名，未直接证明中文名“${hitCanonical}”的汉字写法——未采用，待补中文原文来源`
+    return Object.assign({}, e, { hint: [e.hint, reason].filter(Boolean).join('；') })
+  }
   // Contested entry: a referent substitution (a DIFFERENT written form) is FORBIDDEN unless the fresh verdict
   // carries two_key===true — the verify agent attesting BOTH a high-tier source AND context-fit. Bare
   // concreteness, even a real-looking domain, never licenses it (the coattail failure: verify "confirms" the
@@ -854,8 +1235,21 @@ export function applyVerifiedEntry(e, isPerson, resolvedMap, applied, rejected) 
     return e
   }
   const ownStrong = names.map(stripDesc).filter((n) => n && !isWeakKey(n))
+  // Authority order is explicit:
+  //   user decree (returned above) > carried verified canonical > fresh two-key verification > Scout/ASR guess.
+  // The old guard treated a fresh Scout spelling as if it were already human/externally verified. That made the
+  // exact failure it was meant to fix permanent: Scout flags 林川 as suspect_asr, Verify finds 林传, then the
+  // "strong name" guard keeps 林川. A current suspect-ASR cluster may therefore be corrected only by a concrete
+  // two-key result; a carried 〔核实〕 name remains protected and contested rows still use the stricter branch above.
+  // Fresh first-run strong spellings are still only Scout hypotheses. A decisive Verify result already attests
+  // both source authority and context fit via two_key, so it may correct them even when Scout forgot to set
+  // suspect_asr (the real replay found the right public names but retained five ASR spellings for exactly this
+  // reason). Carried verified and contested rows remain protected by the branches above / this exclusion.
+  const freshTwoKeyCorrection = e.confidence !== 'verified' && e.confidence !== 'contested'
+    && hit.two_key === true && isConcreteSource(hit.source)
   if (isPerson && hit.canonical && ownStrong.length
-      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))) {
+      && !ownStrong.includes(stripDesc(hit.canonical)) && !isWeakKey(stripDesc(hit.canonical))
+      && !freshTwoKeyCorrection) {
     rejected.add(hit)
     const hint = [e.hint, `⚠ 联网核实给出“${hit.canonical}”，与本条强名不符，疑似张冠李戴——未采用，待人工确认`].filter(Boolean).join('；')
     return Object.assign({}, e, { hint })

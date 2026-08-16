@@ -3,6 +3,9 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PUBLICATION_BLOCK_GATES } from '../core/spec.js'
+import { summaryDeliverableName, timelineDeliverableName } from '../core/prompts.js'
+import { sanitizeTranscriptMetadata } from '../core/transcript-metadata.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_PATH = path.join(REPO_ROOT, 'package.json')
@@ -95,12 +98,13 @@ function formatAudit(f) {
   if (failed.includes('content_gap')) parts.push((f.gaps || []).filter((g) => g.severity === 'hard').map((g) => `内容缺口 第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字（疑被无声略过）`).join('、'))
   if (failed.includes('compression_risk')) parts.push(`疑似压缩成摘要（charRatio ${f.metrics ? f.metrics.charRatio : '?'}）`)
   if (failed.includes('under_refined')) parts.push('欠精校（口癖未删净）')
-  if (failed.includes('ending_missing')) parts.push('结尾缺失')
   const hard = (f.findings || []).filter((x) => x.severity === 'hard' && x.count).map((x) => `${x.name}×${x.count}`)
   if (hard.length) parts.push(hard.join('、'))
   if (f.long_paragraphs && f.long_paragraphs.length) parts.push(`超 900 字段×${f.long_paragraphs.length}`)
   return `${path.basename(f.file || '')} — ${parts.join('；') || (failed.join('/') || 'fail')}`
 }
+
+const publicationFailures = (f) => (f.blockingFailed || f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
 
 // M5: one review line per FLAGGED refined section (empty-flags sections are trusted, omitted). Aggregates the
 // audit's per-file sections[] into human 逐节复核 lines: 「§标题 — 源 L340-L360 · 15:17-16:02 — 存疑数字 2 处（样例…）/
@@ -244,15 +248,23 @@ export function reviewSections(result = {}, warnings = []) {
   const sections = [
     { title: '审计未能运行——本次运行失败，产物未经审计（不可采信，请人工运行 audit_refined.mjs 核验）', items: (result.auditUnavailable || []).map((x) => `${x.label ? `${x.label} — ` : ''}${x.path || x}`), priority: 'high' },
     { title: '未完成，需要补做', items: result.failed || [], priority: 'high' },
-    { title: '疑似中途截断，需要检查结尾', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
-    { title: '结尾完整性未核，需要人工抽查', items: result.unchecked || [], priority: 'high' },
-    { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => f.status === 'fail').map(formatAudit), priority: 'high' },
+    { title: '旧版 incomplete 标记，需要按现行源比对审计重新核验', items: (result.incomplete || []).map((x) => `${x.path || x}${x.note ? ` — ${x.note}` : ''}`), priority: 'high' },
+    { title: '源比对审计未核，需要人工运行审计', items: result.unchecked || [], priority: 'high' },
+    { title: '成稿质量抽查未过（内容缺口/压缩/欠精校/残留口癖/超长段）', items: ((result.audit && result.audit.files) || []).filter((f) => publicationFailures(f).length).map(formatAudit), priority: 'high' },
+    {
+      title: '疑似说话人结构未能完全确认（保留原结构，禁止按独白或自行猜人）',
+      items: (result.speakerStructureWarnings || []).map((item) => {
+        const kinds = [...new Set((item.warnings || []).map((warning) => warning && warning.kind).filter(Boolean))]
+        return `${item.label || path.basename(item.path || '')}${kinds.length ? ` — ${kinds.join('、')}` : ''}`
+      }),
+      priority: 'high',
+    },
     { title: '跨文件互证（同一实体在不同文件里数值冲突，每份内部都合规——请对照录音确认）', items: crossFileConflictItems(result), priority: 'high' },
     { title: '派生件溯源：时间线/总结把公开或臆造数字标成【访谈】（源文无对应，疑炮制——须改标注或删除）', items: derivativeHardItems(result), priority: 'high' },
     { title: '派生件待核：时间线/总结的公开来源数字（待记者核实）与未标注/复核数字', items: derivativeReporterItems(result), priority: 'medium' },
     { title: '文档内数值自相矛盾（同一量在同一文件里出现两个不同数值——请对照录音确认哪个是对的）', items: numericConsistencyItems(result), priority: 'medium' },
     { title: '逐节复核清单（存疑数字/语气弱化/未核实名——请逐节对照录音）', items: sectionReviewItems(result), priority: 'medium' },
-    { title: '已在成稿中插入内容缺口标记（总结/时间线/逻辑稿基于插标前文本，补回内容后需重出）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
+    { title: '已在成稿中插入内容缺口标记（本轮派生产物已暂停；补回内容并复检通过后再生成）', items: (result.annotations || []).map((a) => `${path.basename(a.path || '')} — 插入 ${a.inserted.length} 处标记`), priority: 'medium' },
     { title: '侦察疑似损坏，校对表该份不可靠', items: result.scoutSuspect || [], priority: 'medium' },
     { title: '校对表偏薄，建议人工复核（条目数/身份线索/变体比例）', items: glossaryLintItems(result), priority: 'medium' },
     { title: '校对表来源标注（公开/外部事实勿当访谈亲述；未标来源的行请补标【访谈】或【公开·待记者核实】）', items: glossarySourceItems(result), priority: 'medium' },
@@ -260,6 +272,7 @@ export function reviewSections(result = {}, warnings = []) {
     { title: '疑似同指，待人工确认', items: (result.suspectedDuplicates || []).map(formatSuspect), priority: 'medium' },
     { title: '因网络故障未核实，可网络恢复后补查', items: (result.networkUnverified || []).map(formatNetworkItem), priority: 'medium' },
     { title: '逻辑顺序稿失败', items: logic.filter((l) => !l.path).map((l) => l.label || jsonLine(l)), priority: 'medium' },
+    { title: '逻辑顺序稿审计未过（假重排或遗漏精校稿来源小节）', items: (result.logicFailed || []).map((x) => `${path.basename(x.path || '')} — ${(x.findings || []).join('、')}`), priority: 'high' },
     { title: '逻辑顺序稿疑漏小标题', items: logic.filter((l) => l.missingSections && l.missingSections.length).map(formatLogicGap), priority: 'medium' },
     { title: '收尾待问', items: (result.openQuestions || []).map(jsonLine), priority: 'medium' },
     { title: '已自动分段精校（文件超出该模型忠实处理长度，已按发言轮边界切分——仅告知，无需处理）', items: autoChunkItems(result), priority: 'low' },
@@ -274,7 +287,12 @@ export function qualityScorecard(result = {}) {
   const auditFailed = result.auditFailed || []
   const sectionSummary = sectionReviewSummary(result)
   const hardFiles = new Set()
-  for (const f of auditFiles) if (f.status === 'fail' || (f.failed || []).length) hardFiles.add(f.file || f.refinedFile || '')
+  // Do not reinterpret every detector-level `status=fail` as a publication block. The audit intentionally emits
+  // review-only candidates too; only the shared publication contract may promote a body file to hardFiles.
+  for (const f of auditFiles) {
+    const blocking = (f.blockingFailed || f.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))
+    if (blocking.length) hardFiles.add(f.file || f.refinedFile || '')
+  }
   for (const f of auditFailed) hardFiles.add(f.path || '')
   const incomplete = result.incomplete || []
   const unchecked = result.unchecked || []
@@ -285,10 +303,11 @@ export function qualityScorecard(result = {}) {
     : []
   const logicFailed = result.logicFailed || []
   const auditUnavailable = result.auditUnavailable || []
+  const speakerStructureWarnings = result.speakerStructureWarnings || []
   // P7: an audit that could not run blocks the run — the deliverables are unaudited, which is worse than a
   // known hard finding, so it must never grade below "blocked".
   const blocked = hardFiles.size || incomplete.length || logicFailed.length || auditUnavailable.length
-  const reviewNeeded = blocked || unchecked.length || sectionSummary.flagged || networkUnverified.length || openQuestions.length || glossaryWarnings.length
+  const reviewNeeded = blocked || unchecked.length || sectionSummary.flagged || networkUnverified.length || openQuestions.length || glossaryWarnings.length || speakerStructureWarnings.length
   const status = blocked ? 'blocked' : reviewNeeded ? 'review_needed' : 'ready'
   const label = status === 'ready' ? 'Ready' : status === 'blocked' ? 'Blocked' : 'Review Needed'
   return {
@@ -306,9 +325,76 @@ export function qualityScorecard(result = {}) {
       openQuestions: openQuestions.length,
       logicFailed: logicFailed.length,
       glossaryWarnings: glossaryWarnings.length,
+      speakerStructureWarnings: speakerStructureWarnings.length,
     },
     glossaryWarnings,
   }
+}
+
+const qualityStatus = (blocked, review) => blocked.length ? 'blocked' : review.length ? 'review_needed' : 'ready'
+const resolvedPath = (p) => p ? path.resolve(p) : null
+
+// Per-artifact status keeps one bad timeline from making a passed transcript LOOK bad. The run-level quality above
+// still takes the worst state for conservative automation; consumers can use this map to label each attachment by
+// its own evidence. Findings are stable machine keys, not rendered prose.
+export function artifactQualityScorecard(result = {}, context = {}) {
+  const A = context.A || {}
+  const outputDir = path.resolve(context.outputDir || result.outputDir || A.outputDir || process.cwd())
+  const auditFiles = (result.audit && result.audit.files) || []
+  const auditFailed = result.auditFailed || []
+  const failedByPath = new Map()
+  for (const f of auditFailed) failedByPath.set(resolvedPath(f.path), f.findings || ['audit_failed'])
+  const incomplete = new Set((result.incomplete || []).map((x) => resolvedPath(x.path || x)))
+  const unavailable = new Set((result.auditUnavailable || []).map((x) => resolvedPath(x.path || x)))
+  const unchecked = new Set((result.unchecked || []).map((x) => resolvedPath(x.path || x)))
+  const speakerWarnings = new Set((result.speakerStructureWarnings || []).map((x) => resolvedPath(x.path || x)))
+
+  const refined = (result.refined || []).map((r) => {
+    const p = resolvedPath(r.outPath || r.path)
+    const af = auditFiles.find((f) => resolvedPath(f.file || f.refinedFile) === p)
+    const blocking = Array.from(new Set([
+      ...(failedByPath.get(p) || []),
+      ...((af && (af.failed || []).filter((kind) => PUBLICATION_BLOCK_GATES.includes(kind))) || []),
+      ...(incomplete.has(p) ? ['incomplete'] : []),
+      ...(unavailable.has(p) ? ['audit_unavailable'] : []),
+    ]))
+    const review = Array.from(new Set([
+      ...((af && (af.findings || []).filter((f) => f && f.count && !PUBLICATION_BLOCK_GATES.includes(f.name)).map((f) => f.name)) || []),
+      ...((af && (af.sections || []).some((s) => (s.flags || []).length)) ? ['section_review'] : []),
+      ...(unchecked.has(p) ? ['unchecked'] : []),
+      ...(!af && !unavailable.has(p) ? ['audit_missing'] : []),
+      ...(speakerWarnings.has(p) ? ['speaker_structure_ambiguous'] : []),
+    ]))
+    return { path: p, kind: 'transcript', status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  })
+
+  const logic = (result.logic || []).filter((l) => l && l.path).map((l) => {
+    const p = resolvedPath(l.path)
+    const f = ((result.logicAudit && result.logicAudit.files) || []).find((x) => resolvedPath(x.file) === p)
+    const blocking = f && f.status === 'fail' ? (f.failed || ['logic_audit']) : []
+    const review = f ? (f.findings || []).filter((x) => x && x.count && x.severity !== 'hard').map((x) => x.name) : ['audit_missing']
+    return { path: p, kind: 'logic', status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  })
+
+  const derivativeFiles = (result.derivativeAudit && result.derivativeAudit.files) || []
+  const derivative = (kind, value) => {
+    if (!value) return null
+    const fallback = path.join(outputDir, kind === 'summary' ? summaryDeliverableName(A.topic || context.topic || '') : timelineDeliverableName(A.topic || context.topic || ''))
+    const df = derivativeFiles.find((f) => f.kind === kind)
+    const p = resolvedPath((value && value.path) || (df && df.file) || fallback)
+    const blocking = df && (df.hardFail || []).length ? ['derivative_attribution'] : []
+    const review = df
+      ? [
+        ...((df.reporterVerify || []).length ? ['derivative_reporter_verify'] : []),
+        ...((df.review || []).length ? ['derivative_review'] : []),
+        ...((df.contextReview || []).length ? ['derivative_context_review'] : []),
+        ...((df.numericConflicts || []).length ? ['numeric_inconsistency'] : []),
+      ]
+      : ['audit_missing']
+    return { path: p, kind, status: qualityStatus(blocking, review), blockingFindings: blocking, reviewFindings: review }
+  }
+
+  return { refined, logic, summary: derivative('summary', result.summary), timeline: derivative('timeline', result.timeline) }
 }
 
 export function buildReviewMarkdown(result = {}, context = {}) {
@@ -326,7 +412,7 @@ export function buildReviewMarkdown(result = {}, context = {}) {
     '',
     `- 状态：${score.label}`,
     `- 硬问题文件：${score.metrics.hardFiles} / 已审计文件：${score.metrics.auditedFiles}`,
-    `- 结尾缺失：${score.metrics.incomplete}；未完成核对：${score.metrics.unchecked}`,
+    `- 旧版 incomplete 标记：${score.metrics.incomplete}；源比对审计未核：${score.metrics.unchecked}`,
     `- 逐节复核：${score.metrics.flaggedSections} / ${score.metrics.totalSections}`,
     `- 联网未核实：${score.metrics.networkUnverified}；收尾待问：${score.metrics.openQuestions}`,
     score.glossaryWarnings.length ? `- 校对表提示：${score.glossaryWarnings.join('、')}` : '- 校对表提示：0',
@@ -365,6 +451,69 @@ function sanitizeProviderInfo(info = {}) {
   return out
 }
 
+const REPAIR_STOP_REASONS = new Set(['not_needed', 'passed', 'max_rounds', 'audit_unavailable', 'repair_unavailable'])
+const REPAIR_OUTCOMES = new Set(['passed', 'passed_with_tool_errors', 'audit_failed', 'audit_failed_with_tool_errors', 'no_change', 'agent_failed', 'audit_unavailable', 'candidate_rejected'])
+const safeRepairToken = (value, maxLength = 160) => {
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  return text && text.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(text) ? text : null
+}
+const safeRepairCountMap = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out = {}
+  for (const [key, raw] of Object.entries(value)) {
+    const name = safeRepairToken(key, 80)
+    const count = Number(raw)
+    if (name && Number.isInteger(count) && count > 0) out[name] = count
+  }
+  return out
+}
+
+function manifestQualityRepair(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const maxRounds = Number(value.maxRounds)
+  const roundsUsed = Number(value.roundsUsed)
+  const attempts = Array.isArray(value.attempts) ? value.attempts : []
+  return {
+    schemaVersion: 1,
+    maxRounds: Number.isInteger(maxRounds) && maxRounds >= 0 && maxRounds <= 10 ? maxRounds : 0,
+    roundsUsed: Number.isInteger(roundsUsed) && roundsUsed >= 0 && roundsUsed <= 10 ? roundsUsed : 0,
+    stopReason: REPAIR_STOP_REASONS.has(value.stopReason) ? value.stopReason : 'repair_unavailable',
+    attempts: attempts.slice(0, 100).map((attempt) => {
+      const toolSummary = attempt && attempt.toolSummary && typeof attempt.toolSummary === 'object' ? attempt.toolSummary : {}
+      const failedTools = Array.isArray(toolSummary.failed) ? toolSummary.failed : []
+      return {
+        file: attempt && typeof attempt.file === 'string' ? attempt.file : null,
+        round: Number.isInteger(Number(attempt && attempt.round)) ? Number(attempt.round) : 0,
+        action: safeRepairToken(attempt && attempt.action),
+        model: safeRepairToken(attempt && attempt.model),
+        failedBefore: (Array.isArray(attempt && attempt.failedBefore) ? attempt.failedBefore : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
+        hardIssueCountsBefore: safeRepairCountMap(attempt && attempt.hardIssueCountsBefore),
+        toolSummary: {
+          succeeded: safeRepairCountMap(toolSummary.succeeded),
+          failed: failedTools.slice(0, 50).map((item) => ({
+            tool: safeRepairToken(item && item.tool, 80) || 'unknown',
+            code: safeRepairToken(item && item.code, 80) || 'TOOL_UNKNOWN',
+            count: Number.isInteger(Number(item && item.count)) && Number(item.count) > 0 ? Number(item.count) : 1,
+          })),
+        },
+        bytesBefore: Number.isInteger(Number(attempt && attempt.bytesBefore)) && Number(attempt.bytesBefore) >= 0 ? Number(attempt.bytesBefore) : null,
+        bytesAfter: Number.isInteger(Number(attempt && attempt.bytesAfter)) && Number(attempt.bytesAfter) >= 0 ? Number(attempt.bytesAfter) : null,
+        changed: !!(attempt && attempt.changed),
+        agentCompleted: typeof (attempt && attempt.agentCompleted) === 'boolean' ? attempt.agentCompleted : null,
+        candidatePromoted: typeof (attempt && attempt.candidatePromoted) === 'boolean' ? attempt.candidatePromoted : null,
+        candidateSpeakerValid: typeof (attempt && attempt.candidateSpeakerValid) === 'boolean' ? attempt.candidateSpeakerValid : null,
+        candidateRejectedReason: safeRepairToken(attempt && attempt.candidateRejectedReason, 80),
+        candidateHardFindings: (Array.isArray(attempt && attempt.candidateHardFindings) ? attempt.candidateHardFindings : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
+        failedAfter: (Array.isArray(attempt && attempt.failedAfter) ? attempt.failedAfter : []).map((x) => safeRepairToken(x, 80)).filter(Boolean),
+        hardIssueCountsAfter: safeRepairCountMap(attempt && attempt.hardIssueCountsAfter),
+        outcome: REPAIR_OUTCOMES.has(attempt && attempt.outcome) ? attempt.outcome : 'agent_failed',
+        errorCode: safeRepairToken(attempt && attempt.errorCode, 80),
+      }
+    }),
+  }
+}
+
 function manifestFiles(files = []) {
   return files.map((f) => ({
     label: f.label,
@@ -373,8 +522,119 @@ function manifestFiles(files = []) {
     outPath: f.outPath,
     lines: f.lines,
     bytes: f.bytes,
+    sourceKind: f.sourceKind || null,
+    sourceDocumentKind: f.sourceDocumentKind || null,
+    speakerMode: f.speakerMode || null,
     sha256: f.path ? sha256File(f.path) : null,
   }))
+}
+
+function manifestSpeakerTrace(result = {}) {
+  const text = (value, max = 120) => {
+    if (typeof value !== 'string') return null
+    const cleaned = value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim()
+    return cleaned ? cleaned.slice(0, max) : null
+  }
+  return {
+    resolutions: (Array.isArray(result.speakerResolutions) ? result.speakerResolutions : []).slice(0, 50).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      changedLines: Number(item && item.changedLines) || 0,
+      labelLines: Number(item && item.labelLines) || 0,
+      speakerMode: safeRepairToken(item && item.speakerMode, 40),
+      structureWarnings: (Array.isArray(item && item.structureWarnings) ? item.structureWarnings : []).slice(0, 20).map((warning) => ({
+        kind: safeRepairToken(warning && warning.kind, 80),
+        count: Number(warning && warning.count) || 0,
+        lines: (Array.isArray(warning && warning.lines) ? warning.lines : []).slice(0, 20).map((line) => Number(line) || null).filter(Boolean),
+        labels: (Array.isArray(warning && warning.labels) ? warning.labels : []).slice(0, 20).map((label) => text(label, 80)).filter(Boolean),
+      })),
+      recoveredByScout: (Array.isArray(item && item.recoveredByScout) ? item.recoveredByScout : []).slice(0, 100).map((entry) => ({
+        line: Number(entry && entry.line) || null,
+        label: text(entry && entry.label, 80),
+      })),
+      unresolved: (Array.isArray(item && item.unresolved) ? item.unresolved : []).slice(0, 50).map((x) => text(x, 80)).filter(Boolean),
+      mappings: (Array.isArray(item && item.mappings) ? item.mappings : []).slice(0, 50).map((mapping) => ({
+        sourceLabel: text(mapping && mapping.sourceLabel, 80),
+        outputLabel: text(mapping && mapping.outputLabel, 80),
+        role: text(mapping && mapping.role, 80),
+        basis: safeRepairToken(mapping && mapping.basis, 80),
+        speakerTrackId: safeRepairToken(mapping && mapping.speakerTrackId, 40),
+        identityConfidence: safeRepairToken(mapping && mapping.identityConfidence, 20),
+        identityEvidence: text(mapping && mapping.identityEvidence, 300),
+        firstLine: Number(mapping && mapping.firstLine) || null,
+        labelLines: Number(mapping && mapping.labelLines) || 0,
+      })),
+    })),
+    outputEnforcements: (Array.isArray(result.speakerOutputNormalizations) ? result.speakerOutputNormalizations : []).slice(0, 200).map((item, index) => ({
+      sequence: Number(item && item.sequence) || index + 1,
+      phase: safeRepairToken(item && item.phase, 80) || 'post_refine',
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      changedLines: Number(item && item.changedLines) || 0,
+      labelLines: Number(item && item.labelLines) || 0,
+      valid: item && item.valid !== false,
+      contract: safeRepairToken(item && item.contract, 40),
+      replacements: (Array.isArray(item && item.replacements) ? item.replacements : []).slice(0, 200).map((replacement) => ({
+        line: Number(replacement && replacement.line) || null,
+        from: text(replacement && replacement.from, 80),
+        to: text(replacement && replacement.to, 80),
+      })),
+      unknownLabels: (Array.isArray(item && item.unknownLabels) ? item.unknownLabels : []).slice(0, 200).map((unknown) => ({
+        line: Number(unknown && unknown.line) || null,
+        label: text(unknown && unknown.label, 80),
+      })),
+    })),
+    candidateAdjudications: (Array.isArray(result.speakerCandidateAdjudications) ? result.speakerCandidateAdjudications : []).slice(0, 100).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      status: safeRepairToken(item && item.status, 40),
+      model: safeRepairToken(item && item.model, 80),
+      decisions: (Array.isArray(item && item.decisions) ? item.decisions : []).slice(0, 200).map((decision) => ({
+        line: Number(decision && decision.line) || null,
+        label: text(decision && decision.label, 80),
+        verdict: safeRepairToken(decision && decision.verdict, 80),
+        confidence: safeRepairToken(decision && decision.confidence, 20),
+        reason: safeRepairToken(decision && decision.reason, 80),
+        outcome: safeRepairToken(decision && decision.outcome, 20),
+      })),
+    })),
+    identityFinalizations: (Array.isArray(result.speakerIdentityFinalizations) ? result.speakerIdentityFinalizations : []).slice(0, 50).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      contract: safeRepairToken(item && item.contract, 40),
+      rendered: item && item.rendered === true,
+      changed: item && item.changed === true,
+      bytesBefore: Number(item && item.bytesBefore) || 0,
+      bytesAfter: Number(item && item.bytesAfter) || 0,
+      speakerTracks: (Array.isArray(item && item.speakerTracks) ? item.speakerTracks : []).slice(0, 50).map((track) => ({
+        id: safeRepairToken(track && track.id, 40),
+        sourceLabels: (Array.isArray(track && track.sourceLabels) ? track.sourceLabels : []).slice(0, 20).map((label) => text(label, 80)).filter(Boolean),
+        canonicalLabel: text(track && track.canonicalLabel, 100),
+        role: text(track && track.role, 80),
+        basis: safeRepairToken(track && track.basis, 80),
+        identityStatus: safeRepairToken(track && track.identityStatus, 80),
+        confidence: safeRepairToken(track && track.confidence, 20),
+        evidence: text(track && track.evidence, 300),
+      })),
+      changes: (Array.isArray(item && item.changes) ? item.changes : []).slice(0, 50).map((change) => ({
+        speakerTrackId: safeRepairToken(change && change.speakerTrackId, 40),
+        from: text(change && change.from, 100),
+        to: text(change && change.to, 100),
+      })),
+      rejected: (Array.isArray(item && item.rejected) ? item.rejected : []).slice(0, 50).map((entry) => ({
+        speakerTrackId: safeRepairToken(entry && entry.speakerTrackId, 40),
+        canonicalName: text(entry && entry.canonicalName, 100),
+        reason: safeRepairToken(entry && entry.reason, 80),
+      })),
+    })),
+    structuralFailures: (Array.isArray(result.speakerStructuralFailures) ? result.speakerStructuralFailures : []).slice(0, 50).map((item) => ({
+      label: text(item && item.label, 200),
+      path: text(item && item.path, 1000),
+      finding: safeRepairToken(item && item.finding, 80),
+      speakerMode: safeRepairToken(item && item.speakerMode, 40),
+      labels: (Array.isArray(item && item.labels) ? item.labels : []).slice(0, 50).map((label) => text(label, 80)).filter(Boolean),
+    })),
+  }
 }
 
 export function buildRunManifest(result = {}, context = {}) {
@@ -397,6 +657,10 @@ export function buildRunManifest(result = {}, context = {}) {
       name: context.provider || result.provider || null,
       info: sanitizeProviderInfo(context.providerInfo || result.providerInfo || {}),
     },
+    transcriptMetadata: result.transcriptMetadata == null ? null : sanitizeTranscriptMetadata(result.transcriptMetadata),
+    // Execution is separate from editorial quality: a completed run may still be quality.blocked, while a
+    // missing declared output is an execution failure regardless of what a model claimed in structured_output.
+    execution: result.execution || null,
     config: {
       topic: A.topic || context.topic || null,
       date: A.date || null,
@@ -404,7 +668,12 @@ export function buildRunManifest(result = {}, context = {}) {
       verifyDepth: A.verifyDepth || null,
       headingPolicy: A.headingPolicy || null,
       fresh: !!A.fresh,
-      models: A.models || null,
+      // Effective stage→provider-model routing, not merely the caller's sparse override. This makes the
+      // manifest auditable even when defaults supplied most stages.
+      models: A.effectiveModels || result.modelRouting || A.models || null,
+      modelOverrides: A.modelOverrides || {},
+      searchProvider: A.searchProvider || null,
+      fetchProvider: A.fetchProvider || null,
       outputDir,
       skillDir: A.skillDir || null,
       backgroundLength: A.background ? String(A.background).length : 0,
@@ -423,11 +692,13 @@ export function buildRunManifest(result = {}, context = {}) {
     },
     issues: Object.fromEntries(reviewSections(result, context.warnings || result.warnings || []).map((s) => [s.title, s.items.length])),
     quality: qualityScorecard(result),
+    artifactQuality: artifactQualityScorecard(result, { ...context, A, outputDir }),
     result: {
       error: result.error || null,
       failed: result.failed || [],
       incomplete: result.incomplete || [],
       unchecked: result.unchecked || [],
+      auditFailed: result.auditFailed || [],
       // P7 fail-loud: files whose audit could not run — the run is failed, products unaudited.
       auditUnavailable: result.auditUnavailable || [],
       headingConflicts: result.headingConflicts || [],
@@ -435,6 +706,8 @@ export function buildRunManifest(result = {}, context = {}) {
       suspectedDuplicates: result.suspectedDuplicates || [],
       networkUnverified: result.networkUnverified || [],
       openQuestions: result.openQuestions || [],
+      derivativesSkipped: result.derivativesSkipped || [],
+      logicFailed: result.logicFailed || [],
       // M8: cross-file numeric conflicts (same entity + unit, disjoint values across ≥2 files). Structured so a
       // downstream tool can jump to the exact file+line; the human-readable lines are in review.md「跨文件互证」.
       crossFileConflicts: (result.crossFileConflicts || []).map((c) => ({ entity: c.entity, unit: c.unit, values: (c.values || []).map((v) => ({ label: v.label, value: v.value, line: v.line })) })),
@@ -445,6 +718,9 @@ export function buildRunManifest(result = {}, context = {}) {
         ...(((result.derivativeAudit && result.derivativeAudit.files) || []).flatMap((f) => (f.numericConflicts || []).map((c) => ({ file: path.basename(f.file || ''), keyNoun: c.keyNoun, unit: c.unit, values: (c.values || []).map((v) => ({ value: v.value, line: v.line })) })))),
       ],
     },
+    qualityRepair: manifestQualityRepair(result.qualityRepair),
+    speaker: manifestSpeakerTrace(result),
+    webTelemetry: result.webTelemetry || null,
     // P1: derivative-attribution audit of 时间线/总结 (fabricated 访谈 figures → hard; public·待核 / unlabeled → soft).
     derivativeAudit: result.derivativeAudit ? {
       status: result.derivativeAudit.status,
@@ -452,6 +728,10 @@ export function buildRunManifest(result = {}, context = {}) {
         file: f.file, kind: f.kind, status: f.status,
         hardFail: f.hardFail || [], reporterVerify: f.reporterVerify || [], review: f.review || [], contextReview: f.contextReview || [],
       })),
+    } : null,
+    logicAudit: result.logicAudit ? {
+      status: result.logicAudit.status,
+      files: (result.logicAudit.files || []).map((f) => ({ file: f.file, status: f.status, failed: f.failed || [], metrics: f.metrics || null })),
     } : null,
     audit: result.audit ? {
       status: result.audit.status,
@@ -474,6 +754,14 @@ export function buildRunManifest(result = {}, context = {}) {
     // Provider-aware auto-chunking: files auto-split because their 字数 exceeded the refine model's faithful
     // length. Empty unless a budgeted provider (e.g. DeepSeek) hit the cap. Human-readable lines in review.md.
     autoChunk: (result.autoChunk || []).map((a) => ({ label: a.label, model: a.model, budget: a.budget, contentLength: a.contentLength, parts: a.parts, ...(a.requestedChunkSize ? { requestedChunkSize: a.requestedChunkSize } : {}) })),
+    // Written from the pre-dispatch plan rather than successful refine reports, so failed part3+ runs remain
+    // diagnosable. Paths are declared artifact paths only; no prompts or transcript content are included.
+    plannedChunks: (result.plannedChunks || []).map((p) => ({
+      label: p.label, outPath: p.outPath, model: p.model, contentLength: p.contentLength, driver: p.driver,
+      ...(p.budget ? { budget: p.budget } : {}),
+      ...(p.requestedChunkSize ? { requestedChunkSize: p.requestedChunkSize } : {}),
+      parts: (p.parts || []).map((part) => ({ idx: part.idx, startLine: part.startLine, endLine: part.endLine, path: part.path })),
+    })),
     usage,
   }
 }

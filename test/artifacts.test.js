@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildReviewMarkdown, buildRunManifest, qualityScorecard, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
+import { artifactQualityScorecard, buildReviewMarkdown, buildRunManifest, qualityScorecard, reviewSections, writeRunArtifacts } from '../universal/artifacts.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-artifacts-'))
@@ -33,7 +33,7 @@ test('reviewSections groups actionable warnings for handoff', () => {
   const titles = sections.map((s) => s.title)
 
   assert.equal(titles.includes('未完成，需要补做'), true)
-  assert.equal(titles.includes('疑似中途截断，需要检查结尾'), true)
+  assert.equal(titles.includes('旧版 incomplete 标记，需要按现行源比对审计重新核验'), true)
   assert.equal(titles.includes('疑似同指，待人工确认'), true)
   assert.equal(titles.includes('预检提示'), true)
 })
@@ -55,6 +55,56 @@ test('qualityScorecard classifies ready, review-needed, and blocked runs', () =>
   assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, refined: [] }).status, 'ready')
   assert.equal(qualityScorecard({ audit: { status: 'ok', files: [] }, networkUnverified: [{ query: '示例品牌' }] }).status, 'review_needed')
   assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['content_gap'] }] } }).status, 'blocked')
+  assert.equal(qualityScorecard({ audit: { status: 'fail', files: [{ file: 'A.md', status: 'fail', failed: ['detector_candidate_only'] }] } }).status, 'ready', 'unknown detector failures cannot silently become publication gates')
+})
+
+test('speaker parser/Scout disagreement is visible in review, run quality and per-artifact quality', () => {
+  const result = {
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [], sections: [] }] },
+    speakerStructureWarnings: [{
+      label: '访谈 A',
+      path: '/tmp/out/Transcripts/A.md',
+      speakerMode: 'ambiguous',
+      warnings: [{ kind: 'scout_parser_disagreement', count: 2, labels: ['说话人 1', '说话人 2'] }],
+    }],
+  }
+  const sections = reviewSections(result, [])
+  assert.ok(sections.some((section) => section.title.includes('疑似说话人结构未能完全确认')))
+  const quality = qualityScorecard(result)
+  assert.equal(quality.status, 'review_needed')
+  assert.equal(quality.metrics.speakerStructureWarnings, 1)
+  const artifact = artifactQualityScorecard(result, { outputDir: '/tmp/out' })
+  assert.equal(artifact.refined[0].status, 'review_needed')
+  assert.deepEqual(artifact.refined[0].reviewFindings, ['speaker_structure_ambiguous'])
+})
+
+test('artifactQualityScorecard isolates a blocked timeline from a review-only transcript', () => {
+  const result = {
+    outputDir: '/tmp/out',
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    timeline: { path: '/tmp/out/T时间线.md' },
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [{ name: 'hedge_loss', severity: 'soft', count: 1 }], sections: [] }] },
+    auditFailed: [{ path: '/tmp/out/T时间线.md', findings: ['derivative_attribution'] }],
+    derivativeAudit: { status: 'fail', files: [{ file: '/tmp/out/T时间线.md', kind: 'timeline', status: 'fail', hardFail: [{ value: '17' }], reporterVerify: [], review: [] }] },
+  }
+  const q = artifactQualityScorecard(result, { A: { topic: 'T' }, outputDir: '/tmp/out' })
+  assert.equal(q.refined[0].status, 'review_needed')
+  assert.equal(q.timeline.status, 'blocked')
+  assert.deepEqual(q.timeline.blockingFindings, ['derivative_attribution'])
+})
+
+test('artifactQualityScorecard exposes a failed logic draft without downgrading the passed transcript', () => {
+  const result = {
+    refined: [{ outPath: '/tmp/out/Transcripts/A.md' }],
+    logic: [{ label: 'A', path: '/tmp/out/逻辑顺序/A.md' }],
+    audit: { status: 'ok', files: [{ file: '/tmp/out/Transcripts/A.md', status: 'ok', failed: [], findings: [], sections: [] }] },
+    logicAudit: { status: 'fail', files: [{ file: '/tmp/out/逻辑顺序/A.md', status: 'fail', failed: ['logic_order_unchanged'], findings: [] }] },
+  }
+  const q = artifactQualityScorecard(result, { outputDir: '/tmp/out' })
+  assert.equal(q.refined[0].status, 'ready')
+  assert.equal(q.logic[0].status, 'blocked')
+  assert.deepEqual(q.logic[0].blockingFindings, ['logic_order_unchanged'])
 })
 
 test('buildRunManifest records run config without secrets and hashes source files', () => {
@@ -70,6 +120,8 @@ test('buildRunManifest records run config without secrets and hashes source file
       scope: ['refine'],
       verifyDepth: 'key',
       headingPolicy: 'none',
+      searchProvider: 'serper',
+      fetchProvider: 'jina-reader+local-fallback',
       outputDir: dir,
       skillDir: '/repo/skill',
       files: [{ label: 'source', title: 'source', path: source, outPath: path.join(dir, 'Transcripts/source.md'), lines: 1, bytes: 6 }],
@@ -83,11 +135,112 @@ test('buildRunManifest records run config without secrets and hashes source file
   assert.equal(manifest.schemaVersion, 1)
   assert.equal(manifest.quality.status, 'blocked')
   assert.equal(manifest.config.topic, '测试项目')
+  assert.equal(manifest.config.searchProvider, 'serper')
+  assert.equal(manifest.config.fetchProvider, 'jina-reader+local-fallback')
   assert.equal(manifest.config.backgroundLength, 'sensitive background'.length)
   assert.equal(manifest.config.backgroundSha256.length, 64)
   assert.equal(manifest.config.files[0].sha256.length, 64)
   assert.equal(manifest.provider.info.apiKey, undefined)
   assert.equal(manifest.provider.info.keyVar, 'MOCK_API_KEY')
+})
+
+test('run manifest persists only the whitelisted repair ledger and retains earlier tool failures', () => {
+  const qualityRepair = {
+    schemaVersion: 99,
+    maxRounds: 2,
+    roundsUsed: 1,
+    stopReason: 'passed',
+    prompt: 'must not persist',
+    attempts: [{
+      file: '/tmp/out/Transcripts/A.md', round: 1, action: 'targeted_repair', model: 'deepseek-v4-pro',
+      failedBefore: ['residual_noise'], hardIssueCountsBefore: { confirmation_repeats: 5 },
+      toolSummary: {
+        succeeded: { Read: 30, Edit: 30 },
+        failed: [{ tool: 'Edit', code: 'TOOL_EDIT_TARGET_MISMATCH', count: 6 }],
+        oldString: 'must not persist',
+      },
+      bytesBefore: 1000, bytesAfter: 1010, changed: true, agentCompleted: true,
+      candidatePromoted: true, candidateSpeakerValid: true, candidateRejectedReason: null, candidateHardFindings: [],
+      failedAfter: [], hardIssueCountsAfter: {}, outcome: 'passed_with_tool_errors', errorCode: null,
+      response: 'must not persist',
+    }],
+  }
+  const manifest = buildRunManifest({ ...baseResult, qualityRepair }, { outputDir: '/tmp/out', topic: 'T' })
+  assert.equal(manifest.qualityRepair.schemaVersion, 1)
+  assert.equal(manifest.qualityRepair.maxRounds, 2)
+  assert.equal(manifest.qualityRepair.attempts[0].toolSummary.failed[0].count, 6)
+  assert.equal(manifest.qualityRepair.attempts[0].outcome, 'passed_with_tool_errors')
+  assert.equal(manifest.qualityRepair.attempts[0].candidatePromoted, true)
+  assert.equal(manifest.qualityRepair.attempts[0].candidateSpeakerValid, true)
+  assert.equal(JSON.stringify(manifest).includes('must not persist'), false)
+})
+
+test('run manifest persists the full-text speaker mapping and every deterministic output enforcement pass', () => {
+  const speakerResolutions = [{
+    label: '访谈 A',
+    path: '/tmp/out/.converted/A.speaker-resolved.md',
+    speakerMode: 'tracked',
+    changedLines: 12,
+    labelLines: 12,
+    unresolved: [],
+    structureWarnings: [{ kind: 'scout_evidence_unmatched', count: 1, lines: [], labels: ['说话人 2'] }],
+    recoveredByScout: [{ line: 1, label: '说话人 1' }],
+    mappings: [{
+      key: 'generic:1',
+      sourceLabel: '说话人 1',
+      outputLabel: '记者',
+      role: '记者',
+      basis: 'scout_role',
+      firstLine: 1,
+      labelLines: 6,
+    }],
+  }]
+  const speakerOutputNormalizations = [{
+    sequence: 2,
+    phase: 'post_repair_round_1',
+    label: '访谈 A',
+    path: '/tmp/out/Transcripts/A.md',
+    changedLines: 1,
+    labelLines: 11,
+    replacements: [{ line: 20, from: '访谈者', to: '记者' }],
+    unknownLabels: [{ line: 30, label: '神秘人' }],
+  }]
+  const speakerCandidateAdjudications = [{
+    label: '访谈 A',
+    path: '/tmp/out/Transcripts/A.md',
+    status: 'review_needed',
+    model: 'opus',
+    decisions: [{
+      line: 30,
+      label: '神秘人',
+      verdict: 'uncertain',
+      confidence: 'low',
+      reason: 'insufficient_context',
+      outcome: 'review',
+    }],
+  }]
+  const manifest = buildRunManifest({ ...baseResult, speakerResolutions, speakerOutputNormalizations, speakerCandidateAdjudications }, { outputDir: '/tmp/out', topic: 'T' })
+
+  assert.equal(manifest.speaker.resolutions[0].mappings[0].outputLabel, '记者')
+  assert.equal(manifest.speaker.resolutions[0].mappings[0].key, undefined, 'internal track keys/Feishu ids are not persisted')
+  assert.deepEqual(manifest.speaker.resolutions[0].structureWarnings[0], {
+    kind: 'scout_evidence_unmatched',
+    count: 1,
+    lines: [],
+    labels: ['说话人 2'],
+  })
+  assert.deepEqual(manifest.speaker.resolutions[0].recoveredByScout[0], { line: 1, label: '说话人 1' })
+  assert.equal(manifest.speaker.outputEnforcements[0].phase, 'post_repair_round_1')
+  assert.deepEqual(manifest.speaker.outputEnforcements[0].replacements[0], { line: 20, from: '访谈者', to: '记者' })
+  assert.deepEqual(manifest.speaker.outputEnforcements[0].unknownLabels[0], { line: 30, label: '神秘人' })
+  assert.deepEqual(manifest.speaker.candidateAdjudications[0].decisions[0], {
+    line: 30,
+    label: '神秘人',
+    verdict: 'uncertain',
+    confidence: 'low',
+    reason: 'insufficient_context',
+    outcome: 'review',
+  })
 })
 
 test('writeRunArtifacts writes review.md and run.json', () => {
@@ -98,6 +251,13 @@ test('writeRunArtifacts writes review.md and run.json', () => {
   assert.equal(fs.existsSync(paths.manifestPath), true)
   assert.match(fs.readFileSync(paths.reviewPath, 'utf8'), /Review Queue/)
   assert.equal(JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8')).artifacts.reviewPath, paths.reviewPath)
+})
+
+test('run manifest persists web telemetry without credentials', () => {
+  const webTelemetry = { searchCalls: 3, searchAttempts: 2, searchBilled: 2, searchCacheHits: 1, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 1, fetchCacheHits: 0, fetchJinaAttempts: 1, fetchJinaSuccess: 1, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
+  const manifest = buildRunManifest({ ...baseResult, webTelemetry }, { outputDir: '/tmp/out', topic: 'T', A: { searchProvider: 'serper', fetchProvider: 'jina-reader+local-fallback' } })
+  assert.deepEqual(manifest.webTelemetry, webTelemetry)
+  assert.equal(JSON.stringify(manifest).includes('SERPER_API_KEY'), false)
 })
 
 test('provider-budget auto-chunk is traced in run.json and rendered as a plain-language review.md line', () => {
@@ -114,6 +274,28 @@ test('provider-budget auto-chunk is traced in run.json and rendered as a plain-l
   const bare = buildRunManifest(baseResult, { outputDir: '/tmp/out', topic: 'T' })
   assert.deepEqual(bare.autoChunk, [], 'no auto-chunk → empty array')
   assert.ok(!reviewSections(baseResult, []).some((s) => s.title.includes('已自动分段精校')), 'no section when nothing auto-chunked')
+})
+
+test('manifest separates execution failure from quality and preserves the failed file pre-dispatch chunk plan', () => {
+  const execution = {
+    schemaVersion: 1, status: 'failed', stage: 'finished',
+    failure: { code: 'OUTPUT_MISSING', retryable: false, message: 'part3 missing' },
+    failures: [{ label: 'refine:甲#3/3', code: 'OUTPUT_MISSING', retryable: false, message: 'part3 missing' }],
+    progress: { filesTotal: 1, filesRefined: 0, filesFailed: 1, partsPlanned: 3 },
+    eventsPath: '/tmp/out/events.jsonl', statePath: '/tmp/out/run-state.json',
+  }
+  const plannedChunks = [{
+    label: '甲', outPath: '/tmp/out/Transcripts/甲.md', model: 'deepseek-v4-pro', budget: 10000,
+    contentLength: 25000, driver: 'provider_budget',
+    parts: [1, 2, 3].map((idx) => ({ idx, startLine: idx * 100 - 99, endLine: idx * 100, path: `/tmp/out/Transcripts/甲.md.part${idx}` })),
+  }]
+  const manifest = buildRunManifest({ outputDir: '/tmp/out', refined: [], failed: ['甲'], execution, plannedChunks, audit: { status: 'ok', files: [] } }, { outputDir: '/tmp/out', topic: 'T' })
+
+  assert.equal(manifest.execution.status, 'failed')
+  assert.equal(manifest.execution.failure.code, 'OUTPUT_MISSING')
+  assert.equal(manifest.quality.status, 'ready', 'quality remains a separate editorial dimension and does not mask execution failure')
+  assert.equal(manifest.plannedChunks[0].parts.length, 3)
+  assert.equal(manifest.plannedChunks[0].parts[2].path, '/tmp/out/Transcripts/甲.md.part3')
 })
 
 test('manifest carries content-gap details and annotations; review renders 内容缺口', () => {

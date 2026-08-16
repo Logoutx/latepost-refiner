@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JobConfigError, runJob } from './jobs.js'
+import { parseInternalDirectory } from '../core/spec.js'
 
 // re-exported for tests (definitions live in jobs.js, the shared runtime)
 export { deriveTitle, HEADING_RE } from './jobs.js'
@@ -27,6 +28,11 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
   --date <YYYY-MM>       采访时间（写入抬头）
   --background <文本>     采访背景（指导侦察/核实）
   --background-file <路径> 从文件读取背景（背景较长时用）
+  --metadata-catalog <路径> 既有人物/机构规范名 JSON，供目录元数据统一写法
+  --internal-directory <路径> 内部通讯录名单（纯文本，每行一个姓名，# 开头为注释，姓名后可跟部门等列）。
+                         飞书 ASR 常把听不清的名字写成上传方同事名，命中名单的人名会被标为存疑并强制
+                         联网+上下文核实（名单只作存疑依据，不作白名单）。文件只在本地读取，内容绝不进入
+                         prompt、输出或仓库——请放在仓库外或 local/ 目录（已 gitignore）
   --scope <清单>         refine,logic,summary,timeline（逗号分隔；默认 refine）
   --verify <档>          key | deep | none（默认 key）
   --heading-policy <策略> none | keep | regenerate（默认 none）
@@ -45,12 +51,16 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
                          渲染不可见；引文可循此跳回源文件行号与录音时间）
   --no-run-log           不记录本次运行（默认会追加一行到 ~/.config/latepost-refiner/runs.jsonl：
                          时间/token 用量/估算成本）
-  --allow-audit-fail     审计门禁未过（内容缺口/引号，自动修复后仍 hard）时，若成稿等产物已生成，仍以退出码 0 结束
-                         （默认退出 1）。产物照样落盘；请查 review.md / run.json 的 auditFailed 字段逐份核对
+  --dev-trace            开发模式，记录说话人链路详细过程到 .dev-trace/，仅用于开发排查（也可设 REFINER_DEV_TRACE=1）
+  --allow-audit-fail     正文发布门禁未过（忠实性/接缝/清理/排版，定点修复后仍 hard）时，若成稿已生成，
+                         仍以退出码 0 结束（默认退出 1）。主成稿照样落盘、派生产物暂停；请查 review.md / run.json
+                         的 auditFailed 与 derivativesSkipped 字段逐份核对。逻辑稿自身审计失败不能用此参数豁免
 
 密钥（环境变量，或仓库根目录 .env）:
   DEEPSEEK_API_KEY       必填——DeepSeek 的 API key，精校全程使用
-  TAVILY_API_KEY         建议——标准/深度核实与时间线的联网搜索用；未设时联网核实降级为不联网（refine 不受影响）
+  TAVILY_API_KEY         建议——标准/深度核实与时间线的默认联网搜索用
+  SERPER_API_KEY         可选实验——未设 Tavily 时使用的搜索后端
+  JINA_API_KEY           可选实验——Jina Reader key；未设仍可调用公开 Reader，失败后走本地安全抓取
   ⚠ 信源提示            DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。
                          涉敏感话题或需保护信源的访谈请慎用。
 `
@@ -60,17 +70,20 @@ export const HELP_TEXT = `latepost-refiner — 访谈转录精校流水线（Dee
 export function parseArgs(argv) {
   const out = { files: [] }
   const variadic = { '--files': 'files' }
-  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--help': 'help', '-h': 'help' }
+  const booleans = { '--fresh': 'fresh', '--no-annotate': 'noAnnotate', '--no-anchors': 'noAnchors', '--no-run-log': 'noRunLog', '--allow-audit-fail': 'allowAuditFail', '--dev-trace': 'devTrace', '--help': 'help', '-h': 'help' }
   const aliases = {
     '--out': 'outputDir', '--outputDir': 'outputDir', '--output-dir': 'outputDir',
     '--skill-dir': 'skillDir', '--skillDir': 'skillDir',
     '--verify': 'verifyDepth', '--heading-policy': 'headingPolicy',
     '--background-file': 'backgroundFile',
+    '--metadata-catalog': 'metadataCatalogPath',
+    '--internal-directory': 'internalDirectoryPath',
     '--chunk': 'chunkMode', '--chunk-size': 'chunkSize', '--prior-glossary': 'priorGlossaryPath',
   }
   let i = 0
   while (i < argv.length) {
     const tok = argv[i]
+    if (tok === '--models') throw new JobConfigError('DeepSeek 版使用固定模型，CLI 不支持 --models')
     if (booleans[tok]) { out[booleans[tok]] = true; i++; continue }
     if (variadic[tok]) {
       const key = variadic[tok]; i++
@@ -115,11 +128,42 @@ export function buildRunParams(a, { env = process.env } = {}) {
       throw new JobConfigError(`无法读取背景文件 ${backgroundPath}：${e.message}`)
     }
   }
+  let metadataCatalog
+  if (a.metadataCatalogPath) {
+    const catalogPath = path.resolve(a.metadataCatalogPath)
+    try {
+      metadataCatalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'))
+    } catch (e) {
+      throw new JobConfigError(`无法读取元数据目录 ${catalogPath}：${e.message}`)
+    }
+    if (!metadataCatalog || typeof metadataCatalog !== 'object' || Array.isArray(metadataCatalog)) {
+      throw new JobConfigError(`元数据目录 ${catalogPath} 必须是 JSON 对象`)
+    }
+  }
+
+  let internalDirectory
+  if (a.internalDirectoryPath) {
+    const dirPath = path.resolve(a.internalDirectoryPath)
+    let dirText
+    try {
+      dirText = fs.readFileSync(dirPath, 'utf8')
+    } catch (e) {
+      throw new JobConfigError(`无法读取内部通讯录 ${dirPath}：${e.message}`)
+    }
+    internalDirectory = parseInternalDirectory(dirText)
+    if (!internalDirectory.length) throw new JobConfigError(`内部通讯录 ${dirPath} 未解析出任何姓名（每行一个姓名，# 开头为注释）`)
+  }
 
   return {
+    apiKey: env.DEEPSEEK_API_KEY,
+    tavilyKey: env.TAVILY_API_KEY,
+    serperKey: env.SERPER_API_KEY,
+    jinaKey: env.JINA_API_KEY,
     topic,
     date,
     background,
+    metadataCatalog,
+    internalDirectory,
     outputDir,
     skillDir,
     scope: parseScope(a.scope),
@@ -133,6 +177,7 @@ export function buildRunParams(a, { env = process.env } = {}) {
     anchors: a.noAnchors ? false : undefined,   // default on: sections get invisible source anchors
     runLog: a.noRunLog ? false : undefined,     // default on: appends one line to ~/.config/latepost-refiner/runs.jsonl
     priorGlossaryPath: a.priorGlossaryPath ? path.resolve(a.priorGlossaryPath) : undefined,
+    devTrace: a.devTrace || env.REFINER_DEV_TRACE === '1' || undefined,   // 开发排查用，默认关闭
     files: (a.files || []).map((p) => ({ path: path.resolve(p) })),
     concurrency: a.concurrency ? Number(a.concurrency) : undefined,
   }
@@ -142,17 +187,20 @@ const list = (xs) => xs.map((x) => (typeof x === 'string' ? x : (x.path || JSON.
 
 // SF-6 — the process exit code, factored out so it is unit-testable without spawning the CLI.
 //   · a pipeline error → always 1
-//   · audit gate left a file still-hard after auto-repair → 1 by default; with allowAuditFail AND ≥1 成稿 produced
+//   · audit gate left a file still-hard after candidate repair → 1 by default; with allowAuditFail AND ≥1 成稿 produced
 //     (so the ONLY failure is auditFailed and the run otherwise succeeded) → 0
 //   · otherwise → 0
 // The products are written to disk regardless of the exit code; callers should inspect run.json / review.md's
 // auditFailed field, not the exit code, to decide per-file follow-up.
 export function computeExitCode(result, { allowAuditFail = false } = {}) {
   if (result.error) return 1
+  if (result.execution && result.execution.status === 'failed') return 1
+  if ((result.failed || []).length > 0) return 1
   // P7 fail-loud: an audit that could NOT run (deliverables unaudited) always exits 1. This is NOT bypassable
   // by --allow-audit-fail: that flag means "the audit ran and found a hard issue I accept", a different decision
   // from "the audit never ran, so nothing was verified". An unverified run must never masquerade as success.
   if ((result.auditUnavailable || []).length > 0) return 1
+  if ((result.logicFailed || []).length > 0) return 1
   const auditFailed = (result.auditFailed || []).length > 0
   if (!auditFailed) return 0
   const producedOutput = (result.refined || []).length > 0
@@ -160,6 +208,10 @@ export function computeExitCode(result, { allowAuditFail = false } = {}) {
 }
 
 export function printRunSummary(r) {
+  if (r.execution && r.execution.failure) {
+    const f = r.execution.failure
+    console.error(`\n执行失败 [${f.code || 'UNKNOWN'}]${f.retryable ? '（可重试）' : '（不可整单自动重试）'}：${f.message || ''}`)
+  }
   if (r.error) {
     console.error(`\n流水线未执行：${r.error}`)
     console.error(`Review queue：${r.reviewPath}`)
@@ -178,8 +230,9 @@ export function printRunSummary(r) {
     if (flagged > 0) console.error(`\n逐节复核：${flagged} 节需人工对照（共 ${total} 节）——见 review.md「逐节复核清单」`)
   }
   if ((r.crossFileConflicts || []).length) console.error(`\n⚠ 跨文件互证：${r.crossFileConflicts.length} 处同实体数值冲突（各份内部都合规，疑跨文件口径不一）——见 review.md「跨文件互证」`)
-  if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿及其派生的总结/时间线均未经审计，不可视为通过。产物已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
-  if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（自动修复后仍 hard）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
+  if ((r.auditUnavailable || []).length) console.error(`\n⛔ 审计未能运行 ${r.auditUnavailable.length} 份——本次运行判定为失败：这些成稿未经审计，不可视为通过；请求的总结/时间线/逻辑稿已暂停。主成稿已落盘但未经核验，请人工运行 audit_refined.mjs 核验后再采信：` + r.auditUnavailable.map((x) => x.label || path.basename(x.path || '')).join('、') + `\n  （退出码 1，且 --allow-audit-fail 不能豁免——“审计没跑”与“审计跑了但有硬伤”是两回事）`)
+  if ((r.auditFailed || []).length) console.error(`\n⚠ 审计门禁未过（候选修复后仍 hard，或当前运行时不支持安全自动修复）：` + r.auditFailed.map((x) => `${path.basename(x.path)}（${x.findings.join('/')}）`).join('、') + `\n  （成稿等产物已生成、照常落盘；默认退出码 1，加 --allow-audit-fail 则退出 0——请查 review.md / run.json 的 auditFailed 字段逐份核对）`)
+  if ((r.logicFailed || []).length) console.error(`\n⚠ 逻辑顺序稿审计未过：` + r.logicFailed.map((x) => `${path.basename(x.path || '')}（${(x.findings || []).join('/')}）`).join('、') + `\n  （精校主成稿不受影响；失败逻辑稿不可作为合格附件，退出码 1，且 --allow-audit-fail 不豁免）`)
   for (const an of r.annotations || []) {
     if (an.inserted && an.inserted.length) {
       console.error(`⚠ 内容缺口：${path.basename(an.path)} 已插入 ${an.inserted.length} 处标记（` + an.inserted.map((g) => `源第 ${g.startLine}-${g.endLine} 行 约 ${g.chars} 字`).join('；') + '）——疑被模型无声略过，可对照源文件补回或重精校该段')
@@ -196,8 +249,8 @@ export function printRunSummary(r) {
   console.error(`精校成稿：${(r.refined || []).length} 份`)
   for (const rr of r.refined || []) console.error(`  ✓ ${rr.outPath || rr.path}`)
   if ((r.failed || []).length) console.error(`⚠ 未完成（需手动补做）：${list(r.failed)}`)
-  if ((r.incomplete || []).length) console.error(`⚠ 疑似中途截断（需检查结尾）：${r.incomplete.map((x) => `${x.path}${x.note ? `（${x.note}）` : ''}`).join('；')}`)
-  if ((r.unchecked || []).length) console.error(`⚠ 结尾完整性未核（核对代理失败，请人工抽查结尾）：${list(r.unchecked)}`)
+  if ((r.incomplete || []).length) console.error(`⚠ 旧版 incomplete 标记（请按源比对审计重新核验）：${r.incomplete.map((x) => `${x.path}${x.note ? `（${x.note}）` : ''}`).join('；')}`)
+  if ((r.unchecked || []).length) console.error(`⚠ 源比对审计未核（请人工运行审计后再采信）：${list(r.unchecked)}`)
   if ((r.scoutSuspect || []).length) console.error(`⚠ 侦察疑损坏（成稿正常，但校对表该份不可靠，网络稳定后可重扫）：${r.scoutSuspect.join('、')}`)
   if ((r.headingConflicts || []).length) console.error(`⚠ 源文件已带小标题但 headingPolicy=none：${r.headingConflicts.join('、')}——可用 --heading-policy keep|regenerate 重跑该份`)
   if ((r.suspectedDuplicates || []).length) console.error(`⚠ 疑似同指（已写入校对表“疑似同指”节，待人工确认，未自动合并）：${r.suspectedDuplicates.map((s) => (s.members || []).join('／')).join('；')}`)

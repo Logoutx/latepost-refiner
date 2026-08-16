@@ -48,7 +48,7 @@ function refinedDoc(title = '示例访谈') {
   ].join('\n')
 }
 
-test('Codex native prepare normalizes SRT sources into local markdown before prompts', () => {
+test('Codex native short SRT with generic Speaker 1/2 labels is normalized and stays on the staged flow', () => {
   const out = tmpdir()
   const src = path.join(out, '2026-07-01_示例字幕.srt')
   fs.writeFileSync(src, [
@@ -73,6 +73,9 @@ test('Codex native prepare normalizes SRT sources into local markdown before pro
   const args = JSON.parse(fs.readFileSync(prepared.argsPath, 'utf8'))
   assert.equal(args.files[0].sourceKind, 'srt')
   assert.equal(args.files[0].originalPath, src)
+  assert.equal(args.files[0].needsSpeakerResolution, true)
+  assert.equal(prepared.prompts[0].stage, 'scout')
+  assert.ok(!prepared.prompts.some((prompt) => prompt.stage === 'single-pass'))
   assert.match(args.files[0].path, /_codex-native\/sources\/.+\.md$/)
   const normalized = fs.readFileSync(args.files[0].path, 'utf8')
   assert.ok(!/\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(normalized), 'raw timecode arrows are not sent to native prompts')
@@ -274,4 +277,57 @@ test('Codex native logic-plan audit rejects same-order fake reorder before writi
   assert.ok(res.logicPlanAudit[0].issues.some((x) => x.includes('同序率') || x.includes('位移')))
   const next = JSON.parse(fs.readFileSync(res.statePath, 'utf8'))
   assert.equal(next.resultSeed.logic[0].failedPlan, true)
+})
+
+test('Codex native withholds every derivative prompt and ignores injected derivative results when the body gate fails', () => {
+  const out = tmpdir()
+  const src = path.join(out, 'source.md')
+  fs.writeFileSync(src, sourceLines(32), 'utf8')
+  const outPath = path.join(out, 'Transcripts', '缺口样本.md')
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, '# 缺口样本\n\n记者：只保留了开头一句。\n', 'utf8')
+  const args = {
+    topic: '缺口测试', outputDir: out, skillDir: path.resolve('codex-skill/latepost-refiner'),
+    scope: ['refine', 'logic', 'summary', 'timeline'], verifyDepth: 'none',
+    files: [{ path: src, label: '缺口样本', title: '缺口样本', lines: 32, chars: 20000, outPath }],
+  }
+  const state = {
+    refined: [{ label: '缺口样本', path: outPath, outPath }],
+    resultSeed: { refined: [{ label: '缺口样本', path: outPath, outPath }], logic: [], summary: null, timeline: null, openQuestions: [] },
+    sectionMapPath: path.join(out, '_codex-native', 'section-map.json'),
+  }
+  const deliver = deliverPrompts(args, state)
+  assert.equal(deliver.bodyGate.status, 'fail')
+  assert.deepEqual(deliver.prompts, [])
+  assert.deepEqual(deliver.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+
+  const guarded = afterDeliver(args, state, {
+    logicRaw: [{ label: '缺口样本', path: path.join(out, '逻辑顺序', '不应采信.md') }],
+    summaryRaw: { path: path.join(out, '不应采信总结.md') },
+    timelineRaw: { path: path.join(out, '不应采信时间线.md') },
+  }).result
+  assert.deepEqual(guarded.logic, [])
+  assert.equal(guarded.summary, null)
+  assert.equal(guarded.timeline, null)
+  assert.deepEqual(guarded.derivativesSkipped.map((x) => x.kind), ['logic', 'summary', 'timeline'])
+})
+
+test('Codex native treats a reported residual chunk seam as a publication gate', () => {
+  const out = tmpdir()
+  const src = path.join(out, 'source.md')
+  fs.writeFileSync(src, sourceLines(), 'utf8')
+  const outPath = path.join(out, 'Transcripts', '示例访谈.md')
+  fs.mkdirSync(path.dirname(outPath), { recursive: true })
+  fs.writeFileSync(outPath, refinedDoc('示例访谈'), 'utf8')
+  const args = {
+    topic: '接缝测试', outputDir: out, skillDir: path.resolve('codex-skill/latepost-refiner'),
+    scope: ['refine', 'summary'], verifyDepth: 'none',
+    files: [{ path: src, label: '示例访谈', title: '示例访谈', lines: 16, chars: 24000, outPath }],
+  }
+  const entry = { label: '示例访谈', path: outPath, outPath, seamDuplicates: [{ seam: 1, repeatedBlocks: 2 }] }
+  const state = { refined: [entry], resultSeed: { refined: [entry], openQuestions: [] } }
+  const deliver = deliverPrompts(args, state)
+  assert.equal(deliver.bodyGate.status, 'fail')
+  assert.ok(deliver.bodyGate.files[0].failed.includes('seam_duplicate'))
+  assert.deepEqual(deliver.prompts, [])
 })

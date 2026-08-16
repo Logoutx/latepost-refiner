@@ -80,6 +80,22 @@ test('M6 legit label unification does NOT flag: every 发言人2 turn faithfully
   assert.equal(r.mismatches, 0, 'a clean, consistently-labeled refine raises no attribution flag')
 })
 
+test('M6 consumes the canonical mapping to audit Scout-recovered unfamiliar source decorators', () => {
+  const source = buildSource()
+    .replace(/^发言人1\s+(00:\d{2})$/gmu, '⟦$1⟧ 沈其安')
+    .replace(/^发言人2\s+(00:\d{2})$/gmu, '⟦$1⟧ 周砚')
+  const mappings = [
+    { sourceLabel: '沈其安', outputLabel: '沈其安' },
+    { sourceLabel: '周砚', outputLabel: '周砚' },
+  ]
+  const r = checkAttribution(source, buildRefined(), { speakerMode: 'tracked', speakerMappings: mappings })
+  assert.equal(r.status, 'assessed')
+  assert.equal(r.mappedSpeakers, 2)
+  assert.equal(r.mismatches, 0)
+  assert.equal(r.map['沈其安'], '沈其安')
+  assert.equal(r.map['周砚'], '周砚')
+})
+
 test('M6 swapped attribution IS flagged: one guest answer placed under the interviewer label', () => {
   // move the 5th guest answer (index 4, a long distinctive turn) under 沈其安
   const refined = buildRefined({ swapTurnIndex: 4, swapTo: '沈其安' })
@@ -266,28 +282,33 @@ test('M7b is dormant (assessed:false) when the glossary yields no parseable cano
   assert.equal(r.assessed, false, 'no canonicals → dormant, never a false flag')
 })
 
-// ---------- micro-fix #7: 能能 stutter guard ----------
+// ---------- adjacent-character repeat confidence tiers ----------
 
-test('micro-fix 能能: 可能能够 / 智能能力 / 性能能耗 / 功能能 PASS (word ending in 能 + word starting with 能)', () => {
-  for (const s of ['我觉得可能能够解决这个问题', '这套系统的智能能力很强', '它的性能能耗比做得不错', '这个功能能覆盖大部分场景']) {
+test('exact doubles are one review tier across characters instead of a growing lexical allowlist', () => {
+  for (const s of [
+    '我觉得可能能够解决这个问题',
+    '这套系统的智能能力很强',
+    '它的性能能耗比做得不错',
+    '这个功能能覆盖大部分场景',
+    '请告诉我我的安排',
+    '但是是另一种方案',
+    '我我觉得',
+    '就就是说',
+  ]) {
     const r = auditText(s)
-    const stut = r.findings.find((f) => f.name === 'stutter_repeats')
-    assert.equal(stut.count, 0, `${s} → 能能 is legitimate, not a stutter`)
+    assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 0, `${s} → no double is a hard stutter`)
+    assert.equal(r.findings.find((f) => f.name === 'confirmation_repeats').count, 0, `${s} → no double is a hard confirmation`)
+    assert.equal(r.findings.find((f) => f.name === 'contextual_repeat_review').count, 1, `${s} → the double remains reviewable`)
     assert.equal(r.status, 'ok')
   }
 })
 
-test('micro-fix 能能: a standalone 能能 stutter at phrase start STILL fails', () => {
-  const r = auditText('周砚：能能，这个我得想想。')  // 能能 at phrase start (after ：) → real stutter
-  assert.equal(r.findings.find((f) => f.name === 'stutter_repeats').count, 1)
-  assert.equal(r.status, 'fail')
-})
-
-test('micro-fix 能能: 我我 / 就就 stutters and 对对对 / 是是是 confirmations are unchanged', () => {
-  assert.equal(auditText('我我觉得').findings.find((f) => f.name === 'stutter_repeats').count, 1, '我我 still flags')
-  assert.equal(auditText('就就是说').findings.find((f) => f.name === 'stutter_repeats').count, 1, '就就 still flags')
-  assert.equal(auditText('对对对好的').findings.find((f) => f.name === 'confirmation_repeats').count, 1, '对对对 unchanged')
-  assert.equal(auditText('是是是没错').findings.find((f) => f.name === 'confirmation_repeats').count, 1, '是是是 unchanged')
+test('triple repetitions stay hard regardless of phrase position', () => {
+  assert.equal(auditText('周砚：能能能，这个我得想想。').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('我我我觉得').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('就就就是说').findings.find((f) => f.name === 'stutter_repeats').count, 1)
+  assert.equal(auditText('对对对好的').findings.find((f) => f.name === 'confirmation_repeats').count, 1)
+  assert.equal(auditText('是是是没错').findings.find((f) => f.name === 'confirmation_repeats').count, 1)
 })
 
 // ---------- micro-fix #8: heading-level fallback ----------
@@ -309,9 +330,9 @@ test('micro-fix headings: < 3 ## but ≥ 3 of a deeper level → densest deeper 
   assert.equal(detectHeadingRegex(doc).source, /^#{3}\s+/.source, '1 ## vs 4 ### → ###')
 })
 
-// ---------- integration: auditPair surfaces M6 + M7a metrics/findings, all SOFT ----------
+// ---------- integration: calibrated speaker swaps gate; ambiguous review and quote risks stay soft ----------
 
-test('auditPair: attribution + quotes ride as SOFT findings and metrics; a swap never fails the gate', () => {
+test('auditPair: a calibrated attribution swap is a body-fidelity gate', () => {
   const source = buildSource()
   const refined = buildRefined({ swapTurnIndex: 4, swapTo: '沈其安' })
   const r = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
@@ -319,9 +340,34 @@ test('auditPair: attribution + quotes ride as SOFT findings and metrics; a swap 
   assert.equal(r.metrics.attribution.mismatches, 1)
   assert.ok('quotes' in r.metrics, 'quotes metric present in refine mode')
   const am = r.findings.find((f) => f.name === 'attribution_mismatch')
-  assert.equal(am.severity, 'soft')
+  assert.equal(am.severity, 'hard')
   assert.equal(am.count, 1)
-  assert.ok(!r.failed.includes('attribution_mismatch'), 'attribution is SOFT — never a gate this pass')
+  assert.ok(r.failed.includes('attribution_mismatch'), 'a high-confidence speaker swap blocks final-body status')
+})
+
+test('auditPair: a pre-adjudicated unknown speaker candidate cannot hard-fail through attribution', () => {
+  const source = buildSource()
+  const refined = buildRefined({ swapTurnIndex: 4, swapTo: '王小明' })
+  const baseline = auditPair({ sourceText: source, refinedText: refined, mode: 'refine' })
+  assert.ok(baseline.failed.includes('attribution_mismatch'), 'control: the raw parser would treat the candidate as a hard swap')
+
+  const review = auditPair({
+    sourceText: source,
+    refinedText: refined,
+    mode: 'refine',
+    speakerReviewLabels: ['王小明'],
+  })
+  assert.ok(!review.failed.includes('attribution_mismatch'))
+  assert.equal(review.findings.find((f) => f.name === 'attribution_review').count, 1)
+
+  const dismissed = auditPair({
+    sourceText: source,
+    refinedText: refined,
+    mode: 'refine',
+    speakerDismissedLabels: ['王小明'],
+  })
+  assert.ok(!dismissed.failed.includes('attribution_mismatch'))
+  assert.ok(!dismissed.findings.some((f) => f.name === 'attribution_review'))
 })
 
 test('auditPair: entity_substitution_risk is absent by default and present only under strict', () => {

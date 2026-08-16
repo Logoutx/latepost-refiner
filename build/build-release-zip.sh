@@ -57,7 +57,7 @@ cat > "$DS/README.md" <<'EOF'
 # LatePost-Refiner · DeepSeek 版（Mac 免安装）
 
 1. 右键点 `启动.command` → 打开（只有第一次需要右键；之后双击即可）。
-2. 浏览器会自动打开本地页面；DeepSeek / Tavily 的 API key 直接填在网页里，只在内存、不落盘。
+2. 浏览器会自动打开本地页面；DeepSeek / Serper / Jina Reader 的 API key 直接填在网页里，只在内存、不落盘（Jina 可留空）。
 3. 用完关掉那个终端窗口就停了。
 
 - 不用装 Node、不用装 Homebrew；Apple Silicon 和 Intel 芯片都能用（启动器自动挑）。

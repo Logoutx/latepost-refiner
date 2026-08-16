@@ -25,3 +25,6 @@ universal/embedded-assets.js
 /.runs/
 /tmp/
 *.local.md
+
+# Local-only sensitive inputs (e.g. --internal-directory 通讯录名单) — never committed
+/local/

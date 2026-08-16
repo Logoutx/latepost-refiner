@@ -9,18 +9,18 @@ Use this skill to turn rough dialogue transcripts into faithful, citable researc
 
 ## First Choice In Codex: Native Subscription Runtime
 
-When running inside Codex, prefer the Codex native runtime in [references/native-runtime.md](references/native-runtime.md). It runs on the signed-in ChatGPT/Codex subscription through native subagents and deterministic local Node helpers. It does **not** require `OPENAI_API_KEY` or `TAVILY_API_KEY` on the primary path.
+When running inside Codex, prefer the Codex native runtime in [references/native-runtime.md](references/native-runtime.md). It runs on the signed-in ChatGPT/Codex subscription through native subagents and deterministic local Node helpers. It does **not** require `OPENAI_API_KEY`, `SERPER_API_KEY`, or `JINA_API_KEY` on the primary path.
 
 Read [references/native-runtime.md](references/native-runtime.md) when:
 - Running from Codex or installing this skill for Codex.
 - Using no-key scout, verify, refine, logic, summary, or timeline stages.
 - Explaining the generated prompt manifests, local audit, quality scorecard, `review.md`, or `run.json`.
 
-Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch work, `gpt-5.4` for verify/dedup/summary, and `gpt-5.5` for quality-critical refine, logic planning, and logic writing. `verifyDepth: deep` should keep web verification on the native browsing path and surface unresolved items rather than asking for a Tavily key.
+Codex-native model policy: use `gpt-5.4-mini` for mechanical scout/check/stitch work, `gpt-5.4` for verify/dedup/summary, and `gpt-5.5` for quality-critical refine, logic planning, and logic writing. `verifyDepth: deep` should keep web verification on the native browsing path and surface unresolved items rather than asking for external search/reader keys.
 
 ## Universal Runtime Fallback
 
-Use [references/universal-runtime.md](references/universal-runtime.md) for the local web app or CLI, non-Codex users, or when the user explicitly wants CLI/web execution with a `DEEPSEEK_API_KEY`. This fallback is useful, but it is not the primary Codex path.
+Use [references/universal-runtime.md](references/universal-runtime.md) for the local web app or CLI, non-Codex users, or when the user explicitly wants CLI/web execution with a `DEEPSEEK_API_KEY`. Its web verification is Tavily-first, with Serper and Jina as optional fallbacks. This fallback is useful, but it is not the primary Codex path.
 
 ## Opening Questions
 
@@ -54,7 +54,7 @@ After that, do not interrupt with piecemeal questions. Save post-reading doubts 
 node "<skill dir>/scripts/audit_refined.mjs" --source "<source.md>" --refined "<out>/Transcripts/<title>.md" --mode refine
 ```
 
-Fix audit failures before handoff when possible. Compression or missing endings require rerunning from the source rather than trying to recover from a shortened output; local noise failures may be repaired in place. Limit automatic repair attempts to 2 rounds, then surface remaining failures in `review.md`. The audit also emits a soft `entity_merge_review` finding — a wholesale A→B name replacement where B already existed independently in the source (a possible false merge, not proven) — plus an informational 全局统一清单 (a cross-batch roll-up of every renamed entity); both require `--glossary <out>/校对表.md` on the audit call and are review-tier, not blocking.
+Fix audit failures before handoff when possible. Compression or a substantive source gap requires rerunning from the source rather than trying to recover from a shortened output. Do not infer failure merely because the source's last few characters disappeared: closing pleasantries may be folded, while real ending loss is covered by the same source-gap evidence as a middle omission. Repair a separate candidate, re-run both speaker-contract and quality checks, and replace the accepted body only after it passes; otherwise keep the prior body and surface the failure in `review.md`. The audit also emits a soft `entity_merge_review` finding — a wholesale A→B name replacement where B already existed independently in the source (a possible false merge, not proven) — plus an informational 全局统一清单 (a cross-batch roll-up of every renamed entity); both require `--glossary <out>/校对表.md` on the audit call and are review-tier, not blocking.
 6. Read `review.md` first for unresolved issues; do not dump full transcripts into the main context.
 7. Ask any remaining open questions in one final batch, with exact output paths and next actions.
 
@@ -85,6 +85,7 @@ When verification turns up a name that may be an ASR mishearing (spoken form doe
 - Weigh evidence by tier: official domains / major media / encyclopedia entries outrank directories and SEO blogs, which outrank self-promotion.
 - Coattail-inversion rule: a site named after the literal spoken string that reads "Powered by X" or resells X is evidence *for* correction X, not for the literal string as an independent entity (e.g. spoken "K Frame" surfacing `kframe.ai` labeled "Powered by Keyframe" supports Keyframe, not a separate company called K Frame).
 - Context-fit test: an identity contradicted by what the transcript itself says about the entity cannot be marked verified, regardless of source tier.
+- Chinese-name script evidence: identity and orthography are separate claims. An English/Pinyin/Romanized author name may establish who the person is, but cannot choose among homophonic Chinese spellings. A Chinese canonical is eligible for writeback only when a cited page directly shows the exact Han characters; otherwise keep it unresolved/contested.
 - Two-key rule: writing a name different from the spoken form requires **both** a high-tier source **and** a context-fit pass. Missing either key means no silent substitution — the entity is marked `〔同指两解〕` (contested identity: literal spoken form vs. a suspected correction).
 - Transcript annotation: keep the spoken written form in the body; on that entity's first occurrence per file, annotate inline: `（音，存疑：或为 <候选名>）`. Never substitute a different referent for what was actually spoken.
 - Wrap-up template: each `〔同指两解〕` entity gets one line in the final question batch: `〔同指两解〕<口播形>：A=<字面假设>（证据级别）；B=<改正假设>（证据级别）——正文已保留口播形并标注，请定夺`

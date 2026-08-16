@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildRunParams, parseArgs, computeExitCode } from '../universal/cli.js'
+import { buildRunParams, parseArgs, computeExitCode, HELP_TEXT } from '../universal/cli.js'
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'transcriber-cli-'))
@@ -35,7 +35,7 @@ test('parseArgs output maps CLI flags to runJob params', () => {
     '--scope', 'refine,summary,timeline',
     '--prior-glossary', path.join(dir, '往次校对表.md'),
   ])
-  const params = buildRunParams(args, { env: { HOME: dir } })
+  const params = buildRunParams(args, { env: { HOME: dir, DEEPSEEK_API_KEY: 'd', TAVILY_API_KEY: 't', SERPER_API_KEY: 's', JINA_API_KEY: 'j' } })
 
   assert.deepEqual(params.files, [{ path: a }, { path: b }])
   assert.equal(params.topic, '虚构项目')
@@ -51,6 +51,18 @@ test('parseArgs output maps CLI flags to runJob params', () => {
   assert.equal(params.fresh, true)
   assert.equal(params.annotate, false)
   assert.equal(params.priorGlossaryPath, path.join(dir, '往次校对表.md'), '--prior-glossary resolves to an absolute path')
+  assert.equal(params.apiKey, 'd')
+  assert.equal(params.tavilyKey, 't')
+  assert.equal(params.serperKey, 's')
+  assert.equal(params.jinaKey, 'j')
+})
+
+test('CLI does not expose per-stage --models selection', () => {
+  assert.throws(
+    () => parseArgs(['--files', '/tmp/a.md', '--topic', 'T', '--models', 'refine=deepseek-v4-flash']),
+    /固定模型.*不支持 --models/,
+  )
+  assert.doesNotMatch(HELP_TEXT, /--models/)
 })
 
 test('parseArgs: --prior-glossary is undefined when the flag is absent', () => {
@@ -100,6 +112,11 @@ test('computeExitCode: a clean run exits 0', () => {
   assert.equal(computeExitCode({ refined: [{ path: '/o/A.md' }], auditFailed: [] }), 0)
 })
 
+test('computeExitCode: a missing main output is an execution failure even without an audit result', () => {
+  assert.equal(computeExitCode({ failed: ['A'], refined: [], auditFailed: [] }), 1)
+  assert.equal(computeExitCode({ execution: { status: 'failed' }, failed: [], refined: [] }), 1)
+})
+
 test('computeExitCode: audit gate failure exits 1 by DEFAULT even though products were generated', () => {
   const result = { refined: [{ path: '/o/A.md' }], auditFailed: [{ path: '/o/A.md', findings: ['content_gap'] }] }
   assert.equal(computeExitCode(result), 1, 'default: auditFailed → exit 1')
@@ -123,4 +140,14 @@ test('computeExitCode (P7): an audit that could not run exits 1 and is NOT bypas
   const result = { refined: [{ path: '/o/A.md' }], auditFailed: [], auditUnavailable: [{ path: '/o/A.md', label: 'A' }] }
   assert.equal(computeExitCode(result), 1, 'default: auditUnavailable → exit 1')
   assert.equal(computeExitCode(result, { allowAuditFail: true }), 1, '--allow-audit-fail cannot mask an audit that never ran')
+})
+
+test('computeExitCode: a failed logic draft exits 1 and is not bypassed by --allow-audit-fail', () => {
+  const result = {
+    refined: [{ path: '/o/A.md' }],
+    auditFailed: [],
+    logicFailed: [{ path: '/o/logic/A.md', findings: ['logic_order_unchanged'] }],
+  }
+  assert.equal(computeExitCode(result), 1)
+  assert.equal(computeExitCode(result, { allowAuditFail: true }), 1)
 })

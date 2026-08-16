@@ -76,6 +76,23 @@ test('mergeIntoPrior: a later DECISIVE verify (two_key) DOES upgrade contested �
   assert.ok(/\*\*Keyframe\*\*/.test(line), 'canonical is now the corrected form')
 })
 
+test('fresh strong person spelling accepts a concrete two-key correction even without suspect_asr', () => {
+  const merged = emptyMerged({ people: [{ canonical: '陈涛', variants: [], hint: '示例公司研究员' }] })
+  const decisive = { resolved: [{ query: '陈涛', canonical: '陈焘', identity: '示例公司研究员', source: 'example.edu 官方教师页显示“陈焘”', name_script_exact: true, two_key: true }], unresolved: [] }
+  const line = renderGlossary(merged, decisive, { suspects: [] }, GA).split('\n').find((l) => l.includes('**陈焘**')) || ''
+  assert.ok(line, 'the verified public spelling is written back as canonical')
+  assert.ok(line.includes('陈涛'), 'the spoken ASR spelling is retained as a variant for traceability')
+  assert.ok(line.includes('〔核实'), 'the applied correction carries verified confidence')
+})
+
+test('fresh strong person spelling still rejects a rename without the two-key verdict', () => {
+  const merged = emptyMerged({ people: [{ canonical: '陈涛', variants: [], hint: '示例公司研究员' }] })
+  const weak = { resolved: [{ query: '陈涛', canonical: '陈焘', identity: '示例公司研究员', source: 'example.edu 官方教师页' }], unresolved: [] }
+  const line = renderGlossary(merged, weak, { suspects: [] }, GA).split('\n').find((l) => l.includes('**陈涛**')) || ''
+  assert.ok(line.includes('未采用'), 'a concrete source without two_key cannot rewrite a strong person name')
+  assert.ok(!line.includes('〔核实'), 'a rejected rename is not marked verified')
+})
+
 // FIX 1 (a): a self-confirmation of the literal (canonical === spoken form) retires contested ONLY with two_key.
 test('two-batch: a self-confirm without two_key stays contested; with two_key it retires to 核实', () => {
   const priorMd = renderGlossary(emptyMerged({ brands: [{ canonical: 'K Frame', variants: [], hint: '工具' }] }), CONTESTED_V, { suspects: [] }, GA)
@@ -149,6 +166,7 @@ test('verifyPrompt includes the hypothesis-driven protocol for a suspect chunk',
   assert.ok(p.includes('证据分级') || p.includes('分级取信'), 'instructs tiered evidence weighting')
   assert.ok(p.includes('搭便车反转'), 'includes the coattail-inversion rule')
   assert.ok(p.includes('两把钥匙规则'), 'includes the two-key rule')
+  assert.ok(p.includes('name_script_exact') && p.includes('英文名或拼音'), 'Chinese-name spelling requires direct Han-script evidence')
   assert.ok(p.includes('假设优先核实法'), 'includes the hypothesis-first protocol header')
 })
 
@@ -159,6 +177,7 @@ test('verifyPrompt OMITS the heavy protocol for a clean chunk (stays lean)', () 
   assert.ok(!p.includes('假设优先核实法'), 'no hypothesis-first protocol block for a clean chunk')
   // The schema-return line still names contested (always allowed), but the heavy protocol is gone — verify that.
   assert.ok(!p.includes('两把钥匙规则'), 'no two-key protocol section for a clean chunk')
+  assert.ok(p.includes('name_script_exact'), 'the Chinese-name evidence contract applies even to an otherwise clean chunk')
 })
 
 test('looksPhoneticallySuspect: signals and clean cases', () => {

@@ -40,12 +40,32 @@ test('buildRunLogEntry: shape from a fake result (all fields, worked-example cos
   assert.equal(entry.durationMs, 732000)
   assert.equal(entry.durationMin, 12.2)
   // usage is re-shaped to exactly these 5 fields — engine's `failed` counter is not part of the log entry
-  assert.deepEqual(entry.usage, { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, agents: 9 })
+  assert.deepEqual(entry.usage, { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, agents: 9, byModel: {} })
   // fresh = 1000-200 = 800; cheaper (flash) for input, writing-tier (pro) for output:
   // (800*0.14 + 200*0.0028 + 500*0.87) / 1e6 = (112 + 0.56 + 435) / 1e6 = 0.000548
   assert.deepEqual(entry.estCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
+  assert.equal(entry.searchProvider, null)
+  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'No search provider configured' })
+  assert.deepEqual(entry.readerEstCost, { value: 0, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
+  assert.deepEqual(entry.totalEstCost, { value: 0.000548, currency: 'USD', note: 'mixed-tier approximation' })
   assert.equal(entry.auditStatus, 'ok')
   assert.equal(entry.outputDir, '/out/虚构示例项目')
+})
+
+test('buildRunLogEntry separates DeepSeek, Tavily, and Jina estimated costs', () => {
+  const models = { haiku: 'deepseek-v4-flash', sonnet: 'deepseek-v4-flash', opus: 'deepseek-v4-pro' }
+  const result = { usage: { input: 1000, output: 500 }, durationMs: 1 }
+  const webTelemetry = { searchBilled: 7, fetchJinaTokens: 608025, fetchJinaUsageMissing: 0 }
+  const entry = buildRunLogEntry({ params: {}, result, provider: 'deepseek', models, webTelemetry, searchProvider: 'tavily' })
+  assert.equal(entry.estCost.value, 0.000575)
+  assert.equal(entry.searchProvider, 'tavily')
+  assert.deepEqual(entry.searchEstCost, { value: 0.056, currency: 'USD', note: 'Tavily Basic list price: $0.008 / search' })
+  assert.deepEqual(entry.readerEstCost, { value: 0.03040125, currency: 'USD', note: 'Jina Reader estimate: $50 / 1B tokens' })
+  assert.equal(entry.totalEstCost.value, 0.08697625)
+  assert.deepEqual(entry.webTelemetry, webTelemetry)
+
+  const serper = buildRunLogEntry({ result: {}, webTelemetry: { searchBilled: 7 }, searchProvider: 'serper' })
+  assert.deepEqual(serper.searchEstCost, { value: 0.007, currency: 'USD', note: 'Serper list price: $1 / 1,000 searches' })
 })
 
 test('buildRunLogEntry: auditStatus is "unavailable" when result.audit is absent, "fail" when audit failed', () => {
@@ -83,6 +103,19 @@ test('estimateCost: DeepSeek single model (no mixing) computes exactly, no appro
   // rounded to estimateCost's 6dp = 0.001966
   const cost = estimateCost('deepseek', models, usage)
   assert.deepEqual(cost, { value: 0.001966, currency: 'USD', note: null })
+})
+
+test('estimateCost uses API-reported per-model token buckets exactly when available', () => {
+  const usage = {
+    input: 15000, output: 5000, cacheRead: 3000,
+    byModel: {
+      'deepseek-v4-flash': { input: 10000, output: 2000, cacheRead: 2000 },
+      'deepseek-v4-pro': { input: 5000, output: 3000, cacheRead: 1000 },
+    },
+  }
+  const cost = estimateCost('deepseek', { refine: 'deepseek-v4-pro' }, usage)
+  // flash=(8000*.14+2000*.0028+2000*.28), pro=(4000*.435+1000*.003625+3000*.87)
+  assert.deepEqual(cost, { value: 0.006039, currency: 'USD', note: null })
 })
 
 test('estimateCost: deepseek-chat prices the same as deepseek-v4-flash (legacy alias)', () => {
@@ -152,10 +185,12 @@ test('appendRunLog: defaults to ~/.config/latepost-refiner/runs.jsonl when no lo
 
 function mockEngine() {
   const usage = { input: 12, output: 6, cacheRead: 0, cacheWrite: 0, agents: 0, failed: 0 }
+  const webTelemetry = { searchCalls: 1, searchAttempts: 1, searchBilled: 1, searchCacheHits: 0, searchBudgetRejected: 0, searchFailures: 0, fetchCalls: 0, fetchCacheHits: 0, fetchJinaAttempts: 0, fetchJinaSuccess: 0, fetchJinaTokens: 0, fetchJinaUsageMissing: 0, fetchLocalAttempts: 0, fetchLocalSuccess: 0, fetchFailures: 0 }
   return {
     phase() {},
     log() {},
     usage: () => ({ ...usage }),
+    webTelemetry: () => ({ ...webTelemetry }),
     parallel: async (thunks) => Promise.all(thunks.map((t) => t())),
     pipeline: async () => [],
     agent: async (_prompt, opts = {}) => {
@@ -196,6 +231,10 @@ test('runJob integration: a completed run appends exactly one log line with the 
   assert.equal(entry.topic, '虚构示例集团')
   assert.equal(entry.engine, 'universal')
   assert.equal(entry.provider, 'injected')
+  assert.equal(entry.webTelemetry.searchBilled, 1)
+  assert.equal(entry.searchProvider, null)
+  assert.deepEqual(entry.searchEstCost, { value: 0, currency: 'USD', note: 'No search provider configured' })
+  assert.equal(entry.totalEstCost, null)
   assert.ok(['ok', 'fail', 'unavailable'].includes(entry.auditStatus))
 })
 

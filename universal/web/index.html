@@ -57,6 +57,7 @@
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer; }
   details summary { cursor: pointer; font-size: 13px; color: var(--muted); font-weight: 600; }
   details[open] summary { margin-bottom: 8px; }
+  .optional-keys { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
   #console { font-family: var(--mono); font-size: 12.5px; background: #0e0d0b; color: #d7cfc2; border-radius: 10px; padding: 14px; height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
   #console .ph { color: #e0925f; font-weight: 700; }
   #console .er { color: #ef8d84; }
@@ -88,8 +89,21 @@
         <input type="password" id="tavilyKey" placeholder="仅本次使用，不保存" autocomplete="off">
       </div>
     </div>
+    <details class="optional-keys">
+      <summary>可选后备密钥</summary>
+      <div class="row">
+        <div>
+          <label>Serper API Key <span class="opt">Tavily 失败或未配置时使用</span></label>
+          <input type="password" id="serperKey" placeholder="可选，不保存" autocomplete="off">
+        </div>
+        <div>
+          <label>Jina API Key <span class="opt">网页正文提取，可选</span></label>
+          <input type="password" id="jinaKey" placeholder="可选，不保存" autocomplete="off">
+        </div>
+      </div>
+    </details>
     <p class="hint">DeepSeek 由中国境内公司运营，转录全文会传输至其服务器处理并受当地法规约束（含内容审查）。涉敏感话题或需保护信源的访谈请慎用。</p>
-    <p class="hint">Tavily 如不填，无法联网核实：名词校准质量会严重下降，也无法生成时间线。</p>
+    <p class="hint">Tavily 是首选搜索后端；不填 Tavily 时，若填了 Serper 也能联网核实。两者都不填时，名词核实和时间线会降级为不联网。</p>
   </div>
 
   <div class="card">
@@ -154,7 +168,12 @@ let picked = [] // {name, base64}
 function collectModel() {
   const apiKey = $('apiKey').value.trim()
   if (!apiKey) throw new Error('请填写 DeepSeek API Key。')
-  return { apiKey, tavilyKey: $('tavilyKey').value.trim() || undefined }
+  return {
+    apiKey,
+    tavilyKey: $('tavilyKey').value.trim() || undefined,
+    serperKey: $('serperKey').value.trim() || undefined,
+    jinaKey: $('jinaKey').value.trim() || undefined,
+  }
 }
 
 // file picking → base64
@@ -343,7 +362,7 @@ function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': 
 function setStatus(msg, isErr) { const s = $('status'); s.textContent = msg || ''; s.style.color = isErr ? 'var(--err)' : 'var(--muted)' }
 
 // --- persist non-secret settings across reloads (localStorage, lpr_ prefix) ---
-// Never persist: apiKey / tavilyKey or any input[type=password] — those stay in-memory only for the run.
+// Never persist: apiKey / tavilyKey / serperKey / jinaKey or any input[type=password] — those stay in-memory only for the run.
 function persistField(id, key) {
   const el = $(id)
   if (!el) return
