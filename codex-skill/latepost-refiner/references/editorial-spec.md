@@ -36,6 +36,8 @@ Usually keep:
 
 Collapse spelling-confirmation exchanges into the corrected spelling. If the conversation clarified `吴捷`, write `吴捷` and remove the mechanical spelling exchange. If it did not clarify the name, keep `（音）`.
 
+Off-topic chatter blocks are compressed, never silently deleted: opening small talk (equipment fiddling, greetings, warm-up chat before the first real question), closing small talk (farewells, logistics after the last real answer), and any mid-interview interruption (phone call, someone entering) each become ONE bracketed stage-direction line summarizing what happened — e.g. `[开场约几分钟为录音设备调试与寒暄，聊到 XX；正题从下面开始]`. Substance hidden inside chatter (a product judgment, a name, a number) is pulled out and kept per the Facts rules before the rest is folded.
+
 ## Structure
 
 - Add topic-based `##` headings.
