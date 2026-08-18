@@ -504,12 +504,13 @@ export function logicWritePrompt(f, a, missing, planPath) {
     : ''
   const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
   const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+  const logicOut = f.logicOutPath || a.outputDir + '/逻辑顺序/' + outName + '.md'
   return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${trackless ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${trackless ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
-【输出】Write 到 ${a.outputDir}/逻辑顺序/${outName}.md
-【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见 Transcripts/${outName}.md*\`
+【输出】Write 到 ${logicOut}
+【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见同名精校稿*\`
 
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。

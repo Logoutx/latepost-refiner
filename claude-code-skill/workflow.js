@@ -3488,12 +3488,13 @@ function logicWritePrompt(f, a, missing, planPath) {
     : ''
   const speakerMode = (f.speakerResolution && f.speakerResolution.speakerMode) || f.speakerMode
   const trackless = speakerMode === 'untracked' || speakerMode === 'ambiguous'
+  const logicOut = f.logicOutPath || a.outputDir + '/逻辑顺序/' + outName + '.md'
   return `你是「逻辑顺序重排」子代理。把一份**已精校**的访谈稿从“录音顺序”重排成“叙事顺序”——让散落在访谈各处、其实属于同一条线的${trackless ? '内容块' : '问答'}聚到一起，读起来是一个完整的故事。**这是重排，不是改写、更不是摘要**：${trackless ? '段落/内容块' : '问答块'}整段照搬精校稿原文，一字不改、一处不漏，只调换位置。${missNote}
 
 【输入·精校稿】${f.outPath}（已精校，人名/术语已统一）。${readPlan(f)}（这是读精校稿——它和源文件行数可能不同，读到没有更多内容即止。**只读这一份，不读源转录、不联网。**）${planNote}
 【结构模板】先 Read ${a.skillDir}/references/deliverables.md 的「逻辑顺序稿」部分。
-【输出】Write 到 ${a.outputDir}/逻辑顺序/${outName}.md
-【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见 Transcripts/${outName}.md*\`
+【输出】Write 到 ${logicOut}
+【抬头】第一行 \`# ${f.title} · 逻辑顺序稿\`；第二行斜体：\`*基于精校稿重排为叙事顺序，内容照搬未改，仅调顺序 + 少量 [编者] 衔接；原顺序见同名精校稿*\`
 
 做法：
 1. 通读精校稿，**理出这次访谈的主线**：3–7 条叙事线索（如 创业缘起 / 战略转折 / 某产品始末 / 组织 / 行业判断），各给一个自描述 \`##\` 小标题（**一律不编号**）。**源头可溯**：每条线索 \`##\` 小标题下、正文之前，加一行斜体 \`〔取自精校稿：<小标题1>、<小标题2>…〕\`，列出本线索取自精校稿的哪些 \`##\` 小标题（原样照抄精校稿小标题文字，与返回的 source_sections 一致），便于读者回溯原稿对应段落。
@@ -4837,10 +4838,10 @@ if (scope.includes('logic') && derivativePairs.length) {
     const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map(canonicalHeadingKey).filter(Boolean)))
     const srcHeadings = ((rep && rep.headings) || []).map((h) => (h || '').trim()).filter(Boolean)
     const missing = srcHeadings.filter((h) => !covered.has(canonicalHeadingKey(h)))
-    return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
+    return { label: f.label, path: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`), mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`) })))
   logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -4850,7 +4851,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = derivativePairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`) })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]

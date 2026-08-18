@@ -52,7 +52,7 @@ and every step follows it.
 
 Concentrate interaction **in one opening round**: ask everything the user "can answer from memory on the spot", then run autonomously without interrupting. Do four things up front, ideally in one or two exchanges:
 
-1. **Set the output location — ask, with a default the user can change.** Ask the user where to save the output, **offer a default, and let them confirm or change it**. The default is `~/Downloads`, *unless* you remember a last-used folder: if you can run a shell, first read `~/.config/latepost-refiner/last-output` and offer that path instead. After the user settles on a folder, **remember it for next time** — `mkdir -p ~/.config/latepost-refiner && printf '%s' '<chosen folder>' > ~/.config/latepost-refiner/last-output` — and `mkdir -p` the chosen folder if it doesn't exist. (If there's no shell in this environment, just offer `~/Downloads` and ask.) **Output rules**: refined transcripts → `<chosen folder>/Transcripts/`; logical-order rewrites → `<chosen folder>/逻辑顺序/`; timeline and summary → `<chosen folder>/` root.
+1. **Set the output location — ask, with a default the user can change.** Ask the user where to save the output, **offer a default, and let them confirm or change it**. The default is `~/Downloads`, *unless* you remember a last-used folder: if you can run a shell, first read `~/.config/latepost-refiner/last-output` and offer that path instead. After the user settles on a folder, **remember it for next time** — `mkdir -p ~/.config/latepost-refiner && printf '%s' '<chosen folder>' > ~/.config/latepost-refiner/last-output` — and `mkdir -p` the chosen folder if it doesn't exist. (If there's no shell in this environment, just offer `~/Downloads` and ask.) **Output rules (owner convention, 2026-08-18)**: ALL five deliverables go flat in `<chosen folder>/` root — no Transcripts/ or 逻辑顺序/ subfolders — named `【受访者 · 主题 · 日期】 精校稿.md` / `逻辑稿.md` / `时间线.md` / `总结.md` / `校对表.md` (日期 YYYY-MM-DD; year or year-month when that's all that's known; 合辑 for multi-interview company-level files). Raw source material (source transcripts, ASR dumps, docx/srt) goes in `<chosen folder>/Original/`. Set each file's `outPath` and `logicOutPath` accordingly (workflow.js honors `files[].logicOutPath`; without it the legacy 逻辑顺序/ path is used).
 
 2. **Have the user describe the background on the spot** (these don't require reading the full text, and they let you run to the end without interrupting):
    - **Who was interviewed**: the speaker list (including which reporter/host is who) + each interviewee's title/background at the time, even just a nickname or English name.
@@ -121,7 +121,7 @@ Gather these into **one** AskUserQuestion or one message. Deliver at the same ti
 
 ## Output spec (shared conventions)
 
-- **Location**: refined transcripts → `<chosen folder>/Transcripts/`; logical-order rewrites → `<chosen folder>/逻辑顺序/`; timeline and summary → `<chosen folder>/`.
+- **Location & naming (owner convention, 2026-08-18)**: all deliverables flat in `<chosen folder>/`, named `【受访者 · 主题 · 日期】 精校稿.md` / `逻辑稿.md` / `时间线.md` / `总结.md` / `校对表.md`; raw source material in `<chosen folder>/Original/`. The persistent per-company glossary is the newest `*校对表.md` in the folder (pass it as `priorGlossaryPath`).
 - **File title format**: `英文名（中文名）当时的title`.
   - Both an English name and a Chinese real name: `Allan（王哲）CFO·合伙人`, `Joey（李航）合伙人·CEO`.
   - Only a Chinese name (no English name): `陈悦 示例品牌合伙人` (name + title, no parentheses).

@@ -1329,10 +1329,10 @@ if (scope.includes('logic') && derivativePairs.length) {
     const covered = new Set((lrep.threads || []).flatMap((t) => ((t && t.source_sections) || []).map(canonicalHeadingKey).filter(Boolean)))
     const srcHeadings = ((rep && rep.headings) || []).map((h) => (h || '').trim()).filter(Boolean)
     const missing = srcHeadings.filter((h) => !covered.has(canonicalHeadingKey(h)))
-    return { label: f.label, path: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`, mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
+    return { label: f.label, path: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`), mainline: lrep.mainline || '', threads: (lrep.threads || []).map((t) => t && t.title).filter(Boolean), missingSections: missing, open_questions: lrep.open_questions || [] }
   }
   const lreps = await engine.parallel(derivativePairs.map(({ f }) => () =>
-    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })))
+    engine.agent(logicWritePrompt(f, A), { label: `logic:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`) })))
   logic = lreps.map((lrep, k) => toEntry(lrep, derivativePairs[k].f, derivativePairs[k].rep))
   // §5 missingSections auto-rerun (cap 1): any file whose first pass dropped ≥1 refine小标题 is re-run ONCE with
   // the omitted headings named as a must-include list. If the rerun still omits some, keep the (better of the
@@ -1342,7 +1342,7 @@ if (scope.includes('logic') && derivativePairs.length) {
     engine.log(`逻辑顺序补漏：${rerunIdx.map((k) => `${logic[k].label}(${logic[k].missingSections.join('/')})`).join('；')}——各自动重跑一次，点名遗漏小标题`)
     const reReps = await engine.parallel(rerunIdx.map((k) => () => {
       const { f } = derivativePairs[k]
-      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md` })
+      return engine.agent(logicWritePrompt(f, A, logic[k].missingSections), { label: `logic-rerun:${f.label}`, phase: 'Logic', model: M.logic, effort: effortFor(A, 'logic'), schema: LOGIC_REPORT_SCHEMA, outputPath: (f.logicOutPath || `${A.outputDir}/逻辑顺序/${safeName(f.title)}.md`) })
     }))
     rerunIdx.forEach((k, j) => {
       const re = reReps[j]
